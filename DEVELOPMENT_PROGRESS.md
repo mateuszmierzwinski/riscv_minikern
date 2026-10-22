@@ -267,12 +267,35 @@ Three things in it are *not* architecture-neutral and were fixed on the way in:
 - [ ] **P4.2 The SD card (`mmc`).** The JH7110 has a Cadence SDHCI-compatible
       host controller. Read-only first — enough to mount a root filesystem —
       then writes.
-- [ ] **P4.3 NVMe over PCIe.** The VisionFive 2 has an M.2 slot, and this is
-      the storage path that makes the board worth using: a PCIe root-complex
-      walk to find the controller, then the admin and I/O queues. Verifiable
-      under QEMU first (`virt` offers a PCIe host bridge and an emulated NVMe
-      controller), which means the queue handling can be right before the
-      board's root complex is ever touched.
+- [x] **P4.3 NVMe over PCIe — the M.2 slot (2026-10-22).** Worked on the
+      first run, which is what a specification written once and implemented
+      everywhere buys you.
+      **The PCIe walker assigns the memory windows itself.** No firmware here
+      has: on a machine that boots Linux, U-Boot or the kernel writes the base
+      addresses into each device's registers, and nothing on this path does —
+      so a freshly enumerated device has BARs full of zeroes, answers
+      configuration reads perfectly, and ignores every access to its own
+      registers. The size is discovered the way the specification prescribes
+      (write all ones, read back, the bits that stayed zero are not decoded)
+      and the base is taken from the 32-bit window the bridge publishes in its
+      `ranges`. **Bus mastering** is enabled in the same breath, because a
+      controller that cannot master initialises perfectly, accepts commands,
+      and never completes one — it cannot read the queues the driver built.
+      Then NVMe's own handshake: reset, admin queue pair, enable, identify the
+      controller, identify namespace 1, create the I/O queue pair. The model
+      string comes from the drive's own identify data (`QEMU NVMe Ctrl`),
+      which is what proves the admin queue works rather than merely that a
+      device was found; the geometry comes from the namespace's current
+      format, which reports its block size as a log2 in a table.
+      The **phase bit** is the detail worth knowing: completions are never
+      cleared, so "is this entry new?" is answered by comparing its phase with
+      what this pass expects, and that expectation inverts when the ring wraps.
+      A driver that forgets to invert it works for 32 commands and hangs on
+      the 33rd — long after a quick test would have passed.
+      Tested: enumerated, identified, written, read back, and the image's
+      digest unchanged from outside. And **with both a virtio disk and an NVMe
+      drive present, the NVMe drive is chosen**, because on a board with the
+      M.2 slot filled that is the storage anyone would want.
 - [ ] **P4.4 XFS on real storage.** The implementation carries over whole —
       mount, read, logged writes, create, remove, grow — and `xfs_repair -n`
       staying clean after every test remains the rule.

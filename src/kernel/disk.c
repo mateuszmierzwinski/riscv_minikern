@@ -4,6 +4,8 @@
 
 #include "core/console.h"
 #include "core/errno.h"
+#include "drivers/nvme.h"
+#include "drivers/pci.h"
 #include "drivers/virtio_blk.h"
 #include "kernel/mem.h"
 
@@ -17,9 +19,33 @@ static struct blockdev device;
 static struct bcache cache;
 static bool present;
 
+/* Which adapter is in use, so the boot log names the device rather than
+ * merely its size. */
+static const char *attached_kind = "";
+
+const char *disk_kind(void) {
+    return attached_kind;
+}
+
+/* Tries the devices in the order a user would want them: **NVMe first**,
+ * because on a board with an M.2 drive that is the storage worth having, and
+ * virtio second, which is the emulator's. A board with neither is the
+ * ordinary case for a kernel that netboots. */
+static int attach_any(const struct fdt *fdt) {
+    if (pci_init(fdt) == KERR_OK && nvme_init(&device) == KERR_OK) {
+        attached_kind = "nvme";
+        return KERR_OK;
+    }
+    if (virtio_blk_init(fdt, &device) == KERR_OK) {
+        attached_kind = "virtio";
+        return KERR_OK;
+    }
+    return KERR_NOENT;
+}
+
 int disk_attach(const struct fdt *fdt) {
     void *mem;
-    int rc = virtio_blk_init(fdt, &device);
+    int rc = attach_any(fdt);
     if (rc != KERR_OK) {
         return rc;
     }

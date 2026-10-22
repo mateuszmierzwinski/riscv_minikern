@@ -195,6 +195,29 @@ cc_library(
 # against a real device on this architecture — are exercised before the
 # board's own controllers are written, which means a later failure in an SD
 # or NVMe driver is in that driver rather than in the filesystem above it.
+# PCI Express and the M.2 slot behind it. The bus walker assigns the memory
+# windows itself, because no firmware here has: a device whose BARs are still
+# zero answers configuration reads perfectly and ignores its registers.
+cc_library(
+    name = "drivers_pci",
+    srcs = [
+        "src/drivers/nvme.c",
+        "src/drivers/pci.c",
+    ],
+    hdrs = [
+        "src/drivers/nvme.h",
+        "src/drivers/pci.h",
+    ],
+    strip_include_prefix = "src",
+    target_compatible_with = ["//platforms:riscv64"],
+    deps = [
+        ":arch_riscv",
+        ":console",
+        ":kernel_mem",
+        ":storage",
+    ],
+)
+
 cc_library(
     name = "drivers_virtio",
     srcs = [
@@ -224,6 +247,7 @@ cc_library(
     target_compatible_with = ["//platforms:riscv64"],
     deps = [
         ":console",
+        ":drivers_pci",
         ":drivers_virtio",
         ":kernel_mem",
         ":storage",
@@ -311,6 +335,7 @@ kernel_binary(
     deps = [
         ":arch_riscv",
         ":board_jh7110",
+        ":drivers_pci",
         ":drivers_virtio",
         ":kernel_disk",
         ":kernel_mem",

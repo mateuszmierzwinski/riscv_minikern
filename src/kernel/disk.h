@@ -27,6 +27,11 @@ const struct blockdev *disk_device(void);
 
 bool disk_present(void);
 
+/* Which adapter the device came from — "nvme", "virtio", or "" when there is
+ * none. The boot log names it, because "a 64 MiB disk" is much less useful
+ * than knowing which controller produced it. */
+const char *disk_kind(void);
+
 /* A self-test: writes a pattern to a sector near the end of the device,
  * reads it back through the cache, and restores what was there.
  *

@@ -25,6 +25,8 @@
 #include "board/jh7110/console.h"
 #include "board/jh7110/selftest.h"
 #include "board/jh7110/uart.h"
+#include "drivers/nvme.h"
+#include "drivers/pci.h"
 #include "drivers/virtio_blk.h"
 #include "board/jh7110/version.h"
 #include "core/bootinfo.h"
@@ -243,7 +245,12 @@ static void bring_up_storage(uint64_t dtb) {
         return;
     }
     dev = disk_device();
-    kprintf("disk: %s, %llu sectors of %u bytes (%llu MiB)\n", virtio_blk_path(),
+    if (pci_ready()) {
+        kprintf("pci: ecam at %016llx, %u functions\n", (unsigned long long)pci_ecam_base(),
+                pci_functions_seen());
+    }
+    kprintf("disk: %s %s, %llu sectors of %u bytes (%llu MiB)\n", disk_kind(),
+            disk_kind()[0] == 'n' ? nvme_model() : virtio_blk_path(),
             (unsigned long long)dev->blocks, dev->block_size,
             (unsigned long long)(dev->blocks * dev->block_size / (1024u * 1024u)));
     if (cmdline_has(boot_cmdline, "minikern.disktest")) {

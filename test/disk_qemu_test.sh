@@ -52,7 +52,9 @@ fail() { echo "FAIL: $1" >&2; exit 1; }
 
 # It found the device through the transport, and read its capacity from the
 # device's own configuration space rather than from the tree.
-grep -qE '^disk: /soc/virtio_mmio@[0-9a-f]+, 131072 sectors of 512 bytes \(64 MiB\)$' "$log" ||
+# The line names the adapter as well as the geometry: "a 64 MiB disk" is
+# much less useful than knowing which controller produced it.
+grep -qE '^disk: virtio /soc/virtio_mmio@[0-9a-f]+, 131072 sectors of 512 bytes \(64 MiB\)$' "$log" ||
     fail "the disk was not found, or reported the wrong capacity"
 grep -qF "disk: round trip ok" "$log" || fail "the write/read-back round trip failed"
 
@@ -61,6 +63,56 @@ grep -qF "disk: round trip ok" "$log" || fail "the write/read-back round trip fa
 after="$(sha256sum < "$disk" | cut -d' ' -f1)"
 [ "$before" = "$after" ] || fail "the disk was left modified: the restore did not work"
 echo "ok: a real disk written, read back, and left byte-for-byte unchanged"
+
+# ── NVMe, which is what the M.2 slot on the board holds ────────────────────
+#
+# A different path entirely from virtio: a PCI Express bus to walk, a base
+# address register to **assign** (no firmware here has done it, so a device
+# whose BAR is still zero answers configuration reads and ignores its
+# registers), bus mastering to enable, then the controller's own handshake —
+# reset, admin queues, enable, identify — before a single block moves.
+nvme="$tmp/nvme.img"
+nvmelog="$tmp/nvme.log"
+: > "$nvme"
+for i in $(seq 1 128); do
+    printf 'minikern nvme test block %03d%s' "$i" "$(printf '%.0s=' $(seq 1 1000))" >> "$nvme"
+done
+truncate -s 128M "$nvme"
+nvme_before="$(sha256sum < "$nvme" | cut -d' ' -f1)"
+
+status=0
+timeout 90 qemu-system-riscv64 -M virt -smp 4 -m 1G -nographic -bios default -kernel "$image" \
+    -drive "file=$nvme,if=none,format=raw,id=nvm0" -device nvme,serial=mk0001,drive=nvm0 \
+    -append "console=sbi minikern.halt=poweroff minikern.disktest=1" > "$nvmelog" 2>&1 || status=$?
+tr -d '\r' < "$nvmelog" > "$nvmelog.clean" && mv "$nvmelog.clean" "$nvmelog"
+cat "$nvmelog"
+[ "$status" -eq 0 ] || fail "the NVMe boot exited $status"
+! grep -qF PANIC "$nvmelog" || fail "the kernel panicked with an NVMe drive"
+
+grep -qE '^pci: ecam at [0-9a-f]{16}, [0-9]+ functions$' "$nvmelog" ||
+    fail "the PCIe bus was not enumerated"
+# The model comes from the drive's own identify data, not from the tree —
+# which is the proof that the admin queue works, not merely that a device
+# was found.
+grep -qE '^disk: nvme QEMU NVMe Ctrl, 262144 sectors of 512 bytes \(128 MiB\)$' "$nvmelog" ||
+    fail "the NVMe controller was not identified, or reported the wrong geometry"
+grep -qF "disk: round trip ok" "$nvmelog" || fail "the NVMe round trip failed"
+[ "$nvme_before" = "$(sha256sum < "$nvme" | cut -d' ' -f1)" ] ||
+    fail "the NVMe drive was left modified"
+echo "ok: an NVMe drive on the PCIe bus — enumerated, identified, written, read back, restored"
+
+# With both devices present the NVMe drive wins, because on a board with an
+# M.2 slot filled that is the storage anyone would want to use.
+bothlog="$tmp/both.log"
+timeout 90 qemu-system-riscv64 -M virt -m 1G -nographic -bios default -kernel "$image" \
+    -global virtio-mmio.force-legacy=false \
+    -drive "file=$disk,if=none,format=raw,id=hd0" -device virtio-blk-device,drive=hd0 \
+    -drive "file=$nvme,if=none,format=raw,id=nvm1" -device nvme,serial=mk0002,drive=nvm1 \
+    -append "console=sbi minikern.halt=poweroff" > "$bothlog" 2>&1 || fail "the two-disk boot failed"
+tr -d '\r' < "$bothlog" > "$bothlog.clean" && mv "$bothlog.clean" "$bothlog"
+grep -qF "disk: nvme" "$bothlog" ||
+    { cat "$bothlog"; fail "with both devices present, NVMe was not preferred"; }
+echo "ok: with both a virtio disk and an NVMe drive, the NVMe drive is chosen"
 
 # A machine with no disk must say so once and carry on: a kernel that
 # netboots has no disk, and that is not a failure.
