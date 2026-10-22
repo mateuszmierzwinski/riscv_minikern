@@ -119,6 +119,37 @@ func main() {
 	wg.Wait()
 	fmt.Printf("go: 8 goroutines finished, first=%d last=%d\n", results[0], results[7])
 
+	// Real parallelism, measured rather than assumed: the **same total
+	// work**, once on one goroutine and once spread across GOMAXPROCS. On a
+	// machine with one usable core the two take the same time; on four they
+	// do not. A kernel can report four CPUs and schedule every thread onto
+	// one hart, and this is the only thing that tells the difference.
+	units := runtime.GOMAXPROCS(0) * 2
+	serialStart := time.Now()
+	for i := 0; i < units; i++ {
+		sumOfPrimesBelow(400000)
+	}
+	serial := time.Since(serialStart)
+	parallelStart := time.Now()
+	var pwg sync.WaitGroup
+	for i := 0; i < units; i++ {
+		pwg.Add(1)
+		go func() {
+			defer pwg.Done()
+			sumOfPrimesBelow(400000)
+		}()
+	}
+	pwg.Wait()
+	parallel := time.Since(parallelStart)
+	// Reported as a ratio in tenths, because a test can compare an integer
+	// and cannot compare "about twice as fast".
+	speedup := int64(10)
+	if parallel > 0 {
+		speedup = serial.Nanoseconds() * 10 / parallel.Nanoseconds()
+	}
+	fmt.Printf("go: %d units serially %v, in parallel %v, speedup %d.%dx\n", units,
+		serial.Round(time.Millisecond), parallel.Round(time.Millisecond), speedup/10, speedup%10)
+
 	fmt.Printf("go: contended counter reached %d\n", contendedCounter(8, 2000))
 	fmt.Printf("go: channel values %v\n", throughChannels(6))
 

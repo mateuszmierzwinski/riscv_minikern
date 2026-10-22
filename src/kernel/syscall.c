@@ -206,19 +206,33 @@ static int64_t sys_getpid(struct trapframe *tf) {
     return 1;
 }
 
-/* Which CPUs this thread may run on. One, and the caller is told its mask
- * is one byte long — a runtime sizes its worker pool from this, and a zero
- * or an error makes it either abort or spawn by guesswork. */
+/* Which CPUs this thread may run on.
+ *
+ * **Every hart that is in the scheduler**, as a bitmask with one bit per
+ * hart. A runtime sizes its worker pool from this — it is where `NumCPU`
+ * comes from, and `GOMAXPROCS` after it — so under-reporting here is a
+ * machine that runs on one core while three sit idle, with nothing to
+ * suggest anything is wrong.
+ *
+ * The bits are **positions, not hart ids**: a mask is a set of CPU numbers
+ * 0..n-1, and this machine's hart ids are not that (the JH7110's are an S7
+ * at 0 and four U74s at 1-4). Reporting hart 4 as bit 4 would describe a
+ * five-CPU machine with a hole in it. */
 static int64_t sys_sched_getaffinity(struct trapframe *tf) {
     uint8_t *mask = (uint8_t *)(uintptr_t)sysarg(tf, 2);
-    if (mask == NULL || (uint64_t)(uintptr_t)mask >= USER_TOP || sysarg(tf, 1) == 0) {
+    uint64_t bytes = sysarg(tf, 1);
+    uint32_t cpus = sched_cpus();
+    if (mask == NULL || (uint64_t)(uintptr_t)mask >= USER_TOP || bytes == 0) {
         return KERR_FAULT;
     }
-    mask[0] = 1u;
-    for (uint64_t i = 1; i < sysarg(tf, 1) && i < 128u; i++) {
+    bytes = bytes > 128u ? 128u : bytes;
+    for (uint64_t i = 0; i < bytes; i++) {
         mask[i] = 0u;
     }
-    return 8; /* the number of bytes written, which Linux also reports */
+    for (uint32_t cpu = 0; cpu < cpus && cpu / 8u < bytes; cpu++) {
+        mask[cpu / 8u] |= (uint8_t)(1u << (cpu % 8u));
+    }
+    return (int64_t)(bytes < 8u ? bytes : 8u);
 }
 
 static int64_t sys_epoll_create1(struct trapframe *tf) {
@@ -257,11 +271,13 @@ static int64_t sys_epoll_pwait(struct trapframe *tf) {
     if (timeout_ms == 0) {
         return 0;
     }
+    /* A negative timeout means "for ever", which here is bounded: nothing
+     * can arrive, so sleeping for ever would be a deadlock this kernel
+     * caused. Ten milliseconds is short enough that a runtime's timers stay
+     * accurate and long enough that an idle machine is idle. */
     deadline = timer_ns() + (timeout_ms < 0 ? 10000000ull
                                             : (uint64_t)timeout_ms * 1000000ull);
-    while (timer_ns() < deadline) {
-        sched_yield_now();
-    }
+    (void)sched_sleep_until(deadline);
     return 0;
 }
 
@@ -394,8 +410,12 @@ static int64_t sys_nanosleep(struct trapframe *tf) {
     want = (uint64_t)req->sec * 1000000000ull + (uint64_t)req->nsec;
     want = want > 1000000000ull ? 1000000000ull : want;
     deadline = timer_ns() + want;
-    while (timer_ns() < deadline) {
-        __asm__ volatile("wfi");
+    if (!sched_sleep_until(deadline)) {
+        /* No thread to block — before the scheduler is running. Then the
+         * clock is the only thing to wait on. */
+        while (timer_ns() < deadline) {
+            __asm__ volatile("wfi");
+        }
     }
     return 0;
 }

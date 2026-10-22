@@ -14,6 +14,8 @@ _Static_assert(__builtin_offsetof(struct trapframe, sepc) == FRAME_SEPC, "sepc o
 _Static_assert(__builtin_offsetof(struct trapframe, sstatus) == FRAME_SSTATUS, "sstatus offset");
 _Static_assert(__builtin_offsetof(struct trapframe, scause) == FRAME_SCAUSE, "scause offset");
 _Static_assert(__builtin_offsetof(struct trapframe, stval) == FRAME_STVAL, "stval offset");
+_Static_assert(__builtin_offsetof(struct trapframe, kernel_tp) == FRAME_KTP, "kernel_tp offset");
+_Static_assert(FRAME_SIZE % 16u == 0u, "a stack pointer must stay 16-byte aligned");
 
 void trap_entry(void);
 
@@ -149,17 +151,42 @@ static void on_the_way_back(struct trapframe *tf) {
     }
 }
 
+/* Every trap, holding the kernel lock for as long as it is in the kernel.
+ *
+ * Taking it here and releasing it on the way out is what makes four harts
+ * safe without auditing every structure: one hart is inside the kernel at a
+ * time, and the parallelism is in user space. `klock_enter` reports whether
+ * it actually took the lock, because a hart may already hold it — an idle
+ * hart takes an interrupt with the lock released and re-acquires it, and a
+ * thread resumed by the scheduler holds what the scheduler held.
+ *
+ * The lock is a port rather than a direct dependency: `arch/` must not
+ * include `kernel/`, and a trap vector that knew about the scheduler's lock
+ * would be the first inward-pointing dependency in the tree.
+ */
+static bool (*lock_enter)(void);
+static void (*lock_exit)(bool);
+
+void trap_set_lock(bool (*enter)(void), void (*exit)(bool)) {
+    lock_enter = enter;
+    lock_exit = exit;
+}
+
 void trap_handle(struct trapframe *tf) {
+    bool took = lock_enter != NULL && lock_enter();
     if ((tf->scause & SCAUSE_INTERRUPT) != 0 &&
         handle_interrupt(tf->scause & ~SCAUSE_INTERRUPT)) {
         on_the_way_back(tf);
-        return;
-    }
-    if (expected_handler != NULL && expected_handler(tf)) {
+    } else if (expected_handler != NULL && expected_handler(tf)) {
         on_the_way_back(tf);
-        return;
+    } else {
+        /* Does not return: the lock stays held, which is correct for a
+         * machine that is about to stop. */
+        unexpected(tf);
     }
-    unexpected(tf);
+    if (lock_exit != NULL) {
+        lock_exit(took);
+    }
 }
 
 void trap_enable_interrupts(void) {

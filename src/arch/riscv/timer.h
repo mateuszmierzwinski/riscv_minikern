@@ -43,6 +43,16 @@ uint64_t timer_ns(void);
 
 /* How many ticks have been taken, and the configured rate. */
 uint64_t timer_ticks(void);
+
+/* Every hart's ticks added together, which is a measure of how much of the
+ * machine is awake rather than of time. */
+uint64_t timer_ticks_all_harts(void);
+
+/* Arms **this hart's** timer and enables its interrupt. Every hart calls it
+ * for itself, because the comparator is per-hart: `timer_init` reads the
+ * frequency from the tree once, and this is the part that is each hart's
+ * own. */
+int timer_init_cpu(void);
 uint32_t timer_hz(void);
 uint64_t timer_frequency(void);
 bool timer_ready(void);

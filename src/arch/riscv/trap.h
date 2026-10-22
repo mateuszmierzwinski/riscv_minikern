@@ -29,6 +29,8 @@ struct trapframe {
     uint64_t sstatus;
     uint64_t scause;
     uint64_t stval;
+    uint64_t kernel_tp;  /* the hart id to restore on a trap from user mode */
+    uint64_t padding;    /* keeps the frame 16-byte aligned */
 };
 
 /* Exception causes this kernel names. The rest are printed by number. */
@@ -82,6 +84,13 @@ void trap_disable_interrupts(void);
  * returns; false means the fault was not the expected one and the kernel
  * reports it and stops. NULL clears it. */
 void trap_set_expected(bool (*handler)(struct trapframe *tf));
+
+/* The kernel lock, as a port: taken on entering the kernel and released on
+ * leaving it. A port rather than a direct call because `arch/` may not
+ * include `kernel/` — a trap vector that knew about the scheduler's lock
+ * would be the first inward-pointing dependency in the tree. `enter`
+ * reports whether it took the lock; `exit` is given that answer back. */
+void trap_set_lock(bool (*enter)(void), void (*exit)(bool));
 
 /* A hook run on the way back to user mode, after a trap that came from
  * there has been handled. This is where a preemption belongs: inside the

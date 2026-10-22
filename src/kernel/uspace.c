@@ -11,6 +11,7 @@
 #include "core/ustack.h"
 #include "kernel/mem.h"
 #include "kernel/random.h"
+#include "kernel/klock.h"
 #include "kernel/sched.h"
 #include "kernel/syscall.h"
 
@@ -166,23 +167,65 @@ int uspace_build(struct uproc *p, const void *program, uint32_t bytes) {
     return KERR_OK;
 }
 
+/* Undoes exactly what `share_kernel_mappings` did, at both levels.
+ *
+ * This is the mirror image of the sharing, and it has to be, because
+ * destroying a process walks its tables and frees every page it finds — so
+ * any entry the kernel owns must be gone from the process's tables before
+ * the walk starts, or **the kernel's own page tables are handed back to the
+ * allocator**.
+ *
+ * The root level is easy: an entry equal to the kernel's is the kernel's.
+ * The level below is the one that was missed. A collision at the root gives
+ * the process its *own* level-1 table with the kernel's level-1 entries
+ * copied into it — and those entries point at the kernel's level-2 tables.
+ * The root entry is not equal to the kernel's (it is the process's own
+ * table), so clearing by comparison at the root alone left them in place,
+ * and the walk descended through them and freed the kernel's second level.
+ *
+ * What that looked like: nothing at all, for one process. The freed pages
+ * were still mapped and still intact, so the machine carried on. The next
+ * process's kernel stack was then allocated out of them and written over —
+ * and the kernel's own mappings changed underneath it, so loading that
+ * process's `satp` faulted at an address with no console behind it and the
+ * machine stopped with no output. One process never showed it; the SMP work
+ * added the allocation that landed on it.
+ *
+ * It disappears when the kernel moves to the top half, where the two halves
+ * cannot collide and there is nothing to share.
+ */
+static void unshare_kernel_mappings(struct pgtable *pt) {
+    const struct pgtable *kernel = mmu_kernel_table();
+    for (uint32_t i = 0; i < PT_ENTRIES; i++) {
+        uint64_t *ours_l1;
+        const uint64_t *kernel_l1;
+        if (pt->root[i] == 0 || kernel->root[i] == 0) {
+            continue;
+        }
+        if (pt->root[i] == kernel->root[i]) {
+            pt->root[i] = 0; /* shared whole: not ours to free */
+            continue;
+        }
+        /* A resolved collision: our table, carrying copies of the kernel's
+         * entries. Clear each copy, leaving only what this process owns. */
+        if ((kernel->root[i] & (PTE_R | PTE_W | PTE_X)) != 0) {
+            continue; /* a kernel gigapage: never shared into a collision */
+        }
+        kernel_l1 = kernel->mem.to_virt(kernel->mem.self, pte_phys_of(kernel->root[i]));
+        ours_l1 = pt->mem.to_virt(pt->mem.self, pte_phys_of(pt->root[i]));
+        for (uint32_t j = 0; j < PT_ENTRIES; j++) {
+            if (kernel_l1[j] != 0 && ours_l1[j] == kernel_l1[j]) {
+                ours_l1[j] = 0;
+            }
+        }
+    }
+}
+
 void uspace_destroy(struct uproc *p) {
-    const struct pgtable *kernel;
     if (!p->built) {
         return;
     }
-    kernel = mmu_kernel_table();
-    /* Shared entries are cleared before the walk, or destroying a process
-     * would free the kernel's own tables — and the kernel would then be
-     * running on memory the allocator has handed back. Entries resolved one
-     * level down are the process's own tables, so they are freed; what they
-     * contain of the kernel's is a copy of a *pointer* to a table the
-     * process does not own, and the walk stops at the leaves it finds. */
-    for (uint32_t i = 0; i < PT_ENTRIES; i++) {
-        if (p->pt.root[i] == kernel->root[i]) {
-            p->pt.root[i] = 0;
-        }
-    }
+    unshare_kernel_mappings(&p->pt);
     pgtable_destroy(&p->pt);
     p->built = false;
 }
@@ -222,7 +265,7 @@ static bool on_user_trap(struct trapframe *tf) {
             (unsigned long long)tf->stval);
     exit_status = KERR_FAULT;
     exited = true;
-    uspace_leave(running->context);
+    sched_exit_process();
     return true;
 }
 
@@ -238,35 +281,69 @@ static bool on_user_trap(struct trapframe *tf) {
  * Runs to 26 lines: one ordered handover (install the address space, go,
  * unwind), and splitting it would put the `satp` switch and the switch back
  * in different functions (Rule 11, Locking/lifetime). */
+/* The kernel lock's two counters, when tracing.
+ *
+ * They are the one thing worth printing between processes: a ticket lock
+ * whose `next` and `serving` have drifted apart will stop the machine the
+ * next time a hart asks for it, and the gap says which side lost count. It
+ * found the bug it exists for — one acquisition against two releases,
+ * because the lock had been wired into the trap path after a program had
+ * already run, so every syscall took the "no lock configured" path while
+ * the scheduler still released one. */
+static void report_lock_state(void) {
+    uint32_t next = 0, serving = 0;
+    uint64_t owner = 0;
+    if (!sched_tracing()) {
+        return;
+    }
+    klock_state(&next, &serving, &owner);
+    kprintf("klock: next %u serving %u owner %llu%s\n", next, serving,
+            (unsigned long long)owner, next == serving ? "" : " — THESE MUST MATCH");
+}
+
 int64_t uspace_run(struct uproc *p) {
     if (!p->built) {
         return KERR_INVAL;
     }
+    struct trapframe first = {0};
+    int rc;
     running = p;
     exited = false;
     exit_status = 0;
     trap_set_expected(on_user_trap);
     trap_set_user_return_hook(on_user_return);
     calls_at_start = syscall_count();
-    sched_init(&p->main_tid);
-    timer_set_tick_hook(sched_tick);
     __asm__ volatile("csrr %0, satp" : "=r"(kernel_satp_saved));
-    /* SUM so the kernel may read the process's memory for a syscall's
-     * arguments. Without it a supervisor load from a user page faults —
-     * which is a deliberate guard against dereferencing a user pointer by
-     * accident, and is why it is turned on for exactly this window. */
-    __asm__ volatile("csrs sstatus, %0" : : "r"(SSTATUS_SUM));
-    __asm__ volatile("csrw satp, %0\n\tsfence.vma zero, zero"
-                     :
-                     : "r"(pgtable_satp(&p->pt, 1))
-                     : "memory");
-    uspace_enter(p->entry, p->stack_top, p->context);
-    /* Reached only through uspace_leave. */
-    __asm__ volatile("csrw satp, %0\n\tsfence.vma zero, zero"
-                     :
-                     : "r"(kernel_satp_saved)
-                     : "memory");
-    __asm__ volatile("csrc sstatus, %0" : : "r"(SSTATUS_SUM));
+    /* The first thread's register set. `sstatus` carries SUM, because every
+     * frame restored from here onwards inherits it — including a cloned
+     * thread's, which is copied from its parent's. */
+    first.sepc = p->entry;
+    first.sstatus = SSTATUS_SUM;
+    rc = sched_init(&first, p->stack_top, &p->main_tid);
+    if (rc != KERR_OK) {
+        running = NULL;
+        return rc;
+    }
+    report_lock_state();
+    timer_set_tick_hook(sched_tick);
+    /* Secondary harts may now join. They were waiting for exactly this,
+     * because a hart with no process has nothing to claim. */
+    sched_set_accepting(true);
+    uspace_adopt_address_space(p);
+    sched_run();
+    /* **Stop accepting before waiting**, not after. A secondary hart that
+     * sees `accepting` still set re-enters the scheduling loop, marks itself
+     * joined, and leaves again the moment it reads `process_over` — so a
+     * boot hart waiting for the count to reach zero can watch it bounce off
+     * zero for ever. That is a livelock, and it is what a process ending
+     * actually did until this line moved. */
+    sched_set_accepting(false);
+    /* Now wait for them to leave, before anything they might still be
+     * standing on is freed — a kernel stack, or the page tables their own
+     * `satp` still points at. */
+    while (sched_joined_harts() > 0) {
+    }
+    uspace_release_address_space();
     trap_set_expected(NULL);
     trap_set_user_return_hook(NULL);
     timer_set_tick_hook(NULL);
@@ -445,7 +522,45 @@ struct uproc *uspace_current(void) {
 void uspace_exit(int64_t status) {
     exit_status = status;
     exited = true;
-    uspace_leave(running->context);
+    sched_exit_process();
+}
+
+/* Makes this hart able to run the process's threads.
+ *
+ * `satp` and `sstatus.SUM` are **per-hart** registers, so every hart that
+ * runs a thread of this process has to set both for itself — which is the
+ * least obvious consequence of going from one hart to four, and the kind of
+ * thing that works on the hart that set them and faults on every other.
+ *
+ * SUM lets the kernel read the process's memory for a syscall's arguments.
+ * Without it a supervisor load from a user page faults, which is a
+ * deliberate guard against dereferencing a user pointer by accident — so it
+ * is on for exactly the window where the kernel means to. */
+void uspace_adopt_address_space(struct uproc *p) {
+    __asm__ volatile("csrs sstatus, %0" : : "r"(SSTATUS_SUM));
+    __asm__ volatile("csrw satp, %0\n\tsfence.vma zero, zero"
+                     :
+                     : "r"(pgtable_satp(&p->pt, 1))
+                     : "memory");
+}
+
+void uspace_release_address_space(void) {
+    __asm__ volatile("csrw satp, %0\n\tsfence.vma zero, zero"
+                     :
+                     : "r"(kernel_satp_saved)
+                     : "memory");
+    __asm__ volatile("csrc sstatus, %0" : : "r"(SSTATUS_SUM));
+}
+
+/* A secondary hart joining a running process. Returns when the process is
+ * over. It is the whole of what a secondary does with a process: there is
+ * nothing per-hart to set up beyond its own translation, because the
+ * scheduler's state is shared and the kernel lock is what makes that
+ * safe. */
+void uspace_join(struct uproc *p) {
+    uspace_adopt_address_space(p);
+    sched_run();
+    uspace_release_address_space();
 }
 
 /* Rounds a byte count up to whole pages, refusing a request so large that

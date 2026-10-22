@@ -36,6 +36,15 @@ _COMPILE_FLAGS = [
     "-mabi=" + MABI,
     "-mcmodel=medany",
     "-mno-relax",
+    # `tp` is the kernel's: it carries the hart id, which is how every
+    # per-hart array is indexed and how the kernel lock knows who holds it.
+    # Measured on this toolchain (2026-10-22): clang does **not** allocate x4
+    # even under register pressure, because the ABI reserves it as the thread
+    # pointer — so this flag changes nothing today. It is here to say the
+    # register is dedicated, and to keep it dedicated if that convention ever
+    # stops being honoured, since nothing in the kernel would fail loudly:
+    # the hart id would simply be wrong.
+    "-ffixed-x4",
     "-std=c17",
     "-ffreestanding",
     "-fno-builtin",

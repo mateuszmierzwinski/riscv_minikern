@@ -25,6 +25,7 @@ is named. The phase-by-phase record is `DEVELOPMENT_PROGRESS.md`.
 | **8 GiB of RAM**, read and tracked: 2 Mi frames | `boot_qemu_test` (an `-m 8G` boot), `pmm_test` (frames at 9 GiB) |
 | **Interrupts** through the PLIC, with each hart's *context* resolved from the tree rather than assumed to be its hart id | `boot_qemu_test` |
 | **A tick** through SBI's timer, keeping time: 50 ticks in 499 ms at 100 Hz | `boot_qemu_test` |
+| **Four harts, all running user threads** — enumerated from the device tree (ids are not positions), started through the firmware's hart-state interface, scheduled behind one kernel lock; `GOMAXPROCS=4`, 1.6x on 8 units of work | `smp_qemu_test` |
 | **A stock gc Go binary runs unchanged** — `go1.25.5` for `linux/riscv64`, off a filesystem: goroutines, a contended mutex, channels, the garbage collector, sleeps, panic/recover | `go_qemu_test` |
 | **Threads**: `clone`, a run queue, preemption on the tick, a kernel stack each | `go_qemu_test` |
 | **Futexes**: wait and wake, with timeouts | `go_qemu_test` |

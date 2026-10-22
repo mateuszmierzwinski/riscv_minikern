@@ -62,3 +62,34 @@ _start:
     .globl boot_stacks
 boot_stacks:
     .space BOOT_STACK_SIZE * MAX_HARTS
+
+/* _secondary_start — where a hart started by the firmware arrives.
+ *
+ * `sbi_hart_start` enters it **in S-mode with translation off**, at a
+ * physical address, with the hart id in `a0` and whatever was passed as
+ * `opaque` in `a1`. So this is `_start` without the parts that are the boot
+ * hart's alone: no `.bss` to zero (it is already zeroed, and zeroing it
+ * again would wipe what the boot hart has been doing), and no device tree to
+ * read.
+ *
+ * That it is a physical address is only convenient because the kernel is
+ * still identity-mapped. When the kernel moves to the top half (P0.4), this
+ * entry has to stay reachable physically — which is what a trampoline page
+ * is for, and it is the one piece of that move that cannot be deferred.
+ */
+    .section .text
+    .globl _secondary_start
+_secondary_start:
+    csrw    sie, zero
+    csrci   sstatus, 2
+
+    la      t0, boot_stacks
+    li      t1, BOOT_STACK_SIZE
+    addi    t2, a0, 1
+    mul     t1, t1, t2
+    add     sp, t0, t1
+
+    call    smp_secondary_main  /* a0 = hart id, a1 = the satp to adopt */
+
+1:  wfi
+    j       1b

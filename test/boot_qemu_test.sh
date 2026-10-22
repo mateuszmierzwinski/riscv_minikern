@@ -131,9 +131,14 @@ grep -qE '^timer: [0-9]+ Hz counter, 100 ticks a second$' "$ticks" ||
 # 50 ticks at 100 Hz is half a second. The window is wide enough for a loaded
 # host and narrow enough that a clock running at the wrong rate fails: a
 # frequency misread by a factor of two would land at 250 ms or 1000 ms.
+# The count is measured from a baseline, so it is 50 or a few more — the
+# loop can only notice it has passed 50, not stop exactly on it. What is
+# asserted is the **rate**: 50 ticks in half a second, in a window wide
+# enough for a loaded host and narrow enough that a frequency misread by a
+# factor of two lands outside it (250 ms or 1000 ms).
 read -r got ms < <(sed -n 's/^tick: \([0-9]*\) ticks in \([0-9]*\) ms.*/\1 \2/p' "$ticks")
-[ "${got:-0}" = "50" ] ||
-    { cat "$ticks"; echo "FAIL: only ${got:-0} of 50 ticks arrived" >&2; exit 1; }
+[ "${got:-0}" -ge 50 ] && [ "${got:-0}" -le 60 ] ||
+    { cat "$ticks"; echo "FAIL: ${got:-0} ticks, which is not the 50 that were waited for" >&2; exit 1; }
 [ "${ms:-0}" -ge 400 ] && [ "${ms:-0}" -le 700 ] ||
     { cat "$ticks"; echo "FAIL: 50 ticks took ${ms} ms, which is not 100 Hz" >&2; exit 1; }
 echo "ok: the tick is delivered and keeps time — 50 ticks in ${ms} ms at 100 Hz"

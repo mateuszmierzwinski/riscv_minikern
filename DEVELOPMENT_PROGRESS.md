@@ -394,14 +394,89 @@ Three things in it are *not* architecture-neutral and were fixed on the way in:
 
 ## P3 — SMP, the JH7110's way
 
-- [ ] **P3.1 Harts up through SBI HSM.** `hart_start` cannot start a core in
-      the wrong privilege mode — the specification says S-mode — which
-      removes the entire class of bug that made the ARM bring-up hard.
-      **The hart numbering is the thing to get right:** this SoC's harts are
-      an S7 at 0 and four U74s at 1–4, so the kernel enumerates the `cpus`
-      node of the device tree and starts what it finds, rather than counting
-      from zero.
-- [ ] **P3.2 Per-hart state**, with the lesson from the ARM port written down
+- [x] **P3.1 Harts up through SBI HSM (2026-10-22).** One firmware call per
+      hart: `sbi_hart_start(hart, address, opaque)` enters it **in S-mode**,
+      with translation off, at a physical address. The specification says
+      S-mode, so the entire class of bug that made the ARM bring-up hard —
+      PSCI starting a secondary in the mode the *primary* was entered in, so
+      a core that skipped the HYP→SVC drop wrote the hypervisor's MMU
+      registers and died on its next instruction fetch while PSCI reported
+      success — cannot happen here.
+      **The harts come from the device tree**, found by the generic `riscv`
+      entry of their `compatible` list, with each one's `mmu-type` read and a
+      hart that cannot run Sv39 skipped rather than started and lost. The ids
+      are not positions: measured across runs, QEMU's `virt` booted on hart
+      0, 1, 2 and 3 on different runs of the same image, and the JH7110 pairs
+      an S7 at hart 0 with four U74s at 1-4.
+      That the entry address is physical is only convenient because the
+      kernel is still identity-mapped. When it moves to the top half (P0.4)
+      this entry must stay reachable physically, which is the one piece of
+      that move that cannot be deferred.
+- [x] **P3.2 Threads on every hart (2026-10-22).** One lock around the
+      kernel (`kernel/klock.h`), which preserves exactly the property the
+      single-hart design relied on — one hart inside the kernel at a time —
+      without auditing every structure first. The parallelism it buys is in
+      **user space**, which is where a program spends its time. It is a
+      ticket lock, because a test-and-set lock lets the hart with the warmest
+      cache win repeatedly and starves the others.
+      The scheduler's state became **per hart**: `current` was one variable,
+      and two harts would each have believed they owned the same thread. Each
+      hart runs the same loop — claim a runnable thread, run it, repeat — and
+      a thread gives the hart back by switching to the loop rather than
+      picking its own successor, which it could otherwise pick from another
+      hart's. The first thread stopped being special: it used to be the stack
+      `uspace_run` was called on, so it was the only thread another hart
+      could not run.
+      Per-hart registers had to follow: `satp` and `sstatus.SUM` are set by
+      every hart that runs a thread of the process, and the timer comparator
+      is per-hart too — a shared deadline had whichever hart ticked first
+      advance it for everyone, so the others armed a deadline already in the
+      past and took interrupts continuously.
+      **Measured**: `GOMAXPROCS=4 NumCPU=4` from `sched_getaffinity`, every
+      hart running threads, and 8 units of work taking 1.6x less time in
+      parallel than serially — the same figure the ARM project got. The
+      emulator is the limit there: without `-accel tcg,thread=multi` QEMU
+      round-robins every vCPU onto one host thread and the ratio is 1.1x.
+      Four bugs, each worth keeping:
+      **A trap's "did this come from user mode?" test used a register that by
+      then held the interrupted stack pointer**, which is non-zero either
+      way — so the kernel reloaded `tp` (the hart id) from a frame slot that
+      kernel traps never write. The hart then indexed every per-hart array at
+      0: its ticks were counted in another hart's slot and its timer rearmed
+      through that slot, so it stopped ticking after one interrupt. Invisible
+      whenever the boot hart happened to be hart 0, which is most runs, so it
+      presented as a test failing one time in three. The test is the saved
+      `sstatus`'s SPP bit now, the same bit the exit path uses.
+      **Destroying a process freed the kernel's own page tables.** Sharing
+      the kernel's mappings copies its level-1 *entries* into a process's own
+      table wherever the roots collide, and the teardown cleared only the
+      root-level sharing — so the walk descended through those copies and
+      freed the kernel's second level. For one process nothing happened: the
+      pages were still mapped and still intact. The SMP work added a 16 KiB
+      kernel stack per thread, that allocation landed on them, and the
+      kernel's mappings changed underneath it — so loading the next process's
+      `satp` faulted at an address with no console behind it and the machine
+      stopped silently. The teardown is now the exact mirror of the sharing,
+      at both levels, and all of it disappears when the kernel moves to the
+      top half.
+      **A port installed late is a port that was not installed.** The kernel
+      lock was wired into the trap path after the first program had already
+      run, so every syscall took the "no lock configured" path while the
+      scheduler still released one — and the ticket lock's two counters
+      drifted apart until the next hart to ask waited for a ticket that had
+      already been served. It is wired in the composition root now, before
+      anything can trap, and the counters are printed between processes when
+      tracing, because a lock whose numbers have diverged will stop the
+      machine later and at a place that says nothing about why.
+      **A sleep that spins is a sleep that starves.** `nanosleep` and an idle
+      runtime's `epoll_pwait` both looped on the clock calling
+      `sched_yield_now`, which on four harts produced four and a half million
+      thread switches for a program that ran 56 milliseconds — correct, and
+      almost all of it the scheduler talking to itself. A blocked thread with
+      a deadline costs one switch; the same run now does 37.
+
+
+- [ ] **P3.9 Per-hart state**, with the lesson from the ARM port written down
       first: anything a core caches *about its own registers* must be
       invalidated by whatever sets those registers from nothing, or a core
       that stops and restarts runs with a stale idea of what it has installed.

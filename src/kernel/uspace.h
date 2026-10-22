@@ -72,6 +72,14 @@ struct uproc {
  * out. For the hand-written test programs: no headers, no start state. */
 int uspace_build(struct uproc *p, const void *program, uint32_t bytes);
 
+/* Makes this hart able to run the process's threads: its own `satp` and its
+ * own `sstatus.SUM`, both per-hart registers. */
+void uspace_adopt_address_space(struct uproc *p);
+void uspace_release_address_space(void);
+
+/* A secondary hart joining a running process; returns when it is over. */
+void uspace_join(struct uproc *p);
+
 /* The process a syscall is being made by, or NULL outside one. There is one
  * at a time until there is a scheduler. */
 struct uproc *uspace_current(void);

@@ -1,8 +1,10 @@
 #include "kernel/sched.h"
 
+#include "arch/riscv/smp.h"
 #include "arch/riscv/timer.h"
 #include "core/console.h"
 #include "core/errno.h"
+#include "kernel/klock.h"
 #include "kernel/mem.h"
 #include "kernel/uspace.h"
 
@@ -36,14 +38,42 @@ struct thread {
     bool owns_stack;
 };
 
+/* What a hart is doing.
+ *
+ * **Per hart, not global**, which is the whole difference between one core
+ * and four: `current` used to be one variable, and two harts in the kernel
+ * would each have believed they owned the same thread. The index is the
+ * hart's position in the device tree's enumeration, because hart ids are
+ * not 0..n-1 — on the target board they are an S7 at 0 and four U74s at
+ * 1-4.
+ *
+ * `idle_ksp` is where the hart's own scheduling loop is suspended while a
+ * thread runs on it. A thread gives the hart back by switching to it,
+ * rather than picking the next thread itself: a thread that chose its own
+ * successor could choose one another hart is already running. */
+struct hartstate {
+    uint64_t idle_ksp;
+    uint32_t current;   /* SCHED_NO_THREAD when it is idle */
+    uint64_t switches;
+    bool joined;
+};
+
+#define SCHED_NO_THREAD 0xFFFFFFFFu
+
 static struct thread threads[SCHED_MAX_THREADS];
-static uint32_t current;
+static struct hartstate harts[SMP_MAX_HARTS];
+static volatile bool accepting_harts;
+static volatile bool process_over;
 static uint64_t next_tid = 1;
 static bool preempt_pending;
 static bool tracing;
 
 void sched_set_trace(bool on) {
     tracing = on;
+}
+
+bool sched_tracing(void) {
+    return tracing;
 }
 
 /* One line about one thread. Takes the slot rather than the thread so that
@@ -60,17 +90,32 @@ static void trace(const char *what, uint32_t slot, uint64_t detail) {
 void context_switch(uint64_t *save_sp, uint64_t load_sp);
 void uspace_enter_frame(struct trapframe *frame);
 
-void sched_init(uint64_t *tid) {
+/* The hart this code is running on. */
+static struct hartstate *me(void) {
+    return &harts[smp_hart_index()];
+}
+
+/* The thread this hart is running, or NULL when it is between threads. */
+static struct thread *running_thread(void) {
+    struct hartstate *h = me();
+    return h->current == SCHED_NO_THREAD ? NULL : &threads[h->current];
+}
+
+int sched_init(const struct trapframe *frame, uint64_t sp, uint64_t *tid) {
     for (uint32_t i = 0; i < SCHED_MAX_THREADS; i++) {
         threads[i] = (struct thread){0};
     }
-    current = 0;
+    for (uint32_t i = 0; i < SMP_MAX_HARTS; i++) {
+        harts[i] = (struct hartstate){.current = SCHED_NO_THREAD};
+    }
     next_tid = 1;
     preempt_pending = false;
-    threads[0].state = THREAD_RUNNING;
-    threads[0].tid = next_tid++;
-    threads[0].owns_stack = false; /* it is the stack uspace_run was called on */
-    *tid = threads[0].tid;
+    process_over = false;
+    /* The first thread is an ordinary one. It used to be the stack
+     * `uspace_run` was called on, which made it the only thread that could
+     * not be scheduled by another hart — and with four harts that
+     * exception has to go. */
+    return sched_spawn_first(frame, sp, tid);
 }
 
 static uint32_t find_free_slot(void) {
@@ -101,20 +146,33 @@ static struct trapframe *initial_frame_of(const struct thread *t) {
     return (struct trapframe *)(uintptr_t)(t->kstack + KSTACK_PAGES * PAGE_SIZE - FRAME_BYTES);
 }
 
-static void prepare_stack(struct thread *t, const struct trapframe *frame, uint64_t sp);
+static void prepare_stack(struct thread *t, const struct trapframe *frame, uint64_t sp,
+                          bool is_child);
 
 /* The first thing a new thread does. It is a C function so that the stack
  * layout above has an address to name, and it never returns: the thread
  * leaves through `sret`, and comes back only as a trap. */
 static void thread_trampoline(void) {
-    uspace_enter_frame(initial_frame_of(&threads[current]));
+    struct trapframe *frame = initial_frame_of(running_thread());
+    /* The kernel lock, which the scheduling loop was holding when it
+     * switched here, must be given up **before** user mode: a hart that
+     * entered user code still holding it would shut every other hart out of
+     * the kernel until its next trap, which is the whole parallelism gone.
+     * Every other path out of the kernel releases it in `trap_handle`; this
+     * one has no trap to return from, so it does it itself. */
+    trace("entering user mode at", me()->current, frame->sepc);
+    klock_exit(true);
+    uspace_enter_frame(frame);
 }
 
-static void prepare_stack(struct thread *t, const struct trapframe *frame, uint64_t sp) {
+static void prepare_stack(struct thread *t, const struct trapframe *frame, uint64_t sp,
+                          bool is_child) {
     struct trapframe *initial = initial_frame_of(t);
     uint64_t *switch_frame;
     *initial = *frame;
-    initial->x[10] = 0;  /* a0: the child's half of clone's return */
+    if (is_child) {
+        initial->x[10] = 0;  /* a0: the child's half of clone's return */
+    }
     initial->x[2] = sp;  /* the stack the caller gave it */
     /* The switch frame sits just below the initial frame, with `ra` pointing
      * at the trampoline and the callee-saved registers zero. 14 words is
@@ -128,7 +186,9 @@ static void prepare_stack(struct thread *t, const struct trapframe *frame, uint6
     t->ksp = (uint64_t)(uintptr_t)switch_frame;
 }
 
-int sched_spawn(const struct trapframe *frame, uint64_t sp, uint64_t *tid) {
+/* Both spawns are the same work; the first thread differs only in that
+ * `a0` is not forced to 0 — it is not returning from a `clone`. */
+static int spawn(const struct trapframe *frame, uint64_t sp, bool is_child, uint64_t *tid) {
     uint32_t slot = find_free_slot();
     phys_t stack = 0;
     int rc;
@@ -143,70 +203,137 @@ int sched_spawn(const struct trapframe *frame, uint64_t sp, uint64_t *tid) {
                                     .tid = next_tid++,
                                     .state = THREAD_RUNNABLE,
                                     .owns_stack = true};
-    prepare_stack(&threads[slot], frame, sp);
+    prepare_stack(&threads[slot], frame, sp, is_child);
     *tid = threads[slot].tid;
     trace("created, entering at", slot, frame->sepc);
     return KERR_OK;
 }
 
-/* The next thread that can run, starting after the current one so that the
- * order is round-robin rather than "whoever is lowest-numbered". Returns
- * the current slot when nothing else is runnable. */
-static uint32_t next_runnable(void) {
-    for (uint32_t step = 1; step <= SCHED_MAX_THREADS; step++) {
-        uint32_t i = (current + step) % SCHED_MAX_THREADS;
+int sched_spawn(const struct trapframe *frame, uint64_t sp, uint64_t *tid) {
+    return spawn(frame, sp, true, tid);
+}
+
+int sched_spawn_first(const struct trapframe *frame, uint64_t sp, uint64_t *tid) {
+    return spawn(frame, sp, false, tid);
+}
+
+/* A thread no hart is running, claimed for this one. The claim is the
+ * state change: a thread marked RUNNING is owned by whichever hart marked
+ * it, and under the kernel lock that is enough — two harts cannot both see
+ * it RUNNABLE. Round-robin from one shared cursor, so harts do not all
+ * start their search at the same thread and collide on it. */
+static uint32_t claim_runnable(void) {
+    static uint32_t cursor;
+    for (uint32_t step = 0; step < SCHED_MAX_THREADS; step++) {
+        uint32_t i = (cursor + step) % SCHED_MAX_THREADS;
         if (threads[i].state == THREAD_RUNNABLE) {
+            cursor = (i + 1u) % SCHED_MAX_THREADS;
+            threads[i].state = THREAD_RUNNING;
             return i;
         }
     }
-    return current;
+    return SCHED_NO_THREAD;
 }
 
-/* Hands the hart to `to`. The caller has already set its own state. */
-static void switch_to(uint32_t to) {
-    uint32_t from = current;
-    if (to == from) {
-        return;
+/* Gives the hart back to its scheduling loop. The caller has already set
+ * its own state, and the lock is held across the switch — handed on, in the
+ * sense `klock.h` describes: the loop resumes owning what this thread
+ * owned. */
+static void yield_to_scheduler(void) {
+    struct hartstate *h = me();
+    uint32_t was = h->current;
+    h->current = SCHED_NO_THREAD;
+    h->switches++;
+    context_switch(&threads[was].ksp, h->idle_ksp);
+}
+
+/* One hart's scheduling loop: claim a thread, run it, repeat until the
+ * process is over.
+ *
+ * Every hart runs this, including the one that started the process — which
+ * is why there is no special case for the first thread any more. A hart
+ * with nothing to claim waits for an interrupt with the lock released,
+ * because the thing that will give it work is another hart inside the
+ * kernel.
+ *
+ * Runs to 28 lines: the claim, the switch and the idle wait are one
+ * sequence whose middle cannot be named honestly — "run_the_thread" would
+ * hide that control leaves and comes back on the same line (Rule 11,
+ * Naming). */
+void sched_run(void) {
+    struct hartstate *h;
+    bool took = klock_enter();
+    h = me();
+    h->joined = true;
+    while (!process_over) {
+        uint32_t t = claim_runnable();
+        if (t == SCHED_NO_THREAD) {
+            klock_idle_wait();
+            continue;
+        }
+        h->current = t;
+        /* Into the thread, and back here when it yields, blocks or ends.
+         * `idle_ksp` is written before the switch because the thread will
+         * use it to come back. */
+        context_switch(&h->idle_ksp, threads[t].ksp);
+        h->current = SCHED_NO_THREAD;
+        if (preempt_pending) {
+            preempt_pending = false;
+        }
     }
-    threads[to].state = THREAD_RUNNING;
-    current = to;
-    context_switch(&threads[from].ksp, threads[to].ksp);
+    h->joined = false;
+    klock_exit(took);
 }
 
 void sched_yield_now(void) {
-    uint32_t to = next_runnable();
-    if (to == current) {
+    struct thread *t = running_thread();
+    if (t == NULL) {
         return;
     }
-    threads[current].state = THREAD_RUNNABLE;
-    switch_to(to);
+    t->state = THREAD_RUNNABLE;
+    yield_to_scheduler();
 }
 
 bool sched_futex_wait(virt_t addr, uint64_t deadline_ns) {
-    struct thread *me = &threads[current];
-    uint32_t to;
-    me->futex_addr = addr;
-    me->futex_deadline = deadline_ns;
-    me->woken = false;
-    me->state = THREAD_BLOCKED;
-    trace("waits on", current, addr);
-    to = next_runnable();
-    if (to == current) {
-        /* Nothing else can run. Waiting would be a deadlock the kernel
-         * caused, so the wait fails and the caller re-checks — which is
-         * what a futex loop does anyway. A deadline still has to be
-         * honoured, so spin against the clock rather than returning
-         * instantly and burning the caller's retry loop. */
-        me->state = THREAD_RUNNING;
-        trace("has nothing to switch to, so cannot sleep on", current, addr);
-        while (deadline_ns != 0 && timer_ns() < deadline_ns) {
-            __asm__ volatile("wfi");
-        }
+    struct thread *t = running_thread();
+    if (t == NULL) {
         return false;
     }
-    switch_to(to);
-    me->futex_addr = 0;
-    return me->woken;
+    t->futex_addr = addr;
+    t->futex_deadline = deadline_ns;
+    t->woken = false;
+    t->state = THREAD_BLOCKED;
+    trace("waits on", me()->current, addr);
+    yield_to_scheduler();
+    /* Back here only because something made this thread runnable again:
+     * a wake, or the tick noticing the deadline. */
+    t->futex_addr = 0;
+    return t->woken;
+}
+
+/* Sleeps until a deadline, with nothing to be woken by.
+ *
+ * It is a blocked thread with a deadline and **no address**, so no `futex`
+ * wake can match it: `futex_addr` is 0 and a wake on address 0 is refused
+ * before it reaches the scheduler. The tick is what ends it.
+ *
+ * It exists because the alternative is a spin. `nanosleep` and an idle
+ * runtime's `epoll_pwait` both used to loop on the clock calling
+ * `sched_yield_now`, which on four harts produced **four and a half million
+ * thread switches** for a program that ran for 56 milliseconds — correct,
+ * and almost all of it the scheduler talking to itself. A sleeping thread
+ * costs one switch. */
+bool sched_sleep_until(uint64_t deadline_ns) {
+    struct thread *t = running_thread();
+    if (t == NULL || deadline_ns == 0) {
+        return false;
+    }
+    t->futex_addr = 0;
+    t->futex_deadline = deadline_ns;
+    t->woken = false;
+    t->state = THREAD_BLOCKED;
+    yield_to_scheduler();
+    return true;
 }
 
 uint32_t sched_futex_wake(virt_t addr, uint32_t count) {
@@ -215,7 +342,10 @@ uint32_t sched_futex_wake(virt_t addr, uint32_t count) {
      * normal case for a futex — the other side had not got there yet — but
      * it is also exactly what a *lost* wakeup looks like, and the two can
      * only be told apart by seeing both sides. */
-    trace("wakes", current, addr);
+    trace("wakes", me()->current, addr);
+    if (addr == 0) {
+        return 0; /* no futex lives at address 0; a sleeper's slot does */
+    }
     for (uint32_t i = 0; i < SCHED_MAX_THREADS && woke < count; i++) {
         if (threads[i].state == THREAD_BLOCKED && threads[i].futex_addr == addr) {
             threads[i].state = THREAD_RUNNABLE;
@@ -237,25 +367,71 @@ uint32_t sched_live_threads(void) {
 }
 
 uint64_t sched_current_tid(void) {
-    return threads[current].tid;
+    struct thread *t = running_thread();
+    return t == NULL ? 0 : t->tid;
+}
+
+uint32_t sched_hart_switches(uint32_t hart_index) {
+    return hart_index < SMP_MAX_HARTS ? (uint32_t)harts[hart_index].switches : 0u;
 }
 
 void sched_exit_thread(int64_t status) {
-    uint32_t to;
-    trace("ends with status", current, (uint64_t)status);
-    threads[current].state = THREAD_FREE;
-    to = next_runnable();
-    if (to == current) {
-        /* The last thread. The process is over, and leaving through
-         * `uspace_exit` returns to whoever called `uspace_run` — on a stack
-         * that is none of these, which is why that is safe to do from
-         * here. */
+    struct thread *t = running_thread();
+    if (t == NULL) {
+        return;
+    }
+    trace("ends with status", me()->current, (uint64_t)status);
+    t->state = THREAD_FREE;
+    /* Was it the last one? Then the process is over, and **every** hart's
+     * loop must leave — not only this one. The status goes to whoever
+     * called `uspace_run`, which may be a different hart entirely, which is
+     * why it is recorded rather than returned. */
+    if (sched_live_threads() == 0) {
         uspace_exit(status);
     }
     /* Its kernel stack is still being stood on, so it is freed by
-     * `sched_shutdown` rather than here. Switching away never comes back,
+     * `sched_shutdown` rather than here. The switch away never comes back,
      * and `ksp` is written to a slot nothing will read again. */
-    switch_to(to);
+    yield_to_scheduler();
+}
+
+void sched_exit_process(void) {
+    struct thread *t = running_thread();
+    process_over = true;
+    /* Every thread, not just this one: the process is over, and a thread
+     * left RUNNABLE would be claimed by a hart whose loop has not noticed
+     * yet. */
+    for (uint32_t i = 0; i < SCHED_MAX_THREADS; i++) {
+        threads[i].state = THREAD_FREE;
+    }
+    if (t != NULL) {
+        yield_to_scheduler();
+    }
+}
+
+/* How many harts a process may run on. The harts that reached the kernel,
+ * which is what the scheduler can actually hand a thread to — not the
+ * number in the device tree, because a hart the firmware refused to start
+ * is not a CPU this machine has. */
+uint32_t sched_cpus(void) {
+    uint32_t n = smp_running_count();
+    return n == 0 ? 1u : (n > SMP_MAX_HARTS ? SMP_MAX_HARTS : n);
+}
+
+uint32_t sched_joined_harts(void) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < SMP_MAX_HARTS; i++) {
+        n += harts[i].joined ? 1u : 0u;
+    }
+    return n;
+}
+
+bool sched_wants_harts(void) {
+    return accepting_harts;
+}
+
+void sched_set_accepting(bool on) {
+    accepting_harts = on;
 }
 
 void sched_tick(void) {

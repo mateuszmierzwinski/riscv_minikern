@@ -39,6 +39,8 @@
 #include "kernel/disk.h"
 #include "kernel/irq.h"
 #include "kernel/mem.h"
+#include "arch/riscv/smp.h"
+#include "kernel/klock.h"
 #include "kernel/sched.h"
 #include "kernel/syscall.h"
 #include "kernel/uspace.h"
@@ -210,7 +212,7 @@ static void bring_up_interrupts(uint64_t dtb, uint64_t hart) {
 static void wait_for_ticks(void) {
     size_t len = 0;
     const char *v = cmdline_value(boot_cmdline, "minikern.ticks", &len);
-    uint64_t want = 0, start_ns, deadline;
+    uint64_t want = 0, start_ns, deadline, base;
     if (v == NULL) {
         return;
     }
@@ -218,19 +220,30 @@ static void wait_for_ticks(void) {
         want = v[i] >= '0' && v[i] <= '9' ? want * 10u + (uint64_t)(v[i] - '0') : want;
     }
     start_ns = timer_ns();
+    /* **From a baseline**, not from the counter's absolute value: ticks have
+     * been arriving since the timer was initialised, and anything that runs
+     * before this — bringing up a disk, starting the other harts — takes
+     * time that shows up as ticks already counted. The absolute value is
+     * therefore a measure of how long the boot took, where what is wanted is
+     * the rate. */
+    base = timer_ticks();
     /* Twice as long as it should take, by the counter — not by a spin count,
      * which measures the host's speed rather than the guest's clock. */
     deadline = timer_now() + 2u * want * (timer_frequency() / (timer_hz() == 0 ? 1 : timer_hz()));
-    while (timer_ticks() < want && timer_now() < deadline) {
+    while (timer_ticks() - base < want && timer_now() < deadline) {
         __asm__ volatile("wfi");
     }
-    if (timer_ticks() < want) {
-        kprintf("tick: only %llu of %llu ticks arrived — interrupts are not being delivered\n",
-                (unsigned long long)timer_ticks(), (unsigned long long)want);
+    if (timer_ticks() - base < want) {
+        kprintf("tick: only %llu of %llu ticks arrived — interrupts are not being delivered"
+                " (hart %llu index %u, %llu ticks across all harts)\n",
+                (unsigned long long)(timer_ticks() - base), (unsigned long long)want,
+                (unsigned long long)smp_this_hart(), smp_hart_index(),
+                (unsigned long long)timer_ticks_all_harts());
         return;
     }
     kprintf("tick: %llu ticks in %llu ms, %llu irqs dispatched, %llu spurious\n",
-            (unsigned long long)timer_ticks(), (unsigned long long)((timer_ns() - start_ns) / 1000000u),
+            (unsigned long long)(timer_ticks() - base),
+            (unsigned long long)((timer_ns() - start_ns) / 1000000u),
             (unsigned long long)irq_count(), (unsigned long long)irq_spurious());
 }
 
@@ -308,6 +321,115 @@ static void bring_up_filesystem(void) {
 }
 
 static void drive_a_pin(void);
+
+/* ── the other harts ───────────────────────────────────────────────────────── */
+
+/* How many secondaries have reached kernel code and said so. Written by
+ * each of them and read by the boot hart, so it is `volatile`: the boot hart
+ * spins on it, and a compiler that cached it in a register would spin for
+ * ever. It is a count rather than a flag per hart because the question the
+ * boot hart asks is "have they all arrived?". */
+static volatile uint32_t harts_arrived;
+
+/* Defined in start.S: the physical address a started hart arrives at. */
+void _secondary_start(void);
+
+/* Where a secondary hart begins its kernel life.
+ *
+ * Called from `_secondary_start` with the hart id the firmware gave it and
+ * the boot hart's `satp` to adopt. Each hart does for itself exactly what
+ * is its own — its trap vector and its translation — and nothing that is
+ * shared, because the boot hart has already done that and doing it twice
+ * would undo it.
+ *
+ * It parks in `wfi` afterwards. Running user threads on it needs one lock
+ * around the kernel first (P3.2): this scheduler keeps `current` in a
+ * single variable, and two harts in it at once would each believe they owned
+ * the same thread. Starting the harts and then not using them is the honest
+ * intermediate state — the bring-up is proved, and the lock is a separate
+ * piece of work that can be tested on its own.
+ */
+void smp_secondary_main(uint64_t hart, uint64_t satp);
+static void secondary_hart_loop(void);
+static void report_hart_usage(void);
+
+void smp_secondary_main(uint64_t hart, uint64_t satp) {
+    smp_set_this_hart(hart);
+    trap_init_cpu();
+    /* The boot hart's page tables, which map the kernel globally — so this
+     * hart can reach the kernel's code and data the moment translation is
+     * on, and no bring-up table is needed. The fence is not optional: a
+     * hart's TLB starts with whatever the firmware left in it. */
+    __asm__ volatile("csrw satp, %0\n\tsfence.vma zero, zero" : : "r"(satp) : "memory");
+    timer_init_cpu();
+    smp_secondary_arrived(hart);
+    __atomic_add_fetch(&harts_arrived, 1u, __ATOMIC_SEQ_CST);
+    secondary_hart_loop();
+}
+
+/* What a secondary hart does for the rest of the machine's life: run
+ * threads whenever there is a process, and wait when there is not.
+ *
+ * It waits with interrupts **on** around `wfi`, because the thing that will
+ * give it work happens on another hart and the only event that reaches this
+ * one is its own timer tick. A `wfi` with interrupts off on a hart with
+ * nothing pending is a hart that never wakes up. */
+static void secondary_hart_loop(void) {
+    for (;;) {
+        struct uproc *p;
+        while (!sched_wants_harts()) {
+            __asm__ volatile("csrsi sstatus, 2\n\twfi\n\tcsrci sstatus, 2" : : : "memory");
+        }
+        /* Checked again, and for NULL: the process may have ended between
+         * the wait and here. Joining a process that is gone would adopt a
+         * page table that is being freed. */
+        p = uspace_current();
+        if (p != NULL) {
+            uspace_join(p);
+        }
+    }
+}
+
+/* Starts the other harts and waits for them, with a bound.
+ *
+ * The bound matters: a hart the firmware accepted and that then never
+ * arrives would hang the boot here, and "one core fewer" is a better
+ * outcome than a machine that does not boot. What it waits on is the harts'
+ * own report rather than the firmware's acceptance — `sbi_hart_start`
+ * returning 0 means the request was taken, not that the hart ran.
+ */
+static void bring_up_other_harts(uint64_t dtb, uint64_t boot_hart) {
+    struct fdt fdt;
+    uint64_t satp;
+    uint32_t want, waited;
+    if (fdt_open(&fdt, (const void *)(uintptr_t)dtb, FDT_MAX_BYTES) != KERR_OK) {
+        return;
+    }
+    if (smp_enumerate(&fdt, boot_hart) != KERR_OK) {
+        kprintf("smp: no cpus node, so this is a one-hart machine\n");
+        return;
+    }
+    kprintf("smp: %u harts in the tree, booted on %llu\n", smp_hart_count(),
+            (unsigned long long)boot_hart);
+    for (uint32_t i = 0; i < smp_hart_count(); i++) {
+        const struct smp_hart *h = smp_hart(i);
+        kprintf("smp:   hart %llu %s%s\n", (unsigned long long)h->id,
+                h->id == boot_hart ? "is this one" : h->has_sv39 ? "can be started" : "has no usable MMU",
+                h->has_sv39 ? "" : " (skipped)");
+    }
+    if (cmdline_has(boot_cmdline, "minikern.smp=off")) {
+        kprintf("smp: left the other harts alone (minikern.smp=off)\n");
+        return;
+    }
+    __asm__ volatile("csrr %0, satp" : "=r"(satp));
+    want = smp_start_others((phys_t)(uintptr_t)_secondary_start, satp);
+    /* Bounded, because a hart the firmware accepted and that then never
+     * arrives must cost one core rather than the whole boot. */
+    for (waited = 0; harts_arrived < want && waited < 50000000u; waited++) {
+    }
+    kprintf("smp: %u of %u started harts reached the kernel, %u running in total\n",
+            harts_arrived, want, smp_running_count());
+}
 
 /* The board's pins.
  *
@@ -422,6 +544,22 @@ static void run_one_user_program(const char *name, const char *from, const char 
     uspace_destroy(&proc);
 }
 
+/* What each hart actually did.
+ *
+ * The measurement that distinguishes "four harts are available" from "four
+ * harts were used". A hart that never switched to a thread never ran one —
+ * and on the architecture this migrated from, the equivalent check was
+ * satisfiable by a core that had never left its idle loop, which is why
+ * this counts switches rather than asking whether a hart is up. */
+static void report_hart_usage(void) {
+    kprintf("smp: thread switches by hart:");
+    for (uint32_t i = 0; i < smp_hart_count(); i++) {
+        const struct smp_hart *h = smp_hart(i);
+        kprintf(" %llu=%u", (unsigned long long)h->id, sched_hart_switches(i));
+    }
+    kprintf("\n");
+}
+
 /* Runs a real program: an ELF read off the filesystem, loaded at the
  * addresses its own headers name, started with the state a C runtime
  * expects. This is the path a Go binary will take. */
@@ -450,16 +588,20 @@ static void run_init_from_disk(const char *path) {
     status = uspace_run(&proc);
     kprintf("init: %s exited with %lld after %llu syscalls\n", path, (long long)status,
             (unsigned long long)uspace_syscalls());
+    report_hart_usage();
     uspace_destroy(&proc);
 }
 
 static void run_user_programs(void) {
+    /* Set before anything runs, not between the programs: a trace that
+     * starts half way through is worse than none, because the first half
+     * looks quiet. */
+    sched_set_trace(cmdline_has(boot_cmdline, "minikern.trace"));
+    syscall_set_trace(cmdline_has(boot_cmdline, "minikern.calls") ? 400u : 0u);
     if (cmdline_has(boot_cmdline, "minikern.user")) {
         run_one_user_program("hello", user_program_start, user_program_end);
         run_one_user_program("faulter", user_faulter_start, user_faulter_end);
     }
-    sched_set_trace(cmdline_has(boot_cmdline, "minikern.trace"));
-    syscall_set_trace(cmdline_has(boot_cmdline, "minikern.calls") ? 400u : 0u);
     if (cmdline_has(boot_cmdline, "minikern.init")) {
         run_init_from_disk("/init");
     }
@@ -472,6 +614,17 @@ static bool halt_requested(void) {
 }
 
 void kmain(uint64_t hart, uint64_t dtb) {
+    /* The hart id into `tp`, first thing: every per-hart array is indexed
+     * through it, and the kernel lock asks who holds it. The firmware passed
+     * it in `a0` because there is no register a supervisor can ask. */
+    smp_set_this_hart(hart);
+    /* The kernel lock, before anything can trap. Wiring it up later — after
+     * a program had already run — left every syscall taking the "no lock
+     * configured" path while the scheduler still released one, and the
+     * ticket lock's counters drifted apart until the next hart waited for a
+     * ticket that had been served. A port that is installed late is a port
+     * that was not installed. */
+    trap_set_lock(klock_enter, klock_exit);
     struct bootinfo info = {0};
     struct console_port con = jh7110_sbi_console();
     console_attach(&con);
@@ -489,6 +642,7 @@ void kmain(uint64_t hart, uint64_t dtb) {
     bring_up_storage(dtb);
     bring_up_filesystem();
     bring_up_gpio(dtb);
+    bring_up_other_harts(dtb, hart);
     wait_for_ticks();
     run_user_programs();
     (void)selftest_run(boot_cmdline);

@@ -66,9 +66,9 @@ trap_entry:
     /* The interrupted stack pointer. From user mode it is in sscratch (the
      * swap put it there); from the kernel it is just above this frame. */
     csrr    t0, sscratch
-    bnez    t0, 2f
+    bnez    t0, 9f
     addi    t0, sp, FRAME_SIZE
-2:  sd      t0, FRAME_X(2)(sp)
+9:  sd      t0, FRAME_X(2)(sp)
 
     /* In the kernel now, so a fault inside the handler takes the kernel
      * path instead of swapping to a stack that is already in use. */
@@ -83,6 +83,28 @@ trap_entry:
     csrr    t0, stval
     sd      t0, FRAME_STVAL(sp)
 
+    /* The kernel's own `tp` — the hart id — restored when, and only when,
+     * the trap came from user mode, where that register belonged to the
+     * program (frame.h).
+     *
+     * The test is the **saved `sstatus`'s SPP bit**, the same one the exit
+     * path uses, read back from the frame. An earlier version tested a
+     * register that by then held the interrupted stack pointer, which is
+     * non-zero either way — so the restore ran on every trap, including
+     * kernel ones whose frame slot had never been written, and `tp` became
+     * garbage. The hart then indexed every per-hart array at 0: its ticks
+     * were counted in another hart's slot and its timer was rearmed through
+     * that slot, so it stopped ticking after one interrupt.
+     *
+     * It was invisible whenever the boot hart happened to be hart 0, which
+     * is most of the time — the firmware picks by lottery — so it showed up
+     * as a test that failed one run in three. */
+    ld      t1, FRAME_SSTATUS(sp)
+    andi    t1, t1, 0x100           /* SPP: 1 = supervisor, so keep tp */
+    bnez    t1, 2f
+    ld      tp, FRAME_KTP(sp)
+2:
+
     mv      a0, sp
     call    trap_handle
 
@@ -95,11 +117,13 @@ trap_entry:
     csrw    sstatus, t0
 
     /* Returning to user mode? Then leave the kernel stack top in sscratch
-     * for the next entry. SPP is bit 8 of sstatus: 0 means user. */
+     * for the next entry, and this hart's id in the frame so the next trap
+     * can restore it (frame.h). SPP is bit 8 of sstatus: 0 means user. */
     andi    t1, t0, 0x100
     bnez    t1, 3f
     addi    t1, sp, FRAME_SIZE
     csrw    sscratch, t1
+    sd      tp, FRAME_KTP(sp)
 3:
 
     ld      x1, FRAME_X(1)(sp)

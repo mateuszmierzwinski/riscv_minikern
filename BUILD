@@ -252,6 +252,18 @@ cc_test(
 
 # The live memory: one frame allocator and one heap over what the device tree
 # described. The pure parts are :memory above, which the host tests cover.
+# One lock around the kernel: one hart inside it at a time, which preserves
+# the property the single-hart design relied on without auditing every
+# structure. The parallelism it buys is in user space.
+cc_library(
+    name = "klock",
+    srcs = ["src/kernel/klock.c"],
+    hdrs = ["src/kernel/klock.h"],
+    strip_include_prefix = "src",
+    target_compatible_with = ["//platforms:riscv64"],
+    deps = [":arch_riscv"],
+)
+
 cc_library(
     name = "kernel_mem",
     srcs = ["src/kernel/mem.c"],
@@ -392,6 +404,7 @@ cc_library(
         ":exec",
         ":kernel_mem",
         ":kernel_random",
+        ":klock",
         ":pgtable",
     ],
 )
@@ -472,6 +485,7 @@ cc_library(
         "src/arch/riscv/mmu.c",
         "src/arch/riscv/plic.c",
         "src/arch/riscv/sbi.c",
+        "src/arch/riscv/smp.c",
         "src/arch/riscv/start.S",
         "src/arch/riscv/timer.c",
         "src/arch/riscv/trap.c",
@@ -484,6 +498,8 @@ cc_library(
         "src/arch/riscv/mmu.h",
         "src/arch/riscv/plic.h",
         "src/arch/riscv/sbi.h",
+        "src/arch/riscv/smp.h",
+        "src/arch/riscv/spinlock.h",
         "src/arch/riscv/timer.h",
         "src/arch/riscv/trap.h",
         "src/kernel/irq.h",
@@ -671,6 +687,22 @@ sh_test(
     tags = ["manual"],
 )
 
+# P3: four harts, and a Go program using all of them.
+sh_test(
+    name = "smp_qemu_test",
+    size = "large",
+    srcs = ["test/smp_qemu_test.sh"],
+    args = [
+        "$(rootpath :minikern)",
+        "$(rootpath //src/userland/gotest:gotest)",
+    ],
+    data = [
+        ":minikern",
+        "//src/userland/gotest:gotest",
+    ],
+    tags = ["manual"],
+)
+
 test_suite(
     name = "qemu_tests",
     tags = ["manual"],
@@ -680,6 +712,7 @@ test_suite(
         ":go_qemu_test",
         ":init_qemu_test",
         ":selftest_qemu_test",
+        ":smp_qemu_test",
         ":user_qemu_test",
         ":xfs_qemu_test",
     ],

@@ -49,7 +49,12 @@ mkfs.xfs -q -f -m crc=1,finobt=1,reflink=0,rmapbt=0,bigtime=0,inobtcount=0 \
     fail "mkfs.xfs refused to make the image"
 
 status=0
-timeout 300 qemu-system-riscv64 -M virt -smp 4 -m 2G -nographic -bios default -kernel "$image" \
+# Four harts with multi-threaded TCG: the ABI is exercised on the machine
+# this kernel actually runs, and the emulator is not made to pretend four
+# cores onto one host thread — which makes everything about four times
+# slower and tells nothing extra about the ABI.
+timeout 300 qemu-system-riscv64 -M virt -smp 4 -accel tcg,thread=multi -m 2G -nographic \
+    -bios default -kernel "$image" \
     -drive "file=$tmp/fs.img,if=none,format=raw,id=nvm0" -device nvme,serial=mkgo,drive=nvm0 \
     -append "console=sbi minikern.halt=poweroff minikern.init=1" > "$log" 2>&1 || status=$?
 tr -d '\r' < "$log" > "$log.clean" && mv "$log.clean" "$log"
@@ -104,8 +109,14 @@ grep -qF "go: recovered from assignment to entry in nil map" "$log" ||
     fail "panic and recover did not work"
 
 # No goroutine leaked, and it reached its own last line.
-grep -qE '^go: 1 goroutines at the end \(1 at the start\), total time [0-9]+ms$' "$log" ||
-    fail "goroutines leaked"
+#
+# The duration is matched loosely on purpose: Go prints "56ms" or "1.022s"
+# depending on how long it took, and under load — the export script runs the
+# whole suite at once — it takes seconds. An exact unit here failed as
+# "goroutines leaked", which is the wrong diagnosis attached to the right
+# assertion, and that is worse than no assertion.
+grep -qE '^go: 1 goroutines at the end \(1 at the start\), total time .+$' "$log" ||
+    fail "goroutines leaked, or the final line is missing"
 grep -qF "go: done" "$log" || fail "it did not reach its end"
 grep -qE '^init: /init exited with 0 after [0-9]+ syscalls$' "$log" ||
     fail "it did not exit cleanly"

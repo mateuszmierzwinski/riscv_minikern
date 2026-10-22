@@ -71,6 +71,10 @@ uspace_enter_frame:
     addi    t0, a0, FRAME_SIZE
     csrw    sscratch, t0
 
+    /* This hart's id into the frame, so the first trap out of this thread
+     * restores the kernel's `tp` rather than the program's (frame.h). */
+    sd      tp, FRAME_KTP(a0)
+
     ld      t0, FRAME_SEPC(a0)
     csrw    sepc, t0
     li      t0, 0x100               /* SPP: to user mode */
