@@ -40,26 +40,36 @@ run() {
 
 # One at a time, then all together in one boot — which is the case that
 # catches a handler that corrupts state it has already used.
-for which in illegal load store break; do
+for which in illegal load store break rotext; do
     run "$which"
 done
 run all
 
 # The causes must be the right ones, not merely *some* fault. An access fault
-# and a page fault are different diagnoses: translation is off here, so a load
-# from unbacked memory is an access fault, and a kernel that reported a page
-# fault would send its reader to the page tables for a bus problem.
+# and a page fault are different diagnoses — nothing answered on the bus,
+# versus nothing in the table — and a kernel that reports the wrong one sends
+# its reader to the wrong place. Translation is on by the time these run, so
+# an unreachable address is a **page** fault; the kernel asks its own MMU
+# rather than hard-coding either answer.
 log="$tmp/all.log"
 cat "$log"
 grep -qF "illegal instruction at 0000000030102573" "$log" ||
     { echo "FAIL: the M-mode CSR read did not report the instruction in stval" >&2; exit 1; }
-grep -qF "load access fault at 3000000000000000" "$log" ||
-    { echo "FAIL: the load fault did not report the faulting address" >&2; exit 1; }
-grep -qF "store access fault at 3000000000000008" "$log" ||
-    { echo "FAIL: the store fault did not report the faulting address" >&2; exit 1; }
+grep -qF "load page fault at 3000000000000000" "$log" ||
+    { echo "FAIL: the load fault did not report a page fault at the faulting address" >&2; exit 1; }
+grep -qF "store page fault at 3000000000000008" "$log" ||
+    { echo "FAIL: the store fault did not report a page fault at the faulting address" >&2; exit 1; }
 grep -qE "breakpoint at 00000000[0-9a-f]+" "$log" ||
     { echo "FAIL: the breakpoint did not report where it happened" >&2; exit 1; }
 echo "ok: every cause and faulting address was reported correctly"
+
+# Paging must actually be on for the above to mean what it says, and the
+# kernel's own text must be unwritable — proved by writing to it, not asserted.
+grep -qE "^mmu: sv39 on, [0-9]+ table pages, kernel text read-execute$" "$log" ||
+    { echo "FAIL: translation was not enabled, so the page faults above prove less" >&2; exit 1; }
+grep -qF "a store into the kernel's own text faulted as expected: store page fault at 0000000080200000" "$log" ||
+    { echo "FAIL: the kernel's text was writable, or the attempt was not reported" >&2; exit 1; }
+echo "ok: sv39 is on and the kernel's own text is not writable"
 
 # A name that does not exist must say so rather than silently running nothing,
 # which is how a test suite comes to pass while testing nothing at all.

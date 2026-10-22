@@ -17,6 +17,7 @@
 #include <stdint.h>
 
 #include "arch/riscv/layout.h"
+#include "arch/riscv/mmu.h"
 #include "arch/riscv/sbi.h"
 #include "arch/riscv/trap.h"
 #include "board/jh7110/console.h"
@@ -73,6 +74,36 @@ static void read_bootinfo(uint64_t dtb, struct bootinfo *info) {
     }
 }
 
+/* Where the table allocator may carve its pages from: immediately above the
+ * kernel image. Two mebibytes is far more than the identity map needs (it
+ * uses gigapages where it can), and it is reclaimed by nothing because the
+ * kernel's own map lives as long as the machine. */
+#define TABLE_ARENA_BYTES (2u * 1024u * 1024u)
+
+extern char __kernel_end[];
+
+/* Turns translation on, and says what it cost.
+ *
+ * Deliberately after the trap vector is installed: if the new table were
+ * wrong in a way that faults rather than one that stops fetching, a handler
+ * exists to say so. And deliberately before the self-tests, so those faults
+ * are taken with paging on. */
+static void bring_up_translation(const struct bootinfo *info) {
+    uint64_t arena = ((uint64_t)(uintptr_t)__kernel_end + PAGE_SIZE - 1u) & ~(PAGE_SIZE - 1u);
+    int rc;
+    if (info->source != BOOTINFO_FDT || info->mem_size == 0) {
+        kprintf("mmu: no memory map, so translation stays off\n");
+        return;
+    }
+    mmu_set_table_arena(arena, TABLE_ARENA_BYTES);
+    rc = mmu_init(info->mem_base, info->mem_size);
+    if (rc != KERR_OK) {
+        kprintf("mmu: could not build the kernel map (rc %d); translation stays off\n", rc);
+        return;
+    }
+    kprintf("mmu: sv39 on, %u table pages, kernel text read-execute\n", mmu_table_pages_used());
+}
+
 /* True when the operator asked the machine to switch itself off at the end,
  * which is what makes a boot test a test rather than a timeout. */
 static bool halt_requested(void) {
@@ -90,6 +121,7 @@ void kmain(uint64_t hart, uint64_t dtb) {
      * per hart, and a hart that skips it sends its first exception to
      * address zero. */
     trap_init_cpu();
+    bring_up_translation(&info);
     (void)selftest_run(boot_cmdline);
     kprintf("minikern: boot complete\n");
     if (halt_requested()) {

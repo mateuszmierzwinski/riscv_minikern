@@ -5,6 +5,7 @@ ENTRY(_start)
 
 SECTIONS {
     . = 0x80200000;
+    __kernel_start = .;
 
     .text : {
         KEEP(*(.text.entry))
@@ -12,6 +13,11 @@ SECTIONS {
     }
 
     . = ALIGN(4096);
+    /* Where the executable part ends. The kernel maps itself read-execute
+     * below this and read-write above it, so that its own code cannot be
+     * written and its own data cannot be executed. */
+    __text_end = .;
+
     .rodata : { *(.rodata .rodata.*) }
 
     . = ALIGN(4096);

@@ -1,0 +1,59 @@
+# Features
+
+What this kernel does today, and what it is going to do. Honest about the
+difference: nothing is listed as working unless a test proves it, and the test
+is named. The phase-by-phase record is `DEVELOPMENT_PROGRESS.md`.
+
+## Working now
+
+| Feature | Proved by |
+|---|---|
+| Boots as an SBI payload in S-mode, on QEMU's `virt` under real OpenSBI | `boot_qemu_test` |
+| Takes its hart id and device tree from the firmware, and **never assumes it is hart 0** | `boot_qemu_test` (the hart id is in the banner) |
+| Probes which SBI extensions the firmware implements rather than assuming them | `boot_qemu_test` |
+| Reads the device tree: memory, the kernel command line | `boot_qemu_test`, `bootinfo_test`, `fdt_test` |
+| Memory nodes of **any size**, including an 8 GiB board's two-cell values | `bootinfo_test`, `fdt_test` |
+| Powers the machine off through SBI, so a test ends by the machine exiting | `boot_qemu_test` |
+| One trap vector: exceptions and interrupts, with a frame whose layout the assembly and the C are asserted to agree on | `selftest_qemu_test` |
+| Deliberate faults taken and survived — illegal instruction, load, store, breakpoint — each checked for the **right cause and the right faulting address** | `selftest_qemu_test` |
+| **Sv39 paging**, with the kernel identity-mapped: text read-execute, everything else read-write | `pgtable_test` (10 cases, on the host), `selftest_qemu_test` |
+| The kernel's own text is **not writable**, and that is proved by trying | `selftest_qemu_test` (`rotext`) |
+| Large pages where they fit: a 1 GiB identity map costs 3 table pages | `pgtable_test` |
+| A printf-style formatter, command-line parsing, CRC-32C, SHA-256, SHA-512, Ed25519 verification | host tests, carried over |
+
+## Carried over, not yet wired up
+
+These came from the ARM kernel and depend on no architecture, so they are
+already in the tree and already have host tests. They are listed separately
+because *present* is not *working*: each needs the kernel services beneath it.
+
+IPv4 with ARP, ICMP, UDP and TCP · DHCP · the MKNB netboot protocol with
+Ed25519-verified offers · XFS (mount, read, logged writes, create, remove,
+grow) · a network block device client · a buffer cache · the page and heap
+allocators · the VMA tree · an ELF loader · a ustar reader.
+
+## Planned
+
+In the order it will be built, because each step needs the one before it:
+
+| | |
+|---|---|
+| **The kernel's own UART** | 16550-compatible, from the device tree; SBI's console stays as the fallback |
+| **Memory and processes** | the allocators over the real memory map, user address spaces, the timer through SBI, threads |
+| **The syscall interface** | the generic table, ELF64, the process start state, signals — then Go binaries unchanged |
+| **SMP** | harts started through SBI's hart-state extension, enumerated **from the device tree** because this SoC's application cores are 1–4 |
+| **Storage** | virtio-blk first (so XFS is exercised under the emulator), then the SD card, then **NVMe** over PCIe for the M.2 slot |
+| **Network** | virtio-net first, then the DesignWare GMAC |
+| **The board's hardware** | GPIO, clocks and resets, the temperature sensor and frequency scaling |
+| **The real boot path** | an SD-card image with U-Boot, and the documented flash procedure |
+
+## Deliberately not planned
+
+- **A second architecture.** This kernel targets the JH7110. The ARM work is
+  archived at [arm_minikern](https://github.com/mateuszmierzwinski/arm_minikern),
+  and keeping both would mean an abstraction layer whose only user is history.
+- **SACK**, in TCP. It improves on reassembly rather than replacing it, and
+  with the reassembly queue a loss already costs one round trip.
+- **XFS log replay.** A filesystem whose log is not clean is refused at mount,
+  so a crash is `xfs_repair`'s to deal with rather than something this kernel
+  guesses at.

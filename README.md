@@ -40,7 +40,7 @@ on day one of this port rather than at the end of it.
 
 Early. The kernel boots on QEMU's `virt` machine under real OpenSBI firmware,
 in S-mode, reads its device tree, and powers the machine off through SBI. Four
-host tests and one boot test, all green. `TASKS.md` is the plan and the record.
+host tests and one boot test, all green. `DEVELOPMENT_PROGRESS.md` is the plan and the record, `GOALS.md` the design and the measured hardware facts.
 
 ```bash
 bazel test //...          # host tests

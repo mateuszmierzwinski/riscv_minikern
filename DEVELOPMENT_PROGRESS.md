@@ -1,8 +1,10 @@
-# TASKS — minikern on RISC-V (StarFive JH7110 / VisionFive 2)
+# Development progress — minikern on RISC-V (JH7110 / VisionFive 2)
 
-The plan and the record. Newest work is marked as it lands; `[~]` means
-partly done with the remainder named, and nothing is marked `[x]` until it is
-tested.
+The plan and the record, in one file so that what was done and what is left
+cannot drift apart. `[x]` means tested, `[~]` means partly done with the
+remainder named, and **nothing is marked done because it was written** — only
+because something proves it. What the kernel can do today is summarised in
+`FEATURES.md`; the design and the measured hardware facts are in `GOALS.md`.
 
 The order is the same discipline the ARM project used and it is the reason
 that one got as far as it did: **each phase ends with something that boots and
@@ -78,11 +80,33 @@ Three things in it are *not* architecture-neutral and were fixed on the way in:
       fault in a later test; the cause was arithmetic. The length is now read
       from the instruction itself, which is the architectural rule. Running
       each case in its own boot is what made it findable at all.
-- [ ] **P0.4 Sv39 paging.** Three levels, 4 KiB pages, with the kernel in the
-      top half (sign-extended, so `0xFFFF_FFC0...`) and user space in the
-      bottom. The page-table code is pure and host-tested before it is ever
-      installed, which is how the ARM equivalent caught a descriptor-type bug
-      that would otherwise have been a silent fault storm.
+- [~] **P0.4 Sv39 paging — on, with the kernel identity-mapped (2026-10-22).**
+      Three levels, 4 KiB pages, 2 MiB megapages and 1 GiB gigapages, written
+      as **pure arithmetic that touches no CSR** and host-tested in ten cases
+      before anything installed a table: canonical-address checking (bits
+      63:39 must copy bit 38, and the 255 TiB hole between the halves is not
+      an address), large mappings and their alignment rules, refusing to
+      replace a live mapping, unmap reporting what it removed, and running out
+      of table memory being reported rather than ignored. That separation is
+      what the ARM project's page-table test earned its place by.
+      `mmu.c` then builds the kernel's map and writes `satp`. The map is an
+      **identity** map, because the instruction after `csrw satp` is fetched
+      through the table just installed — if the kernel's own code is not at
+      the address it is executing from, there is no handler to say so and the
+      machine simply stops fetching. Text is mapped read-execute and
+      everything else read-write, so the kernel's code cannot be written and
+      its data cannot be executed, and `minikern.selftest=rotext` **proves the
+      text protection by trying to write to it** rather than asserting it.
+      A 1 GiB identity map costs **3 table pages**, because gigapage leaves
+      need nothing below them.
+      *The bug it surfaced immediately:* the fault self-tests expected *access*
+      faults for unreachable addresses, which is right with translation off and
+      wrong with it on — an unmapped address is a **page** fault. The
+      distinction is a real diagnosis (nothing answered on the bus, versus
+      nothing in the table), so the tests now ask the MMU which world they are
+      in rather than hard-coding one.
+      **What remains:** moving the kernel to the top half, which needs the
+      image linked high and a jump, and per-process address spaces (P1.2).
 - [ ] **P0.5 The real boot path on the board.** U-Boot on the VisionFive 2
       loads a flat image with `booti`; an SD card image with a `boot.scr`, and
       the documented flash procedure in `README.md`. The ARM project's
@@ -201,6 +225,11 @@ Three things in it are *not* architecture-neutral and were fixed on the way in:
       parity on the things that matter (Go unchanged, SMP, storage, network).
       It is published and tagged, so removal loses nothing — but it happens
       *after* the replacement works, not before.
+- [ ] **P7.4 The documents a reader wants.** `GOALS.md`, `FEATURES.md` and
+      this file are the published record; the agent ruleset (`CLAUDE.md`) and
+      session state (`MEMORY.md`) are working documents and stay out of the
+      repository, because a public tree carrying an instruction file addressed
+      to a tool is confusing rather than transparent.
 - [ ] **P7.2 The CVE suites**, which are the largest test surface in the ARM
       project and carry over: hostile syscalls from a Go program, malformed
       and attacking packets under ASan and UBSan, and the server's own

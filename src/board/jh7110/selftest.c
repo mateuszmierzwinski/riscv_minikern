@@ -2,6 +2,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "arch/riscv/mmu.h"
 #include "arch/riscv/trap.h"
 #include "board/jh7110/selftest.h"
 #include "core/cmdline.h"
@@ -92,24 +93,47 @@ static bool test_illegal_instruction(void) {
     return expectation_met("an M-mode CSR read from S-mode");
 }
 
-/* A load from an address no memory answers at. Translation is off, so this
- * is an access fault rather than a page fault — and the distinction is the
- * point: a kernel that reports the wrong one sends its reader looking at the
- * page tables for a bus problem. */
+/* An unreachable address raises **different causes depending on whether
+ * translation is on**, and the difference is a real diagnosis rather than a
+ * detail: with paging off it is an *access* fault, meaning nothing on the bus
+ * answered; with paging on it is a *page* fault, meaning the address is not
+ * in the table. A kernel that conflates them sends its reader to the page
+ * tables for a bus problem, or to the memory map for a missing mapping.
+ *
+ * So the test asks the MMU which world it is in rather than hard-coding one,
+ * and this is how it was found: the expectation was written before paging
+ * existed, and the first boot with Sv39 on reported a load page fault where
+ * the test still wanted an access fault. */
 static bool test_load_fault(void) {
     const uint64_t bad = 0x3000000000000000ull;
     uint64_t sink = 0;
-    arm_expectation(EXC_LOAD_FAULT, bad, true);
+    arm_expectation(mmu_enabled() ? EXC_LOAD_PAGE_FAULT : EXC_LOAD_FAULT, bad, true);
     __asm__ volatile("ld %0, 0(%1)" : "=r"(sink) : "r"(bad));
     (void)sink;
-    return expectation_met("a load from unbacked memory");
+    return expectation_met("a load from unreachable memory");
 }
 
 static bool test_store_fault(void) {
     const uint64_t bad = 0x3000000000000008ull;
-    arm_expectation(EXC_STORE_FAULT, bad, true);
+    arm_expectation(mmu_enabled() ? EXC_STORE_PAGE_FAULT : EXC_STORE_FAULT, bad, true);
     __asm__ volatile("sd zero, 0(%0)" : : "r"(bad));
-    return expectation_met("a store to unbacked memory");
+    return expectation_met("a store to unreachable memory");
+}
+
+/* The kernel's own code must not be writable. This is the protection the
+ * identity map sets up (text read-execute, everything else read-write), and
+ * it is worth proving rather than assuming: a kernel that believes its text
+ * is protected and is wrong has a weakness nobody will notice. */
+static bool test_kernel_text_is_not_writable(void) {
+    extern char __kernel_start[];
+    uint64_t at = (uint64_t)(uintptr_t)__kernel_start;
+    if (!mmu_enabled()) {
+        kprintf("selftest: translation is off, so text protection does not apply\n");
+        return true;
+    }
+    arm_expectation(EXC_STORE_PAGE_FAULT, at, true);
+    __asm__ volatile("sd zero, 0(%0)" : : "r"(at));
+    return expectation_met("a store into the kernel's own text");
 }
 
 /* An ebreak, which is how a debugger stops a program and how this kernel
@@ -132,6 +156,7 @@ static const struct selftest tests[] = {
     {"load", test_load_fault},
     {"store", test_store_fault},
     {"break", test_breakpoint},
+    {"rotext", test_kernel_text_is_not_writable},
 };
 
 bool selftest_run(const char *cmdline) {

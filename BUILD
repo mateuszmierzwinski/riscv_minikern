@@ -52,6 +52,16 @@ cc_library(
     deps = [":kfmt"],
 )
 
+# Sv39 translation, as pure arithmetic: no CSR is touched here, which is what
+# lets it be tested on the host before any hardware installs a table.
+cc_library(
+    name = "pgtable",
+    srcs = ["src/arch/riscv/pgtable.c"],
+    hdrs = ["src/arch/riscv/pgtable.h"],
+    strip_include_prefix = "src",
+    deps = [":core_boot"],
+)
+
 # ── host tests, which need no board and no emulator ────────────────────────
 
 cc_test(
@@ -95,6 +105,16 @@ cc_test(
 )
 
 cc_test(
+    name = "pgtable_test",
+    size = "small",
+    srcs = ["test/pgtable_test.c"],
+    deps = [
+        ":ktest",
+        ":pgtable",
+    ],
+)
+
+cc_test(
     name = "bootinfo_test",
     size = "small",
     srcs = ["test/bootinfo_test.c"],
@@ -119,6 +139,7 @@ cc_library(
 cc_library(
     name = "arch_riscv",
     srcs = [
+        "src/arch/riscv/mmu.c",
         "src/arch/riscv/sbi.c",
         "src/arch/riscv/start.S",
         "src/arch/riscv/trap.c",
@@ -127,12 +148,16 @@ cc_library(
     hdrs = [
         "src/arch/riscv/frame.h",
         "src/arch/riscv/layout.h",
+        "src/arch/riscv/mmu.h",
         "src/arch/riscv/sbi.h",
         "src/arch/riscv/trap.h",
     ],
     strip_include_prefix = "src",
     target_compatible_with = ["//platforms:riscv64"],
-    deps = [":console"],
+    deps = [
+        ":console",
+        ":pgtable",
+    ],
     # _start is referenced by nothing, so without this the linker drops it
     # from the archive and the image boots into whatever follows.
     alwayslink = True,
