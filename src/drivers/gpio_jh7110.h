@@ -24,12 +24,12 @@
  * controller of any kind, so every register access below has been written
  * from an implementation that runs on this silicon and has never run on it
  * from this kernel. The offsets are cross-checked; the behaviour is not.
- * Nor are the block's **clocks and resets** handled yet — the device tree
- * declares them, and the lesson from the ARM thermal sensor is exactly that
- * a complete driver which was never switched on reads nothing and looks
- * like it works. In practice the firmware enables this block because it
- * uses GPIO itself, which is an assumption and is recorded as one
- * (DEVELOPMENT_PROGRESS.md P6.1).
+ * Its **clock and reset are handled** (drivers/crg_jh7110.h), and both are
+ * confirmed by reading back rather than assumed: a block held in reset
+ * accepts every write and ignores all of them, which is how the ARM thermal
+ * sensor came to look like it worked. A controller whose clock will not
+ * enable or whose reset will not release is **not marked up**, so nothing
+ * above it can drive a pin through a block that is not listening.
  */
 #ifndef MINIKERN_DRIVERS_GPIO_JH7110_H
 #define MINIKERN_DRIVERS_GPIO_JH7110_H

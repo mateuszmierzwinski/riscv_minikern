@@ -417,11 +417,37 @@ Three things in it are *not* architecture-neutral and were fixed on the way in:
       No emulator models this controller, so the register *behaviour* has
       never run — the same honest position the ARM project ended in, reached
       deliberately this time and with the testable half tested.
-- [ ] **P6.2 Clocks and resets.** Every peripheral here needs its gate
-      ungated and its reset released before its registers mean anything —
-      which is exactly the bug that left the ARM thermal sensor dead: a
-      complete driver that had never been switched on. A peripheral's clocks
-      and resets are part of its contract.
+      **Update (2026-10-22): the clock and reset gap is closed** (P6.2). The
+      controller's clock is enabled and its reset released, both confirmed by
+      reading back, and a controller that fails either is not marked up.
+- [x] **P6.2 Clocks and resets (2026-10-22).** Written *because* of the ARM
+      thermal sensor: a complete, correct driver that had never been switched
+      on, so on silicon every write would have been ignored and every reading
+      refused while the governor above it reported temperatures and looked
+      healthy. A peripheral's clocks and resets are part of its contract, and
+      every JH7110 driver in this tree now goes through this first.
+      The layout is regular: a **clock** is one word at `base + 4 * index`
+      with bit 31 enabling it; a **reset** is one bit in a bank, where
+      *setting* the bit holds the block in reset and clearing it releases, and
+      a separate status bank reads back 1 for a released line.
+      **Both are confirmed by reading back, not assumed.** An enable bit that
+      will not stay set means the *parent* clock is off — a different
+      diagnosis from "I wrote it" — and a block still in reset accepts every
+      write and ignores all of them. A controller whose clock will not enable
+      or whose reset will not release is **not marked up**, so nothing above
+      can drive a pin through a block that is not listening.
+      The generators are found by `compatible`, never by address, and there is
+      one per domain: the system peripherals' and the always-on domain's,
+      with *different* reset-bank offsets — which is the "a pin controller is
+      not one block" lesson one level further down.
+      The addressing is pure and host-tested: a word per clock, resets banked
+      32 to a word with the boundaries checked, and every id in the system
+      generator's range proved to map to its own distinct bit. A reset id that
+      resolves to the wrong bank releases a *different* peripheral, which
+      takes a board down in a way nothing explains.
+      GPIO now switches its block on through this, so **P6.1's named gap is
+      closed** — and on a machine with no generator (an emulator) the kernel
+      says so and touches nothing.
 - [ ] **P6.3 Thermal and frequency.** The JH7110 has a temperature sensor
       (`sfctemp`) and CPU frequency control through its clock tree. The policy
       carries over from the ARM project — temperature overrules load,

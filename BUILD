@@ -253,8 +253,14 @@ cc_library(
 # not tested and cannot be: no emulator models this controller.
 cc_library(
     name = "drivers_gpio",
-    srcs = ["src/drivers/gpio_jh7110.c"],
-    hdrs = ["src/drivers/gpio_jh7110.h"],
+    srcs = [
+        "src/drivers/crg_jh7110.c",
+        "src/drivers/gpio_jh7110.c",
+    ],
+    hdrs = [
+        "src/drivers/crg_jh7110.h",
+        "src/drivers/gpio_jh7110.h",
+    ],
     strip_include_prefix = "src",
     target_compatible_with = ["//platforms:riscv64"],
     deps = [
@@ -263,12 +269,25 @@ cc_library(
     ],
 )
 
-# The pure half, which the host can judge.
+# The pure halves, which the host can judge.
 cc_library(
     name = "gpio_offsets",
-    hdrs = ["src/drivers/gpio_jh7110.h"],
+    hdrs = [
+        "src/drivers/crg_jh7110.h",
+        "src/drivers/gpio_jh7110.h",
+    ],
     strip_include_prefix = "src",
     deps = [":core_boot"],
+)
+
+cc_test(
+    name = "crg_jh7110_test",
+    size = "small",
+    srcs = ["test/crg_jh7110_test.c"],
+    deps = [
+        ":gpio_offsets",
+        ":ktest",
+    ],
 )
 
 cc_test(

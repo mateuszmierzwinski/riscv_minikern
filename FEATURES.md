@@ -28,7 +28,8 @@ is named. The phase-by-phase record is `DEVELOPMENT_PROGRESS.md`.
 | **XFS on a real device** — mounted off NVMe, directory listed, file contents read; and every feature it does not understand refused | `xfs_qemu_test`, `xfs_test` |
 | **A block-size adapter**: a filesystem's 4 KiB blocks over a controller's 512-byte sectors | `blockscale_test` |
 | Built with **`-mcpu=sifive-u74`**: the JH7110's own core and pipeline, not a generic RV64GC | the whole suite runs on it |
-| **GPIO** on both JH7110 pin controllers: found, mapped, and the pin-to-register arithmetic proved (a *byte* per pin, not a bit) — no pin is driven yet, see below | `gpio_jh7110_test` |
+| **GPIO** on both JH7110 pin controllers: found, mapped, **clocked and brought out of reset** (both confirmed by reading back), with the pin-to-register arithmetic proved — a *byte* per pin, not a bit | `gpio_jh7110_test` |
+| **Clocks and resets** through the JH7110's generators, found by `compatible`, with every enable and release confirmed rather than assumed | `crg_jh7110_test` |
 | **An SD card** through a standard host controller — found, powered up, addressed, sized correctly, read and written | `disk_qemu_test` |
 | **NVMe over PCIe** — the M.2 slot: the bus walked, BARs assigned, bus mastering enabled, the controller identified and read/written | `disk_qemu_test` |
 | **A PCIe bus walker** that assigns memory windows itself, because no firmware here has | `disk_qemu_test` |

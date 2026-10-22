@@ -1,0 +1,104 @@
+#include "drivers/crg_jh7110.h"
+
+#include <stddef.h>
+
+#include "arch/riscv/mmu.h"
+#include "core/console.h"
+#include "core/errno.h"
+
+#define CLOCK_ENABLE (1u << CRG_CLOCK_ENABLE_BIT)
+
+/* Where each generator keeps its reset banks, relative to its own base.
+ * They differ per domain, which is why they live in the table below rather
+ * than in a constant. */
+struct domain_layout {
+    const char *compatible;
+    uint32_t assert_offset;
+    uint32_t status_offset;
+    uint32_t resets;
+};
+
+static const struct domain_layout layouts[CRG_DOMAINS] = {
+    {"starfive,jh7110-syscrg", 0x2f8u, 0x308u, 126u},
+    {"starfive,jh7110-aoncrg", 0x038u, 0x03cu, 8u},
+};
+
+static struct {
+    volatile uint32_t *regs;
+    phys_t base;
+    bool up;
+} domains[CRG_DOMAINS];
+
+#define CONFIRM_SPINS 100000u
+
+static void write_reg(enum crg_domain d, uint32_t off, uint32_t v) {
+    domains[d].regs[off / 4u] = v;
+}
+
+static uint32_t read_reg(enum crg_domain d, uint32_t off) {
+    return domains[d].regs[off / 4u];
+}
+
+uint32_t crg_jh7110_init(const struct fdt *fdt) {
+    uint32_t found = 0;
+    for (uint32_t i = 0; i < CRG_DOMAINS; i++) {
+        char path[64];
+        phys_t base = 0;
+        uint64_t size = 0;
+        if (fdt_find_compatible(fdt, layouts[i].compatible, path, sizeof path) != KERR_OK ||
+            fdt_device_reg(fdt, path, 0, &base, &size) != KERR_OK ||
+            mmu_map_device(base, size) != KERR_OK) {
+            continue;
+        }
+        domains[i].regs = (volatile uint32_t *)(uintptr_t)base;
+        domains[i].base = base;
+        domains[i].up = true;
+        found++;
+    }
+    return found;
+}
+
+int crg_enable_clock(enum crg_domain domain, uint32_t index) {
+    uint32_t off = crg_clock_offset(index);
+    if (domain >= CRG_DOMAINS || !domains[domain].up) {
+        return KERR_NOENT;
+    }
+    write_reg(domain, off, read_reg(domain, off) | CLOCK_ENABLE);
+    /* Read back. An enable bit that does not stay set means the parent clock
+     * is off, and the difference between that and "I wrote it" is the
+     * difference between a diagnosis and a mystery. */
+    return (read_reg(domain, off) & CLOCK_ENABLE) != 0 ? KERR_OK : KERR_IO;
+}
+
+int crg_release_reset(enum crg_domain domain, uint32_t id) {
+    uint32_t bank, mask, assert_off, status_off;
+    if (domain >= CRG_DOMAINS || !domains[domain].up) {
+        return KERR_NOENT;
+    }
+    if (id >= layouts[domain].resets) {
+        return KERR_INVAL;
+    }
+    bank = crg_reset_bank(id);
+    mask = 1u << crg_reset_bit(id);
+    assert_off = layouts[domain].assert_offset + bank;
+    status_off = layouts[domain].status_offset + bank;
+    /* Clearing the bit releases; setting it holds the block in reset. */
+    write_reg(domain, assert_off, read_reg(domain, assert_off) & ~mask);
+    for (uint32_t spin = 0; spin < CONFIRM_SPINS; spin++) {
+        /* A released line reads back as 1 in the status bank. Confirmed
+         * rather than assumed, because a block still in reset accepts every
+         * write and ignores all of them. */
+        if ((read_reg(domain, status_off) & mask) != 0) {
+            return KERR_OK;
+        }
+    }
+    return KERR_TIMEDOUT;
+}
+
+phys_t crg_base(enum crg_domain domain) {
+    return domain < CRG_DOMAINS ? domains[domain].base : 0;
+}
+
+bool crg_present(enum crg_domain domain) {
+    return domain < CRG_DOMAINS && domains[domain].up;
+}

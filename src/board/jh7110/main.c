@@ -25,6 +25,7 @@
 #include "board/jh7110/console.h"
 #include "board/jh7110/selftest.h"
 #include "board/jh7110/uart.h"
+#include "drivers/crg_jh7110.h"
 #include "drivers/gpio_jh7110.h"
 #include "drivers/nvme.h"
 #include "drivers/pci.h"
@@ -316,9 +317,18 @@ static void bring_up_gpio(uint64_t dtb) {
     if (fdt_open(&fdt, (const void *)(uintptr_t)dtb, FDT_MAX_BYTES) != KERR_OK) {
         return;
     }
+    /* The clock generators first: a pin controller cannot be switched on
+     * without them, and a driver that skips that step is the one the ARM
+     * thermal sensor was (drivers/crg_jh7110.h). */
+    if (crg_jh7110_init(&fdt) == 0) {
+        kprintf("gpio: no JH7110 clock generator in the device tree\n");
+        return;
+    }
+    kprintf("crg: sys at %016llx, aon at %016llx\n", (unsigned long long)crg_base(CRG_SYS),
+            (unsigned long long)crg_base(CRG_AON));
     found = gpio_jh7110_init(&fdt);
     if (found == 0) {
-        kprintf("gpio: no JH7110 pin controller in the device tree\n");
+        kprintf("gpio: no pin controller came up\n");
         return;
     }
     for (uint32_t i = 0; i < 2u; i++) {

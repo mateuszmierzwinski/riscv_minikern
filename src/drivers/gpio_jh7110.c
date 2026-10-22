@@ -5,6 +5,7 @@
 #include "arch/riscv/mmu.h"
 #include "core/console.h"
 #include "core/errno.h"
+#include "drivers/crg_jh7110.h"
 
 /* The output-enable byte's values: 0 drives the pin, 1 leaves it an input.
  * Active low, which is worth naming rather than leaving as a bare 0. */
@@ -43,6 +44,30 @@ static void remember_path(uint32_t i, const char *path) {
     controllers[i].path[at] = '\0';
 }
 
+/* The clock and the reset each controller needs, and which generator owns
+ * them. The `sys` pin controller is clocked and reset by the system
+ * generator; the always-on one by the always-on generator — which is the
+ * same "a pin controller is not one block" point one level down. */
+static bool switch_on(uint32_t which) {
+    enum crg_domain domain = which == 0 ? CRG_SYS : CRG_AON;
+    int rc;
+    if (!crg_present(domain)) {
+        kprintf("gpio: no clock generator for controller %u; not touching it\n", which);
+        return false;
+    }
+    rc = crg_enable_clock(domain, JH7110_SYSCLK_IOMUX_APB);
+    if (rc != KERR_OK) {
+        kprintf("gpio: controller %u's clock would not enable (rc %d)\n", which, rc);
+        return false;
+    }
+    rc = crg_release_reset(domain, JH7110_SYSRST_IOMUX_APB);
+    if (rc != KERR_OK) {
+        kprintf("gpio: controller %u stayed in reset (rc %d)\n", which, rc);
+        return false;
+    }
+    return true;
+}
+
 uint32_t gpio_jh7110_init(const struct fdt *fdt) {
     uint32_t found = 0;
     for (uint32_t i = 0; i < CONTROLLERS; i++) {
@@ -57,9 +82,16 @@ uint32_t gpio_jh7110_init(const struct fdt *fdt) {
         controllers[i].regs = (volatile uint8_t *)(uintptr_t)base;
         controllers[i].base = base;
         controllers[i].pins = kinds[i].pins;
-        controllers[i].up = true;
         remember_path(i, path);
-        found++;
+        /* **Switch the block on before believing any of its registers.**
+         * The device tree declares a clock and a reset for this node, and a
+         * driver that skips them is the one the ARM thermal sensor was: every
+         * write ignored, every read meaningless, and the layer above
+         * reporting success. Both are confirmed by reading back, so a
+         * failure here is a refusal rather than a silent half-start
+         * (drivers/crg_jh7110.h). */
+        controllers[i].up = switch_on(i);
+        found += controllers[i].up ? 1u : 0u;
     }
     return found;
 }
