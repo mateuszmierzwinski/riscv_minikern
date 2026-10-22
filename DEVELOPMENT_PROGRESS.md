@@ -339,13 +339,39 @@ Three things in it are *not* architecture-neutral and were fixed on the way in:
 
 ## P6 — The board's own hardware
 
-- [ ] **P6.1 GPIO.** The JH7110's pin controller, as a `gpio_pin` port — the
-      interface already exists and is host-tested. The lesson from the ARM
-      port is recorded in advance: **a pin controller is not one block.** On
-      that SoC the pin everything cared about lived in a *second* controller
-      with its own clock gate, and the name parser rejected it as a typo, so
-      the feature was unusable on every board that had it. Enumerate the
-      controllers from the device tree; do not assume one.
+- [~] **P6.1 GPIO — written, with the half that can be proved proved
+      (2026-10-22).** **Both** controllers are enumerated from the device
+      tree: the `sys` one with 64 pins and the always-on `aon` one with four.
+      That is the ARM lesson applied in advance rather than relearned — there,
+      the one pin anybody cared about lived in a second controller the pin
+      parser did not know existed, so the feature was unusable on every board
+      that had it, silently.
+      **The register layout is unusual, and that is where the risk is:** a
+      pin's output enable and output value are each a **byte** in a table of
+      64, not a bit in a word; inputs are the conventional one-bit-per-pin
+      across two words. Writing a bit where a byte belongs lands on a
+      *neighbouring pin*, which on a board wired to real hardware is how a
+      GPIO driver damages something — and no boot log would show it. So the
+      mapping from pin to register is pure and **host-tested**: consecutive
+      pins must be consecutive bytes, the two output tables must not overlap,
+      every pin must map to a distinct input bit, and the input words must not
+      land inside the output tables. The offsets are cross-checked against an
+      implementation that runs on this silicon.
+      The value is written **before** the enable, because a pin switched to
+      output while its value byte still holds the last thing written drives
+      that for an instruction — and on a board that glitch is on a wire.
+      **What is not done, and is named rather than glossed:** the block's
+      **clocks and resets** are not handled. The device tree declares them,
+      and the ARM thermal sensor is the warning — a complete driver that was
+      never switched on reads nothing and looks like it works. In practice the
+      firmware enables this block because it uses GPIO itself; that is an
+      assumption, and it is written down here as one. It needs a clock driver
+      (P6.2), and until then no pin is driven: the kernel reports the
+      controllers it found and stops there, because poking at pins on a board
+      whose schematic it has not seen is how a kernel shorts something.
+      No emulator models this controller, so the register *behaviour* has
+      never run — the same honest position the ARM project ended in, reached
+      deliberately this time and with the testable half tested.
 - [ ] **P6.2 Clocks and resets.** Every peripheral here needs its gate
       ungated and its reset released before its registers mean anything —
       which is exactly the bug that left the ARM thermal sensor dead: a

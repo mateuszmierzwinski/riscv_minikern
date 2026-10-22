@@ -25,6 +25,7 @@ is named. The phase-by-phase record is `DEVELOPMENT_PROGRESS.md`.
 | **8 GiB of RAM**, read and tracked: 2 Mi frames | `boot_qemu_test` (an `-m 8G` boot), `pmm_test` (frames at 9 GiB) |
 | **Interrupts** through the PLIC, with each hart's *context* resolved from the tree rather than assumed to be its hart id | `boot_qemu_test` |
 | **A tick** through SBI's timer, keeping time: 50 ticks in 499 ms at 100 Hz | `boot_qemu_test` |
+| **GPIO** on both JH7110 pin controllers: found, mapped, and the pin-to-register arithmetic proved (a *byte* per pin, not a bit) — no pin is driven yet, see below | `gpio_jh7110_test` |
 | **An SD card** through a standard host controller — found, powered up, addressed, sized correctly, read and written | `disk_qemu_test` |
 | **NVMe over PCIe** — the M.2 slot: the bus walked, BARs assigned, bus mastering enabled, the controller identified and read/written | `disk_qemu_test` |
 | **A PCIe bus walker** that assigns memory windows itself, because no firmware here has | `disk_qemu_test` |
@@ -53,7 +54,7 @@ In the order it will be built, because each step needs the one before it:
 | **SMP** | harts started through SBI's hart-state extension, enumerated **from the device tree** because this SoC's application cores are 1–4 |
 | **Storage** | XFS over the block devices that work now |
 | **Network** | virtio-net first, then the DesignWare GMAC |
-| **The board's hardware** | GPIO, clocks and resets, the temperature sensor and frequency scaling |
+| **The board's hardware** | clocks and resets — which GPIO needs before it drives a pin — then the temperature sensor and frequency scaling |
 | **The real boot path** | an SD-card image with U-Boot, and the documented flash procedure |
 
 ## Deliberately not planned

@@ -198,6 +198,41 @@ cc_library(
 # PCI Express and the M.2 slot behind it. The bus walker assigns the memory
 # windows itself, because no firmware here has: a device whose BARs are still
 # zero answers configuration reads perfectly and ignores its registers.
+# The board's pins. The arithmetic that maps a pin to a register is pure and
+# host-tested, because the JH7110 uses a *byte* per pin where a bit would be
+# conventional — and writing a bit where a byte belongs lands on a
+# neighbouring pin, which no boot log would show. The register *behaviour* is
+# not tested and cannot be: no emulator models this controller.
+cc_library(
+    name = "drivers_gpio",
+    srcs = ["src/drivers/gpio_jh7110.c"],
+    hdrs = ["src/drivers/gpio_jh7110.h"],
+    strip_include_prefix = "src",
+    target_compatible_with = ["//platforms:riscv64"],
+    deps = [
+        ":arch_riscv",
+        ":console",
+    ],
+)
+
+# The pure half, which the host can judge.
+cc_library(
+    name = "gpio_offsets",
+    hdrs = ["src/drivers/gpio_jh7110.h"],
+    strip_include_prefix = "src",
+    deps = [":core_boot"],
+)
+
+cc_test(
+    name = "gpio_jh7110_test",
+    size = "small",
+    srcs = ["test/gpio_jh7110_test.c"],
+    deps = [
+        ":gpio_offsets",
+        ":ktest",
+    ],
+)
+
 cc_library(
     name = "drivers_pci",
     srcs = [
@@ -325,6 +360,9 @@ cc_library(
         ":arch_riscv",
         ":console",
         ":core_boot",
+        ":drivers_gpio",
+        ":drivers_pci",
+        ":drivers_virtio",
         ":kernel_disk",
         ":kernel_mem",
     ],
@@ -337,6 +375,7 @@ kernel_binary(
     deps = [
         ":arch_riscv",
         ":board_jh7110",
+        ":drivers_gpio",
         ":drivers_pci",
         ":drivers_virtio",
         ":kernel_disk",

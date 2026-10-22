@@ -25,6 +25,7 @@
 #include "board/jh7110/console.h"
 #include "board/jh7110/selftest.h"
 #include "board/jh7110/uart.h"
+#include "drivers/gpio_jh7110.h"
 #include "drivers/nvme.h"
 #include "drivers/pci.h"
 #include "drivers/virtio_blk.h"
@@ -267,6 +268,33 @@ static void bring_up_storage(uint64_t dtb) {
     }
 }
 
+/* The board's pins.
+ *
+ * Reports what it found and nothing more: driving a pin is something only a
+ * board can be asked to do, and a kernel that pokes at pins on a machine
+ * whose schematic it has not seen is a kernel that shorts something. Under
+ * an emulator there is no pin controller at all, which is said rather than
+ * passed over — "no GPIO" and "GPIO I failed to find" must not look the
+ * same. */
+static void bring_up_gpio(uint64_t dtb) {
+    struct fdt fdt;
+    uint32_t found;
+    if (fdt_open(&fdt, (const void *)(uintptr_t)dtb, FDT_MAX_BYTES) != KERR_OK) {
+        return;
+    }
+    found = gpio_jh7110_init(&fdt);
+    if (found == 0) {
+        kprintf("gpio: no JH7110 pin controller in the device tree\n");
+        return;
+    }
+    for (uint32_t i = 0; i < 2u; i++) {
+        if (gpio_jh7110_path(i)[0] != '\0') {
+            kprintf("gpio: %s at %016llx\n", gpio_jh7110_path(i),
+                    (unsigned long long)gpio_jh7110_base(i));
+        }
+    }
+}
+
 /* True when the operator asked the machine to switch itself off at the end,
  * which is what makes a boot test a test rather than a timeout. */
 static bool halt_requested(void) {
@@ -289,6 +317,7 @@ void kmain(uint64_t hart, uint64_t dtb) {
     bring_up_memory(&info);
     bring_up_interrupts(dtb, hart);
     bring_up_storage(dtb);
+    bring_up_gpio(dtb);
     wait_for_ticks();
     (void)selftest_run(boot_cmdline);
     kprintf("minikern: boot complete\n");
