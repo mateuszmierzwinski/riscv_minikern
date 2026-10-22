@@ -121,10 +121,14 @@ cc_library(
     srcs = [
         "src/arch/riscv/sbi.c",
         "src/arch/riscv/start.S",
+        "src/arch/riscv/trap.c",
+        "src/arch/riscv/trap_entry.S",
     ],
     hdrs = [
+        "src/arch/riscv/frame.h",
         "src/arch/riscv/layout.h",
         "src/arch/riscv/sbi.h",
+        "src/arch/riscv/trap.h",
     ],
     strip_include_prefix = "src",
     target_compatible_with = ["//platforms:riscv64"],
@@ -139,9 +143,11 @@ cc_library(
     srcs = [
         "src/board/jh7110/console.c",
         "src/board/jh7110/main.c",
+        "src/board/jh7110/selftest.c",
     ],
     hdrs = [
         "src/board/jh7110/console.h",
+        "src/board/jh7110/selftest.h",
         "src/board/jh7110/version.h",
     ],
     # The series comes from the monorepo's single constant (Rule 28). It has
@@ -190,8 +196,21 @@ sh_test(
     tags = ["manual"],
 )
 
+# P0.3: the trap path, proved by taking deliberate faults.
+sh_test(
+    name = "selftest_qemu_test",
+    size = "medium",
+    srcs = ["test/selftest_qemu_test.sh"],
+    args = ["$(rootpath :minikern)"],
+    data = [":minikern"],
+    tags = ["manual"],
+)
+
 test_suite(
     name = "qemu_tests",
     tags = ["manual"],
-    tests = [":boot_qemu_test"],
+    tests = [
+        ":boot_qemu_test",
+        ":selftest_qemu_test",
+    ],
 )

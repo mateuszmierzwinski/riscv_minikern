@@ -18,7 +18,9 @@
 
 #include "arch/riscv/layout.h"
 #include "arch/riscv/sbi.h"
+#include "arch/riscv/trap.h"
 #include "board/jh7110/console.h"
+#include "board/jh7110/selftest.h"
 #include "board/jh7110/version.h"
 #include "core/bootinfo.h"
 #include "core/cmdline.h"
@@ -84,6 +86,11 @@ void kmain(uint64_t hart, uint64_t dtb) {
     banner(hart);
     report_firmware();
     read_bootinfo(dtb, &info);
+    /* Before anything can fault by accident: this hart's trap vector. It is
+     * per hart, and a hart that skips it sends its first exception to
+     * address zero. */
+    trap_init_cpu();
+    (void)selftest_run(boot_cmdline);
     kprintf("minikern: boot complete\n");
     if (halt_requested()) {
         kprintf("minikern: powering off\n");

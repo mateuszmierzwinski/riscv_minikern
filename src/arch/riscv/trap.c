@@ -1,0 +1,107 @@
+#include "arch/riscv/trap.h"
+
+#include "arch/riscv/frame.h"
+#include "core/console.h"
+
+/* The frame the entry code writes and the structure the C reads are two
+ * descriptions of one thing, so they are checked against each other here
+ * rather than trusted to stay in step. */
+_Static_assert(sizeof(struct trapframe) == FRAME_SIZE, "trapframe and frame.h disagree");
+_Static_assert(__builtin_offsetof(struct trapframe, sepc) == FRAME_SEPC, "sepc offset");
+_Static_assert(__builtin_offsetof(struct trapframe, sstatus) == FRAME_SSTATUS, "sstatus offset");
+_Static_assert(__builtin_offsetof(struct trapframe, scause) == FRAME_SCAUSE, "scause offset");
+_Static_assert(__builtin_offsetof(struct trapframe, stval) == FRAME_STVAL, "stval offset");
+
+void trap_entry(void);
+
+/* The ABI's names, so a dump reads like the code that faulted rather than
+ * like a table of x-numbers. */
+static const char *const reg_names[32] = {
+    "zero", "ra", "sp", "gp", "tp", "t0", "t1", "t2", "s0", "s1", "a0",
+    "a1", "a2", "a3", "a4", "a5", "a6", "a7", "s2", "s3", "s4", "s5",
+    "s6", "s7", "s8", "s9", "s10", "s11", "t3", "t4", "t5", "t6",
+};
+
+static const char *exception_name(uint64_t code) {
+    switch (code) {
+        case EXC_INSN_MISALIGNED: return "instruction address misaligned";
+        case EXC_INSN_FAULT: return "instruction access fault";
+        case EXC_ILLEGAL_INSN: return "illegal instruction";
+        case EXC_BREAKPOINT: return "breakpoint";
+        case EXC_LOAD_MISALIGNED: return "load address misaligned";
+        case EXC_LOAD_FAULT: return "load access fault";
+        case EXC_STORE_MISALIGNED: return "store address misaligned";
+        case EXC_STORE_FAULT: return "store access fault";
+        case EXC_ECALL_FROM_U: return "ecall from user mode";
+        case EXC_ECALL_FROM_S: return "ecall from supervisor mode";
+        case EXC_INSN_PAGE_FAULT: return "instruction page fault";
+        case EXC_LOAD_PAGE_FAULT: return "load page fault";
+        case EXC_STORE_PAGE_FAULT: return "store page fault";
+        default: return "unknown exception";
+    }
+}
+
+static const char *interrupt_name(uint64_t code) {
+    switch (code) {
+        case IRQ_S_SOFTWARE: return "software interrupt";
+        case IRQ_S_TIMER: return "timer interrupt";
+        case IRQ_S_EXTERNAL: return "external interrupt";
+        default: return "unknown interrupt";
+    }
+}
+
+const char *trap_cause_name(uint64_t scause) {
+    uint64_t code = scause & ~SCAUSE_INTERRUPT;
+    return (scause & SCAUSE_INTERRUPT) != 0 ? interrupt_name(code) : exception_name(code);
+}
+
+/* Four registers per line, named. Reading a fault report should not require
+ * counting columns. */
+static void dump_registers(const struct trapframe *tf) {
+    for (uint32_t i = 1; i < 32u; i++) {
+        kprintf("%-5s %016llx%s", reg_names[i], (unsigned long long)tf->x[i],
+                (i % 4u) == 0 ? "\n" : "  ");
+    }
+    kprintf("\n");
+}
+
+void trap_dump(const struct trapframe *tf) {
+    kprintf("trap: %s (scause %016llx)\n", trap_cause_name(tf->scause),
+            (unsigned long long)tf->scause);
+    kprintf("trap: sepc %016llx  stval %016llx  sstatus %016llx\n",
+            (unsigned long long)tf->sepc, (unsigned long long)tf->stval,
+            (unsigned long long)tf->sstatus);
+    dump_registers(tf);
+}
+
+/* What the kernel does with a fault it did not expect, which for now is to
+ * report it fully and stop. Resuming would be guessing, and a kernel that
+ * guesses after a store fault corrupts whatever it guesses about. */
+static void unexpected(struct trapframe *tf) {
+    kprintf("\nPANIC: unhandled trap in the kernel\n");
+    trap_dump(tf);
+    for (;;) {
+        __asm__ volatile("wfi");
+    }
+}
+
+/* A handler the self-tests install to step over the instruction that
+ * faulted, so a deliberate fault can be taken and survived. */
+static bool (*expected_handler)(struct trapframe *tf);
+
+void trap_set_expected(bool (*handler)(struct trapframe *tf)) {
+    expected_handler = handler;
+}
+
+void trap_handle(struct trapframe *tf) {
+    if (expected_handler != NULL && expected_handler(tf)) {
+        return;
+    }
+    unexpected(tf);
+}
+
+void trap_init_cpu(void) {
+    /* Direct mode: every cause enters at one address. Vectored mode exists
+     * and buys nothing here — the handler reads scause either way. */
+    __asm__ volatile("csrw stvec, %0" : : "r"((uint64_t)(uintptr_t)trap_entry));
+}

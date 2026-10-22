@@ -55,12 +55,29 @@ Three things in it are *not* architecture-neutral and were fixed on the way in:
       here rather than from a header. SBI's console stays as the fallback for
       the window before the tree is read, and for a board whose UART this
       kernel has not been told about.
-- [ ] **P0.3 Trap entry and exceptions.** One `stvec`, one `scause`, one
-      `sepc`, one `stval`: a single vector and a dispatch on the cause, where
-      ARM had eight vectors and banked registers per mode. The frame is saved
-      on the current stack. Deliberate faults (illegal instruction, load
-      fault, store fault) as a self-test, the way `minikern.selftest=` proved
-      the ARM trap path.
+- [x] **P0.3 Trap entry and exceptions (2026-10-22).** One `stvec`, one
+      `scause`, one `sepc`, one `stval`: a single vector, a frame saved on the
+      stack already in use, and a dispatch on the cause — against ARM's eight
+      vectors, banked registers per mode, and a different stack depending on
+      which mode you came from. The frame's layout lives in one header shared
+      by the assembly and the C, with static assertions that the two agree,
+      because "the offsets drifted" is a bug with no symptom until it has a
+      catastrophic one.
+      `minikern.selftest=illegal|load|store|break|all` takes each fault on
+      purpose and survives it, checking the **cause and the faulting address**
+      against what it asked for — and failing if the instruction does *not*
+      fault, which is the more dangerous outcome. The illegal-instruction case
+      is the M-mode CSR read that killed this kernel's first spike, so the
+      trap path is proved against the real mistake rather than a synthetic one.
+      **The bug it found immediately:** stepping over a faulting instruction
+      assumed 4 bytes. `rv64gc` includes the compressed extension, so an
+      instruction is **2 or 4 bytes** — `csrr` and `sd zero` happen to be 4
+      (x0 is not a register `c.sd` can name), while `c.ld` and `c.ebreak` are
+      2, so resuming landed *inside* the next instruction and raised an
+      illegal instruction of its own. The symptom was a second unexplained
+      fault in a later test; the cause was arithmetic. The length is now read
+      from the instruction itself, which is the architectural rule. Running
+      each case in its own boot is what made it findable at all.
 - [ ] **P0.4 Sv39 paging.** Three levels, 4 KiB pages, with the kernel in the
       top half (sign-extended, so `0xFFFF_FFC0...`) and user space in the
       bottom. The page-table code is pure and host-tested before it is ever

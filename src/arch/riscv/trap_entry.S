@@ -1,0 +1,107 @@
+/* The one trap vector.
+ *
+ * Saves x1..x31 and the four CSRs that describe what happened, calls C with
+ * a pointer to the frame, restores, and returns with `sret`.
+ *
+ * It runs on the stack that was already in use, which is correct for a trap
+ * taken in S-mode. When user mode arrives (TASKS.md P2) this gains an
+ * `sscratch` swap to find the kernel stack — one addition, where the ARM
+ * equivalent had a different stack *and* a different register bank per mode.
+ */
+#include "arch/riscv/frame.h"
+
+    .section .text
+    .globl trap_entry
+    .align 4                      /* stvec requires a 4-byte aligned address */
+trap_entry:
+    addi    sp, sp, -FRAME_SIZE
+
+    sd      x1, FRAME_X(1)(sp)
+    sd      x3, FRAME_X(3)(sp)
+    sd      x4, FRAME_X(4)(sp)
+    sd      x5, FRAME_X(5)(sp)
+    sd      x6, FRAME_X(6)(sp)
+    sd      x7, FRAME_X(7)(sp)
+    sd      x8, FRAME_X(8)(sp)
+    sd      x9, FRAME_X(9)(sp)
+    sd      x10, FRAME_X(10)(sp)
+    sd      x11, FRAME_X(11)(sp)
+    sd      x12, FRAME_X(12)(sp)
+    sd      x13, FRAME_X(13)(sp)
+    sd      x14, FRAME_X(14)(sp)
+    sd      x15, FRAME_X(15)(sp)
+    sd      x16, FRAME_X(16)(sp)
+    sd      x17, FRAME_X(17)(sp)
+    sd      x18, FRAME_X(18)(sp)
+    sd      x19, FRAME_X(19)(sp)
+    sd      x20, FRAME_X(20)(sp)
+    sd      x21, FRAME_X(21)(sp)
+    sd      x22, FRAME_X(22)(sp)
+    sd      x23, FRAME_X(23)(sp)
+    sd      x24, FRAME_X(24)(sp)
+    sd      x25, FRAME_X(25)(sp)
+    sd      x26, FRAME_X(26)(sp)
+    sd      x27, FRAME_X(27)(sp)
+    sd      x28, FRAME_X(28)(sp)
+    sd      x29, FRAME_X(29)(sp)
+    sd      x30, FRAME_X(30)(sp)
+    sd      x31, FRAME_X(31)(sp)
+
+    /* The stack pointer as it was before this frame, so a dump shows the
+     * interrupted sp rather than the handler's. */
+    addi    t0, sp, FRAME_SIZE
+    sd      t0, FRAME_X(2)(sp)
+
+    csrr    t0, sepc
+    sd      t0, FRAME_SEPC(sp)
+    csrr    t0, sstatus
+    sd      t0, FRAME_SSTATUS(sp)
+    csrr    t0, scause
+    sd      t0, FRAME_SCAUSE(sp)
+    csrr    t0, stval
+    sd      t0, FRAME_STVAL(sp)
+
+    mv      a0, sp
+    call    trap_handle
+
+    /* sepc may have been advanced by the handler — past an ecall, or past an
+     * instruction a self-test meant to skip — so it is reloaded rather than
+     * assumed unchanged. */
+    ld      t0, FRAME_SEPC(sp)
+    csrw    sepc, t0
+    ld      t0, FRAME_SSTATUS(sp)
+    csrw    sstatus, t0
+
+    ld      x1, FRAME_X(1)(sp)
+    ld      x3, FRAME_X(3)(sp)
+    ld      x4, FRAME_X(4)(sp)
+    ld      x5, FRAME_X(5)(sp)
+    ld      x6, FRAME_X(6)(sp)
+    ld      x7, FRAME_X(7)(sp)
+    ld      x8, FRAME_X(8)(sp)
+    ld      x9, FRAME_X(9)(sp)
+    ld      x10, FRAME_X(10)(sp)
+    ld      x11, FRAME_X(11)(sp)
+    ld      x12, FRAME_X(12)(sp)
+    ld      x13, FRAME_X(13)(sp)
+    ld      x14, FRAME_X(14)(sp)
+    ld      x15, FRAME_X(15)(sp)
+    ld      x16, FRAME_X(16)(sp)
+    ld      x17, FRAME_X(17)(sp)
+    ld      x18, FRAME_X(18)(sp)
+    ld      x19, FRAME_X(19)(sp)
+    ld      x20, FRAME_X(20)(sp)
+    ld      x21, FRAME_X(21)(sp)
+    ld      x22, FRAME_X(22)(sp)
+    ld      x23, FRAME_X(23)(sp)
+    ld      x24, FRAME_X(24)(sp)
+    ld      x25, FRAME_X(25)(sp)
+    ld      x26, FRAME_X(26)(sp)
+    ld      x27, FRAME_X(27)(sp)
+    ld      x28, FRAME_X(28)(sp)
+    ld      x29, FRAME_X(29)(sp)
+    ld      x30, FRAME_X(30)(sp)
+    ld      x31, FRAME_X(31)(sp)
+
+    addi    sp, sp, FRAME_SIZE
+    sret
