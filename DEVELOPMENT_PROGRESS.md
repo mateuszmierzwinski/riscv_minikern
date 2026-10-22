@@ -264,9 +264,35 @@ Three things in it are *not* architecture-neutral and were fixed on the way in:
       now prints why. Without it, an emulator full of legacy transports looked
       exactly like a machine with no devices at all, and the silence was the
       bug.
-- [ ] **P4.2 The SD card (`mmc`).** The JH7110 has a Cadence SDHCI-compatible
-      host controller. Read-only first — enough to mount a root filesystem —
-      then writes.
+- [x] **P4.2 The SD card (2026-10-22).** The board's controller is a Cadence
+      part implementing the **SD Host Controller Interface**, a published
+      standard rather than a vendor interface — so the driver is written
+      against the standard and binds to the emulator's controller as well.
+      The card protocol is identical either way and only the registers' address
+      differs, which is what makes an SD driver testable without the board.
+      Two protocols kept apart: the host controller (issue a command, clock the
+      bus, move a block through the data port) and the card (CMD0, CMD8, ACMD41
+      until it powers up, CMD2 and CMD3 for an address, CMD9 for its capacity).
+      Polled, not DMA: the data port is correct, identical on every
+      implementation, and needs no memory the card can reach. Speed is worth
+      having once something waits on it.
+      **The bug worth recording: every field of the capacity register arrives
+      8 bits from where the specification says it is.** The card sends 136 bits
+      — start, transmission, reserved, the 128-bit register, a CRC — and the
+      controller presents only the middle, having dropped the CRC byte. So
+      specification bit 127 arrives as response bit 119, and reading the
+      documented positions gave plausible nonsense: a **64 MiB card reported
+      itself as 30 GiB**, and the write that followed was addressed past its
+      end. A test that only checked "a card was found" would have passed.
+      And the other half of the same question: a high-capacity card addresses
+      **blocks** while an older one addresses **bytes**, so getting that wrong
+      reaches the first 1/512th of a modern card.
+      One more find: an SD host controller reports its PCI class as
+      `08:05:01` for "SDHCI 1.0 compliant" or `08:05:02` for a DMA-only
+      variant, so the class match needed a **mask** — an exact match on
+      `08:05:00` found nothing at all. There is a `minikern.pciscan` bus
+      listing now, because "no controller" and "a controller whose class I did
+      not recognise" are different problems that look identical without one.
 - [x] **P4.3 NVMe over PCIe — the M.2 slot (2026-10-22).** Worked on the
       first run, which is what a specification written once and implemented
       everywhere buys you.

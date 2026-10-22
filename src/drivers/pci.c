@@ -160,11 +160,11 @@ static void enable_device(struct pci_device *d) {
     pci_config_write32(d, PCI_COMMAND, cmd | PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
 }
 
-static bool matches_class(uint32_t class_revision, uint32_t wanted) {
-    return (class_revision >> 8) == wanted;
+static bool matches_class(uint32_t class_revision, uint32_t wanted, uint32_t mask) {
+    return ((class_revision >> 8) & mask) == (wanted & mask);
 }
 
-int pci_find_class(uint32_t class_code, struct pci_device *out) {
+int pci_find_class(uint32_t class_code, uint32_t mask, struct pci_device *out) {
     if (!pci.up) {
         return KERR_NODEV;
     }
@@ -181,7 +181,7 @@ int pci_find_class(uint32_t class_code, struct pci_device *out) {
                 d = (struct pci_device){.bus = bus, .slot = slot, .function = fn,
                                         .vendor = (uint16_t)id, .device = (uint16_t)(id >> 16),
                                         .class_code = read32(bus, slot, fn, PCI_CLASS_REVISION)};
-                if (!matches_class(d.class_code, class_code)) {
+                if (!matches_class(d.class_code, class_code, mask)) {
                     continue;
                 }
                 if (assign_bar0(&d) != KERR_OK) {
@@ -194,6 +194,27 @@ int pci_find_class(uint32_t class_code, struct pci_device *out) {
         }
     }
     return KERR_NOENT;
+}
+
+void pci_list(void) {
+    if (!pci.up) {
+        kprintf("pci: no host bridge\n");
+        return;
+    }
+    for (uint8_t bus = 0; bus < MAX_BUSES; bus++) {
+        for (uint8_t slot = 0; slot < MAX_SLOTS; slot++) {
+            for (uint8_t fn = 0; fn < MAX_FUNCTIONS; fn++) {
+                uint32_t id = read32(bus, slot, fn, PCI_VENDOR_ID);
+                uint32_t cls;
+                if ((id & 0xffffu) == PCI_NO_VENDOR) {
+                    break;
+                }
+                cls = read32(bus, slot, fn, PCI_CLASS_REVISION);
+                kprintf("pci: %02x:%02x.%u  %04x:%04x  class %06x\n", bus, slot, fn,
+                        id & 0xffffu, id >> 16, cls >> 8);
+            }
+        }
+    }
 }
 
 phys_t pci_ecam_base(void) {

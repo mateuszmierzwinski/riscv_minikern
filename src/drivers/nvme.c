@@ -309,7 +309,7 @@ static int start_controller(void) {
 
 int nvme_init(struct blockdev *out) {
     uint8_t *page;
-    int rc = pci_find_class(NVME_PCI_CLASS, &nvme.pci);
+    int rc = pci_find_class(NVME_PCI_CLASS, NVME_PCI_CLASS_MASK, &nvme.pci);
     if (rc != KERR_OK) {
         return rc;
     }

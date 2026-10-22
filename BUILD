@@ -203,10 +203,12 @@ cc_library(
     srcs = [
         "src/drivers/nvme.c",
         "src/drivers/pci.c",
+        "src/drivers/sdhci.c",
     ],
     hdrs = [
         "src/drivers/nvme.h",
         "src/drivers/pci.h",
+        "src/drivers/sdhci.h",
     ],
     strip_include_prefix = "src",
     target_compatible_with = ["//platforms:riscv64"],

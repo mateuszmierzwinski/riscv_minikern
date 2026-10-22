@@ -242,15 +242,23 @@ static void bring_up_storage(uint64_t dtb) {
     }
     if (disk_attach(&fdt) != KERR_OK) {
         kprintf("disk: none attached\n");
+        if (pci_ready() && cmdline_has(boot_cmdline, "minikern.pciscan")) {
+            pci_list();
+        }
         return;
     }
     dev = disk_device();
     if (pci_ready()) {
         kprintf("pci: ecam at %016llx, %u functions\n", (unsigned long long)pci_ecam_base(),
                 pci_functions_seen());
+        if (cmdline_has(boot_cmdline, "minikern.pciscan")) {
+            pci_list();
+        }
     }
     kprintf("disk: %s %s, %llu sectors of %u bytes (%llu MiB)\n", disk_kind(),
-            disk_kind()[0] == 'n' ? nvme_model() : virtio_blk_path(),
+            disk_kind()[0] == 'n' ? nvme_model()
+            : disk_kind()[0] == 'S' ? "card"
+                                    : virtio_blk_path(),
             (unsigned long long)dev->blocks, dev->block_size,
             (unsigned long long)(dev->blocks * dev->block_size / (1024u * 1024u)));
     if (cmdline_has(boot_cmdline, "minikern.disktest")) {

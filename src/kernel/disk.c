@@ -6,6 +6,7 @@
 #include "core/errno.h"
 #include "drivers/nvme.h"
 #include "drivers/pci.h"
+#include "drivers/sdhci.h"
 #include "drivers/virtio_blk.h"
 #include "kernel/mem.h"
 
@@ -32,8 +33,13 @@ const char *disk_kind(void) {
  * virtio second, which is the emulator's. A board with neither is the
  * ordinary case for a kernel that netboots. */
 static int attach_any(const struct fdt *fdt) {
-    if (pci_init(fdt) == KERR_OK && nvme_init(&device) == KERR_OK) {
+    bool pci = pci_init(fdt) == KERR_OK;
+    if (pci && nvme_init(&device) == KERR_OK) {
         attached_kind = "nvme";
+        return KERR_OK;
+    }
+    if (sdhci_init(fdt, &device) == KERR_OK) {
+        attached_kind = sdhci_kind();
         return KERR_OK;
     }
     if (virtio_blk_init(fdt, &device) == KERR_OK) {

@@ -66,9 +66,23 @@ int pci_init(const struct fdt *fdt);
  * driver builds for it, and the symptom is a controller that initialises
  * perfectly and never completes a command.
  *
- * `class_code` is compared on the top 24 bits: 0x010802 is NVMe, 0x080501 an
- * SD host controller. */
-int pci_find_class(uint32_t class_code, struct pci_device *out);
+ * The class is three bytes — class, subclass, programming interface — and
+ * `mask` says which of them matter. **That third byte is why there is a
+ * mask:** an SD host controller reports `08:05:01` for "SDHCI 1.0
+ * compliant" and `08:05:02` for a DMA-only variant, so a driver for the
+ * standard registers wants the first two bytes and not the third. An exact
+ * match on `08:05:00` found nothing at all, which is how this was
+ * discovered. NVMe, by contrast, is precisely `01:08:02` and is matched
+ * whole. */
+int pci_find_class(uint32_t class_code, uint32_t mask, struct pci_device *out);
+
+/* Prints every function on the bus with its vendor, device and class.
+ *
+ * On a board with an M.2 slot this is the first thing worth having when
+ * something is not found: "no NVMe drive" and "a drive whose class I did not
+ * recognise" are different problems, and without a listing they look
+ * identical. `minikern.pciscan` asks for it. */
+void pci_list(void);
 
 /* Configuration-space access, for a driver that needs more than the walker
  * read. */

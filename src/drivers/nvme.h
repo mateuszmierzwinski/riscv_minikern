@@ -33,6 +33,7 @@
 /* The PCI class of an NVMe controller: mass storage, non-volatile memory,
  * NVM Express. */
 #define NVME_PCI_CLASS 0x010802u
+#define NVME_PCI_CLASS_MASK 0xffffffu  /* exact: NVM Express is one thing */
 
 /* Finds an NVMe controller behind the PCIe bus, brings it up, identifies
  * namespace 1 and presents it as a block device.

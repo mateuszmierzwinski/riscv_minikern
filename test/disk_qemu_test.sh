@@ -114,6 +114,47 @@ grep -qF "disk: nvme" "$bothlog" ||
     { cat "$bothlog"; fail "with both devices present, NVMe was not preferred"; }
 echo "ok: with both a virtio disk and an NVMe drive, the NVMe drive is chosen"
 
+# ── the SD card, through a standard host controller ────────────────────────
+#
+# The board's SD controller is a Cadence part implementing the SD Host
+# Controller Interface, which is a published standard — so the driver is
+# written against the standard and binds to the emulator's controller too.
+# The card protocol is identical either way; only where the registers live
+# differs, which is what makes an SD driver testable without the board.
+#
+# The capacity is the assertion that matters. Every field of the card's
+# capacity register arrives **8 bits away** from where the specification says
+# it is, because the controller drops the CRC byte — and reading the
+# documented positions gave a 64 MiB card reporting itself as 30 GiB, with
+# the write that followed addressed past its end. A test that only checked
+# "a card was found" would have passed.
+sdimg="$tmp/sd.img"
+sdlog="$tmp/sd.log"
+: > "$sdimg"
+for i in $(seq 1 64); do
+    printf 'minikern sd test block %02d%s' "$i" "$(printf '%.0s-' $(seq 1 1000))" >> "$sdimg"
+done
+truncate -s 64M "$sdimg"
+sd_before="$(sha256sum < "$sdimg" | cut -d' ' -f1)"
+
+status=0
+timeout 120 qemu-system-riscv64 -M virt -smp 4 -m 1G -nographic -bios default -kernel "$image" \
+    -device sdhci-pci -drive "file=$sdimg,if=none,format=raw,id=sd0" -device sd-card,drive=sd0 \
+    -append "console=sbi minikern.halt=poweroff minikern.disktest=1" > "$sdlog" 2>&1 || status=$?
+tr -d '\r' < "$sdlog" > "$sdlog.clean" && mv "$sdlog.clean" "$sdlog"
+cat "$sdlog"
+[ "$status" -eq 0 ] || fail "the SD boot exited $status"
+! grep -qF PANIC "$sdlog" || fail "the kernel panicked with an SD card"
+
+# 64 MiB exactly: a standard-capacity card, whose size comes from a geometry
+# to multiply out rather than from a block count.
+grep -qE '^disk: SD card, 131072 sectors of 512 bytes \(64 MiB\)$' "$sdlog" ||
+    fail "the card's capacity was read wrongly"
+grep -qF "disk: round trip ok" "$sdlog" || fail "the SD round trip failed"
+[ "$sd_before" = "$(sha256sum < "$sdimg" | cut -d' ' -f1)" ] ||
+    fail "the SD card was left modified"
+echo "ok: an SD card through a standard host controller — identified, sized, written, read back"
+
 # A machine with no disk must say so once and carry on: a kernel that
 # netboots has no disk, and that is not a failure.
 nodisk="$tmp/nodisk.log"
