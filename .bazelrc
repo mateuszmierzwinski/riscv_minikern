@@ -1,0 +1,6 @@
+# What a failing test printed, rather than the path to the log that holds it.
+test --test_output=errors
+
+# The kernel is built by the project's own clang-based toolchain (toolchain/),
+# selected only for the //platforms:visionfive2 platform, so nothing here
+# touches it. The host tests build with whatever C compiler Bazel finds.
