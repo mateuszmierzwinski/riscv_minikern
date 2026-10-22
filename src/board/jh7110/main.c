@@ -29,6 +29,7 @@
 #include "core/console.h"
 #include "core/errno.h"
 #include "core/fdt.h"
+#include "kernel/mem.h"
 #include "core/ports.h"
 
 #include <stdbool.h>
@@ -106,6 +107,22 @@ static void bring_up_translation(const struct bootinfo *info) {
     kprintf("mmu: sv39 on, %u table pages, kernel text read-execute\n", mmu_table_pages_used());
 }
 
+/* The frame allocator and the heap, over the memory that is left.
+ *
+ * After translation, because the arena the page tables came from has to be
+ * reserved and its size is only known once they are built. Every frame
+ * starts out used and the free ones are released, so a reservation nobody
+ * wrote loses memory rather than handing out memory in use (kernel/mem.h). */
+static void bring_up_memory(const struct bootinfo *info) {
+    uint64_t arena = ((uint64_t)(uintptr_t)__kernel_end + PAGE_SIZE - 1u) & ~(PAGE_SIZE - 1u);
+    if (mem_init(info, arena, TABLE_ARENA_BYTES) != KERR_OK) {
+        kprintf("mem: no usable memory map\n");
+        return;
+    }
+    kprintf("mem: %u of %u pages free (%u MiB of %u MiB)\n", mem_free_pages_count(),
+            mem_total_pages(), mem_free_pages_count() / 256u, mem_total_pages() / 256u);
+}
+
 /* Takes the board's own UART over from the firmware's console.
  *
  * Deliberately after translation is on, because the UART's registers have to
@@ -147,6 +164,7 @@ void kmain(uint64_t hart, uint64_t dtb) {
     trap_init_cpu();
     bring_up_translation(&info);
     adopt_the_real_uart(dtb);
+    bring_up_memory(&info);
     (void)selftest_run(boot_cmdline);
     kprintf("minikern: boot complete\n");
     if (halt_requested()) {

@@ -19,19 +19,23 @@ log="${TEST_TMPDIR:-$(mktemp -d)}/console.log"
 
 command -v qemu-system-riscv64 >/dev/null || { echo "qemu-system-riscv64 is not installed" >&2; exit 1; }
 
+boot() {
+    local memory="$1"
+    local out="$2"
+    local status=0
+    timeout 60 qemu-system-riscv64 -M virt -smp 4 -m "$memory" -nographic \
+        -bios default -kernel "$image" \
+        -append "console=sbi minikern.halt=poweroff" > "$out" 2>&1 || status=$?
+    tr -d '\r' < "$out" > "$out.clean" && mv "$out.clean" "$out"
+    [ "$status" -eq 0 ] || { cat "$out"; echo "FAIL: with $memory, qemu exited $status" >&2; exit 1; }
+}
+
 status=0
-timeout 60 qemu-system-riscv64 -M virt -smp 4 -m 1G -nographic \
-    -bios default -kernel "$image" \
-    -append "console=sbi minikern.halt=poweroff" > "$log" 2>&1 || status=$?
-# The console ends its lines with a carriage return, which an anchored
-# pattern would otherwise have to match. Strip them once, here.
-tr -d '\r' < "$log" > "$log.clean" && mv "$log.clean" "$log"
+boot 1G "$log"
 cat "$log"
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
 expect() { grep -qF -- "$1" "$log" || fail "the console lacks: $1"; }
-
-[ "$status" -eq 0 ] || fail "qemu exited $status (124 = hang, so no power-off)"
 
 # The firmware ran and handed over.
 expect "OpenSBI"
@@ -69,5 +73,22 @@ expect "minikern: powering off"
 # kernel mapped itself — so the device mapping works too.
 grep -qE '^mmu: sv39 on, [0-9]+ table pages, kernel text read-execute$' "$log" ||
     { echo "FAIL: translation was not enabled" >&2; exit 1; }
-echo "ok: firmware → S-mode → device tree → sv39 → the kernel's own UART → power-off"
+# The frame allocator over the memory the tree described, with the kernel
+# image, the device tree and the page-table arena reserved.
+grep -qE '^mem: 261[0-9]{3} of 262144 pages free \(10[0-9]{2} MiB of 1024 MiB\)$' "$log" ||
+    { echo "FAIL: the frame allocator did not come up over 1 GiB" >&2; exit 1; }
+echo "ok: firmware → S-mode → device tree → sv39 → the kernel's own UART → memory → power-off"
+
+# **Eight gibibytes**, which is a VisionFive 2 configuration and the case the
+# 32-bit reader this kernel grew from could not express at all: it refused a
+# two-cell value whose high word was set, so a board like this would have
+# booted believing it had no memory. 2 Mi frames is also 256 KiB of bitmap,
+# which is sized for the largest board so one image runs on every one.
+big="${log%.log}-8g.log"
+boot 8G "$big"
+grep -qE '^mem: 8192 MiB at 0000000080000000$' "$big" ||
+    { cat "$big"; echo "FAIL: the 8 GiB memory node was not read" >&2; exit 1; }
+grep -qE '^mem: 209[0-9]{4} of 2097152 pages free \(818[0-9] MiB of 8192 MiB\)$' "$big" ||
+    { cat "$big"; echo "FAIL: the frame allocator did not come up over 8 GiB" >&2; exit 1; }
+echo "ok: 8 GiB of RAM is read and tracked — 2 Mi frames, the case 32 bits could not express"
 echo PASS

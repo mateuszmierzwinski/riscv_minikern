@@ -131,9 +131,25 @@ Three things in it are *not* architecture-neutral and were fixed on the way in:
 
 ## P1 — Memory and processes
 
-- [ ] **P1.1 Physical and kernel allocators**, which are carried over: the
-      page allocator and the heap are pure and already host-tested. What is
-      new is the memory map they are given, read from the device tree.
+- [x] **P1.1 Physical and kernel allocators, over the real memory map
+      (2026-10-22).** Both carried over and already host-tested; what is new
+      is 64-bit physical addresses and the map they are given.
+      **Every frame starts out used** and the boot path releases what is
+      really free, so a reservation nobody wrote loses memory rather than
+      handing out memory in use — the only direction this mistake may fail in.
+      Reserved: the kernel image, the page-table arena, and the device tree
+      the firmware left in RAM, which the command line still points into.
+      The bitmap lives in `.bss`, not in the memory it describes, so there is
+      no moment where the allocator is allocating the storage it needs in
+      order to exist. It is sized for **8 GiB** (2 Mi frames, 256 KiB of
+      bitmap) so one image runs on every VisionFive 2.
+      Proved on both configurations, and the big one is the point: with 8 GiB,
+      2,096,535 of 2,097,152 frames come up free. That is the case the reader
+      this kernel grew from **could not express at all** — it refused a
+      two-cell value whose high word was set, so a board like this would have
+      booted believing it had no memory. The frame allocator's own test now
+      covers frames at 9 GiB, where a 32-bit address would wrap into an index
+      that looks valid.
 - [ ] **P1.2 User address spaces**, lazy faults, `mmap`/`munmap`/`mprotect`.
       The VMA tree carries over; the page-table backing is Sv39.
 - [ ] **P1.3 The timer and the scheduler.** SBI's timer extension sets one

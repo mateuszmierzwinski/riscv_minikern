@@ -21,6 +21,8 @@ is named. The phase-by-phase record is `DEVELOPMENT_PROGRESS.md`.
 | Large pages where they fit: a 1 GiB identity map costs 3 table pages | `pgtable_test` |
 | **Finds devices in the device tree by `compatible` string** and maps their registers — the pattern every driver uses | `fdt_test`, `boot_qemu_test` |
 | Its own **16550 UART**, found that way, taking the console over from SBI | `boot_qemu_test` |
+| **A frame allocator and a kernel heap** over the memory the tree describes, with the kernel, the tree and the page tables reserved | `pmm_test`, `boot_qemu_test` |
+| **8 GiB of RAM**, read and tracked: 2 Mi frames | `boot_qemu_test` (an `-m 8G` boot), `pmm_test` (frames at 9 GiB) |
 | A printf-style formatter, command-line parsing, CRC-32C, SHA-256, SHA-512, Ed25519 verification | host tests, carried over |
 
 ## Carried over, not yet wired up
@@ -31,8 +33,8 @@ because *present* is not *working*: each needs the kernel services beneath it.
 
 IPv4 with ARP, ICMP, UDP and TCP · DHCP · the MKNB netboot protocol with
 Ed25519-verified offers · XFS (mount, read, logged writes, create, remove,
-grow) · a network block device client · a buffer cache · the page and heap
-allocators · the VMA tree · an ELF loader · a ustar reader.
+grow) · a network block device client · a buffer cache · the VMA tree · an
+ELF loader · a ustar reader.
 
 ## Planned
 
@@ -40,7 +42,7 @@ In the order it will be built, because each step needs the one before it:
 
 | | |
 |---|---|
-| **Memory and processes** | the allocators over the real memory map, user address spaces, the timer through SBI, threads |
+| **Processes** | user address spaces, the timer through SBI, threads |
 | **The syscall interface** | the generic table, ELF64, the process start state, signals — then Go binaries unchanged |
 | **SMP** | harts started through SBI's hart-state extension, enumerated **from the device tree** because this SoC's application cores are 1–4 |
 | **Storage** | virtio-blk first (so XFS is exercised under the emulator), then the SD card, then **NVMe** over PCIe for the M.2 slot |

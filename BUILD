@@ -52,6 +52,34 @@ cc_library(
     deps = [":kfmt"],
 )
 
+# The physical page allocator and the kernel heap: carried over, pure, and
+# host-tested. Widened to 64-bit physical addresses, because DRAM on this
+# board starts at 0x4000_0000 and can run past 0x2_0000_0000.
+cc_library(
+    name = "memory",
+    srcs = [
+        "src/core/kheap.c",
+        "src/core/pmm.c",
+    ],
+    hdrs = [
+        "src/core/kheap.h",
+        "src/core/pmm.h",
+        "src/core/ports.h",
+    ],
+    strip_include_prefix = "src",
+    deps = [":core_boot"],
+)
+
+cc_test(
+    name = "pmm_test",
+    size = "small",
+    srcs = ["test/pmm_test.c"],
+    deps = [
+        ":ktest",
+        ":memory",
+    ],
+)
+
 # Sv39 translation, as pure arithmetic: no CSR is touched here, which is what
 # lets it be tested on the host before any hardware installs a table.
 cc_library(
@@ -124,6 +152,21 @@ cc_test(
     ],
 )
 
+# The live memory: one frame allocator and one heap over what the device tree
+# described. The pure parts are :memory above, which the host tests cover.
+cc_library(
+    name = "kernel_mem",
+    srcs = ["src/kernel/mem.c"],
+    hdrs = ["src/kernel/mem.h"],
+    strip_include_prefix = "src",
+    target_compatible_with = ["//platforms:riscv64"],
+    deps = [
+        ":console",
+        ":memory",
+        ":pgtable",
+    ],
+)
+
 # ── the kernel ─────────────────────────────────────────────────────────────
 
 # memset and friends: the kernel links no libc, and the compiler emits calls
@@ -187,6 +230,7 @@ cc_library(
         ":arch_riscv",
         ":console",
         ":core_boot",
+        ":kernel_mem",
     ],
     alwayslink = True,
 )
@@ -197,6 +241,7 @@ kernel_binary(
     deps = [
         ":arch_riscv",
         ":board_jh7110",
+        ":kernel_mem",
         ":kmem",
     ],
 )

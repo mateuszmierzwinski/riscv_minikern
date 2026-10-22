@@ -19,7 +19,7 @@ static void set_page(struct pmm *p, uint32_t i, bool used) {
     }
 }
 
-void pmm_init(struct pmm *p, uint32_t base, uint32_t npages, uint32_t *bitmap) {
+void pmm_init(struct pmm *p, phys_t base, uint32_t npages, uint32_t *bitmap) {
     *p = (struct pmm){.base = base, .npages = npages, .bitmap = bitmap};
     for (uint32_t w = 0; w < PMM_BITMAP_WORDS(npages); w++) {
         bitmap[w] = ~0u;
@@ -34,13 +34,13 @@ static void mark_range(struct pmm *p, uint64_t first, uint64_t last, bool used) 
     }
 }
 
-void pmm_release(struct pmm *p, uint32_t phys, uint32_t len) {
+void pmm_release(struct pmm *p, phys_t phys, uint64_t len) {
     uint64_t start = ((uint64_t)phys + PMM_PAGE_SIZE - 1u) >> PMM_PAGE_SHIFT;
     uint64_t end = ((uint64_t)phys + len) >> PMM_PAGE_SHIFT;
     mark_range(p, start, end, false);
 }
 
-void pmm_reserve(struct pmm *p, uint32_t phys, uint32_t len) {
+void pmm_reserve(struct pmm *p, phys_t phys, uint64_t len) {
     uint64_t start = (uint64_t)phys >> PMM_PAGE_SHIFT;
     uint64_t end = ((uint64_t)phys + len + PMM_PAGE_SIZE - 1u) >> PMM_PAGE_SHIFT;
     mark_range(p, start, end, true);
@@ -82,7 +82,7 @@ static int alloc_run(const struct pmm *p, uint32_t npages, uint32_t align, uint3
     return KERR_NOMEM;
 }
 
-int pmm_alloc(struct pmm *p, uint32_t npages, uint32_t align_pages, uint32_t *phys) {
+int pmm_alloc(struct pmm *p, uint32_t npages, uint32_t align_pages, phys_t *phys) {
     uint32_t align = align_pages == 0 ? 1u : align_pages;
     uint32_t index = 0;
     int rc;
@@ -100,7 +100,7 @@ int pmm_alloc(struct pmm *p, uint32_t npages, uint32_t align_pages, uint32_t *ph
     return KERR_OK;
 }
 
-int pmm_free(struct pmm *p, uint32_t phys, uint32_t npages) {
+int pmm_free(struct pmm *p, phys_t phys, uint32_t npages) {
     uint32_t index = (phys - p->base) >> PMM_PAGE_SHIFT;
     if (phys < p->base || (phys & (PMM_PAGE_SIZE - 1u)) != 0 || index >= p->npages ||
         npages > p->npages - index) {
