@@ -84,6 +84,12 @@ struct xfs {
     uint8_t uuid[16];     /* what metadata blocks must carry */
     bool ftype;           /* directory entries carry a type byte */
     bool mounted;
+    /* The filesystem uses read-only-compatible features this reader does not
+     * implement — reverse mapping, reflink — so it can be read but must
+     * never be written: a writer is what those features place obligations
+     * on. `xfs_writable` refuses on it, which is the enforcement of the
+     * promise `check_features` makes when it allows the mount. */
+    bool write_refused;
 };
 
 /* One inode, parsed, with its inline fork copied out so no cached block

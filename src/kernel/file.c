@@ -4,11 +4,18 @@
 
 #include "core/errno.h"
 #include "kernel/mem.h"
+#include "kernel/uspace.h"
 
-/* The process's table. One process, so one table — the same arrangement as
- * the signal dispositions, and it moves into `struct uproc` at the same
- * time as those do. */
-static struct file *table[FD_MAX];
+/* The running process's table, which **lives in the process**: two
+ * processes with one descriptor table would see each other's files, and the
+ * first thing a `fork` does is give the child a copy of its parent's.
+ *
+ * A NULL process — the kernel between programs — has no descriptors, and
+ * every operation on one fails rather than touching another process's. */
+static struct file **table_of_current(void) {
+    struct uproc *p = uspace_current();
+    return p == NULL ? NULL : p->fds;
+}
 
 /* Bumped by every readiness change anywhere. An epoll waiter reads it before
  * it sleeps and again when it wakes: unchanged means nothing could have
@@ -17,13 +24,42 @@ static struct file *table[FD_MAX];
 static uint32_t readiness_generation;
 
 void fd_reset(void) {
+    struct file **table = table_of_current();
+    if (table == NULL) {
+        return;
+    }
     for (uint32_t i = 0; i < FD_MAX; i++) {
         if (table[i] != NULL) {
             file_put(table[i]);
             table[i] = NULL;
         }
     }
-    readiness_generation = 0;
+}
+
+void fd_close_on_exec(void) {
+    struct file **table = table_of_current();
+    if (table == NULL) {
+        return;
+    }
+    /* `execve` keeps the descriptor table, **except** what was marked
+     * close-on-exec: that is the whole point of the flag, and it is how a
+     * shell stops a child inheriting the pipe ends it should not have. */
+    for (uint32_t i = 0; i < FD_MAX; i++) {
+        if (table[i] != NULL && (table[i]->flags & O_CLOEXEC) != 0) {
+            file_put(table[i]);
+            table[i] = NULL;
+        }
+    }
+}
+
+int fd_copy_table(struct uproc *to, const struct uproc *from) {
+    for (uint32_t i = 0; i < FD_MAX; i++) {
+        /* A copy shares the **files**, not the descriptors: both processes
+         * then write to the same console and read the same pipe, which is
+         * what inheriting a descriptor means. */
+        to->fds[i] = from->fds[i] != NULL ? file_get(from->fds[i]) : NULL;
+    }
+    return KERR_OK;
 }
 
 struct file *file_new(const struct file_ops *ops, void *priv, uint32_t flags) {
@@ -56,8 +92,13 @@ void file_put(struct file *f) {
 }
 
 int fd_install(struct file *f) {
+    struct file **table = table_of_current();
     if (f == NULL) {
         return KERR_NOMEM;
+    }
+    if (table == NULL) {
+        file_put(f);
+        return KERR_BADF;
     }
     /* The **lowest** free descriptor, which is what the ABI promises and
      * what a program relies on when it dups onto 0, 1 or 2. */
@@ -72,12 +113,14 @@ int fd_install(struct file *f) {
 }
 
 struct file *fd_get(int32_t fd) {
-    return fd >= 0 && (uint32_t)fd < FD_MAX ? table[fd] : NULL;
+    struct file **table = table_of_current();
+    return table != NULL && fd >= 0 && (uint32_t)fd < FD_MAX ? table[fd] : NULL;
 }
 
 int fd_close(int32_t fd) {
+    struct file **table = table_of_current();
     struct file *f = fd_get(fd);
-    if (f == NULL) {
+    if (f == NULL || table == NULL) {
         return KERR_BADF;
     }
     table[fd] = NULL;
@@ -91,6 +134,27 @@ int fd_dup(int32_t fd) {
         return KERR_BADF;
     }
     return fd_install(file_get(f));
+}
+
+int fd_dup_to(int32_t from, int32_t to) {
+    struct file **table = table_of_current();
+    struct file *f = fd_get(from);
+    if (f == NULL || table == NULL) {
+        return KERR_BADF;
+    }
+    if (to < 0 || (uint32_t)to >= FD_MAX) {
+        return KERR_BADF;
+    }
+    if (from == to) {
+        return to; /* `dup3` refuses this; `dup2` returns it unchanged */
+    }
+    /* Whatever was there is closed first, silently — that is what makes
+     * `dup2` the tool for putting a pipe on descriptor 1. */
+    if (table[to] != NULL) {
+        file_put(table[to]);
+    }
+    table[to] = file_get(f);
+    return to;
 }
 
 void file_readiness_changed(struct file *f) {

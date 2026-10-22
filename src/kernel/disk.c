@@ -3,11 +3,13 @@
 #include <stddef.h>
 
 #include "core/blockscale.h"
+#include "core/partition.h"
 #include "core/console.h"
 #include "core/errno.h"
 #include "drivers/nvme.h"
 #include "drivers/pci.h"
 #include "drivers/sdhci.h"
+#include "drivers/dwmmc.h"
 #include "drivers/virtio_blk.h"
 #include "kernel/mem.h"
 
@@ -25,6 +27,9 @@
 #define FILESYSTEM_BLOCK 4096u
 
 static struct blockdev raw;
+static struct partition parts[PARTITION_MAX];
+static struct partdev part;
+static struct blockdev whole;
 static struct blockscale scale;
 static struct blockdev device;
 static struct bcache cache;
@@ -52,11 +57,40 @@ static int attach_any(const struct fdt *fdt) {
         attached_kind = sdhci_kind();
         return KERR_OK;
     }
+    /* The **DesignWare** mobile-storage controller, which is what a real
+     * VisionFive 2 has where the documentation promised a Cadence SDHCI.
+     * After SDHCI rather than before it only because an emulator models the
+     * other one; on the board the SDHCI probe finds nothing and falls
+     * through to here. */
+    if (dwmmc_init(fdt, &raw) == KERR_OK) {
+        attached_kind = "sd (designware)";
+        return KERR_OK;
+    }
     if (virtio_blk_init(fdt, &raw) == KERR_OK) {
         attached_kind = "virtio";
         return KERR_OK;
     }
     return KERR_NOENT;
+}
+
+/* Picks what the filesystem is read from: the first partition if the disk has
+ * a table, the whole disk if it does not.
+ *
+ * The first partition rather than a search for a filesystem, because
+ * choosing by content would mean mounting each candidate to find out — and
+ * the operator who partitioned the disk put the filesystem in partition 1.
+ * A disk whose table is corrupt reports no partitions and is used whole,
+ * which fails at the superblock rather than at a plausible offset. */
+static int adopt_partition_or_whole(void) {
+    uint32_t found = partition_scan(&raw, parts, PARTITION_MAX);
+    if (found == 0) {
+        whole = raw;
+        return KERR_OK;
+    }
+    kprintf("disk: %u partition%s; using the first, %llu sectors at %llu\n", found,
+            found == 1u ? "" : "s", (unsigned long long)parts[0].sectors,
+            (unsigned long long)parts[0].first);
+    return partition_wrap(&raw, &parts[0], &part, &whole);
 }
 
 int disk_attach(const struct fdt *fdt) {
@@ -65,10 +99,23 @@ int disk_attach(const struct fdt *fdt) {
     if (rc != KERR_OK) {
         return rc;
     }
+    /* **The filesystem may not start at sector 0.** A card formatted whole
+     * puts its superblock there and every disk this project had read was
+     * made that way; a drive partitioned the ordinary way puts the first
+     * partition at sector 2048, and a reader pointed at sector 0 finds a
+     * partition table where it expects a superblock.
+     *
+     * No table is not an error — it is a whole-disk filesystem, which is
+     * what the SD cards here are — so the raw device is used directly in
+     * that case and the layers above never learn the difference. */
+    rc = adopt_partition_or_whole();
+    if (rc != KERR_OK) {
+        return rc;
+    }
     /* The filesystem's block over the controller's sector. A device whose
      * sector size does not divide it is refused rather than rounded: a
      * ratio that is not whole cannot be a block device. */
-    rc = blockscale_wrap(&raw, FILESYSTEM_BLOCK, &scale, &device);
+    rc = blockscale_wrap(&whole, FILESYSTEM_BLOCK, &scale, &device);
     if (rc != KERR_OK) {
         kprintf("disk: %u-byte sectors cannot present %u-byte blocks\n", raw.block_size,
                 FILESYSTEM_BLOCK);

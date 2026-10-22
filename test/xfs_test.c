@@ -420,6 +420,11 @@ static void damage_inprogress(void) {
     seal(block(0), 512u, XFS_SB_CRC);
 }
 
+/* No damage at all: the control for a test that checks a refusal, so the
+ * refusal is shown to be the feature's doing. */
+static void damage_nothing(void) {
+}
+
 static void damage_reflink(void) {
     put32(block(0) + XFS_SB_FEAT_RO_COMPAT, XFS_FEAT_RO_FINOBT | XFS_FEAT_RO_REFLINK);
     seal(block(0), 512u, XFS_SB_CRC);
@@ -502,13 +507,38 @@ static void damage_dirblklog(void) {
     seal(block(0), 512u, XFS_SB_CRC);
 }
 
+/* The promise made when a read-only-compatible feature is allowed through:
+ * the filesystem is readable and **not writable**. Reflink means extents
+ * can be shared, and a writer that does not implement copy-on-write would
+ * corrupt the file that shares them. */
+static void test_read_only_features_mount_but_forbid_writing(void) {
+    KTEST_CHECK(mount_with(damage_reflink) == KERR_OK);
+    KTEST_CHECK(!xfs_writable(&fs));
+    KTEST_CHECK(mount_with(damage_rmapbt) == KERR_OK);
+    KTEST_CHECK(!xfs_writable(&fs));
+    /* A filesystem with none of them stays writable, so the refusal is the
+     * feature's doing and not a mount that is read-only anyway. */
+    KTEST_CHECK(mount_with(damage_nothing) == KERR_OK);
+    KTEST_CHECK(xfs_writable(&fs));
+}
+
 static void test_a_superblock_that_cannot_be_trusted(void) {
     KTEST_CHECK(mount_with(damage_magic) == KERR_INVAL);
     KTEST_CHECK(mount_with(damage_version) == KERR_NOTSUP);
     KTEST_CHECK(mount_with(damage_crc) == KERR_IO);
     KTEST_CHECK(mount_with(damage_inprogress) == KERR_INVAL);
-    KTEST_CHECK(mount_with(damage_reflink) == KERR_NOTSUP);
-    KTEST_CHECK(mount_with(damage_rmapbt) == KERR_NOTSUP);
+    /* Reflink and reverse mapping are **read-only-compatible** features:
+     * the format says a reader may ignore them so long as it does not
+     * write, and this reader does not. So they mount — and the obligation
+     * that buys the mount is checked next door, in
+     * `test_read_only_features_mount_but_forbid_writing`.
+     *
+     * These two lines used to assert a refusal, which made the reader
+     * usable only on a filesystem formatted specially for it: `mkfs.xfs`
+     * turns both on by default, so an ordinary drive was rejected. A test
+     * that encodes an assumption protects the assumption, not the user. */
+    KTEST_CHECK(mount_with(damage_reflink) == KERR_OK);
+    KTEST_CHECK(mount_with(damage_rmapbt) == KERR_OK);
     KTEST_CHECK(mount_with(damage_nrext64) == KERR_NOTSUP);
     KTEST_CHECK(mount_with(damage_spinodes) == KERR_NOTSUP);
     KTEST_CHECK(mount_with(damage_needsrepair) == KERR_NOTSUP);
@@ -917,6 +947,7 @@ int main(void) {
     KTEST_RUN(test_paths);
     KTEST_RUN(test_a_directory_is_not_a_file);
     KTEST_RUN(test_holes_and_unwritten_read_as_zeroes);
+    KTEST_RUN(test_read_only_features_mount_but_forbid_writing);
     KTEST_RUN(test_a_superblock_that_cannot_be_trusted);
     KTEST_RUN(test_a_dirty_log_is_refused);
     KTEST_RUN(test_an_inode_that_cannot_be_trusted);

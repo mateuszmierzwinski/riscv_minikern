@@ -40,6 +40,7 @@ struct thread {
     bool woken;
     bool owns_stack;
     struct thread_signals signals;
+    struct uproc *proc;  /* the process this thread belongs to */
     /* The floating-point registers, which are this thread's state as much
      * as the integer ones. Aligned because the save instructions address it
      * directly. */
@@ -61,6 +62,11 @@ struct thread {
  * successor could choose one another hart is already running. */
 struct hartstate {
     uint64_t idle_ksp;
+    /* The process whose address space this hart has loaded. Checked before
+     * each switch, because two processes are two `satp` values and a hart
+     * that forgets to change it runs one process's code against another's
+     * page tables. */
+    struct uproc *loaded;
     uint32_t current;   /* SCHED_NO_THREAD when it is idle */
     uint64_t switches;
     bool joined;
@@ -114,7 +120,7 @@ static struct thread *running_thread(void) {
     return h->current == SCHED_NO_THREAD ? NULL : &threads[h->current];
 }
 
-int sched_init(const struct trapframe *frame, uint64_t sp, uint64_t *tid) {
+int sched_init(struct uproc *proc, const struct trapframe *frame, uint64_t sp, uint64_t *tid) {
     for (uint32_t i = 0; i < SCHED_MAX_THREADS; i++) {
         threads[i] = (struct thread){0};
     }
@@ -133,7 +139,7 @@ int sched_init(const struct trapframe *frame, uint64_t sp, uint64_t *tid) {
      * `uspace_run` was called on, which made it the only thread that could
      * not be scheduled by another hart — and with four harts that
      * exception has to go. */
-    return sched_spawn_first(frame, sp, tid);
+    return sched_spawn_first(proc, frame, sp, tid);
 }
 
 static uint32_t find_free_slot(void) {
@@ -206,7 +212,8 @@ static void prepare_stack(struct thread *t, const struct trapframe *frame, uint6
 
 /* Both spawns are the same work; the first thread differs only in that
  * `a0` is not forced to 0 — it is not returning from a `clone`. */
-static int spawn(const struct trapframe *frame, uint64_t sp, bool is_child, uint64_t *tid) {
+static int spawn(struct uproc *proc, const struct trapframe *frame, uint64_t sp, bool is_child,
+                 uint64_t *tid) {
     uint32_t slot = find_free_slot();
     phys_t stack = 0;
     int rc;
@@ -220,7 +227,8 @@ static int spawn(const struct trapframe *frame, uint64_t sp, bool is_child, uint
     threads[slot] = (struct thread){.kstack = stack,
                                     .tid = next_tid++,
                                     .state = THREAD_RUNNABLE,
-                                    .owns_stack = true};
+                                    .owns_stack = true,
+                                    .proc = proc};
     /* A new thread **inherits its creator's signal mask**, as the ABI
      * requires, and nothing else: not its pending signals, and not its
      * alternate stack, which is the creator's own memory and would be shared
@@ -237,11 +245,38 @@ static int spawn(const struct trapframe *frame, uint64_t sp, bool is_child, uint
 }
 
 int sched_spawn(const struct trapframe *frame, uint64_t sp, uint64_t *tid) {
-    return spawn(frame, sp, true, tid);
+    /* The creator's process: a cloned **thread** shares everything. */
+    return spawn(sched_current_proc(), frame, sp, true, tid);
 }
 
-int sched_spawn_first(const struct trapframe *frame, uint64_t sp, uint64_t *tid) {
-    return spawn(frame, sp, false, tid);
+int sched_spawn_in(struct uproc *proc, const struct trapframe *frame, uint64_t sp,
+                   uint64_t *tid) {
+    return spawn(proc, frame, sp, true, tid);
+}
+
+int sched_spawn_first(struct uproc *proc, const struct trapframe *frame, uint64_t sp,
+                      uint64_t *tid) {
+    return spawn(proc, frame, sp, false, tid);
+}
+
+uint32_t sched_end_siblings(const struct uproc *proc) {
+    uint32_t ended = 0;
+    struct thread *me_thread = running_thread();
+    for (uint32_t i = 0; i < SCHED_MAX_THREADS; i++) {
+        if (threads[i].state == THREAD_FREE || &threads[i] == me_thread) {
+            continue;
+        }
+        if (threads[i].proc != proc) {
+            continue;
+        }
+        /* Marked free rather than switched to: a thread that is not running
+         * anywhere is simply forgotten, and one that *is* running on another
+         * hart stops at its next trap because its state is no longer
+         * runnable. Its kernel stack is reclaimed with the process's. */
+        threads[i].state = THREAD_FREE;
+        ended++;
+    }
+    return ended;
 }
 
 /* A thread no hart is running, claimed for this one. The claim is the
@@ -327,6 +362,14 @@ void sched_run(void) {
             continue;
         }
         h->current = t;
+        /* **This hart's address space must be the thread's.** With one
+         * process it never changed, so nothing noticed it was not being
+         * checked; with two, a hart that skips this runs one process's code
+         * against another's page tables. */
+        if (h->loaded != threads[t].proc) {
+            uspace_adopt_address_space(threads[t].proc);
+            h->loaded = threads[t].proc;
+        }
         fp_restore(threads[t].fp);
         /* Into the thread, and back here when it yields, blocks or ends.
          * `idle_ksp` is written before the switch because the thread will
@@ -495,9 +538,22 @@ uint32_t sched_live_threads(void) {
     return live;
 }
 
+uint32_t sched_live_threads_of(const struct uproc *p) {
+    uint32_t live = 0;
+    for (uint32_t i = 0; i < SCHED_MAX_THREADS; i++) {
+        live += threads[i].state != THREAD_FREE && threads[i].proc == p ? 1u : 0u;
+    }
+    return live;
+}
+
 uint64_t sched_current_tid(void) {
     struct thread *t = running_thread();
     return t == NULL ? 0 : t->tid;
+}
+
+struct uproc *sched_current_proc(void) {
+    struct thread *t = running_thread();
+    return t == NULL ? NULL : t->proc;
 }
 
 struct thread_signals *sched_current_signals(void) {
@@ -525,11 +581,11 @@ void sched_exit_thread(int64_t status) {
     }
     trace("ends with status", me()->current, (uint64_t)status);
     t->state = THREAD_FREE;
-    /* Was it the last one? Then the process is over, and **every** hart's
-     * loop must leave — not only this one. The status goes to whoever
-     * called `uspace_run`, which may be a different hart entirely, which is
-     * why it is recorded rather than returned. */
-    if (sched_live_threads() == 0) {
+    /* Was it the last thread **of its process**? Then that process is over.
+     * The status goes to whoever is waiting for it — its parent, or
+     * `uspace_run` — which may be on a different hart, which is why it is
+     * recorded rather than returned. */
+    if (sched_live_threads_of(t->proc) == 0) {
         uspace_exit(status);
     }
     /* Its kernel stack is still being stood on, so it is freed by
@@ -538,16 +594,20 @@ void sched_exit_thread(int64_t status) {
     yield_to_scheduler();
 }
 
-void sched_exit_process(void) {
+void sched_exit_proc(struct uproc *p, bool is_root) {
     struct thread *t = running_thread();
-    process_over = true;
-    /* Every thread, not just this one: the process is over, and a thread
-     * left RUNNABLE would be claimed by a hart whose loop has not noticed
-     * yet. */
+    /* Only the harts' loops stop, and only for the process they were
+     * started for. A child ending must leave its parent running. */
+    process_over = process_over || is_root;
+    /* Every thread **of this process**, not every thread: one left RUNNABLE
+     * would be claimed by a hart whose loop has not noticed yet, and one
+     * belonging to another process must not be touched at all. */
     for (uint32_t i = 0; i < SCHED_MAX_THREADS; i++) {
-        threads[i].state = THREAD_FREE;
+        if (threads[i].proc == p) {
+            threads[i].state = THREAD_FREE;
+        }
     }
-    if (t != NULL) {
+    if (t != NULL && t->proc == p) {
         yield_to_scheduler();
     }
 }

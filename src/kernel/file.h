@@ -72,8 +72,19 @@ struct file {
     uint32_t poll_gen;
 };
 
-/* Empties the table, for a process starting. */
+struct uproc;
+
+/* Closes every descriptor of the running process. */
 void fd_reset(void);
+
+/* Closes the ones marked close-on-exec, which is what `execve` does: the
+ * table survives an exec, except for what a caller asked to be dropped. */
+void fd_close_on_exec(void);
+
+/* Gives `to` a copy of `from`'s table, sharing the files. Inheriting a
+ * descriptor means sharing the file behind it — both processes then write to
+ * the same console and read the same pipe. */
+int fd_copy_table(struct uproc *to, const struct uproc *from);
 
 /* Takes a file and gives it the lowest free descriptor. The file's reference
  * is transferred. Negative on failure (KERR_MFILE when the table is full). */
@@ -89,6 +100,11 @@ int fd_close(int32_t fd);
 
 /* Duplicates a descriptor into the lowest free one, for `dup`. */
 int fd_dup(int32_t fd);
+
+/* Duplicates onto a **chosen** descriptor, closing whatever was there. This
+ * is what puts a pipe on descriptor 1 before an `exec`, and it is the reason
+ * `dup2`/`dup3` exist at all. */
+int fd_dup_to(int32_t from, int32_t to);
 
 /* Allocates a file with `ops` and `priv`. NULL when memory runs out. */
 struct file *file_new(const struct file_ops *ops, void *priv, uint32_t flags);

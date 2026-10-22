@@ -37,9 +37,24 @@
  * filesystem anyway, and the kernel is not preemptible. */
 static uint8_t scratch[XLOG_SECTOR];
 
-/* One basic block of the log, into buf (XLOG_SECTOR bytes). */
+/* One basic block of the log, into buf (XLOG_SECTOR bytes).
+ *
+ * **`logstart` is an AG-encoded block number, not a linear one.** It packs
+ * the allocation group into its high bits — the same encoding as an inode
+ * number — so it has to go through `xfs_fsb_to_block` like every other
+ * fsblock. This read path multiplied the raw value instead, while the log
+ * *write* path in the same filesystem already converted it: the two halves
+ * disagreed about where the log was.
+ *
+ * It is invisible on any filesystem whose log sits in AG 0, because there
+ * the encoding is the identity, and it does not fail loudly when it is
+ * wrong — it reads some other part of the card. On a 7.6 GiB card whose log
+ * landed in AG 2 it read 4 GiB too far, into never-written flash, and
+ * 0xffffffff came back as a cycle number. The card before it had its log
+ * read at a wrong offset too and mounted anyway, because the bytes there
+ * were zero and zero means "this log was never written". */
 static int read_bb(struct xfs *fs, uint64_t bb, uint8_t *buf) {
-    uint64_t off = fs->logstart * fs->blocksize + bb * XLOG_SECTOR;
+    uint64_t off = xfs_fsb_to_block(fs, fs->logstart) * (uint64_t)fs->blocksize + bb * XLOG_SECTOR;
     return bcache_pread(fs->cache, off, buf, XLOG_SECTOR);
 }
 
@@ -133,9 +148,71 @@ static int find_newest_record(struct xfs *fs, uint64_t head, uint32_t cycle, uin
     return KERR_NOENT;
 }
 
+/* The newest record in a log whose every block carries the same cycle.
+ *
+ * The bisection above cannot find a head here, and the reason is worth
+ * stating because it looks like a contradiction: it searches for the first
+ * block that is **not** in the current cycle, and `mkfs` stamps the *whole*
+ * log with cycle 1 — so the honest answer is "the end of the log", where
+ * there is no record within any sensible lookback. A freshly made card that
+ * has never been mounted hides this, because its first block reads cycle 0
+ * and the check takes the "never written" exit; the first card formatted for
+ * this project did exactly that and mounted, and the first card with files
+ * on it did not.
+ *
+ * The records are contiguous from block 0 in this case, and each header
+ * carries its own length, so the newest is reached by stepping from record
+ * to record: as many steps as there are records, not as many as the log has
+ * blocks. */
+static int walk_to_newest(struct xfs *fs, uint64_t blocks, uint32_t cycle, uint64_t *at) {
+    uint64_t bb = 0;
+    bool any = false;
+    while (bb < blocks) {
+        uint64_t len;
+        int rc = read_bb(fs, bb, scratch);
+        if (rc != KERR_OK) {
+            return rc;
+        }
+        if (!is_record_header(scratch, cycle)) {
+            break;
+        }
+        *at = bb;
+        any = true;
+        len = xfs_be32(scratch + XLOG_REC_LEN);
+        bb += 1u + (len + XLOG_SECTOR - 1u) / XLOG_SECTOR;
+    }
+    return any ? KERR_OK : KERR_NOENT;
+}
+
+/* The newest record, by whichever search the log's shape allows.
+ *
+ * A log that has wrapped partway has a cycle boundary to bisect for; one
+ * stamped uniformly does not, and the two are told apart by the only
+ * evidence available — whether the last block belongs to the same cycle as
+ * the first. */
+static int find_newest(struct xfs *fs, uint64_t blocks, uint32_t cycle, uint64_t *newest) {
+    uint64_t head = 0;
+    int rc = read_bb(fs, blocks - 1u, scratch);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    if (bb_cycle(scratch) == cycle) {
+        return walk_to_newest(fs, blocks, cycle, newest);
+    }
+    rc = find_head(fs, blocks, cycle, &head);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    rc = find_newest_record(fs, head, cycle, newest);
+    if (rc == KERR_NOENT) {
+        kprintf("xfs: the log's head at %u has no record before it\n", (uint32_t)head);
+    }
+    return rc;
+}
+
 int xfs_log_check(struct xfs *fs) {
     uint64_t blocks = (uint64_t)fs->logblocks * (fs->blocksize / XLOG_SECTOR);
-    uint64_t head = 0, newest = 0;
+    uint64_t newest = 0;
     uint32_t cycle;
     bool unmount = false;
     int rc;
@@ -151,12 +228,9 @@ int xfs_log_check(struct xfs *fs) {
     if (cycle == 0) {
         return KERR_OK; /* never written: there is nothing to replay */
     }
-    rc = find_head(fs, blocks, cycle, &head);
-    if (rc == KERR_OK) {
-        rc = find_newest_record(fs, head, cycle, &newest);
-    }
+    rc = find_newest(fs, blocks, cycle, &newest);
     if (rc == KERR_NOENT) {
-        kprintf("xfs: the log's head at %u has no record before it\n", (uint32_t)head);
+        kprintf("xfs: the log carries cycle %u but no record this reader can find\n", cycle);
         return KERR_NOTSUP;
     }
     if (rc == KERR_OK) {

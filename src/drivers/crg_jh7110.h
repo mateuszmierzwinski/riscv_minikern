@@ -87,6 +87,21 @@ int crg_enable_clock(enum crg_domain domain, uint32_t index);
  * is how a driver comes to look like it works. */
 int crg_release_reset(enum crg_domain domain, uint32_t id);
 
+/* Switches on everything a device node asks for: each clock in its `clocks`
+ * property and each reset in its `resets`.
+ *
+ * A node names them as (phandle, index) pairs, and the phandle says which
+ * generator — so this resolves the phandle rather than assuming the system
+ * one, because a device on the always-on generator would otherwise have its
+ * neighbour's clock switched on instead.
+ *
+ * It is how a driver switches its own controller on without knowing any
+ * clock numbers: the tree already holds them. KERR_NOENT when the node has
+ * no clocks, and whatever the enable or the release reported when one of
+ * them fails — both of which are confirmed by reading back, so a failure
+ * here is a block that really is not running. */
+int crg_enable_device(const struct fdt *fdt, const char *path);
+
 /* Where a generator was found. */
 phys_t crg_base(enum crg_domain domain);
 bool crg_present(enum crg_domain domain);

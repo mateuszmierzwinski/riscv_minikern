@@ -102,7 +102,8 @@ int xfs_file_read(struct xfs *fs, const struct xfs_inode *ip, uint64_t off, void
 /* ── writing ───────────────────────────────────────────────────────────── */
 
 bool xfs_writable(const struct xfs *fs) {
-    return fs->mounted && fs->cache != NULL && !fs->cache->dev->read_only;
+    return fs->mounted && fs->cache != NULL && !fs->cache->dev->read_only &&
+           !fs->write_refused;
 }
 
 int xfs_flush(struct xfs *fs) {

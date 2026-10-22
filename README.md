@@ -10,10 +10,21 @@ MIT licensed. Built and tested entirely with Bazel.
 
 A stock **gc Go binary** for `linux/riscv64` — built by the ordinary Go
 toolchain, with no build tags and no knowledge of this kernel — is read off
-an XFS filesystem on an NVMe drive and runs unchanged: goroutines on real
-threads, a contended mutex, channels, the garbage collector, sleeps that
-really sleep, panic and recover. That was the goal of the ARM project this
-migrated from, and it is now reached on RISC-V.
+an XFS filesystem and runs unchanged: goroutines on real threads, a contended
+mutex, channels, the garbage collector, sleeps that really sleep, panic and
+recover. That was the goal of the ARM project this migrated from, and it is
+now reached on RISC-V.
+
+**On real hardware.** A StarFive VisionFive 2 boots this kernel, brings up
+its SD card and an NVMe drive in its M.2 slot, reads the GPT on the drive,
+mounts XFS, loads that Go binary off the card and runs it on all four U74
+cores — 3.3x on eight units of work. `FEATURES.md` lists what the board
+proved and what each of those things cost, because an emulator had agreed
+with every mistake they found: a response with no CRC whose CRC was being
+checked, a configuration read to an unrouted bus that never returns, a
+filesystem whose reader and writer disagreed about where its log was, and a
+`running++` across four real cores that quietly cost the machine half its
+CPUs.
 
 ## This is a migration, not a fresh start
 

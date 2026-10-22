@@ -44,28 +44,34 @@ static void remember_path(uint32_t i, const char *path) {
     controllers[i].path[at] = '\0';
 }
 
-/* The clock and the reset each controller needs, and which generator owns
- * them. The `sys` pin controller is clocked and reset by the system
- * generator; the always-on one by the always-on generator — which is the
- * same "a pin controller is not one block" point one level down. */
-static bool switch_on(uint32_t which) {
-    enum crg_domain domain = which == 0 ? CRG_SYS : CRG_AON;
-    int rc;
-    if (!crg_present(domain)) {
-        kprintf("gpio: no clock generator for controller %u; not touching it\n", which);
-        return false;
+/* Switches a controller on using **the clock and reset its own node names**.
+ *
+ * It used to use a constant — `JH7110_SYSCLK_IOMUX_APB` — for both
+ * controllers, and that is the system generator's numbering. The always-on
+ * pin controller is clocked by the *always-on* generator, whose numbering is
+ * its own, so the constant selected whatever happens to sit at that index
+ * there: on a real board the enable bit would not stay set and controller 1
+ * refused to start (`rc -5`). The number was never this driver's to know —
+ * the tree carries it, in the node's `clocks` and `resets`, and a board that
+ * wires its pin controller differently is then right by construction.
+ *
+ * This is the same correction the SD controller needed, one level down: a
+ * pin controller is not one block, and the second one is not the first with
+ * a different address. */
+static bool switch_on(const struct fdt *fdt, uint32_t which, const char *path) {
+    int rc = crg_enable_device(fdt, path);
+    if (rc == KERR_OK) {
+        return true;
     }
-    rc = crg_enable_clock(domain, JH7110_SYSCLK_IOMUX_APB);
-    if (rc != KERR_OK) {
-        kprintf("gpio: controller %u's clock would not enable (rc %d)\n", which, rc);
-        return false;
+    if (rc == KERR_NOENT) {
+        /* The node names no clock this kernel can switch — on a board whose
+         * firmware has already started it, that is the ordinary case and not
+         * a reason to refuse the controller. */
+        kprintf("gpio: controller %u names no clock here; taking it as already on\n", which);
+        return true;
     }
-    rc = crg_release_reset(domain, JH7110_SYSRST_IOMUX_APB);
-    if (rc != KERR_OK) {
-        kprintf("gpio: controller %u stayed in reset (rc %d)\n", which, rc);
-        return false;
-    }
-    return true;
+    kprintf("gpio: controller %u would not switch on (rc %d)\n", which, rc);
+    return false;
 }
 
 uint32_t gpio_jh7110_init(const struct fdt *fdt) {
@@ -90,7 +96,7 @@ uint32_t gpio_jh7110_init(const struct fdt *fdt) {
          * reporting success. Both are confirmed by reading back, so a
          * failure here is a refusal rather than a silent half-start
          * (drivers/crg_jh7110.h). */
-        controllers[i].up = switch_on(i);
+        controllers[i].up = switch_on(fdt, i, path);
         found += controllers[i].up ? 1u : 0u;
     }
     return found;

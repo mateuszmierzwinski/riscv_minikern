@@ -75,3 +75,19 @@ bool cmdline_has(const char *cmdline, const char *key) {
     size_t len = 0;
     return cmdline_value(cmdline, key, &len) != NULL;
 }
+
+uint64_t cmdline_number(const char *cmdline, const char *key, uint64_t fallback) {
+    size_t len = 0;
+    const char *v = cmdline_value(cmdline, key, &len);
+    uint64_t n = 0;
+    if (v == NULL || len == 0) {
+        return fallback;
+    }
+    for (size_t i = 0; i < len; i++) {
+        if (v[i] < '0' || v[i] > '9') {
+            return fallback;
+        }
+        n = n * 10u + (uint64_t)(v[i] - '0');
+    }
+    return n;
+}

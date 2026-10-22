@@ -102,3 +102,76 @@ phys_t crg_base(enum crg_domain domain) {
 bool crg_present(enum crg_domain domain) {
     return domain < CRG_DOMAINS && domains[domain].up;
 }
+
+/* Which generator a phandle refers to. The tree's own numbering, resolved
+ * rather than guessed: a device on the always-on generator whose clock was
+ * switched on in the system one would have its neighbour started instead. */
+static int domain_of_phandle(const struct fdt *fdt, uint32_t phandle, enum crg_domain *out) {
+    char path[64];
+    if (fdt_find_phandle(fdt, phandle, path, sizeof path) != KERR_OK) {
+        return KERR_NOENT;
+    }
+    /* The system generator is the one at 0x13020000 and the always-on one at
+     * 0x17000000; which is which comes from the address rather than the
+     * node's name, because a name is a label and an address is a fact. */
+    {
+        phys_t base = 0;
+        uint64_t size = 0;
+        if (fdt_device_reg(fdt, path, 0, &base, &size) != KERR_OK) {
+            return KERR_NOENT;
+        }
+        if (base == crg_base(CRG_SYS)) {
+            *out = CRG_SYS;
+            return KERR_OK;
+        }
+        if (base == crg_base(CRG_AON)) {
+            *out = CRG_AON;
+            return KERR_OK;
+        }
+    }
+    return KERR_NOENT;
+}
+
+int crg_enable_device(const struct fdt *fdt, const char *path) {
+    struct fdt_prop clocks, resets;
+    bool any = false;
+    int rc;
+    if (fdt_get_prop(fdt, path, "clocks", &clocks) == KERR_OK) {
+        /* Pairs of (phandle, index), so two cells each. */
+        for (uint32_t at = 0; at + 1u < clocks.len / 4u; at += 2u) {
+            uint64_t phandle = 0, index = 0;
+            enum crg_domain domain;
+            if (fdt_prop_cells(&clocks, at, 1, &phandle) != KERR_OK ||
+                fdt_prop_cells(&clocks, at + 1u, 1, &index) != KERR_OK) {
+                return KERR_INVAL;
+            }
+            if (domain_of_phandle(fdt, (uint32_t)phandle, &domain) != KERR_OK) {
+                continue; /* a clock from some other provider: not ours to switch */
+            }
+            rc = crg_enable_clock(domain, (uint32_t)index);
+            if (rc != KERR_OK) {
+                return rc;
+            }
+            any = true;
+        }
+    }
+    if (fdt_get_prop(fdt, path, "resets", &resets) == KERR_OK) {
+        for (uint32_t at = 0; at + 1u < resets.len / 4u; at += 2u) {
+            uint64_t phandle = 0, id = 0;
+            enum crg_domain domain;
+            if (fdt_prop_cells(&resets, at, 1, &phandle) != KERR_OK ||
+                fdt_prop_cells(&resets, at + 1u, 1, &id) != KERR_OK) {
+                return KERR_INVAL;
+            }
+            if (domain_of_phandle(fdt, (uint32_t)phandle, &domain) != KERR_OK) {
+                continue;
+            }
+            rc = crg_release_reset(domain, (uint32_t)id);
+            if (rc != KERR_OK) {
+                return rc;
+            }
+            any = true;
+        }
+    }
+    return any ? KERR_OK : KERR_NOENT;
+}

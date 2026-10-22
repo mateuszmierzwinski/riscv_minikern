@@ -30,6 +30,7 @@
 #define SYS_EPOLL_CTL 21u
 #define SYS_EPOLL_PWAIT 22u
 #define SYS_DUP 23u
+#define SYS_DUP3 24u
 #define SYS_FCNTL 25u
 #define SYS_IOCTL 29u
 #define SYS_FACCESSAT 48u
@@ -92,6 +93,12 @@ void syscall_set_trace(uint32_t budget);
 /* Logs every sleep with the duration it asked for. Separate from the call
  * trace because a sleep happens long after any sensible call budget. */
 void syscall_trace_sleeps(bool on);
+bool syscall_tracing_sleeps(void);
+
+/* Logs every call that returns an error, however late it happens. A budget
+ * cannot see a child process's first call; a failure filter can. */
+void syscall_trace_errors(bool on);
+bool syscall_tracing_errors(void);
 
 /* Whether `tgkill` really raises a signal. Off drops it, which costs a
  * runtime its asynchronous preemption and nothing else. */
@@ -102,6 +109,13 @@ void syscall_allow_tgkill(bool on);
  * place every syscall lives: the dispatcher searches the domains in turn,
  * and a new domain is a new file and one line here. */
 extern const struct syscall_entry sys_socket_table[];
+
+/* The process domain's table, in `sys_proc.c`: `clone`, `execve`, `wait4`. */
+extern const struct syscall_entry sys_proc_table[];
+
+/* A cloned thread, which the process domain's `clone` calls for the
+ * `CLONE_THREAD` case. */
+int64_t syscall_clone_thread(struct trapframe *tf);
 
 /* Dispatches one call. Returns true when it was handled — which includes
  * being handled by returning an error. False only for `exit`, which does

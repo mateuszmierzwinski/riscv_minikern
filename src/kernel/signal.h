@@ -25,9 +25,13 @@
 
 #include "arch/riscv/trap.h"
 #include "core/types.h"
-#include "kernel/uspace.h"
 
-#define SIG_COUNT 64u
+/* 65, not 64: the signals are numbered **1 to 64**, so a table indexed by
+ * number needs 65 entries and a bound of `< 64` rejects signal 64 — which a
+ * runtime sets a handler for along with all the others, and which then
+ * failed with EINVAL in the middle of a child's setup. The unused entry 0 is
+ * the price of indexing by the number the ABI uses. */
+#define SIG_COUNT 65u
 
 /* The signals this kernel raises or is asked about by name. */
 #define SIGILL 4
@@ -137,18 +141,6 @@ bool signal_is_fatal(uint32_t *signo);
 /* `rt_sigreturn`: restore the frame a handler was entered with. Does not
  * return a value to user space — it replaces the whole register set. */
 int signal_return(struct trapframe *tf);
-
-/* Where the kernel's return trampoline is mapped in the process, and the
- * instructions it contains. The page is mapped read-execute, user, by
- * whoever builds the address space.
- *
- * **One page below the bottom of the stack**, derived rather than written
- * down: a literal address a page under the stack *top* was inside the stack
- * — 64 pages of it — and the mapping was refused as a collision, which
- * presented as "this program's headers were refused". Deriving it from the
- * two constants that define the stack means it cannot drift into it when
- * either changes. */
-#define SIGNAL_TRAMPOLINE (USER_STACK_TOP - (uint64_t)(USER_STACK_PAGES + 1u) * 4096ull)
 
 /* The trampoline's instructions, and how many bytes of them: `li a7, 139`
  * then `ecall`, which is `rt_sigreturn`. Exposed so the address space

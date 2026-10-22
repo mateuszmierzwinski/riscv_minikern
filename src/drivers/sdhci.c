@@ -7,6 +7,7 @@
 #include "core/console.h"
 #include "core/errno.h"
 #include "drivers/pci.h"
+#include "drivers/sdcard.h"
 
 /* Host controller registers (SD Host Controller Interface 3.0). */
 #define SDHCI_ARGUMENT 0x08u
@@ -85,14 +86,14 @@
 #define OCR_HIGH_CAPACITY (1u << 30)
 #define OCR_POWERED_UP (1u << 31)
 
-#define BLOCK_BYTES 512u
+#define BLOCK_BYTES SD_BLOCK_BYTES
 #define WAIT_SPINS 50000000u
 
+/* The controller. What the *card* is — its address, its capacity and whether
+ * it addresses blocks or bytes — belongs to the shared protocol and lives in
+ * `card` below. */
 static struct {
     volatile uint8_t *regs;
-    uint32_t rca;        /* the address the card was given */
-    bool high_capacity;  /* addresses blocks rather than bytes */
-    uint64_t blocks;
     bool up;
 } sd;
 
@@ -135,6 +136,51 @@ static int wait_ready_for_command(bool with_data) {
  * are left clear so nothing is raised. A card is slow and this kernel has
  * nothing else to do during a block transfer, so polling is not a shortcut —
  * it is the simpler correct answer. */
+/* The shared protocol's response kinds in this controller's flags.
+ *
+ * **The CRC is checked only where there is one.** The OCR (an R3 response)
+ * carries reserved bits where a CRC would go, so a controller told to check
+ * it reports a CRC failure for a perfectly good answer. QEMU's card model
+ * does not compute response CRCs, so this was invisible here and stopped a
+ * real card one command into powering up. */
+static uint8_t flags_for(uint32_t kind, bool with_data) {
+    uint8_t flags = with_data ? CMD_DATA : 0u;
+    switch (kind) {
+        case SD_RESP_LONG:
+            return flags | CMD_RESP_136 | CMD_CRC_CHECK;
+        case SD_RESP_BUSY:
+            return flags | CMD_RESP_48_BUSY | CMD_CRC_CHECK;
+        case SD_RESP_SHORT:
+            return flags | CMD_RESP_48 | CMD_CRC_CHECK;
+        case SD_RESP_SHORT_NOCRC:
+            return flags | CMD_RESP_48;
+        default:
+            return flags | CMD_RESP_NONE;
+    }
+}
+
+/* This controller's long response, in the layout the shared protocol expects.
+ *
+ * **Every field is 8 bits from where the specification says it is**, and the
+ * shift belongs here rather than in the protocol. The card sends 136 bits — a
+ * start bit, a transmission bit, six reserved, the 128-bit payload and a CRC
+ * — and this controller presents only the middle of that, having dropped the
+ * trailing CRC byte. So the specification's bit 127 arrives as response bit
+ * 119, and reading the documented positions gives plausible nonsense: a
+ * 64 MiB card reported itself as 30 GiB, and the write that followed was
+ * addressed past the end of it. A DesignWare controller does not do this,
+ * which is how the shift came to be a transport's business. */
+static void read_long_response(uint32_t out[4]) {
+    uint32_t raw[4];
+    for (uint32_t i = 0; i < 4u; i++) {
+        raw[i] = read32(SDHCI_RESPONSE + i * 4u);
+    }
+    out[0] = raw[0] << 8;
+    out[1] = (raw[0] >> 24) | (raw[1] << 8);
+    out[2] = (raw[1] >> 24) | (raw[2] << 8);
+    out[3] = (raw[2] >> 24) | (raw[3] << 8);
+}
+
 static int command(uint8_t index, uint32_t argument, uint8_t flags, uint32_t *response) {
     int rc = wait_ready_for_command((flags & CMD_DATA) != 0);
     if (rc != KERR_OK) {
@@ -158,10 +204,24 @@ static int command(uint8_t index, uint32_t argument, uint8_t flags, uint32_t *re
     return KERR_TIMEDOUT;
 }
 
-/* An application-specific command is an ordinary one prefixed by CMD55. */
-static int app_command(uint8_t index, uint32_t argument, uint32_t *response) {
-    int rc = command(CMD_APP_CMD, sd.rca << 16, CMD_RESP_48 | CMD_CRC_CHECK, NULL);
-    return rc != KERR_OK ? rc : command(index, argument, CMD_RESP_48, response);
+/* The shared protocol's command port. A long response is normalised on the
+ * way out; a short one is a single register. */
+static int sdhci_send(void *self, uint8_t index, uint32_t argument, uint32_t kind,
+                      uint32_t *response) {
+    bool with_data = index == CMD_READ_SINGLE || index == CMD_WRITE_SINGLE;
+    int rc;
+    if (with_data) {
+        write16(SDHCI_BLOCK_SIZE, BLOCK_BYTES);
+        write16(SDHCI_BLOCK_COUNT, 1);
+        write16(SDHCI_TRANSFER_MODE, index == CMD_READ_SINGLE ? TRANSFER_READ : 0u);
+    }
+    (void)self;
+    rc = command(index, argument, flags_for(kind, with_data),
+                 kind == SD_RESP_LONG ? NULL : response);
+    if (rc == KERR_OK && kind == SD_RESP_LONG && response != NULL) {
+        read_long_response(response);
+    }
+    return rc;
 }
 
 /* Resets the controller and starts its clock. */
@@ -192,97 +252,18 @@ static int start_controller(void) {
     return KERR_OK;
 }
 
-/* Powers the card up and finds out whether it is high-capacity.
- *
- * ACMD41 is asked repeatedly because a card takes time to power up and says
- * so by leaving the ready bit clear — the loop is the protocol, not a
- * workaround. */
-static int power_up_card(void) {
-    uint32_t response = 0;
-    int rc = command(CMD_GO_IDLE, 0, CMD_RESP_NONE, NULL);
-    if (rc != KERR_OK) {
-        return rc;
-    }
-    /* CMD8's echoed pattern distinguishes a card that understands the modern
-     * protocol from a floating bus that reads as all ones. */
-    rc = command(CMD_SEND_IF_COND, IF_COND_VOLTAGE | IF_COND_PATTERN,
-                 CMD_RESP_48 | CMD_CRC_CHECK, &response);
-    if (rc != KERR_OK || (response & 0xffu) != IF_COND_PATTERN) {
-        return KERR_NOTSUP;
-    }
-    for (uint32_t tries = 0; tries < 1000u; tries++) {
-        rc = app_command(ACMD_SEND_OP_COND, OCR_VOLTAGE_WINDOW | OCR_HIGH_CAPACITY, &response);
-        if (rc != KERR_OK) {
-            return rc;
-        }
-        if ((response & OCR_POWERED_UP) != 0) {
-            sd.high_capacity = (response & OCR_HIGH_CAPACITY) != 0;
-            return KERR_OK;
-        }
-    }
-    return KERR_TIMEDOUT;
-}
+/* This controller sets its clock from a register this driver already
+ * programmed for identification, and the shared protocol's "go faster" step
+ * has nothing to add here: raising it safely needs the card's own capability
+ * data, which is a later concern. Declared so the port is complete. */
+static const struct sd_transport transport = {
+    .self = NULL,
+    .command = sdhci_send,
+    .move_block = NULL, /* this driver drives its own data path, below */
+    .run_faster = NULL,
+};
 
-/* Reads the card's capacity out of its CSD register.
- *
- * **Every field here is 8 bits away from where the specification says it
- * is.** The card sends 136 bits — a start bit, a transmission bit, six
- * reserved, the 128-bit CSD, and a CRC — and the host controller presents
- * only the middle of that in its response registers, having dropped the
- * trailing CRC byte. So the specification's bit 127 arrives as response bit
- * 119, and reading the documented positions directly gives plausible
- * nonsense: a 64 MiB card reported itself as 30 GiB, and the write that
- * followed was addressed past the end of it.
- *
- * Then two layouts of those bits, which is the one piece of real variation
- * in the protocol: a card up to 2 GiB reports a geometry to multiply out,
- * and a high-capacity card reports a block count directly. Reading the
- * wrong one of a modern card gives a working driver that sees a fraction of
- * the storage.
- *
- * `r[0]` holds response bits 31:0, `r[3]` bits 127:96; a specification bit
- * B is response bit B-8. */
-static void take_capacity(const uint32_t r[4]) {
-    uint32_t version = (r[3] >> 22) & 0x3u;  /* CSD_STRUCTURE, spec 127:126 */
-    if (version == 1u) {
-        /* SDHC/SDXC: C_SIZE is spec 69:48, so response 61:40. Capacity is
-         * (C_SIZE + 1) * 512 KiB, which is (C_SIZE + 1) * 1024 blocks. */
-        uint32_t c_size = (r[1] >> 8) & 0x3fffffu;
-        sd.blocks = ((uint64_t)c_size + 1u) * 1024u;
-    } else {
-        /* Standard capacity: C_SIZE is spec 73:62 (response 65:54),
-         * C_SIZE_MULT spec 49:47 (response 41:39), READ_BL_LEN spec 83:80
-         * (response 75:72). */
-        uint32_t c_size = ((r[2] & 0x3u) << 10) | (r[1] >> 22);
-        uint32_t mult = (r[1] >> 7) & 0x7u;
-        uint32_t read_len = (r[2] >> 8) & 0xfu;
-        sd.blocks = ((uint64_t)c_size + 1u) * (1ull << (mult + 2u)) * (1ull << read_len) /
-                    BLOCK_BYTES;
-    }
-}
-
-/* Gives the card an address and asks for its capacity. */
-static int identify_card(void) {
-    uint32_t csd[4] = {0};
-    uint32_t response = 0;
-    int rc = command(CMD_ALL_SEND_CID, 0, CMD_RESP_136 | CMD_CRC_CHECK, NULL);
-    rc = rc != KERR_OK ? rc
-                       : command(CMD_SEND_RELATIVE_ADDR, 0, CMD_RESP_48 | CMD_CRC_CHECK, &response);
-    if (rc != KERR_OK) {
-        return rc;
-    }
-    sd.rca = response >> 16;
-    rc = command(CMD_SEND_CSD, sd.rca << 16, CMD_RESP_136 | CMD_CRC_CHECK, NULL);
-    if (rc != KERR_OK) {
-        return rc;
-    }
-    for (uint32_t i = 0; i < 4u; i++) {
-        csd[i] = read32(SDHCI_RESPONSE + i * 4u);
-    }
-    take_capacity(csd);
-    rc = command(CMD_SELECT_CARD, sd.rca << 16, CMD_RESP_48_BUSY | CMD_CRC_CHECK, NULL);
-    return rc != KERR_OK ? rc : command(CMD_SET_BLOCKLEN, BLOCK_BYTES, CMD_RESP_48, NULL);
-}
+static struct sd_card card;
 
 /* Moves one block through the controller's data port, a word at a time.
  *
@@ -322,19 +303,15 @@ static int move_block(bool reading, void *buf) {
  * the capacity question, and getting it wrong on a modern card addresses the
  * first 1/512th of it. */
 static int one_block(bool reading, uint64_t lba, void *buf) {
-    uint32_t argument = sd.high_capacity ? (uint32_t)lba : (uint32_t)(lba * BLOCK_BYTES);
-    int rc;
-    write16(SDHCI_BLOCK_SIZE, BLOCK_BYTES);
-    write16(SDHCI_BLOCK_COUNT, 1);
-    write16(SDHCI_TRANSFER_MODE, reading ? TRANSFER_READ : 0u);
-    rc = command(reading ? CMD_READ_SINGLE : CMD_WRITE_SINGLE, argument,
-                 CMD_RESP_48 | CMD_CRC_CHECK | CMD_DATA, NULL);
+    uint32_t argument = card.high_capacity ? (uint32_t)lba : (uint32_t)(lba * BLOCK_BYTES);
+    int rc = sdhci_send(NULL, reading ? CMD_READ_SINGLE : CMD_WRITE_SINGLE, argument,
+                        SD_RESP_SHORT, NULL);
     return rc != KERR_OK ? rc : move_block(reading, buf);
 }
 
 static int sd_read(void *self, uint64_t lba, uint32_t count, void *buf) {
     (void)self;
-    if (!sd.up || count == 0 || lba + count > sd.blocks) {
+    if (!sd.up || count == 0 || lba + count > card.blocks) {
         return KERR_INVAL;
     }
     for (uint32_t i = 0; i < count; i++) {
@@ -348,7 +325,7 @@ static int sd_read(void *self, uint64_t lba, uint32_t count, void *buf) {
 
 static int sd_write(void *self, uint64_t lba, uint32_t count, const void *buf) {
     (void)self;
-    if (!sd.up || count == 0 || lba + count > sd.blocks) {
+    if (!sd.up || count == 0 || lba + count > card.blocks) {
         return KERR_INVAL;
     }
     if ((read32(SDHCI_PRESENT_STATE) & PRESENT_WRITE_ENABLED) == 0) {
@@ -401,21 +378,20 @@ int sdhci_init(const struct fdt *fdt, struct blockdev *out) {
         return rc;
     }
     rc = start_controller();
-    rc = rc != KERR_OK ? rc : power_up_card();
-    rc = rc != KERR_OK ? rc : identify_card();
+    rc = rc != KERR_OK ? rc : sdcard_bring_up(&transport, &card);
     if (rc != KERR_OK) {
         return rc;
     }
     sd.up = true;
     *out = (struct blockdev){.read = sd_read, .write = sd_write, .flush = sd_flush, .self = NULL,
-                             .block_size = BLOCK_BYTES, .blocks = sd.blocks, .read_only = false};
+                             .block_size = BLOCK_BYTES, .blocks = card.blocks, .read_only = false};
     return KERR_OK;
 }
 
 const char *sdhci_kind(void) {
-    return sd.up ? (sd.high_capacity ? "SDHC/SDXC" : "SD") : "";
+    return sd.up ? (card.high_capacity ? "SDHC/SDXC" : "SD") : "";
 }
 
 uint64_t sdhci_blocks(void) {
-    return sd.blocks;
+    return card.blocks;
 }

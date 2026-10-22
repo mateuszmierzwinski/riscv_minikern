@@ -5,6 +5,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 /* Finds key=value among space-separated words. On success returns the value
  * (not NUL-terminated at the word end) and stores its length in *len. A bare
@@ -26,5 +27,9 @@ bool cmdline_equals(const char *cmdline, const char *key, const char *value);
  * stored to address zero. A function that cannot be called wrongly beats a
  * comment telling callers not to. */
 bool cmdline_has(const char *cmdline, const char *key);
+
+/* A numeric option's value, or `fallback` when it is absent or not a
+ * number. For the options whose interesting part is how many. */
+uint64_t cmdline_number(const char *cmdline, const char *key, uint64_t fallback);
 
 #endif

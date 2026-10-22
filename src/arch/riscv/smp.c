@@ -81,6 +81,8 @@ static void add_hart(const struct fdt *fdt, const char *path, uint64_t boot_hart
                   mmu_is_usable((const char *)mmu.value, mmu.len);
     h->startable = id != boot_hart && h->has_sv39;
     h->running = id == boot_hart;
+    /* Before any other hart is started, so a plain increment is correct
+     * here and only here. */
     running += h->running ? 1u : 0u;
 }
 
@@ -121,16 +123,36 @@ const struct smp_hart *smp_hart(uint32_t index) {
 }
 
 uint32_t smp_running_count(void) {
-    return running;
+    /* Read atomically because harts are still arriving while the boot hart
+     * reports the total. */
+    return __atomic_load_n(&running, __ATOMIC_SEQ_CST);
 }
 
+/* A hart reporting that it reached the kernel.
+ *
+ * **Every hart calls this at once, so none of it may be a plain
+ * read-modify-write.** It used to claim the slot and then write `running++`,
+ * and on four real U74s starting together increments were simply lost: the
+ * atomic counter beside it in the composition root said three harts had
+ * arrived while this one said two, and an earlier boot of the same binary
+ * said three. A deficit that varies run to run is the signature.
+ *
+ * It is not a cosmetic counter. `sched_nprocs` reports it to user space,
+ * which is where a Go runtime gets `NumCPU` — so the board ran Go on two of
+ * its four cores and nothing looked wrong. QEMU never showed it, because
+ * its harts arrive far enough apart.
+ *
+ * The slot is claimed with an exchange, which also makes a second call for
+ * the same hart harmless. */
 void smp_secondary_arrived(uint64_t hart) {
     for (uint32_t i = 0; i < count; i++) {
-        if (harts[i].id == hart && !harts[i].running) {
-            harts[i].running = true;
-            running++;
-            return;
+        if (harts[i].id != hart) {
+            continue;
         }
+        if (!__atomic_exchange_n(&harts[i].running, true, __ATOMIC_SEQ_CST)) {
+            __atomic_add_fetch(&running, 1u, __ATOMIC_SEQ_CST);
+        }
+        return;
     }
 }
 

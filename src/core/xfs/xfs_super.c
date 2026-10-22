@@ -105,17 +105,37 @@ static int check_geometry(const struct xfs *fs) {
     return KERR_OK;
 }
 
-/* Refuses every feature this reader does not fully understand. That
- * refusal is the reader's safety argument, so it is a whitelist: a flag
- * nobody here has heard of stops the mount rather than being ignored. */
-static int check_features(const uint8_t *sb) {
+/* Refuses every feature this reader does not fully understand — except the
+ * ones the **format itself** says a read-only mount may ignore.
+ *
+ * That exception is not a relaxation of the safety argument; it is what the
+ * `ro_compat` field means. XFS divides its feature flags into three sets,
+ * and the compatibility each promises is different: an `incompat` flag
+ * changes the structures a reader must understand, a `log_incompat` flag the
+ * log's contents, and an `ro_compat` flag only the structures a *writer*
+ * must maintain. Reverse mapping and reflink are both of the last kind: the
+ * reverse-map tree is an auxiliary index that reading never consults, and a
+ * shared extent is read exactly like an unshared one — sharing only
+ * constrains what writing may do to it.
+ *
+ * Refusing them outright made this reader usable only on a filesystem
+ * formatted specially for it. The first card here was made with
+ * `reflink=0,rmapbt=0` and mounted; a drive formatted with `mkfs.xfs`'s
+ * **defaults**, which turn both on, was refused — and "your filesystem must
+ * be built for my kernel" is not a filesystem reader.
+ *
+ * The obligation that comes with it is enforced rather than assumed: a
+ * filesystem carrying `ro_compat` flags this reader does not implement is
+ * marked unwritable, so every write path refuses it (`xfs_writable`). The
+ * `incompat` and `log_incompat` sets stay a strict whitelist. */
+static int check_features(struct xfs *fs, const uint8_t *sb) {
     uint32_t ro = xfs_be32(sb + XFS_SB_FEAT_RO_COMPAT);
     uint32_t in = xfs_be32(sb + XFS_SB_FEAT_INCOMPAT);
     uint32_t log = xfs_be32(sb + XFS_SB_FEAT_LOG_INCOMPAT);
     if ((ro & ~XFS_FEAT_RO_SUPPORTED) != 0) {
-        kprintf("xfs: unsupported read-only features %08x (reflink or rmapbt: refused)\n",
+        kprintf("xfs: read-only features %08x not implemented here: no writing\n",
                 ro & ~XFS_FEAT_RO_SUPPORTED);
-        return KERR_NOTSUP;
+        fs->write_refused = true;
     }
     if ((in & ~XFS_FEAT_IN_SUPPORTED) != 0) {
         kprintf("xfs: unsupported features %08x (sparse inodes, nrext64 or needsrepair: refused)\n",
@@ -130,7 +150,7 @@ static int check_features(const uint8_t *sb) {
 }
 
 /* Checks the superblock image is a v5 one we may use. */
-static int check_super(const uint8_t *sb) {
+static int check_super(struct xfs *fs, const uint8_t *sb) {
     uint16_t version;
     if (xfs_be32(sb + 0) != XFS_SB_MAGIC) {
         kprintf("xfs: not an XFS filesystem (magic %08x)\n", xfs_be32(sb + 0));
@@ -145,7 +165,7 @@ static int check_super(const uint8_t *sb) {
         kprintf("xfs: mkfs did not finish with this filesystem\n");
         return KERR_INVAL;
     }
-    return check_features(sb);
+    return check_features(fs, sb);
 }
 
 /* The superblock's checksum covers its whole **sector**, not the fields
@@ -171,7 +191,7 @@ static void take_uuid(struct xfs *fs, const uint8_t *sb) {
 /* Reads block 0 and takes everything the geometry needs from it. The block
  * stays pinned for as long as the superblock is being read out of it. */
 static int mount_from_super(struct xfs *fs, const uint8_t *sb) {
-    int rc = check_super(sb);
+    int rc = check_super(fs, sb);
     if (rc != KERR_OK) {
         return rc;
     }

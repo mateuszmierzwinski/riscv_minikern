@@ -49,15 +49,29 @@ kernel_image = rule(
     doc = "Builds the kernel for the board platform and names the ELF the firmware loads.",
 )
 
-def kernel_binary(name, srcs, deps, **kwargs):
-    """A cc_binary with the kernel's link script and the version stamped in."""
+def kernel_binary(name, srcs, deps, load_address = None, binary = False, **kwargs):
+    """A cc_binary with the kernel's link script and the version stamped in.
+
+    `load_address` overrides where the image is linked. The default is QEMU's
+    `0x80200000`; a real VisionFive 2 has DRAM at `0x40000000`, so its image
+    links at `0x40200000` — measured from the board's own U-Boot, which
+    reports `kernel_addr_r=0x40200000`.
+
+    `binary` emits a **flat image** rather than an ELF, which is what a
+    loader's `booti` takes. The linker produces it directly
+    (`--oformat=binary`), which matters here: Fedora's binutils cannot read a
+    RISC-V object at all, so there is no `objcopy` to convert one with.
+    """
+    linkopts = ["-Wl,-T,$(location src/arch/riscv/link.ld)"]
+    if load_address:
+        linkopts.append("-Wl,--defsym=KERNEL_LOAD=%s" % load_address)
+    if binary:
+        linkopts.append("-Wl,--oformat=binary")
     cc_binary(
         name = name,
         srcs = srcs,
         additional_linker_inputs = ["src/arch/riscv/link.ld"],
-        linkopts = [
-            "-Wl,-T,$(location src/arch/riscv/link.ld)",
-        ],
+        linkopts = linkopts,
         local_defines = ['MINIKERN_VERSION=\\"%s\\"' % MINIKERN_VERSION],
         target_compatible_with = ["//platforms:riscv64"],
         deps = deps,

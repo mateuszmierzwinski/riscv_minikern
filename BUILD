@@ -70,6 +70,30 @@ cc_library(
     deps = [":core_boot"],
 )
 
+# The SD protocol's arithmetic, with no controller: the capacity a CSD
+# reports, in both of the layouts a card can use.
+# Partition tables: both formats, and the protective MBR that must not be
+# followed.
+cc_test(
+    name = "partition_test",
+    size = "small",
+    srcs = ["test/partition_test.c"],
+    deps = [
+        ":ktest",
+        ":partition",
+    ],
+)
+
+cc_test(
+    name = "sdcard_test",
+    size = "small",
+    srcs = ["test/sdcard_test.c"],
+    deps = [
+        ":drivers_sdcard",
+        ":ktest",
+    ],
+)
+
 cc_test(
     name = "pmm_test",
     size = "small",
@@ -469,7 +493,47 @@ cc_library(
     deps = [
         ":arch_riscv",
         ":console",
+        ":drivers_sdcard",
         ":kernel_mem",
+        ":storage",
+    ],
+)
+
+# The SD controller a VisionFive 2 actually has: a DesignWare mobile-storage
+# controller, not the Cadence SDHCI the documentation claimed. The card's side
+# of the protocol is shared with the SDHCI path.
+# The SD card's side of the conversation, with no controller in it: one copy,
+# shared by the two transports that have nothing else in common.
+# One partition of a disk, as a disk: GPT and MBR, so a filesystem that does
+# not start at sector 0 is found.
+cc_library(
+    name = "partition",
+    srcs = ["src/core/partition.c"],
+    hdrs = ["src/core/partition.h"],
+    strip_include_prefix = "src",
+    deps = [":storage"],
+)
+
+cc_library(
+    name = "drivers_sdcard",
+    srcs = ["src/drivers/sdcard.c"],
+    hdrs = ["src/drivers/sdcard.h"],
+    strip_include_prefix = "src",
+    deps = [":core_boot"],
+)
+
+cc_library(
+    name = "drivers_dwmmc",
+    srcs = ["src/drivers/dwmmc.c"],
+    hdrs = ["src/drivers/dwmmc.h"],
+    strip_include_prefix = "src",
+    target_compatible_with = ["//platforms:riscv64"],
+    deps = [
+        ":arch_riscv",
+        ":console",
+        ":core_boot",
+        ":drivers_gpio",
+        ":drivers_sdcard",
         ":storage",
     ],
 )
@@ -503,6 +567,7 @@ cc_library(
         "src/kernel/sched.c",
         "src/kernel/fdobjects.c",
         "src/kernel/sock_tcp.c",
+        "src/kernel/sys_proc.c",
         "src/kernel/sys_socket.c",
         "src/kernel/sock_udp.c",
         "src/kernel/socket.c",
@@ -529,6 +594,7 @@ cc_library(
         ":exec",
         ":kernel_mem",
         ":kernel_net",
+        ":kernel_xfs",
         ":kernel_random",
         ":klock",
         ":net",
@@ -572,9 +638,11 @@ cc_library(
     target_compatible_with = ["//platforms:riscv64"],
     deps = [
         ":console",
+        ":drivers_dwmmc",
         ":drivers_pci",
         ":drivers_virtio",
         ":kernel_mem",
+        ":partition",
         ":storage",
     ],
 )
@@ -699,6 +767,35 @@ kernel_binary(
         ":kernel_xfs",
         ":kmem",
     ],
+)
+
+# The same kernel for a real VisionFive 2: linked at DRAM's base plus 2 MiB,
+# which on this board is 0x40200000 rather than QEMU's 0x80200000, and emitted
+# as a flat image because that is what a loader's `booti` takes.
+kernel_binary(
+    name = "kernel_board",
+    srcs = [],
+    binary = True,
+    load_address = "0x40200000",
+    tags = ["manual"],
+    deps = [
+        ":arch_riscv",
+        ":board_jh7110",
+        ":drivers_gpio",
+        ":drivers_pci",
+        ":drivers_virtio",
+        ":kernel_disk",
+        ":kernel_mem",
+        ":kernel_uspace",
+        ":kernel_xfs",
+        ":kmem",
+    ],
+)
+
+kernel_image(
+    name = "minikern_board",
+    kernel = ":kernel_board",
+    tags = ["manual"],
 )
 
 kernel_image(

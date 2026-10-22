@@ -331,20 +331,43 @@ static int start_controller(void) {
     return wait_ready(true);
 }
 
+/* The buffer an identify command writes into.
+ *
+ * **Page-aligned by construction, not by allocation.** A command's data
+ * pointer is a PRP entry: a page address plus an offset, and identify
+ * requires that offset to be zero. The heap returns 8-byte-aligned memory,
+ * so a `kzalloc(4096)` here gave the controller a pointer into the middle of
+ * a page and the command came back with an error — on real silicon. QEMU's
+ * model accepts it, which is why the queues were allocated as pages and this
+ * one buffer was not: the mistake was invisible for as long as there was no
+ * drive to refuse it.
+ *
+ * Static rather than allocated because it is used twice during start-up and
+ * never afterwards, and because an alignment that the type system states is
+ * one a later edit cannot quietly lose. */
+static uint8_t identify_buffer[4096] __attribute__((aligned(4096)));
+
 int nvme_init(struct blockdev *out) {
-    uint8_t *page;
+    uint8_t *page = identify_buffer;
     int rc = pci_find_class(NVME_PCI_CLASS, NVME_PCI_CLASS_MASK, &nvme.pci);
     if (rc != KERR_OK) {
         return rc;
     }
     nvme.regs = (volatile uint32_t *)(uintptr_t)nvme.pci.bar0;
+    /* The controller's capability register, before anything is asked of it.
+     * A drive that is mapped but not reachable reads all-ones or zeros here,
+     * which separates "the bridge does not forward this address" from "the
+     * controller refused to start" — two failures that otherwise look the
+     * same from outside. */
+    kprintf("nvme: bar0 %016llx, cap %08x%08x\n", (unsigned long long)nvme.pci.bar0,
+            (unsigned)nvme.regs[1], (unsigned)nvme.regs[0]);
     rc = start_controller();
     if (rc != KERR_OK) {
+        kprintf("nvme: the controller would not start (rc %d)\n", rc);
         return rc;
     }
-    page = kzalloc(4096u);
-    if (page == NULL) {
-        return KERR_NOMEM;
+    for (uint32_t i = 0; i < sizeof identify_buffer; i++) {
+        identify_buffer[i] = 0;
     }
     rc = identify(1u, 0, page); /* the controller */
     if (rc == KERR_OK) {
@@ -355,8 +378,8 @@ int nvme_init(struct blockdev *out) {
         take_geometry(page);
         rc = create_io_queues();
     }
-    kfree(page);
     if (rc != KERR_OK) {
+        kprintf("nvme: identify or queue setup failed (rc %d)\n", rc);
         return rc;
     }
     nvme.up = true;

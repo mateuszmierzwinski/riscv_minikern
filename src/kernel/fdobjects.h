@@ -29,6 +29,28 @@ int fdobjects_open_eventfd(uint64_t initial, uint32_t flags);
 /* An epoll instance. */
 int fdobjects_open_epoll(uint32_t flags);
 
+/* Opens one of the few paths a process can name.
+ *
+ * There is no filesystem in a process's view of the world — the kernel reads
+ * its programs off the disk, but a process has no path namespace — so this
+ * is a short list of **synthesised** files rather than a lookup. The list is
+ * short because it is demand-driven: each entry is here because a program
+ * asked for it and could not proceed without it.
+ *
+ * `/dev/null` is the one that matters: a runtime opens it for any command
+ * whose input or output it was not given, so `os/exec` cannot start a
+ * program without it.
+ *
+ * KERR_NOENT for anything else, which is the right answer and one a runtime
+ * handles — it is what a probe for an optional file expects. */
+int fdobjects_open_path(const char *path, uint32_t flags);
+
+/* A pipe: two descriptors, the read end first, which is the order `pipe2`
+ * writes them in. This is how a program started by another reports that it
+ * could not start — the only way, in fact, because by then it has no
+ * descriptors of its own to speak through. */
+int fdobjects_open_pipe(int32_t out[2], uint32_t flags);
+
 /* One registration in an epoll instance, as user space passes it.
  *
  * **Not packed.** `struct epoll_event` carries `__attribute__((packed))` in

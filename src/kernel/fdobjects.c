@@ -114,6 +114,196 @@ int fdobjects_open_eventfd(uint64_t initial, uint32_t flags) {
     return fd_install(f);
 }
 
+/* ── the few paths that exist ───────────────────────────────────────────── */
+
+/* `/dev/null`: reads end immediately, writes vanish. */
+static int32_t null_read(struct file *f, void *buf, uint32_t n) {
+    (void)f;
+    (void)buf;
+    (void)n;
+    return 0;
+}
+
+static int32_t null_write(struct file *f, const void *buf, uint32_t n) {
+    (void)f;
+    (void)buf;
+    return (int32_t)n;
+}
+
+/* `/dev/zero`: reads give zeros, for ever. */
+static int32_t zero_read(struct file *f, void *buf, uint32_t n) {
+    uint8_t *to = buf;
+    (void)f;
+    for (uint32_t i = 0; i < n; i++) {
+        to[i] = 0;
+    }
+    return (int32_t)n;
+}
+
+static const struct file_ops null_ops = {.read = null_read, .write = null_write};
+static const struct file_ops zero_ops = {.read = zero_read, .write = null_write};
+
+static bool same_path(const char *a, const char *b) {
+    uint32_t i = 0;
+    while (a[i] != '\0' && a[i] == b[i]) {
+        i++;
+    }
+    return a[i] == b[i];
+}
+
+int fdobjects_open_path(const char *path, uint32_t flags) {
+    const struct file_ops *ops = NULL;
+    struct file *f;
+    if (same_path(path, "/dev/null")) {
+        ops = &null_ops;
+    } else if (same_path(path, "/dev/zero")) {
+        ops = &zero_ops;
+    } else if (same_path(path, "/dev/console") || same_path(path, "/dev/tty")) {
+        ops = &console_ops;
+    }
+    if (ops == NULL) {
+        return KERR_NOENT;
+    }
+    f = file_new(ops, NULL, flags);
+    return f == NULL ? KERR_NOMEM : fd_install(f);
+}
+
+/* ── a pipe ─────────────────────────────────────────────────────────────── */
+
+/* A ring, shared by the two ends, and a count of how many ends are still
+ * open — which is what makes a read return end-of-file rather than blocking
+ * for ever once the writer has gone, and what makes a write fail rather than
+ * filling a buffer nobody will drain.
+ *
+ * 4 KiB because that is the capacity a program may assume; it is also what
+ * makes a report from a failed `exec` fit in one write. */
+#define PIPE_BYTES 4096u
+
+struct pipe {
+    uint8_t data[PIPE_BYTES];
+    uint32_t head;
+    uint32_t count;
+    bool reader_open;
+    bool writer_open;
+};
+
+static uint32_t pipe_used(const struct pipe *pp) {
+    return pp->count;
+}
+
+static int32_t pipe_read(struct file *f, void *buf, uint32_t n) {
+    struct pipe *pp = f->priv;
+    uint8_t *to = buf;
+    uint32_t took = 0;
+    if (pipe_used(pp) == 0) {
+        /* **End of file only when the writer has gone.** An empty pipe with
+         * a live writer is "not yet", which is `EAGAIN` — reporting 0 there
+         * would tell the reader the conversation was over. */
+        return pp->writer_open ? KERR_AGAIN : 0;
+    }
+    while (took < n && pp->count > 0) {
+        to[took++] = pp->data[pp->head];
+        pp->head = (pp->head + 1u) % PIPE_BYTES;
+        pp->count--;
+    }
+    file_readiness_changed(f);
+    (void)sched_futex_wake(SCHED_POLLER_KEY, 64u);
+    return (int32_t)took;
+}
+
+static int32_t pipe_write(struct file *f, const void *buf, uint32_t n) {
+    struct pipe *pp = f->priv;
+    const uint8_t *from = buf;
+    uint32_t put = 0;
+    if (!pp->reader_open) {
+        /* Writing to a pipe nobody will read. Linux also raises SIGPIPE;
+         * the error alone is what a runtime checks. */
+        return KERR_PIPE;
+    }
+    while (put < n && pp->count < PIPE_BYTES) {
+        pp->data[(pp->head + pp->count) % PIPE_BYTES] = from[put++];
+        pp->count++;
+    }
+    if (put == 0) {
+        return KERR_AGAIN; /* full: a short write of zero is a would-block */
+    }
+    file_readiness_changed(f);
+    (void)sched_futex_wake(SCHED_POLLER_KEY, 64u);
+    return (int32_t)put;
+}
+
+static uint32_t pipe_read_poll(struct file *f) {
+    const struct pipe *pp = f->priv;
+    uint32_t ready = pipe_used(pp) != 0 ? EPOLLIN : 0u;
+    /* A closed writer makes the end readable *and* hung up: a reader must
+     * wake to see the end of the stream, not wait for data that cannot
+     * come. */
+    return ready | (pp->writer_open ? 0u : (EPOLLIN | EPOLLHUP));
+}
+
+static uint32_t pipe_write_poll(struct file *f) {
+    const struct pipe *pp = f->priv;
+    uint32_t ready = pipe_used(pp) < PIPE_BYTES ? EPOLLOUT : 0u;
+    return ready | (pp->reader_open ? 0u : EPOLLERR);
+}
+
+/* The ring is freed when **both** ends have gone, which is why each end's
+ * release only clears its own flag. */
+static void pipe_release_read(struct file *f) {
+    struct pipe *pp = f->priv;
+    pp->reader_open = false;
+    if (!pp->writer_open) {
+        kfree(pp);
+    }
+}
+
+static void pipe_release_write(struct file *f) {
+    struct pipe *pp = f->priv;
+    pp->writer_open = false;
+    if (!pp->reader_open) {
+        kfree(pp);
+    }
+}
+
+static const struct file_ops pipe_read_ops = {
+    .read = pipe_read,
+    .poll = pipe_read_poll,
+    .release = pipe_release_read,
+};
+
+static const struct file_ops pipe_write_ops = {
+    .write = pipe_write,
+    .poll = pipe_write_poll,
+    .release = pipe_release_write,
+};
+
+int fdobjects_open_pipe(int32_t out[2], uint32_t flags) {
+    struct pipe *pp = kzalloc(sizeof *pp);
+    struct file *r;
+    struct file *w;
+    if (pp == NULL) {
+        return KERR_NOMEM;
+    }
+    pp->reader_open = true;
+    pp->writer_open = true;
+    r = file_new(&pipe_read_ops, pp, flags);
+    w = file_new(&pipe_write_ops, pp, flags);
+    if (r == NULL || w == NULL) {
+        file_put(r);
+        file_put(w);
+        kfree(pp);
+        return KERR_NOMEM;
+    }
+    out[0] = (int32_t)fd_install(r);
+    out[1] = (int32_t)fd_install(w);
+    if (out[0] < 0 || out[1] < 0) {
+        (void)fd_close(out[0]);
+        (void)fd_close(out[1]);
+        return KERR_MFILE;
+    }
+    return KERR_OK;
+}
+
 /* ── the epoll instance ─────────────────────────────────────────────────── */
 
 #define EPOLL_WATCHED 32u

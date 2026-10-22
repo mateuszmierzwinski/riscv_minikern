@@ -7,9 +7,27 @@
 #include "core/console.h"
 #include "core/errno.h"
 
-/* 16550 registers, one byte each. The JH7110 and QEMU's ns16550a agree on
- * these; a part that needs 32-bit accesses would need its own reg-shift,
- * which the device tree provides and this driver would have to honour. */
+/* 16550 register *numbers*. How far apart they actually sit, and how wide
+ * each access must be, is **the board's business and the device tree says
+ * so**:
+ *
+ *   - QEMU's `ns16550a` has no `reg-shift`, so the registers are one byte
+ *     apart and a byte access reaches them.
+ *   - The **JH7110's `snps,dw-apb-uart` has `reg-shift = <2>` and
+ *     `reg-io-width = <4>`**: the registers are four bytes apart and must be
+ *     read and written as 32-bit words.
+ *
+ * This driver assumed one byte apart, which was right on the emulator and
+ * wrong on the board — and the failure was not silence but *garbling*. The
+ * transmit register is at offset 0 either way, so characters went out; the
+ * line-status register is number 5, which with a shift of two is at 0x14 and
+ * without it is a byte inside the interrupt-enable register. So the
+ * "is the transmitter ready?" test read an unrelated register, the driver
+ * wrote without waiting, the FIFO overran, and most of the output
+ * disappeared. The board printed its boot banner through SBI perfectly and
+ * then became unreadable the moment the kernel took the port over.
+ *
+ * No emulator could have shown this: QEMU's shift is zero. */
 #define UART_THR 0u  /* write: transmit */
 #define UART_RBR 0u  /* read: receive */
 #define UART_IER 1u
@@ -28,16 +46,35 @@ static const char *const compatibles[] = {"snps,dw-apb-uart", "ns16550a"};
 static struct {
     volatile uint8_t *regs;
     phys_t base;
+    /* From the tree: how far apart the registers are (as a shift) and how
+     * wide each access must be. */
+    uint32_t reg_shift;
+    uint32_t io_width;
     char path[64];
     bool up;
 } uart;
 
+/* One register's address, honouring the board's spacing. */
+static volatile void *at(uint32_t reg) {
+    return (volatile void *)(uart.regs + ((size_t)reg << uart.reg_shift));
+}
+
 static void put(uint32_t reg, uint8_t v) {
-    uart.regs[reg] = v;
+    /* The width matters as much as the spacing: a part that wants 32-bit
+     * accesses may ignore a byte write entirely, or take it and leave the
+     * other three bytes of the word undefined. */
+    if (uart.io_width == 4u) {
+        *(volatile uint32_t *)at(reg) = v;
+    } else {
+        *(volatile uint8_t *)at(reg) = v;
+    }
 }
 
 static uint8_t get(uint32_t reg) {
-    return uart.regs[reg];
+    if (uart.io_width == 4u) {
+        return (uint8_t)*(volatile uint32_t *)at(reg);
+    }
+    return *(volatile uint8_t *)at(reg);
 }
 
 /* Waits for the transmit holding register to drain. Bounded, because a
@@ -101,6 +138,14 @@ int jh7110_uart_init(const struct fdt *fdt, struct console_port *out) {
     }
     uart.regs = (volatile uint8_t *)(uintptr_t)base;
     uart.base = base;
+    /* **How the registers are laid out, from the tree rather than assumed.**
+     * `reg-shift` is how far apart they are as a power of two and
+     * `reg-io-width` how wide each access must be; both default to the
+     * generic 16550's one-byte arrangement, which is what an emulator
+     * describes and what this driver used to hard-code. The JH7110 says 2
+     * and 4. */
+    uart.reg_shift = fdt_get_u32(fdt, path, "reg-shift", 0u);
+    uart.io_width = fdt_get_u32(fdt, path, "reg-io-width", 1u);
     remember_path(path);
     /* The FIFOs on and receive interrupts off: this console is polled, and a
      * device left asserting an interrupt nobody handles is how a board hangs
@@ -109,6 +154,11 @@ int jh7110_uart_init(const struct fdt *fdt, struct console_port *out) {
     put(UART_IER, 0);
     put(UART_FCR, 0x07u); /* enable, and clear both FIFOs */
     uart.up = true;
+    /* Reported, because getting it wrong is not silence but garbling — and
+     * garbled output is the hardest thing to diagnose with nothing but
+     * garbled output to read. */
+    kprintf("uart: registers %u bytes apart, %u-byte accesses\n",
+            1u << uart.reg_shift, uart.io_width);
     *out = (struct console_port){.write = uart_write, .self = NULL};
     return KERR_OK;
 }

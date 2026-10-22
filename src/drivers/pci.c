@@ -79,26 +79,67 @@ static int read_memory_window(const struct fdt *fdt, const char *path) {
             fdt_prop_cells(&ranges, i * 7u + 5u, 2, &size) != KERR_OK) {
             return KERR_INVAL;
         }
-        if ((tag >> 24) == 0x02u) {
+        /* **Only the space code identifies the window.** The top byte of a
+         * `ranges` tag carries three independent flags above the two-bit
+         * space code — non-relocatable, prefetchable, aliased — and this
+         * compared the whole byte against `0x02`, the value QEMU happens to
+         * emit. A VisionFive 2 emits `0x82` for its 32-bit window and `0xc3`
+         * for its 64-bit one, so both were rejected and the board appeared
+         * to have no host bridge at all.
+         *
+         * 0b10 is a 32-bit memory window and 0b11 a 64-bit one; either will
+         * do for a BAR, and the 32-bit one is preferred because a 32-bit
+         * BAR cannot be placed above 4 GiB. */
+        uint32_t space = (uint32_t)((tag >> 24) & 0x03u);
+        if (space == 0x02u) {
             pci.mem_base = parent;
             pci.mem_size = size;
             return KERR_OK;
+        }
+        if (space == 0x03u && pci.mem_size == 0) {
+            pci.mem_base = parent; /* a fallback if there is no 32-bit window */
+            pci.mem_size = size;
         }
     }
     return KERR_NOENT;
 }
 
-int pci_init(const struct fdt *fdt) {
-    char path[64];
+/* The host bridges this kernel can read config space through.
+ *
+ * `pci-host-ecam-generic` is the emulator's. **`starfive,jh7110-pcie` is a
+ * PLDA XpressRich controller**, and this kernel uses it on one explicit
+ * condition: the firmware has already brought it up. Its first `reg` is a
+ * 16 MiB window addressed exactly as ECAM is — bus at bit 20, device at 15,
+ * function at 12 — so once the clocks, the PHY and link training are done,
+ * reading a device's configuration space is the same operation on both
+ * bridges.
+ *
+ * That dependency is real and is stated rather than hidden: U-Boot prints
+ * `Starfive PCIe bus probed` before handing over, and this kernel inherits a
+ * trained link the way it inherits OpenSBI's trap handling. A cold boot into
+ * this kernel with no firmware PCIe initialisation would need the
+ * controller's own bring-up — six resets, four clocks and a syscon
+ * handshake, per the node — which is not written. The honest consequence: no
+ * device appears, rather than something subtly wrong.
+ *
+ * **Both are tried, and every instance of each.** This board has two PCIe
+ * controllers, `pcie@940000000` and `pcie@9c0000000`, and the M.2 slot is on
+ * one of them — the same lesson the two MMC controllers taught an hour
+ * earlier (CLAUDE.md §5). */
+static const char *const host_bridges[] = {"pci-host-ecam-generic", "starfive,jh7110-pcie"};
+
+/* Maps one candidate bridge's config space and adopts it. */
+static int adopt_bridge(const struct fdt *fdt, const char *path) {
     phys_t base = 0;
     uint64_t size = 0;
-    int rc = fdt_find_compatible(fdt, "pci-host-ecam-generic", path, sizeof path);
+    int rc = fdt_device_reg(fdt, path, 0, &base, &size);
     if (rc != KERR_OK) {
+        kprintf("pci: %s has no readable reg (rc %d)\n", path, rc);
         return rc;
     }
-    rc = fdt_device_reg(fdt, path, 0, &base, &size);
-    rc = rc != KERR_OK ? rc : read_memory_window(fdt, path);
+    rc = read_memory_window(fdt, path);
     if (rc != KERR_OK) {
+        kprintf("pci: %s: could not read its memory window (rc %d)\n", path, rc);
         return rc;
     }
     /* Only the buses this kernel walks are mapped: the whole ECAM region is
@@ -115,6 +156,76 @@ int pci_init(const struct fdt *fdt) {
     return KERR_OK;
 }
 
+/* True when a bridge has anything behind it. A controller with no link reads
+ * every vendor id as all-ones, and adopting that one would hide the bridge
+ * that does have the drive on it. */
+static bool bridge_has_a_device(void) {
+    return read32(0, 0, 0, PCI_VENDOR_ID) != 0xffffffffu &&
+           (read32(0, 0, 0, PCI_VENDOR_ID) & 0xffffu) != PCI_NO_VENDOR;
+}
+
+/* **Every** host bridge, not the first one with something behind it.
+ *
+ * A VisionFive 2 has two PCIe controllers. The USB 3 controller sits behind
+ * one of them and the M.2 slot behind the other, so a kernel that adopted
+ * the first bridge that answered found a USB controller, concluded there was
+ * no NVMe drive, and fell back to the SD card — with a drive fitted and
+ * working. It is the two-MMC-controllers lesson for the third time in one
+ * evening (CLAUDE.md §5), which is how often a board has two of something.
+ *
+ * Each is kept with its own window, and a search walks them in turn. */
+static struct host_bridge {
+    phys_t ecam_base;
+    uint64_t ecam_size;
+    phys_t mem_base;
+    uint64_t mem_size;
+} bridges[4];
+static uint32_t bridge_count;
+
+/* Points the config-space accessors at one of the bridges found. */
+static void select_bridge(uint32_t i) {
+    pci.ecam = (volatile uint8_t *)(uintptr_t)bridges[i].ecam_base;
+    pci.ecam_base = bridges[i].ecam_base;
+    pci.ecam_size = bridges[i].ecam_size;
+    pci.mem_base = bridges[i].mem_base;
+    pci.mem_size = bridges[i].mem_size;
+    pci.mem_used = 0;
+    pci.up = true;
+}
+
+int pci_init(const struct fdt *fdt) {
+    bridge_count = 0;
+    for (uint32_t which = 0; which < sizeof host_bridges / sizeof host_bridges[0]; which++) {
+        for (uint32_t skip = 0; skip < 4u; skip++) {
+            char path[64];
+            if (fdt_find_compatible_nth(fdt, host_bridges[which], skip, path, sizeof path) !=
+                KERR_OK) {
+                break;
+            }
+            if (adopt_bridge(fdt, path) != KERR_OK ||
+                bridge_count >= sizeof bridges / sizeof bridges[0]) {
+                continue;
+            }
+            if (!bridge_has_a_device()) {
+                kprintf("pci: %s: nothing behind it\n", path);
+                pci.up = false;
+                continue;
+            }
+            bridges[bridge_count++] = (struct host_bridge){.ecam_base = pci.ecam_base,
+                                                           .ecam_size = pci.ecam_size,
+                                                           .mem_base = pci.mem_base,
+                                                           .mem_size = pci.mem_size};
+            kprintf("pci: %s at %016llx\n", path, (unsigned long long)pci.ecam_base);
+        }
+    }
+    if (bridge_count == 0) {
+        kprintf("pci: no usable host bridge\n");
+        return KERR_NOENT;
+    }
+    select_bridge(0);
+    return KERR_OK;
+}
+
 /* Gives BAR0 an address out of the bridge's window.
  *
  * The size is discovered the way the specification prescribes: write all
@@ -128,6 +239,38 @@ static int assign_bar0(struct pci_device *d) {
     uint64_t size, at;
     if ((original & BAR_IO) != 0) {
         return KERR_NOTSUP; /* an I/O BAR: nothing here needs one */
+    }
+    /* **A BAR the firmware already placed is left where it is.**
+     *
+     * On a board whose firmware enumerated the bus — which is every board
+     * that reaches this kernel through U-Boot — the root port's windows are
+     * programmed to forward exactly the addresses it handed out. Choosing a
+     * different address out of the bridge's `ranges` produces a BAR the
+     * bridge does not forward: the device answers nothing, and the first
+     * read of its registers hangs rather than failing, because a PCIe read
+     * with no completer is a transaction that never completes.
+     *
+     * So the existing assignment is adopted and only an unprogrammed BAR is
+     * given an address. An emulator that hands over a bare bus still takes
+     * the second path, which is why both exist. */
+    if ((original & BAR_MEM_MASK) != 0) {
+        uint64_t existing = original & BAR_MEM_MASK;
+        if ((original & BAR_TYPE_64) != 0) {
+            existing |= (uint64_t)pci_config_read32(d, PCI_BAR0 + 4u) << 32;
+        }
+        pci_config_write32(d, PCI_BAR0, 0xffffffffu);
+        probe = pci_config_read32(d, PCI_BAR0);
+        pci_config_write32(d, PCI_BAR0, original);
+        mask = probe & BAR_MEM_MASK;
+        if (mask == 0) {
+            return KERR_NOTSUP;
+        }
+        d->bar0 = existing;
+        d->bar0_size = (uint64_t)(~mask) + 1u;
+        kprintf("pci: %02x:%02x.%u keeping its BAR0 at %016llx, %llu KiB\n", d->bus, d->slot,
+                d->function, (unsigned long long)d->bar0,
+                (unsigned long long)(d->bar0_size / 1024u));
+        return mmu_map_device(d->bar0, d->bar0_size);
     }
     pci_config_write32(d, PCI_BAR0, 0xffffffffu);
     probe = pci_config_read32(d, PCI_BAR0);
@@ -160,37 +303,138 @@ static void enable_device(struct pci_device *d) {
     pci_config_write32(d, PCI_COMMAND, cmd | PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
 }
 
+/* The buses this kernel looks at: bus 0, and whatever a bridge found on a
+ * bus already being scanned says lies behind it.
+ *
+ * **Not a sweep of bus numbers.** A configuration read addressed to a bus
+ * the root complex does not route is a transaction with no completer: it
+ * does not return all-ones and it does not fail — it never completes, and
+ * the kernel stops there with no output and nothing to read. QEMU's host
+ * bridge answers for every bus number, so sweeping 0..3 was correct against
+ * the emulator and hung on the first real board, immediately after the
+ * bridge was adopted.
+ *
+ * The bus numbers a machine actually has are the ones its own bridges name,
+ * in their secondary-bus register. */
+static uint8_t buses[MAX_BUSES];
+static uint32_t bus_count;
+
+static void note_bus(uint8_t bus) {
+    for (uint32_t i = 0; i < bus_count; i++) {
+        if (buses[i] == bus) {
+            return;
+        }
+    }
+    if (bus_count < MAX_BUSES) {
+        buses[bus_count++] = bus;
+    }
+}
+
 static bool matches_class(uint32_t class_revision, uint32_t wanted, uint32_t mask) {
     return ((class_revision >> 8) & mask) == (wanted & mask);
 }
 
+/* Nothing in this slot.
+ *
+ * **Absent reads back as zero here, not as all-ones.** The specification's
+ * convention — and QEMU's behaviour — is that a configuration read for a
+ * function that is not there returns all-ones, and this kernel tested only
+ * for that. The VisionFive 2's root complex returns **zero** instead, so an
+ * empty slot presented itself as vendor 0000, device 0000, class 000000;
+ * the kernel believed it, went on to read the rest of that function's
+ * configuration space, and hung on a transaction with no completer.
+ *
+ * Vendor id 0 is not a valid vendor, so both readings mean the same thing
+ * and both are checked. */
+static bool no_function_at(uint32_t id) {
+    return id == 0u || id == 0xffffffffu || (id & 0xffffu) == PCI_NO_VENDOR ||
+           (id & 0xffffu) == 0u;
+}
+
+/* Reads one function, notes a bridge's far side, and says whether it is the
+ * device being looked for. */
+static bool look_at(uint8_t bus, uint8_t slot, uint8_t fn, uint32_t class_code, uint32_t mask,
+                    struct pci_device *out) {
+    uint32_t id = read32(bus, slot, fn, PCI_VENDOR_ID);
+    uint32_t header;
+    struct pci_device d;
+    if (no_function_at(id)) {
+        return false;
+    }
+    pci.functions++;
+    header = read32(bus, slot, fn, PCI_HEADER_TYPE & ~3u) >> (8u * (PCI_HEADER_TYPE & 3u));
+    d = (struct pci_device){.bus = bus, .slot = slot, .function = fn, .vendor = (uint16_t)id,
+                            .device = (uint16_t)(id >> 16),
+                            .class_code = read32(bus, slot, fn, PCI_CLASS_REVISION)};
+    if ((header & 0x7fu) == 1u) {
+        /* A bridge: the bus behind it is a bus that exists. */
+        uint32_t secondary = read32(bus, slot, fn, PCI_SECONDARY_BUS & ~3u) >>
+                             (8u * (PCI_SECONDARY_BUS & 3u));
+        note_bus((uint8_t)(secondary & 0xffu));
+    }
+    kprintf("pci: %02x:%02x.%u  %04x:%04x  class %06x\n", bus, slot, fn, d.vendor, d.device,
+            (unsigned)(d.class_code >> 8));
+    if (!matches_class(d.class_code, class_code, mask) || assign_bar0(&d) != KERR_OK) {
+        return false;
+    }
+    enable_device(&d);
+    *out = d;
+    return true;
+}
+
+/* Whether a slot has anything in it, and whether to look at its other
+ * functions: a single-function device answers for function 0 only, and
+ * reading the rest of its functions is reading nothing. */
+static bool slot_is_multifunction(uint8_t bus, uint8_t slot) {
+    uint32_t header = read32(bus, slot, 0, PCI_HEADER_TYPE & ~3u) >>
+                      (8u * (PCI_HEADER_TYPE & 3u));
+    return (header & 0x80u) != 0;
+}
+
+static bool slot_is_empty(uint8_t bus, uint8_t slot) {
+    return no_function_at(read32(bus, slot, 0, PCI_VENDOR_ID));
+}
+
+/* Searches the bus tree of whichever bridge is currently selected. */
+static int find_class_here(uint32_t class_code, uint32_t mask, struct pci_device *out) {
+    bus_count = 0;
+    note_bus(0);
+    /* `bus_count` grows as bridges are found, so this walks the tree the
+     * machine actually has rather than the numbers it might have used. */
+    for (uint32_t i = 0; i < bus_count; i++) {
+        /* **Only bus 0 has slots.** A PCIe link is point to point: the bus
+         * behind a bridge has exactly one device on it, at slot 0. Reading
+         * the other 31 is not merely pointless — each one is a transaction
+         * the root complex answers only after a completion timeout, so a
+         * full sweep of two buses spent tens of seconds producing nothing,
+         * which reads exactly like a hang. Conventional PCI, where a bus
+         * really can carry 32 devices, is what bus 0 is scanned for. */
+        uint8_t slots = buses[i] == 0 ? MAX_SLOTS : 1u;
+        for (uint8_t slot = 0; slot < slots; slot++) {
+            uint8_t functions;
+            if (slot_is_empty(buses[i], slot)) {
+                continue;
+            }
+            functions = slot_is_multifunction(buses[i], slot) ? MAX_FUNCTIONS : 1u;
+            for (uint8_t fn = 0; fn < functions; fn++) {
+                if (look_at(buses[i], slot, fn, class_code, mask, out)) {
+                    return KERR_OK;
+                }
+            }
+        }
+    }
+    return KERR_NOENT;
+}
+
 int pci_find_class(uint32_t class_code, uint32_t mask, struct pci_device *out) {
-    if (!pci.up) {
+    if (bridge_count == 0) {
         return KERR_NODEV;
     }
     pci.functions = 0;
-    for (uint8_t bus = 0; bus < MAX_BUSES; bus++) {
-        for (uint8_t slot = 0; slot < MAX_SLOTS; slot++) {
-            for (uint8_t fn = 0; fn < MAX_FUNCTIONS; fn++) {
-                uint32_t id = read32(bus, slot, fn, PCI_VENDOR_ID);
-                struct pci_device d;
-                if ((id & 0xffffu) == PCI_NO_VENDOR) {
-                    break; /* nothing in this slot: its other functions are absent too */
-                }
-                pci.functions++;
-                d = (struct pci_device){.bus = bus, .slot = slot, .function = fn,
-                                        .vendor = (uint16_t)id, .device = (uint16_t)(id >> 16),
-                                        .class_code = read32(bus, slot, fn, PCI_CLASS_REVISION)};
-                if (!matches_class(d.class_code, class_code, mask)) {
-                    continue;
-                }
-                if (assign_bar0(&d) != KERR_OK) {
-                    continue;
-                }
-                enable_device(&d);
-                *out = d;
-                return KERR_OK;
-            }
+    for (uint32_t i = 0; i < bridge_count; i++) {
+        select_bridge(i);
+        if (find_class_here(class_code, mask, out) == KERR_OK) {
+            return KERR_OK;
         }
     }
     return KERR_NOENT;

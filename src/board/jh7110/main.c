@@ -41,6 +41,7 @@
 #include "kernel/mem.h"
 #include "arch/riscv/fp.h"
 #include "arch/riscv/smp.h"
+#include "drivers/dwmmc.h"
 #include "drivers/virtio_net.h"
 #include "kernel/klock.h"
 #include "kernel/net.h"
@@ -159,6 +160,17 @@ static void bring_up_memory(const struct bootinfo *info) {
 static void adopt_the_real_uart(uint64_t dtb) {
     struct console_port port;
     struct fdt fdt;
+    /* `minikern.uart=sbi` keeps the firmware's console and never touches the
+     * hardware. It exists because on a real board the two are not equally
+     * trustworthy: the firmware's console is known to work — it printed the
+     * banner — and this driver is the new thing. When output turned to
+     * fragments on first contact with a VisionFive 2, this was what
+     * separated "the kernel is stuck" from "the kernel is fine and cannot
+     * be heard". */
+    if (cmdline_has(boot_cmdline, "minikern.uart=sbi")) {
+        kprintf("uart: keeping the firmware's console (minikern.uart=sbi)\n");
+        return;
+    }
     if (fdt_open(&fdt, (const void *)(uintptr_t)dtb, FDT_MAX_BYTES) != KERR_OK) {
         return;
     }
@@ -260,6 +272,7 @@ static void wait_for_ticks(void) {
  * the last, because a filesystem lives at the beginning and a test that
  * scribbles on sector 0 destroys what the next test wants to read. */
 static void bring_up_storage(uint64_t dtb) {
+    dwmmc_set_trace(cmdline_has(boot_cmdline, "minikern.mmctrace"));
     struct fdt fdt;
     const struct blockdev *dev;
     if (fdt_open(&fdt, (const void *)(uintptr_t)dtb, FDT_MAX_BYTES) != KERR_OK) {
@@ -326,6 +339,8 @@ static void bring_up_filesystem(void) {
 }
 
 static void drive_a_pin(void);
+static void read_a_pin(void);
+static void loopback_pins(void);
 
 /* ── the other harts ───────────────────────────────────────────────────────── */
 
@@ -500,21 +515,36 @@ static void bring_up_network(uint64_t dtb) {
  * an emulator there is no pin controller at all, which is said rather than
  * passed over — "no GPIO" and "GPIO I failed to find" must not look the
  * same. */
+/* The clock generators, **before anything that needs a clock**.
+ *
+ * This used to be the first half of bringing up GPIO, which put it after
+ * storage — so the SD controller asked to be switched on before the thing
+ * that switches peripherals on existed, and reported "could not be clocked"
+ * on a board where its clocks were perfectly available. A step that
+ * everything else depends on belongs on its own, early. */
+static void bring_up_clocks(uint64_t dtb) {
+    struct fdt fdt;
+    if (fdt_open(&fdt, (const void *)(uintptr_t)dtb, FDT_MAX_BYTES) != KERR_OK) {
+        return;
+    }
+    if (crg_jh7110_init(&fdt) == 0) {
+        kprintf("crg: no JH7110 clock generator in the device tree\n");
+        return;
+    }
+    kprintf("crg: sys at %016llx, aon at %016llx\n", (unsigned long long)crg_base(CRG_SYS),
+            (unsigned long long)crg_base(CRG_AON));
+}
+
 static void bring_up_gpio(uint64_t dtb) {
     struct fdt fdt;
     uint32_t found;
     if (fdt_open(&fdt, (const void *)(uintptr_t)dtb, FDT_MAX_BYTES) != KERR_OK) {
         return;
     }
-    /* The clock generators first: a pin controller cannot be switched on
-     * without them, and a driver that skips that step is the one the ARM
-     * thermal sensor was (drivers/crg_jh7110.h). */
-    if (crg_jh7110_init(&fdt) == 0) {
-        kprintf("gpio: no JH7110 clock generator in the device tree\n");
+    if (!crg_present(CRG_SYS)) {
+        kprintf("gpio: no clock generator, so no pin controller\n");
         return;
     }
-    kprintf("crg: sys at %016llx, aon at %016llx\n", (unsigned long long)crg_base(CRG_SYS),
-            (unsigned long long)crg_base(CRG_AON));
     found = gpio_jh7110_init(&fdt);
     if (found == 0) {
         kprintf("gpio: no pin controller came up\n");
@@ -526,6 +556,8 @@ static void bring_up_gpio(uint64_t dtb) {
                     (unsigned long long)gpio_jh7110_base(i));
         }
     }
+    read_a_pin();
+    loopback_pins();
     drive_a_pin();
 }
 
@@ -544,21 +576,139 @@ static void bring_up_gpio(uint64_t dtb) {
  * This cannot run under an emulator — nothing models this controller — so a
  * machine without one says so and does nothing, which is the honest
  * outcome rather than a test that appears to pass. */
-static void drive_a_pin(void) {
+/* One `<controller>:<pin>` at `*at`, advancing past it and any comma. False
+ * when there is no number there, which ends a list. */
+static bool parse_pin(const char *spec, size_t len, uint32_t *at, uint32_t *controller,
+                      uint32_t *pin) {
+    uint32_t digits = 0;
+    *controller = 0;
+    *pin = 0;
+    while (*at < len && spec[*at] >= '0' && spec[*at] <= '9') {
+        *controller = *controller * 10u + (uint32_t)(spec[(*at)++] - '0');
+        digits++;
+    }
+    *at += *at < len && spec[*at] == ':' ? 1u : 0u;
+    while (*at < len && spec[*at] >= '0' && spec[*at] <= '9') {
+        *pin = *pin * 10u + (uint32_t)(spec[(*at)++] - '0');
+        digits++;
+    }
+    *at += *at < len && spec[*at] == ',' ? 1u : 0u;
+    return digits > 0;
+}
+
+/* A single `<controller>:<pin>` from a named option. False when the option is
+ * absent, so a caller can tell "not asked for" from "asked for pin 0". */
+static bool pin_from_cmdline(const char *option, uint32_t *controller, uint32_t *pin) {
     size_t len = 0;
-    const char *spec = cmdline_value(boot_cmdline, "minikern.gpio", &len);
-    uint32_t controller = 0, pin = 0, at = 0;
+    const char *spec = cmdline_value(boot_cmdline, option, &len);
+    uint32_t at = 0;
+    if (spec == NULL) {
+        return false;
+    }
+    return parse_pin(spec, len, &at, controller, pin);
+}
+
+/* Reads a pin without driving it.
+ *
+ * `minikern.gpio.read=<controller>:<pin>` — separate from driving one
+ * because reading is safe on any pin and driving is not, and because there
+ * is a pin on this board whose state is **known independently**: the SD
+ * slot's card-detect line. The tree says `cd-gpios = <… 41 1>`, active low,
+ * so with a card in the slot it must read low and with the slot empty it
+ * must read high. That makes it the one GPIO check on real silicon whose
+ * answer is not supplied by the thing being tested. */
+static void report_one_pin(uint32_t controller, uint32_t pin) {
     bool high = false;
-    int rc;
+    int rc = gpio_jh7110_set_input(controller, pin);
+    if (rc != KERR_OK) {
+        kprintf("gpio: could not make controller %u pin %u an input (rc %d)\n", controller, pin,
+                rc);
+        return;
+    }
+    rc = gpio_jh7110_read(controller, pin, &high);
+    if (rc != KERR_OK) {
+        kprintf("gpio: could not read controller %u pin %u (rc %d)\n", controller, pin, rc);
+        return;
+    }
+    kprintf("gpio: controller %u pin %u reads %s\n", controller, pin, high ? "high" : "low");
+}
+
+static void read_a_pin(void) {
+    size_t len = 0;
+    const char *spec = cmdline_value(boot_cmdline, "minikern.gpio.read", &len);
+    uint32_t at = 0, controller = 0, pin = 0;
     if (spec == NULL) {
         return;
     }
-    while (at < len && spec[at] >= '0' && spec[at] <= '9') {
-        controller = controller * 10u + (uint32_t)(spec[at++] - '0');
+    /* A list, because **one reading proves very little**: a register path
+     * that returns the same value for every pin would pass a single check on
+     * the card-detect line and mean nothing. Several pins that do not all
+     * agree is the evidence that the reading is the pin's and not the
+     * driver's. */
+    while (parse_pin(spec, len, &at, &controller, &pin)) {
+        report_one_pin(controller, pin);
     }
-    at += at < len && spec[at] == ':' ? 1u : 0u;
-    while (at < len && spec[at] >= '0' && spec[at] <= '9') {
-        pin = pin * 10u + (uint32_t)(spec[at++] - '0');
+}
+
+/* Drives one pin and reads another, with a wire between them.
+ *
+ * `minikern.gpio.loop=<controller>:<out>,<controller>:<in>` — the operator's
+ * own suggestion, and a **strictly better test than a pad loopback**: a pad
+ * loopback cannot distinguish a signal that reached the pin from a
+ * controller that merely remembers what it was told, because both the write
+ * and the read go through the same pin's logic. A jumper makes the two pins
+ * independent, so a reading on the far pin is evidence that the level
+ * physically left the near one and travelled down a wire.
+ *
+ * It also tests both directions at once — one pin configured as an output
+ * and another as an input — and it tests them *against each other*, which
+ * nothing inside the kernel can fake.
+ *
+ * Both levels are tried, because a pin stuck high reads correctly for half
+ * the test, and that half is the one a hasty check runs. */
+static void one_loopback(uint32_t out_ctrl, uint32_t out_pin, uint32_t in_ctrl, uint32_t in_pin) {
+    uint32_t matched = 0;
+    if (gpio_jh7110_set_input(in_ctrl, in_pin) != KERR_OK) {
+        kprintf("gpio: could not make %u:%u an input\n", in_ctrl, in_pin);
+        return;
+    }
+    for (uint32_t step = 0; step < 2u; step++) {
+        bool want = step == 0, got = false;
+        if (gpio_jh7110_set_output(out_ctrl, out_pin, want) != KERR_OK ||
+            gpio_jh7110_read(in_ctrl, in_pin, &got) != KERR_OK) {
+            kprintf("gpio: %u:%u -> %u:%u could not drive or read\n", out_ctrl, out_pin, in_ctrl,
+                    in_pin);
+            return;
+        }
+        matched += got == want ? 1u : 0u;
+    }
+    kprintf("gpio: %u:%u -> %u:%u  %s (%u of 2 levels)\n", out_ctrl, out_pin, in_ctrl, in_pin,
+            matched == 2u ? "WIRE OK" : "MISMATCH", matched);
+}
+
+static void loopback_pins(void) {
+    size_t len = 0;
+    const char *spec = cmdline_value(boot_cmdline, "minikern.gpio.loop", &len);
+    uint32_t at = 0, out_ctrl = 0, out_pin = 0, in_ctrl = 0, in_pin = 0;
+    if (spec == NULL) {
+        return;
+    }
+    /* Pairs of pairs: each wire is tested in **both** directions, which also
+     * proves a pin can be turned round from an output into an input — a
+     * one-way test leaves half the driver unexercised and would pass on a
+     * pin that is stuck in whichever mode it was first put into. */
+    while (parse_pin(spec, len, &at, &out_ctrl, &out_pin) &&
+           parse_pin(spec, len, &at, &in_ctrl, &in_pin)) {
+        one_loopback(out_ctrl, out_pin, in_ctrl, in_pin);
+    }
+}
+
+static void drive_a_pin(void) {
+    uint32_t controller = 0, pin = 0;
+    bool high = false;
+    int rc;
+    if (!pin_from_cmdline("minikern.gpio", &controller, &pin)) {
+        return;
     }
     kprintf("gpio: driving controller %u pin %u\n", controller, pin);
     for (uint32_t step = 0; step < 2u; step++) {
@@ -592,17 +742,24 @@ extern const char user_program_start[], user_program_end[];
 extern const char user_faulter_start[], user_faulter_end[];
 
 static void run_one_user_program(const char *name, const char *from, const char *to) {
-    struct uproc proc;
+    struct uproc *proc = uspace_alloc();
     int64_t status;
-    int rc = uspace_build(&proc, from, (uint32_t)(to - from));
-    if (rc != KERR_OK) {
-        kprintf("uspace: could not build %s (rc %d)\n", name, rc);
+    int rc;
+    if (proc == NULL) {
+        kprintf("uspace: no free process slot for %s\n", name);
         return;
     }
-    status = uspace_run(&proc);
+    rc = uspace_build(proc, from, (uint32_t)(to - from));
+    if (rc != KERR_OK) {
+        kprintf("uspace: could not build %s (rc %d)\n", name, rc);
+        uspace_release(proc);
+        return;
+    }
+    status = uspace_run(proc);
     kprintf("uspace: %s exited with %lld after %llu syscalls\n", name, (long long)status,
             (unsigned long long)uspace_syscalls());
-    uspace_destroy(&proc);
+    uspace_destroy(proc);
+    uspace_release(proc);
 }
 
 /* What each hart actually did.
@@ -638,17 +795,23 @@ static void report_hart_usage(void) {
 #define INIT_MAX_BYTES (4u * 1024u * 1024u)
 
 static void run_init_from_disk(const char *path) {
-    struct uproc proc;
+    struct uproc *proc = uspace_alloc();
     uint8_t *image = NULL;
     uint32_t size = 0;
     int64_t status;
-    int rc = xfsmount_read_file(path, INIT_MAX_BYTES, &image, &size);
+    int rc;
+    if (proc == NULL) {
+        kprintf("init: no free process slot\n");
+        return;
+    }
+    rc = xfsmount_read_file(path, INIT_MAX_BYTES, &image, &size);
     if (rc != KERR_OK) {
         kprintf("init: cannot read %s (rc %d)\n", path, rc);
+        uspace_release(proc);
         return;
     }
     kprintf("init: %s is %u bytes\n", path, size);
-    rc = uspace_build_elf(&proc, image, size, path);
+    rc = uspace_build_elf(proc, image, size, path);
     /* The image is copied into the process's pages, so it is not needed
      * once the address space is built. */
     kfree(image);
@@ -662,9 +825,10 @@ static void run_init_from_disk(const char *path) {
                 : rc == KERR_EXIST ? "its address space collides with the kernel's mappings"
                 : rc == KERR_NOMEM ? "out of memory"
                                    : "refused");
+        uspace_release(proc);
         return;
     }
-    status = uspace_run(&proc);
+    status = uspace_run(proc);
     kprintf("init: %s exited with %lld after %llu syscalls (%llu stale-translation faults)\n",
             path, (long long)status, (unsigned long long)uspace_syscalls(),
             (unsigned long long)uspace_stale_faults());
@@ -676,7 +840,7 @@ static void run_init_from_disk(const char *path) {
     if (cmdline_has(boot_cmdline, "minikern.netstat")) {
         knet_report();
     }
-    uspace_destroy(&proc);
+    uspace_destroy(proc);
 }
 
 static void run_user_programs(void) {
@@ -684,8 +848,12 @@ static void run_user_programs(void) {
      * starts half way through is worse than none, because the first half
      * looks quiet. */
     sched_set_trace(cmdline_has(boot_cmdline, "minikern.trace"));
-    syscall_set_trace(cmdline_has(boot_cmdline, "minikern.calls") ? 400u : 0u);
+    /* `minikern.calls=N` traces the first N calls. A fixed budget was
+     * useless for anything that happens late — the budget was gone long
+     * before a child process made its first call. */
+    syscall_set_trace(cmdline_number(boot_cmdline, "minikern.calls", 0u));
     syscall_trace_sleeps(cmdline_has(boot_cmdline, "minikern.sleeps"));
+    syscall_trace_errors(cmdline_has(boot_cmdline, "minikern.errors"));
     signal_set_delivery(!cmdline_has(boot_cmdline, "minikern.nosignals"));
     syscall_allow_tgkill(!cmdline_has(boot_cmdline, "minikern.nopreempt"));
     if (cmdline_has(boot_cmdline, "minikern.user")) {
@@ -733,6 +901,7 @@ void kmain(uint64_t hart, uint64_t dtb) {
     adopt_the_real_uart(dtb);
     bring_up_memory(&info);
     bring_up_interrupts(dtb, hart);
+    bring_up_clocks(dtb);
     bring_up_storage(dtb);
     bring_up_filesystem();
     bring_up_gpio(dtb);

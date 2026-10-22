@@ -27,7 +27,10 @@
 #include <stdint.h>
 
 #include "arch/riscv/pgtable.h"
+#include "arch/riscv/trap.h"
 #include "core/types.h"
+#include "kernel/file.h"
+#include "kernel/signal.h"
 
 /* Where a user program and its stack live. Low addresses, well inside the
  * bottom half, and nowhere near the kernel's. */
@@ -48,6 +51,19 @@
 #define USER_STACK_TOP 0x3FFFFFF000ull
 #define USER_MMAP_BASE 0x2000000000ull
 
+/* Where the kernel's return trampoline is mapped in the process, and the
+ * instructions it contains. The page is mapped read-execute, user, by
+ * whoever builds the address space.
+ *
+ * **One page below the bottom of the stack**, derived rather than written
+ * down: a literal address a page under the stack *top* was inside the stack
+ * — 64 pages of it — and the mapping was refused as a collision, which
+ * presented as "this program's headers were refused". Deriving it from the
+ * two constants that define the stack means it cannot drift into it when
+ * either changes. */
+#define SIGNAL_TRAMPOLINE (USER_STACK_TOP - (uint64_t)(USER_STACK_PAGES + 1u) * 4096ull)
+
+
 /* The kernel registers that must survive a trip through user mode: the
  * return address, the stack pointer, and s0..s11 — exactly what a C caller
  * expects a call to preserve. */
@@ -55,7 +71,32 @@
 
 /* One process: its address space, where it starts, and the kernel context
  * to come back to when it stops. */
+/* How many processes may exist. Two is the interesting number — a shell
+ * running a program — and four leaves room for the shape of `os/exec`, where
+ * a parent, a vforked child and whatever it execs are briefly all alive. */
+#define PROC_MAX 4u
+
 struct uproc {
+    /* ── identity ──────────────────────────────────────────────────────── */
+    uint32_t pid;
+    uint32_t parent_pid;
+    bool used;
+    bool zombie;        /* finished, and keeping its status for its parent */
+    int64_t status;     /* what `wait4` will report */
+
+    /* ── what a process owns ───────────────────────────────────────────── */
+    /* The descriptor table and the signal dispositions are **the
+     * process's**, which is what made them singletons until there were two
+     * processes. A thread's own signal state stays in the thread. */
+    struct file *fds[FD_MAX];
+    struct user_sigaction actions[SIG_COUNT];
+
+    /* ── the address space ─────────────────────────────────────────────── */
+    /* `shares_pt` says the tables belong to another process: a `vfork` child
+     * runs in its parent's address space until it execs, and freeing the
+     * tables twice would hand the same pages back twice. */
+    bool shares_pt;
+
     uint64_t main_tid; /* the first thread's id */
     virt_t brk;        /* the program break, past the last segment */
     virt_t brk_floor;  /* where it started, which it may not go below */
@@ -66,6 +107,64 @@ struct uproc {
     uint64_t context[USPACE_CONTEXT_WORDS];
     bool built;
 };
+
+/* ── the process table ─────────────────────────────────────────────────────
+ *
+ * Processes live in a table rather than wherever a caller puts them. A
+ * `struct uproc` carries a 64-entry descriptor table and 64 signal
+ * dispositions, which is two and a half kilobytes — the frame-size guard
+ * caught the first attempt to keep one on a stack, which is exactly what
+ * that guard is for.
+ */
+
+/* Takes a free slot and gives it a pid. NULL when the table is full. */
+struct uproc *uspace_alloc(void);
+
+/* Gives a slot back. A zombie keeps its slot until its parent reaps it. */
+void uspace_release(struct uproc *p);
+
+/* The process with this pid, or NULL. */
+struct uproc *uspace_by_pid(uint32_t pid);
+
+/* A zombie child of `parent`, or NULL when it has none. */
+struct uproc *uspace_reapable_child(uint32_t parent_pid);
+
+/* ── running a program from a program ──────────────────────────────────────
+ */
+
+/* Replaces `p`'s program with the ELF in `image`, keeping its identity, its
+ * descriptors (minus close-on-exec) and its thread, and giving it a fresh
+ * address space, break, mapping cursor and start state.
+ *
+ * The old address space is freed **only once the new one is built**, so a
+ * failure leaves the process able to carry on — which is what a program that
+ * handles a failing `execve` is entitled to. */
+int uspace_exec(struct uproc *p, const uint8_t *image, uint32_t bytes, const char *path,
+                const char *const *argv, uint32_t argc);
+
+/* Points `tf` at the newly execed program, so the calling thread restarts
+ * there instead of returning from the syscall. */
+void uspace_restart_thread(struct trapframe *tf, const struct uproc *p);
+
+/* Makes `child` a process that **borrows** `parent`'s address space: the
+ * `vfork` arrangement, safe only because the parent is then suspended. The
+ * child's descriptors are copies of its parent's. */
+int uspace_fork_shared(struct uproc *child, struct uproc *parent);
+
+/* Suspends the calling thread until `child` execs or exits, which is what
+ * `CLONE_VFORK` promises. */
+void uspace_wait_for_vfork(struct uproc *child);
+
+/* Suspends the calling thread until one of its children finishes. */
+void uspace_wait_for_child(struct uproc *parent);
+
+/* How many live children a process has, so `wait4` can tell "none finished"
+ * from "none exist". */
+uint32_t uspace_count_children(uint32_t parent_pid);
+
+/* Frees an image read for an `execve`. A thin name over the heap so
+ * `sys_proc.c` need not know which allocator it came from. */
+void kfree_image(void *image);
 
 /* Builds an address space with the kernel's mappings shared, `bytes` of
  * program copied in at USER_TEXT, and a stack. KERR_NOMEM when pages run
@@ -160,6 +259,11 @@ virt_t uspace_brk(struct uproc *p, virt_t want);
  * KERR_INVAL for headers that contradict the file, KERR_NOMEM when pages
  * run out. */
 int uspace_build_elf(struct uproc *p, const uint8_t *image, uint32_t bytes, const char *path);
+
+/* The same, with the argument list a caller supplies — which is what
+ * `execve` needs and what `argv[0]` being the program's own choice means. */
+int uspace_build_elf_args(struct uproc *p, const uint8_t *image, uint32_t bytes, const char *path,
+                          const char *const *argv, uint32_t argc);
 
 /* Releases the process's pages and its table. */
 void uspace_destroy(struct uproc *p);

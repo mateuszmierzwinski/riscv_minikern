@@ -28,6 +28,65 @@
     .section .text.entry, "ax"
     .globl _start
 _start:
+    /* ── the RISC-V Linux image header ─────────────────────────────────────
+     *
+     * Sixty-four bytes that make this image bootable by **the standard
+     * loader path** — U-Boot's `booti`, which is how a kernel is started on
+     * a real board and from an SD card. Without it the loader refuses the
+     * image with "Bad Linux RISC-V Image magic!", and the alternatives all
+     * involve entering the kernel without the two arguments the boot
+     * protocol passes: the hart id and the device tree.
+     *
+     * The layout is the one Linux documents (`boot-image-header.rst`), and
+     * the fields that matter are:
+     *
+     *   - `code0`/`code1`: the first two instructions, which must jump over
+     *     the header. The entry point *is* the header's address, so the
+     *     header has to begin with working code.
+     *   - `text_offset`: where the image wants to sit relative to the base
+     *     of memory. A loader relocates the image to `ram_base +
+     *     text_offset`, so 2 MiB here is what puts the kernel at
+     *     `0x4020_0000` on a board whose memory starts at `0x4000_0000` and
+     *     at `0x8020_0000` under QEMU — one number that is right on both.
+     *   - `image_size`: how much to move, which the link script computes.
+     */
+    /* `.option norvc` because **`j` assembles to two bytes, not four**, when
+     * the compressed extension is on — and it is, this being rv64gc. The
+     * header's first field is four bytes wide, so a compressed jump shifts
+     * every field after it by two: the first attempt produced a text_offset
+     * of 0xf000000000000020 and a magic nowhere near where a loader looks.
+     * The same trap caught this project once before, in the code that steps
+     * over a faulting instruction. */
+    /* The jump is written as its **encoding**, not as a mnemonic.
+     *
+     * `j` assembles to two bytes on this ISA — the compressed extension is
+     * on, this being rv64gc — and the header's first field is four bytes
+     * wide, so a compressed jump shifts every field after it by two: the
+     * first attempt produced a text offset of 0xf000000000000020 and put the
+     * magic two bytes from where a loader looks for it. `.option norvc`
+     * around it did not help, so the encoding is spelled out.
+     *
+     * 0x0400006f is `jal x0, +64`: opcode 0x6f, rd 0, and an immediate of 64
+     * in the J-type's scattered bit order (bits 10:1 of the offset sit at
+     * 30:21, so 64 >> 1 = 32 lands as 32 << 21). 64 is the header's own
+     * size, and the link script asserts that it still is. */
+    .word   0x0400006f              /* code0: jal x0, +64 — over the header */
+    .word   0                       /* code1 */
+    .quad   0x200000                /* text_offset: 2 MiB above DRAM's base */
+    .quad   __image_size            /* image_size, from the link script */
+    .quad   0                       /* flags: little-endian, no constraints */
+    .word   0x00000002              /* version 0.2 of this header */
+    .word   0                       /* res1 */
+    .quad   0                       /* res2 */
+    .ascii  "RISCV\0\0\0"           /* magic (deprecated but still checked) */
+    .ascii  "RSC\x05"                /* magic2 */
+    .word   0                       /* res3: a PE/COFF offset, unused */
+
+    /* Global so the link script can assert the header's size against it. A
+     * local label is invisible to the linker, and the assertion that keeps
+     * the hand-written jump honest is worth a symbol. */
+    .globl _start_after_header
+_start_after_header:
     /* No translation yet and no interrupts: make that explicit rather than
      * inherited, so a firmware that left either on cannot surprise us. */
     csrw    satp, zero

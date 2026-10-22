@@ -107,12 +107,24 @@ echo "ok: a filesystem mkfs.xfs made, mounted off an NVMe drive, listed and read
 # best effort: reading a filesystem whose layout you have guessed at is how
 # data is lost quietly. Each of these is made deliberately and must be turned
 # away.
+# Reflink and reverse mapping are a different case from the rest, and the
+# difference is the format's own: they are **read-only compatible**. The
+# structures they add are a writer's obligation — a shared extent is read
+# exactly like an unshared one — so a reader that never writes may ignore
+# them, and must then actually never write.
+#
+# This asserted a refusal until a real drive arrived. `mkfs.xfs` turns both
+# on by default, so refusing them meant the kernel could only read a
+# filesystem formatted specially for it, which is not a filesystem reader.
 make_image "$tmp/reflink.img" "crc=1,finobt=1,reflink=1,rmapbt=1,bigtime=0,inobtcount=0"
 boot "$tmp/reflink.img" "$tmp/reflink.log"
-grep -qF "xfs: unsupported read-only features" "$tmp/reflink.log" ||
-    { cat "$tmp/reflink.log"; fail "reflink and rmapbt were not refused"; }
-grep -qF "xfs: not mounted" "$tmp/reflink.log" || fail "it mounted a filesystem it should refuse"
-echo "ok: reflink and rmapbt are refused rather than guessed at"
+grep -qF "xfs: read-only features" "$tmp/reflink.log" ||
+    { cat "$tmp/reflink.log"; fail "the read-only features were not reported"; }
+grep -qF "xfs: mounted read-only" "$tmp/reflink.log" ||
+    { cat "$tmp/reflink.log"; fail "a reflink filesystem did not mount"; }
+grep -qF "hello.txt" "$tmp/reflink.log" ||
+    { cat "$tmp/reflink.log"; fail "a reflink filesystem mounted but could not be listed"; }
+echo "ok: reflink and rmapbt mount read-only, as the format allows"
 
 make_image "$tmp/sparse.img" "$MINIMAL_M" "sparse=1,size=512,nrext64=0"
 boot "$tmp/sparse.img" "$tmp/sparse.log"

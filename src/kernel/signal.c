@@ -24,12 +24,21 @@
  *
  * A named struct because resetting it needs a type to name: `typeof` is not
  * C17, which this is built as. */
+/* What is left here is a counter and a switch. The **dispositions live in
+ * the process** (`struct uproc::actions`), because two processes must not
+ * share handlers — a child that execs resets them all to default, and a
+ * shared table would reset its parent's too. */
 struct signal_state {
-    struct user_sigaction action[SIG_COUNT];
     uint64_t delivered;
 };
 
 static struct signal_state sig;
+
+/* The running process's dispositions, or NULL outside a process. */
+static struct user_sigaction *actions(void) {
+    struct uproc *p = uspace_current();
+    return p == NULL ? NULL : p->actions;
+}
 
 /* Not a secret, just a value that is not plausible as anything else. */
 #define SIGFRAME_COOKIE 0x5349474652414d45ull /* "SIGFRAME" */
@@ -81,15 +90,24 @@ static uint64_t bit_of(uint32_t signo) {
 }
 
 void signal_reset(void) {
-    sig = (struct signal_state){0};
+    struct user_sigaction *a = actions();
+    sig.delivered = 0;
+    /* Every handler back to default, which is what a process starting — or
+     * one that has just execed — must see. The ABI says an exec keeps the
+     * mask and the pending set but resets every *handler*, because the
+     * handlers belonged to code that is no longer there. */
+    for (uint32_t i = 0; a != NULL && i < SIG_COUNT; i++) {
+        a[i] = (struct user_sigaction){0};
+    }
 }
 
 int signal_action(uint32_t signo, const struct user_sigaction *in, struct user_sigaction *out) {
-    if (!valid_signal(signo)) {
+    struct user_sigaction *a = actions();
+    if (!valid_signal(signo) || a == NULL) {
         return KERR_INVAL;
     }
     if (out != NULL) {
-        *out = sig.action[signo];
+        *out = a[signo];
     }
     if (in != NULL) {
         /* SIGKILL cannot be caught or ignored. A kernel that allowed it
@@ -97,7 +115,7 @@ int signal_action(uint32_t signo, const struct user_sigaction *in, struct user_s
         if (signo == SIGKILL) {
             return KERR_INVAL;
         }
-        sig.action[signo] = *in;
+        a[signo] = *in;
     }
     return KERR_OK;
 }
@@ -214,8 +232,9 @@ static uint32_t next_deliverable(const struct thread_signals *me) {
 
 bool signal_is_fatal(uint32_t *signo) {
     struct thread_signals *me = mine();
+    const struct user_sigaction *a = actions();
     uint32_t s;
-    if (me == NULL) {
+    if (me == NULL || a == NULL) {
         return false;
     }
     /* A **fault's** signal that cannot be delivered is fatal whatever the
@@ -227,7 +246,7 @@ bool signal_is_fatal(uint32_t *signo) {
      * that was fixed. */
     if (me->forced != 0 && (me->pending & bit_of(me->forced)) != 0) {
         bool blocked = (me->blocked & bit_of(me->forced)) != 0;
-        uint64_t handler = sig.action[me->forced].sa_handler;
+        uint64_t handler = a[me->forced].sa_handler;
         if (blocked || handler == SIG_DFL || handler == SIG_IGN) {
             *signo = me->forced;
             return true;
@@ -240,11 +259,11 @@ bool signal_is_fatal(uint32_t *signo) {
     /* No handler means the default action, and for everything this kernel
      * raises the default action is to end the process. Ignoring is the one
      * exception and is handled by clearing it here. */
-    if (sig.action[s].sa_handler == SIG_IGN) {
+    if (a[s].sa_handler == SIG_IGN) {
         me->pending &= ~bit_of(s);
         return signal_is_fatal(signo);
     }
-    if (sig.action[s].sa_handler == SIG_DFL) {
+    if (a[s].sa_handler == SIG_DFL) {
         *signo = s;
         return true;
     }
@@ -327,7 +346,7 @@ bool signal_deliver(struct trapframe *tf) {
     if (signo == 0) {
         return false;
     }
-    a = &sig.action[signo];
+    a = &actions()[signo];
     if (a->sa_handler == SIG_DFL || a->sa_handler == SIG_IGN) {
         return false; /* the caller deals with the default action */
     }

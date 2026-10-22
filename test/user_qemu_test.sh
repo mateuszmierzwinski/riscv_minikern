@@ -54,7 +54,9 @@ grep -qF "uspace: hello exited with 7 after 3 syscalls" "$log" ||
 # A user fault is the process's problem. The address is the kernel's text,
 # which is mapped in that address space and not user-reachable.
 grep -qF "about to touch the kernel's memory" "$log" || fail "the faulting program did not run"
-grep -qE '^uspace: fault in user code: load page fault at sepc [0-9a-f]+, stval 0000000080200000$' "$log" ||
+# The process is named in the message: once there can be more than one user
+# process, "a fault happened" is not enough to act on.
+grep -qE '^uspace: fault in user code \(pid [0-9]+\): load page fault at sepc [0-9a-f]+, stval 0000000080200000$' "$log" ||
     fail "the fault was not reported, or not as a load page fault at the kernel's text"
 grep -qF "uspace: faulter exited with -14 after 1 syscalls" "$log" ||
     fail "the faulting process did not end with a fault status"

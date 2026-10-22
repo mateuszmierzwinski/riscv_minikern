@@ -34,7 +34,14 @@
 
 static uint64_t prot_bits(uint32_t prot);
 
+/* The process table. Static because a process is too big for a stack — the
+ * frame-size guard said so the first time one was put there — and because a
+ * process must outlive whatever created it. */
+static struct uproc procs[PROC_MAX];
+static uint32_t next_pid = 1;
+
 static struct uproc *running;
+static struct uproc *building;
 static int64_t exit_status;
 static bool exited;
 static uint64_t kernel_satp_saved;
@@ -256,10 +263,12 @@ static void on_user_return(struct trapframe *tf) {
      * because the handler must start *instead of* the faulting instruction
      * rather than after it. */
     if (signal_is_fatal(&fatal)) {
-        kprintf("\nuspace: killed by signal %u\n", fatal);
-        exit_status = -(int64_t)fatal;
-        exited = true;
-        sched_exit_process();
+        /* A signal nothing handled. It ends the process it was raised
+         * against, which may be a child — so it goes through the ordinary
+         * exit path rather than stopping the machine. */
+        kprintf("\nuspace: pid %u killed by signal %u\n",
+                uspace_current() != NULL ? uspace_current()->pid : 0u, fatal);
+        uspace_exit(-(int64_t)fatal);
         return;
     }
     (void)signal_deliver(tf);
@@ -371,12 +380,17 @@ static bool on_user_trap(struct trapframe *tf) {
      * stops, and the kernel carries on. Reporting it this way — rather than
      * panicking — is the whole difference between a user fault and a kernel
      * one. */
-    kprintf("\nuspace: fault in user code: %s at sepc %016llx, stval %016llx\n",
-            trap_cause_name(tf->scause), (unsigned long long)tf->sepc,
-            (unsigned long long)tf->stval);
-    exit_status = KERR_FAULT;
-    exited = true;
-    sched_exit_process();
+    kprintf("\nuspace: fault in user code (pid %u): %s at sepc %016llx, stval %016llx\n",
+            uspace_current() != NULL ? uspace_current()->pid : 0u, trap_cause_name(tf->scause),
+            (unsigned long long)tf->sepc, (unsigned long long)tf->stval);
+    /* The registers, when asked for. A faulting address alone says where the
+     * program stopped but not what it was holding, and the difference
+     * between "a pointer was null" and "a pointer was wrong" is the whole
+     * diagnosis. */
+    if (syscall_tracing_errors()) {
+        trap_dump(tf);
+    }
+    uspace_exit(KERR_FAULT);
     return true;
 }
 
@@ -430,6 +444,7 @@ int64_t uspace_run(struct uproc *p) {
      * thread's, which is copied from its parent's. */
     first.sepc = p->entry;
     first.sstatus = SSTATUS_SUM;
+    building = p;
     signal_reset();
     fd_reset();
     /* Descriptors 0, 1 and 2 before the program starts: a runtime checks
@@ -438,7 +453,7 @@ int64_t uspace_run(struct uproc *p) {
         running = NULL;
         return KERR_NOMEM;
     }
-    rc = sched_init(&first, p->stack_top, &p->main_tid);
+    rc = sched_init(p, &first, p->stack_top, &p->main_tid);
     if (rc != KERR_OK) {
         running = NULL;
         return rc;
@@ -467,7 +482,9 @@ int64_t uspace_run(struct uproc *p) {
     trap_set_user_return_hook(NULL);
     timer_remove_tick_hook(sched_tick);
     sched_shutdown();
+    building = p;
     fd_reset();
+    building = NULL;
     running = NULL;
     return exit_status;
 }
@@ -581,17 +598,16 @@ static int map_signal_trampoline(struct uproc *p) {
 /* Builds the stack: the block is assembled in the page that will be the top
  * of the stack, then mapped. Assembling it in place would need the process's
  * address space to be loaded, which it is not yet. */
-static int build_start_state(struct uproc *p, const struct elf_image *img, const char *path) {
+static int build_start_state(struct uproc *p, const struct elf_image *img, const char *path,
+                             const char *const *argv, uint32_t argc) {
     struct auxv_pair auxv[USTACK_MAX_AUXV];
-    const char *argv[1];
     const char *envp[2] = {"HOME=/", "PATH=/"};
-    struct ustack_args args = {.argv = argv, .argc = 1u, .envp = envp, .envc = 2u, .auxv = auxv,
+    struct ustack_args args = {.argv = argv, .argc = argc, .envp = envp, .envc = 2u, .auxv = auxv,
                                .execfn = path};
     phys_t stack = 0;
     virt_t sp = 0;
     uint32_t used = 0;
     int rc;
-    argv[0] = path;
     args.nauxv = build_auxv(img, auxv);
     random_fill(args.random, sizeof args.random);
     rc = mem_alloc_pages(USER_STACK_PAGES, 1, &stack);
@@ -618,10 +634,31 @@ static int build_start_state(struct uproc *p, const struct elf_image *img, const
 }
 
 int uspace_build_elf(struct uproc *p, const uint8_t *image, uint32_t bytes, const char *path) {
+    const char *argv[1] = {path};
+    return uspace_build_elf_args(p, image, bytes, path, argv, 1u);
+}
+
+int uspace_build_elf_args(struct uproc *p, const uint8_t *image, uint32_t bytes, const char *path,
+                          const char *const *argv, uint32_t argc) {
     struct pt_mem mem = {.alloc = proc_alloc, .free = proc_free, .to_virt = proc_to_virt};
     struct elf_image img;
     int rc;
-    *p = (struct uproc){0};
+    /* Only what **this function owns** is cleared: the address space and the
+     * things derived from it. Zeroing the whole process here wiped its
+     * identity as well — `used` and `pid` — so the next `uspace_alloc`
+     * handed the same slot out again and the parent's descriptor table
+     * disappeared the moment it forked. The symptom was a child whose every
+     * descriptor operation failed, which looked like the child's table never
+     * having been copied rather than the parent's having been deleted. */
+    p->pt = (struct pgtable){0};
+    p->entry = 0;
+    p->stack_top = 0;
+    p->brk = 0;
+    p->brk_floor = 0;
+    p->mmap_next = 0;
+    p->main_tid = 0;
+    p->built = false;
+    p->shares_pt = false;
     rc = elf_parse(image, bytes, USER_TOP, &img);
     if (rc != KERR_OK) {
         return rc;
@@ -630,7 +667,7 @@ int uspace_build_elf(struct uproc *p, const uint8_t *image, uint32_t bytes, cons
     for (uint32_t i = 0; rc == KERR_OK && i < img.nloads; i++) {
         rc = load_segment(p, &img.loads[i], image);
     }
-    rc = rc != KERR_OK ? rc : build_start_state(p, &img, path);
+    rc = rc != KERR_OK ? rc : build_start_state(p, &img, path, argv, argc);
     rc = rc != KERR_OK ? rc : map_signal_trampoline(p);
     rc = rc != KERR_OK ? rc : share_kernel_mappings(&p->pt);
     if (rc != KERR_OK) {
@@ -652,6 +689,129 @@ int uspace_build_elf(struct uproc *p, const uint8_t *image, uint32_t bytes, cons
     return KERR_OK;
 }
 
+void kfree_image(void *image) {
+    kfree(image);
+}
+
+int uspace_fork_shared(struct uproc *child, struct uproc *parent) {
+    uint32_t pid = child->pid;
+    /* Everything of the parent's except its identity and its threads. The
+     * page tables are **shared, not copied**: that is what `vfork` is, and
+     * it is why the parent must then be suspended. */
+    child->pt = parent->pt;
+    child->shares_pt = true;
+    child->entry = parent->entry;
+    child->stack_top = parent->stack_top;
+    child->brk = parent->brk;
+    child->brk_floor = parent->brk_floor;
+    child->mmap_next = parent->mmap_next;
+    child->built = true;
+    child->pid = pid;
+    child->parent_pid = parent->pid;
+    for (uint32_t i = 0; i < SIG_COUNT; i++) {
+        child->actions[i] = parent->actions[i];
+    }
+    return fd_copy_table(child, parent);
+}
+
+uint32_t uspace_count_children(uint32_t parent_pid) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < PROC_MAX; i++) {
+        n += procs[i].used && procs[i].parent_pid == parent_pid ? 1u : 0u;
+    }
+    return n;
+}
+
+void uspace_wait_for_vfork(struct uproc *child) {
+    /* Waits on the child's own address, which whatever ends the borrowing
+     * wakes: `uspace_exec` when it gives the child its own tables, and the
+     * exit path when it does not get that far. A deadline so that a child
+     * which somehow does neither costs a stall rather than the machine. */
+    while (child->used && child->shares_pt && !child->zombie) {
+        (void)sched_wait_on(child, timer_ns() + 1000000000ull);
+    }
+}
+
+void uspace_wait_for_child(struct uproc *parent) {
+    (void)sched_wait_on(parent, timer_ns() + 1000000000ull);
+}
+
+/* Where an `execve` assembles the new address space before adopting it.
+ *
+ * Static, not a local: a `struct uproc` is two and a half kilobytes and the
+ * frame-size guard refuses that on a stack — twice now, which is the guard
+ * earning its place. One is enough because an `execve` holds the kernel lock
+ * from beginning to end and never sleeps, so two cannot overlap. */
+static struct uproc exec_scratch;
+
+/* Frees a set of page tables that belong to nobody, which is what the old
+ * address space becomes once a new one has been adopted.
+ *
+ * The holder is static for the same reason the scratch is: a `struct uproc`
+ * on a stack is two and a half kilobytes, which the frame guard refuses, and
+ * an `execve` is serialised by the kernel lock. */
+static struct uproc free_holder;
+
+static void free_tables(struct pgtable *pt) {
+    free_holder = (struct uproc){.built = true};
+    free_holder.pt = *pt;
+    uspace_destroy(&free_holder);
+}
+
+int uspace_exec(struct uproc *p, const uint8_t *image, uint32_t bytes, const char *path,
+                const char *const *argv, uint32_t argc) {
+    struct pgtable old = p->pt;
+    bool had_own = !p->shares_pt;
+    struct uproc *fresh = &exec_scratch;
+    int rc;
+    /* The new address space is built **beside** the old one, so a failure
+     * here leaves the process exactly as it was. A program that handles a
+     * failing `execve` is entitled to carry on. */
+    *fresh = (struct uproc){.pid = p->pid, .parent_pid = p->parent_pid, .used = true};
+    rc = uspace_build_elf_args(fresh, image, bytes, path, argv, argc);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    /* Now the swap. The descriptors stay, minus close-on-exec; the signal
+     * handlers go, because they pointed into code that no longer exists;
+     * the thread's own signal mask stays, which is what the ABI says. */
+    p->pt = fresh->pt;
+    p->entry = fresh->entry;
+    p->stack_top = fresh->stack_top;
+    p->brk = fresh->brk;
+    p->brk_floor = fresh->brk_floor;
+    p->mmap_next = fresh->mmap_next;
+    p->built = true;
+    p->shares_pt = false;
+    fd_close_on_exec();
+    signal_reset();
+    /* The old tables are freed only if they were this process's. A `vfork`
+     * child's were its parent's, and freeing them would take the parent's
+     * program with it — which is the whole reason `shares_pt` exists. */
+    if (had_own) {
+        free_tables(&old);
+    }
+    /* Whoever was waiting for this child to stop borrowing can go. */
+    (void)sched_wake_on(p, SCHED_MAX_THREADS);
+    /* This hart's loaded address space is now stale. */
+    uspace_adopt_address_space(p);
+    return KERR_OK;
+}
+
+void uspace_restart_thread(struct trapframe *tf, const struct uproc *p) {
+    /* A fresh register set: an execed program must not inherit anything
+     * from what it replaced. Only `sstatus` is carried over, because it
+     * holds the mode and the user-access bits rather than any of the old
+     * program's state. */
+    uint64_t sstatus = tf->sstatus;
+    for (uint32_t i = 0; i < 32u; i++) {
+        tf->x[i] = 0;
+    }
+    tf->sstatus = sstatus;
+    tf->sepc = p->entry;
+    tf->x[2] = p->stack_top;
+}
+
 uint64_t uspace_stale_faults(void) {
     return stale_faults;
 }
@@ -668,16 +828,21 @@ uint64_t uspace_syscalls(void) {
  * process's table. A zero-length range is vacuously fine, which matters
  * because a caller may legitimately pass one. */
 static bool range_has(virt_t at, uint32_t n, uint64_t want) {
+    /* **The calling process's** tables, not the root program's. They were
+     * the same thing while there was one process; with a child they are not,
+     * and checking the wrong ones would either refuse a valid pointer or —
+     * worse — accept one that is only valid in another address space. */
+    const struct uproc *p = uspace_current();
     if (n == 0) {
         return true;
     }
-    if (running == NULL || at == 0 || at >= USER_TOP || n > USER_TOP - at) {
+    if (p == NULL || at == 0 || at >= USER_TOP || n > USER_TOP - at) {
         return false;
     }
     for (virt_t va = at & ~(PAGE_SIZE - 1u); va < at + n; va += PAGE_SIZE) {
         phys_t phys = 0;
         uint64_t flags = 0, size = 0;
-        if (!pgtable_lookup(&running->pt, va, &phys, &flags, &size)) {
+        if (!pgtable_lookup(&p->pt, va, &phys, &flags, &size)) {
             return false;
         }
         if ((flags & want) != want || (flags & PTE_U) == 0) {
@@ -715,14 +880,78 @@ int uspace_copy_out(virt_t to, const void *from, uint32_t n) {
     return KERR_OK;
 }
 
+struct uproc *uspace_alloc(void) {
+    for (uint32_t i = 0; i < PROC_MAX; i++) {
+        if (!procs[i].used) {
+            procs[i] = (struct uproc){.used = true, .pid = next_pid++};
+            return &procs[i];
+        }
+    }
+    return NULL;
+}
+
+void uspace_release(struct uproc *p) {
+    if (p != NULL) {
+        *p = (struct uproc){0};
+    }
+}
+
+struct uproc *uspace_by_pid(uint32_t pid) {
+    for (uint32_t i = 0; i < PROC_MAX; i++) {
+        if (procs[i].used && procs[i].pid == pid) {
+            return &procs[i];
+        }
+    }
+    return NULL;
+}
+
+struct uproc *uspace_reapable_child(uint32_t parent_pid) {
+    for (uint32_t i = 0; i < PROC_MAX; i++) {
+        if (procs[i].used && procs[i].zombie && procs[i].parent_pid == parent_pid) {
+            return &procs[i];
+        }
+    }
+    return NULL;
+}
+
 struct uproc *uspace_current(void) {
-    return running;
+    /* The running thread's process, which is the honest answer once there is
+     * more than one. `building` covers the window in which a process is
+     * being set up and has no thread yet — its descriptor table is opened
+     * and its signals reset before its first thread exists. */
+    struct uproc *p = sched_current_proc();
+    return p != NULL ? p : building;
 }
 
 void uspace_exit(int64_t status) {
-    exit_status = status;
-    exited = true;
-    sched_exit_process();
+    struct uproc *me = uspace_current();
+    bool is_root = me == NULL || me == running;
+    if (is_root) {
+        /* The program the kernel started. Its status is what `uspace_run`
+         * returns, and its ending stops the harts' loops. */
+        exit_status = status;
+        exited = true;
+    } else {
+        /* A child. It becomes a **zombie**: the slot and the status stay
+         * until its parent reaps them, because a parent is entitled to ask
+         * what happened to a child that has already finished. Its address
+         * space goes now, unless it was borrowing its parent's. */
+        me->status = status;
+        me->zombie = true;
+        if (!me->shares_pt) {
+            uspace_destroy(me);
+        }
+        me->shares_pt = false;
+        /* Whoever is waiting — a `vfork` parent, or one in `wait4`. */
+        (void)sched_wake_on(me, SCHED_MAX_THREADS);
+        {
+            struct uproc *parent = uspace_by_pid(me->parent_pid);
+            if (parent != NULL) {
+                (void)sched_wake_on(parent, SCHED_MAX_THREADS);
+            }
+        }
+    }
+    sched_exit_proc(me, is_root);
 }
 
 /* Makes this hart able to run the process's threads.

@@ -4,6 +4,31 @@ What this kernel does today, and what it is going to do. Honest about the
 difference: nothing is listed as working unless a test proves it, and the test
 is named. The phase-by-phase record is `DEVELOPMENT_PROGRESS.md`.
 
+## Proved on a real VisionFive 2
+
+Everything below this section is proved by a test under QEMU. These are
+proved on the board itself — a StarFive VisionFive 2 (`VF7110B1`, 8 GiB),
+driven over its UART with its power switched by a relay. An emulator agreed
+with every one of the mistakes they found.
+
+| On the board | What it took |
+|---|---|
+| **The whole kernel boots on silicon**, through the board's own OpenSBI | the hart id, the device tree, the memory node and the timer frequency all read rather than assumed: this board's harts are 1–4, **hart 0 is a monitor core with no usable MMU**, its PLIC context is 8, and its timer is 4 MHz where QEMU's is 10 |
+| **Four U74 cores running Go**, `NumCPU=4`, **3.3x** on 8 units of work | a lost-increment race in the hart-arrival counter: it was a plain `running++`, and that number reaches user space as `NumCPU`, so the board ran Go on two of its four cores with nothing looking wrong |
+| **An SD card**, through the controller the board actually has | the documentation said Cadence SDHCI; the board's tree says `starfive,jh7110-mmc`, a DesignWare MSHC. Two transports now share one copy of the card protocol |
+| **XFS mounted from that card, and a stock Go binary loaded off it and run** | `logstart` is an AG-encoded block number — this filesystem's *write* path converted it and its *read* path did not, so the two halves disagreed about where the log was |
+| **An NVMe drive in the M.2 slot**: `TS128GMTE110S`, 122 GB | the board's PCIe is `starfive,jh7110-pcie`, read through the link the firmware trained; and a command's data pointer must be page-aligned, which `kzalloc` is not |
+| **Its GPT read**, and the first partition presented as a disk | GPT and MBR, with a GPT disk's protective MBR recognised and skipped rather than followed |
+| **The kernel's own UART**, taking the console over from the firmware | a 16550's registers are not always one byte apart: this one has `reg-shift = 2` and `reg-io-width = 4`, and getting it wrong is *garbling*, not silence |
+| **A GPIO level crossing a physical wire**: driven on pin 60, read on pin 63 | the operator's jumper. It immediately showed what a loopback cannot: the other pin could not be driven at all, because this driver does not yet select a pad's function |
+| **Both pin controllers clocked**, including the always-on one | a clock index belongs to a generator, not to a SoC — and the right numbers are in each node's own `clocks` property |
+
+What is **not** done on the board: the pad function is not selected, so only a
+pin the firmware already left as GPIO can be driven; there is no driver for
+the board's own DesignWare GMAC; an XFS made with `mkfs.xfs`'s defaults stops
+at `nrext64`, which changes the inode layout; and thermal and frequency
+scaling are not started.
+
 ## Working now
 
 | Feature | Proved by |
@@ -46,9 +71,10 @@ is named. The phase-by-phase record is `DEVELOPMENT_PROGRESS.md`.
 | Built with **`-mcpu=sifive-u74`**: the JH7110's own core and pipeline, not a generic RV64GC | the whole suite runs on it |
 | **GPIO** on both JH7110 pin controllers: found, mapped, **clocked and brought out of reset** (both confirmed by reading back), with the pin-to-register arithmetic proved — a *byte* per pin, not a bit | `gpio_jh7110_test` |
 | **Clocks and resets** through the JH7110's generators, found by `compatible`, with every enable and release confirmed rather than assumed | `crg_jh7110_test` |
-| **An SD card** through a standard host controller — found, powered up, addressed, sized correctly, read and written | `disk_qemu_test` |
-| **NVMe over PCIe** — the M.2 slot: the bus walked, BARs assigned, bus mastering enabled, the controller identified and read/written | `disk_qemu_test` |
-| **A PCIe bus walker** that assigns memory windows itself, because no firmware here has | `disk_qemu_test` |
+| **An SD card** over two host controllers — SDHCI and the JH7110's DesignWare MSHC — sharing one copy of the card protocol: powered up, addressed, sized, read and written | `disk_qemu_test`, `sdcard_test`, and a real card on the board |
+| **NVMe over PCIe** — the M.2 slot: the bus walked, the controller identified, read and written | `disk_qemu_test`, and a real drive on the board |
+| **A PCIe bus walker** that follows bridges rather than sweeping bus numbers, and keeps a BAR the firmware placed | `disk_qemu_test`, and two real controllers on the board |
+| **Partition tables**, GPT and MBR, with a GPT disk's protective MBR skipped rather than followed | `partition_test`, and a real GPT drive on the board |
 | **A real block device** over virtio, with the carried-over buffer cache on top — written, read back, and the image byte-for-byte unchanged | `disk_qemu_test`, `bcache_test` |
 | A printf-style formatter, command-line parsing, CRC-32C, SHA-256, SHA-512, Ed25519 verification | host tests, carried over |
 
@@ -69,11 +95,12 @@ In the order it will be built, because each step needs the one before it:
 
 | | |
 |---|---|
-| **Processes** | user address spaces, the timer through SBI, threads |
-| **The syscall interface** | the rest of the generic table, ELF64, the process start state, signals — then Go binaries unchanged |
-| **SMP** | harts started through SBI's hart-state extension, enumerated **from the device tree** because this SoC's application cores are 1–4 |
-| **Network** | virtio-net first, then the DesignWare GMAC |
-| **The board's hardware** | clocks and resets — which GPIO needs before it drives a pin — then the temperature sensor and frequency scaling |
+| **The pad function** | GPIO writes reach a pad only if the pin controller's mux selects GPIO for it. Without that, a pin muxed to a peripheral ignores them in silence — which is what the board showed |
+| **The board's Ethernet** | the DesignWare GMAC. The cable is in the second of the two, which is the one that negotiates |
+| **Modern XFS** | `nrext64` changes the inode core's layout, and sparse inodes change the inode b-tree's records. Until both are read, a filesystem made with `mkfs.xfs`'s defaults is refused rather than guessed at |
+| **`fork` and `exec`** | so `os/exec` works. The ARM kernel had them; this one does not yet |
+| **The top half** | the kernel still lives in the bottom half of the address space |
+| **Thermal and frequency scaling** | the temperature sensor, then the clock tree |
 | **The real boot path** | an SD-card image with U-Boot, and the documented flash procedure |
 
 ## Deliberately not planned

@@ -30,6 +30,11 @@
 #include "arch/riscv/trap.h"
 #include "core/types.h"
 
+/* A process, defined in `uspace.h`. Declared here rather than included,
+ * because `uspace.h` needs this header's thread types: the two know about
+ * each other and neither owns the other. */
+struct uproc;
+
 /* A thread's signal state.
  *
  * **Per thread, and that is not a detail.** The mask and the alternate stack
@@ -73,19 +78,25 @@ struct thread_signals {
  * The first thread is an **ordinary** thread. It used to be the stack
  * `uspace_run` was called on, which made it the only one another hart could
  * not run — and with four harts that exception had to go. */
-int sched_init(const struct trapframe *frame, uint64_t sp, uint64_t *tid);
+int sched_init(struct uproc *proc, const struct trapframe *frame, uint64_t sp, uint64_t *tid);
 
 /* Makes the first thread, which unlike a cloned one keeps its `a0`. */
-int sched_spawn_first(const struct trapframe *frame, uint64_t sp, uint64_t *tid);
+int sched_spawn_first(struct uproc *proc, const struct trapframe *frame, uint64_t sp,
+                      uint64_t *tid);
 
 /* One hart's scheduling loop: claim a runnable thread, run it, repeat until
  * the process is over. **Every** hart runs this, the one that started the
  * process included, which is what makes a thread runnable anywhere. */
 void sched_run(void);
 
-/* Ends the process: every thread is dropped and every hart's loop leaves.
- * Does not return when called from a thread. */
-void sched_exit_process(void);
+/* Ends **one process**: every thread of it is dropped, and the harts' loops
+ * leave only if it was the process they were started for. Does not return
+ * when called from a thread of that process.
+ *
+ * The distinction appeared with the second process. "End the process" used
+ * to mean "stop the machine", which is right when there is one and wrong the
+ * moment a child exits: a child ending must leave its parent running. */
+void sched_exit_proc(struct uproc *p, bool is_root);
 
 /* How many harts a process may run on: those that reached the kernel. This
  * is what `sched_getaffinity` reports, and therefore what a Go runtime's
@@ -115,6 +126,26 @@ struct thread_signals *sched_signals_of(uint64_t tid);
  * measurement that distinguishes "four harts available" from "four harts
  * used" — a hart that never switched never ran a thread. */
 uint32_t sched_hart_switches(uint32_t hart_index);
+
+/* The process the running thread belongs to, or NULL between threads.
+ *
+ * This is what makes processes plural: a thread belongs to a process, a hart
+ * runs a thread, so "the current process" is a property of the hart and not
+ * a global. It was a global while there was one process, which is exactly
+ * the kind of singleton that looks like a simplification until a second one
+ * appears. */
+struct uproc *sched_current_proc(void);
+
+/* Makes a thread in a **given** process, for a child's first thread. The
+ * ordinary `sched_spawn` puts the new thread in the creator's process, which
+ * is what `clone` with `CLONE_THREAD` means. */
+int sched_spawn_in(struct uproc *proc, const struct trapframe *frame, uint64_t sp,
+                   uint64_t *tid);
+
+/* Ends every thread of a process except the calling one, which is what
+ * `execve` must do before it replaces the address space: the other threads
+ * were running code that is about to disappear. Reports how many ended. */
+uint32_t sched_end_siblings(const struct uproc *proc);
 
 /* Makes a thread that enters user mode at `frame`'s `sepc` with `frame`'s
  * registers, except `a0`, which is 0 — the child's half of `clone`'s
@@ -191,6 +222,10 @@ void sched_exit_thread(int64_t status);
 /* The calling thread's id, and how many threads are alive. */
 uint64_t sched_current_tid(void);
 uint32_t sched_live_threads(void);
+
+/* How many live threads one process has, which is what says whether *that*
+ * process is finished. */
+uint32_t sched_live_threads_of(const struct uproc *p);
 
 /* Called from the timer interrupt. Preempts the running thread when another
  * is runnable, and wakes anything whose futex deadline has passed. */

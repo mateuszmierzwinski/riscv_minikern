@@ -27,9 +27,30 @@ void syscall_set_trace(uint32_t budget) {
  * switch rather than the general trace's budget, because a sleep happens
  * after hundreds of other calls and a budget is long gone by then. */
 static bool tracing_sleeps;
+static bool tracing_errors;
+
+/* Logs every call that **fails**, rather than the first N calls of any kind.
+ *
+ * A budget is useless for anything that happens late: a child process makes
+ * its first call thousands of calls into the program's life, and by then the
+ * budget is long gone. Failures are rare and are what a diagnosis needs —
+ * this is how the one failing syscall in a child's setup was found, where
+ * the child's only visible symptom was the exit status a runtime uses for
+ * "the child could not start". */
+void syscall_trace_errors(bool on) {
+    tracing_errors = on;
+}
 
 void syscall_trace_sleeps(bool on) {
     tracing_sleeps = on;
+}
+
+bool syscall_tracing_sleeps(void) {
+    return tracing_sleeps;
+}
+
+bool syscall_tracing_errors(void) {
+    return tracing_errors;
 }
 
 static void trace_sleep(const char *what, uint64_t ns) {
@@ -292,14 +313,54 @@ static int64_t sys_dup(struct trapframe *tf) {
     return fd_dup((int32_t)sysarg(tf, 0));
 }
 
-/* There is no path namespace in a process's view of the world: the kernel
- * reads its program off the disk, but a process has no filesystem. So every
- * path is absent, which is what a runtime probing for
- * `/sys/kernel/mm/transparent_hugepage/hpage_pmd_size` or `/proc/self/maps`
- * expects to be told when the file is not there. */
+/* `dup3`: duplicate onto a chosen descriptor. This is what puts a pipe on
+ * descriptor 1 before an `exec`, and the reason the call exists. Unlike
+ * `dup2` it refuses `from == to`, which is how a caller can tell the two
+ * apart. */
+static int64_t sys_dup3(struct trapframe *tf) {
+    int32_t from = (int32_t)sysarg(tf, 0), to = (int32_t)sysarg(tf, 1);
+    if (from == to) {
+        return KERR_INVAL;
+    }
+    return fd_dup_to(from, to);
+}
+
+static int64_t sys_pipe2(struct trapframe *tf) {
+    int32_t fds[2] = {-1, -1};
+    int rc = fdobjects_open_pipe(fds, (uint32_t)sysarg(tf, 1) & (O_NONBLOCK | O_CLOEXEC));
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    if (uspace_copy_out(sysarg(tf, 0), fds, sizeof fds) != KERR_OK) {
+        (void)fd_close(fds[0]);
+        (void)fd_close(fds[1]);
+        return KERR_FAULT;
+    }
+    return 0;
+}
+
+/* Opening a path. There is no filesystem in a process's view of the world,
+ * so this is the short list of synthesised files in `fdobjects.c` and
+ * `ENOENT` for everything else — which is the right answer for a probe and
+ * one a runtime handles.
+ *
+ * `/dev/null` is the entry that had to exist: a runtime opens it for any
+ * command whose input it was not given, so `os/exec` could not start a
+ * program at all without it. */
+#define OPEN_MAX_PATH 128u
+
 static int64_t sys_openat(struct trapframe *tf) {
-    (void)tf;
-    return KERR_NOENT;
+    char path[OPEN_MAX_PATH];
+    virt_t at = sysarg(tf, 1);
+    for (uint32_t i = 0; i < OPEN_MAX_PATH; i++) {
+        if (uspace_copy_in(&path[i], at + i, 1) != KERR_OK) {
+            return KERR_FAULT;
+        }
+        if (path[i] == '\0') {
+            return fdobjects_open_path(path, (uint32_t)sysarg(tf, 2) & (O_NONBLOCK | O_CLOEXEC));
+        }
+    }
+    return KERR_NAMETOOLONG;
 }
 
 static int64_t sys_eventfd2(struct trapframe *tf) {
@@ -429,7 +490,10 @@ static int64_t sys_nanosleep(struct trapframe *tf) {
 #define CLONE_VM 0x00000100u
 #define CLONE_THREAD 0x00010000u
 
-static int64_t sys_clone(struct trapframe *tf) {
+/* A cloned **thread**, which is what `CLONE_THREAD` means: everything
+ * shared. `sys_proc.c` decides which kind of clone was asked for and calls
+ * this for the thread case. */
+int64_t syscall_clone_thread(struct trapframe *tf) {
     uint64_t flags = sysarg(tf, 0), stack = sysarg(tf, 1);
     uint64_t tid = 0;
     struct trapframe child = *tf;
@@ -646,7 +710,6 @@ static const struct syscall_entry table[] = {
     {SYS_RT_SIGRETURN, "rt_sigreturn", sys_rt_sigreturn},
     {SYS_SCHED_GETAFFINITY, "sched_getaffinity", sys_sched_getaffinity},
     {SYS_SCHED_YIELD, "sched_yield", sys_sched_yield},
-    {SYS_CLONE, "clone", sys_clone},
     {SYS_FUTEX, "futex", sys_futex},
     {SYS_TGKILL, "tgkill", sys_tgkill},
     {SYS_PRLIMIT64, "prlimit64", sys_prlimit64},
@@ -659,6 +722,8 @@ static const struct syscall_entry table[] = {
     {SYS_READ, "read", sys_read},
     {SYS_CLOSE, "close", sys_close},
     {SYS_DUP, "dup", sys_dup},
+    {SYS_DUP3, "dup3", sys_dup3},
+    {SYS_PIPE2, "pipe2", sys_pipe2},
     {SYS_OPENAT, "openat", sys_openat},
     {SYS_RISCV_HWPROBE, "riscv_hwprobe", sys_riscv_hwprobe},
     {SYS_NANOSLEEP, "nanosleep", sys_nanosleep},
@@ -688,6 +753,11 @@ static const struct syscall_entry *entry_of(uint64_t nr) {
         }
     }
     for (const struct syscall_entry *d = sys_socket_table; d->call != NULL; d++) {
+        if (d->nr == nr) {
+            return d;
+        }
+    }
+    for (const struct syscall_entry *d = sys_proc_table; d->call != NULL; d++) {
         if (d->nr == nr) {
             return d;
         }
@@ -725,9 +795,38 @@ bool syscall_dispatch(struct trapframe *tf) {
     {
         const struct syscall_entry *e = entry_of(nr);
         if (e != NULL) {
+            /* The arguments are copied **before** the call, because `a0` is
+             * both the first argument and the result: printing it afterwards
+             * shows the return value where the argument should be, and reads
+             * as a program passing nonsense. That cost an hour of suspecting
+             * the wrong thing. */
+            uint64_t a0 = sysarg(tf, 0), a1 = sysarg(tf, 1), a2 = sysarg(tf, 2);
+            uint64_t a3 = sysarg(tf, 3);
             tf->x[10] = (uint64_t)e->call(tf);
             if (tracing) {
                 kprintf("call:   -> %lld\n", (long long)(int64_t)tf->x[10]);
+            }
+            if (tracing_errors && (int64_t)tf->x[10] < 0) {
+                /* The pid as well as the thread, because "this descriptor
+                 * is not open" and "this is the wrong process's table" look
+                 * identical from a thread id alone. */
+                {
+                    /* What the kernel thinks the caller's descriptor table
+                     * is. "This descriptor is not open" and "this is the
+                     * wrong table" are the same symptom, and only the
+                     * contents tell them apart. */
+                    const struct uproc *who = uspace_current();
+                    kprintf("fail:   proc %p, fds 0..3 = %p %p %p %p\n", (const void *)who,
+                            (const void *)(who != NULL ? who->fds[0] : NULL),
+                            (const void *)(who != NULL ? who->fds[1] : NULL),
+                            (const void *)(who != NULL ? who->fds[2] : NULL),
+                            (const void *)(who != NULL ? who->fds[3] : NULL));
+                }
+                kprintf("fail: pid %u tid %llu %s(%llu) %llx %llx %llx %llx -> %lld\n",
+                        uspace_current() != NULL ? uspace_current()->pid : 0u,
+                        (unsigned long long)sched_current_tid(), e->name, (unsigned long long)nr,
+                        (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
+                        (unsigned long long)a3, (long long)(int64_t)tf->x[10]);
             }
             return true;
         }
