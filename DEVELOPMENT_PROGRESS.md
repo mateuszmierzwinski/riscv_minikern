@@ -51,12 +51,29 @@ Three things in it are *not* architecture-neutral and were fixed on the way in:
       works**, where PSCI's on the ARM board was refused by U-Boot, so a boot
       test can wait for an exit instead of grepping for a line and killing the
       emulator.
-- [ ] **P0.2 The kernel's own UART.** The JH7110's UART0 is 16550-compatible,
-      so the ARM board's `uart.c` is the one driver that ports nearly
-      unchanged — but the base address and clock come from the device tree
-      here rather than from a header. SBI's console stays as the fallback for
-      the window before the tree is read, and for a board whose UART this
-      kernel has not been told about.
+- [x] **P0.2 The kernel's own UART, found in the device tree (2026-10-22).**
+      It binds by **what the device says it is**, not by where it is:
+      `fdt_find_compatible` scans for `snps,dw-apb-uart` (what the JH7110's
+      tree says) or `ns16550a` (what an emulator says), reads the node's `reg`
+      honouring two address and two size cells, maps the registers, and takes
+      the console over from SBI. On `virt` it finds `/soc/serial@10000000`, and
+      every line after that one is printed by the kernel's own driver.
+      **This is the pattern every later driver here uses** — GPIO, the SD host
+      controller and NVMe all begin with "find the node that says it is one of
+      these" — so it is tested on the host in its own right: either compatible
+      string finds the node, a *prefix* of one does not (or a driver binds to a
+      part it does not understand), a path that does not fit is **refused
+      rather than truncated** because half a path names a different node, and a
+      device above 4 GiB is read correctly, which is where a PCIe window lives.
+      Two deliberate choices: the console is **polled**, because a console that
+      needs interrupts cannot report a fault in the interrupt controller; and
+      the **baud rate is left exactly as the firmware set it**, because a
+      kernel that recomputes a divisor from a clock it has guessed at goes
+      silent at the moment it would have told you why.
+      `mmu_map_device` maps registers in 4 KiB pages even where a larger one
+      would fit: device registers sit next to other devices' registers, and a
+      2 MiB mapping of a 4 KiB UART makes a megabyte of other peripherals
+      reachable — which on some parts is a stray write away from reprogrammed.
 - [x] **P0.3 Trap entry and exceptions (2026-10-22).** One `stvec`, one
       `scause`, one `sepc`, one `stval`: a single vector, a frame saved on the
       stack already in use, and a dispatch on the cause — against ARM's eight

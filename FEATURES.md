@@ -19,6 +19,8 @@ is named. The phase-by-phase record is `DEVELOPMENT_PROGRESS.md`.
 | **Sv39 paging**, with the kernel identity-mapped: text read-execute, everything else read-write | `pgtable_test` (10 cases, on the host), `selftest_qemu_test` |
 | The kernel's own text is **not writable**, and that is proved by trying | `selftest_qemu_test` (`rotext`) |
 | Large pages where they fit: a 1 GiB identity map costs 3 table pages | `pgtable_test` |
+| **Finds devices in the device tree by `compatible` string** and maps their registers — the pattern every driver uses | `fdt_test`, `boot_qemu_test` |
+| Its own **16550 UART**, found that way, taking the console over from SBI | `boot_qemu_test` |
 | A printf-style formatter, command-line parsing, CRC-32C, SHA-256, SHA-512, Ed25519 verification | host tests, carried over |
 
 ## Carried over, not yet wired up
@@ -38,7 +40,6 @@ In the order it will be built, because each step needs the one before it:
 
 | | |
 |---|---|
-| **The kernel's own UART** | 16550-compatible, from the device tree; SBI's console stays as the fallback |
 | **Memory and processes** | the allocators over the real memory map, user address spaces, the timer through SBI, threads |
 | **The syscall interface** | the generic table, ELF64, the process start state, signals — then Go binaries unchanged |
 | **SMP** | harts started through SBI's hart-state extension, enumerated **from the device tree** because this SoC's application cores are 1–4 |

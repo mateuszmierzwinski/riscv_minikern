@@ -51,4 +51,25 @@ int fdt_prop_cells(const struct fdt_prop *p, uint32_t at, uint32_t cells, uint64
  * fallback when it is absent or malformed. */
 uint32_t fdt_get_u32(const struct fdt *fdt, const char *path, const char *prop, uint32_t fallback);
 
+/* Finds the first node whose `compatible` property names `compat`, and
+ * writes its path.
+ *
+ * This is how a driver finds its device, and it is the pattern every driver
+ * after the console needs: a board is described rather than hard-coded, so
+ * the same binary runs on an emulator and on silicon with different
+ * addresses. A `compatible` value is a list of strings, most specific first,
+ * and matching **any** of them is correct — a 16550 driver must bind to a
+ * node that says "snps,dw-apb-uart", "ns16550a".
+ *
+ * KERR_OK with the path written; KERR_NOENT when nothing matches;
+ * KERR_NOMEM when the path does not fit, which is a refusal rather than a
+ * truncation, because half a path names the wrong node. */
+int fdt_find_compatible(const struct fdt *fdt, const char *compat, char *path, uint32_t cap);
+
+/* The `which`-th (base, size) pair of a node's `reg`, honouring the root's
+ * `#address-cells` and `#size-cells`. Both are 64-bit, because on this
+ * architecture they are two cells each and a device can live above 4 GiB. */
+int fdt_device_reg(const struct fdt *fdt, const char *path, uint32_t which, phys_t *base,
+                   uint64_t *size);
+
 #endif

@@ -56,8 +56,18 @@ grep -qE '^boot: device tree at [0-9a-f]{16}, [0-9]+ bytes$' "$log" ||
 grep -qE '^mem: 1024 MiB at 0000000080000000$' "$log" ||
     fail "the memory node was not read as 1024 MiB at 0x80000000"
 expect 'cmdline: "console=sbi minikern.halt=poweroff"'
+# The kernel finds its own UART in the device tree and takes the console
+# over from the firmware — which is the pattern every later driver uses: ask
+# the tree what the machine has, rather than being compiled for one board.
+# Everything printed after this line came out of the kernel's own driver.
+grep -qE '^uart: /soc/serial@[0-9a-f]+ at [0-9a-f]{16}, taken over from sbi$' "$log" ||
+    { echo "FAIL: it did not find and adopt a 16550 from the device tree" >&2; exit 1; }
 expect "minikern: boot complete"
 expect "minikern: powering off"
 ! grep -qF "refused to power off" "$log" || fail "the firmware refused the power-off"
-echo "ok: firmware → S-mode → device tree → power-off, on four harts"
+# Translation is on, and the lines above it were printed through the UART the
+# kernel mapped itself — so the device mapping works too.
+grep -qE '^mmu: sv39 on, [0-9]+ table pages, kernel text read-execute$' "$log" ||
+    { echo "FAIL: translation was not enabled" >&2; exit 1; }
+echo "ok: firmware → S-mode → device tree → sv39 → the kernel's own UART → power-off"
 echo PASS

@@ -169,10 +169,12 @@ cc_library(
         "src/board/jh7110/console.c",
         "src/board/jh7110/main.c",
         "src/board/jh7110/selftest.c",
+        "src/board/jh7110/uart.c",
     ],
     hdrs = [
         "src/board/jh7110/console.h",
         "src/board/jh7110/selftest.h",
+        "src/board/jh7110/uart.h",
         "src/board/jh7110/version.h",
     ],
     # The series comes from the monorepo's single constant (Rule 28). It has

@@ -123,6 +123,31 @@ int mmu_init(phys_t ram_base, uint64_t ram_bytes) {
     return KERR_OK;
 }
 
+int mmu_map_device(phys_t base, uint64_t bytes) {
+    uint64_t at = page_down(base);
+    uint64_t end = page_up(base + bytes);
+    if (!enabled) {
+        return KERR_OK; /* with translation off, the registers are already there */
+    }
+    for (; at < end; at += PAGE_SIZE) {
+        phys_t already = 0;
+        uint64_t prot = 0, size = 0;
+        int rc;
+        if (pgtable_lookup(&kernel_table, at, &already, &prot, &size)) {
+            continue; /* mapped already, by an earlier call or by the RAM map */
+        }
+        rc = pgtable_map(&kernel_table, at, at, PAGE_SIZE, PT_PROT_RW);
+        if (rc != KERR_OK) {
+            return rc;
+        }
+    }
+    /* A mapping the implementation has not seen before needs no fence, but
+     * one that replaces a cached non-mapping does, and there is no way to
+     * tell which this was. */
+    __asm__ volatile("sfence.vma zero, zero" : : : "memory");
+    return KERR_OK;
+}
+
 struct pgtable *mmu_kernel_table(void) {
     return &kernel_table;
 }

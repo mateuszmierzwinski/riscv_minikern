@@ -135,6 +135,75 @@ static void test_unterminated_bootargs_ignored(void) {
     KTEST_CHECK(info.mem_size == 0 && info.initrd_start == 0);
 }
 
+/* ── finding a device, which is how every driver after the console binds ── */
+
+/* A device is found by what it says it is, not by where it is. The same
+ * kernel then runs on an emulator and on silicon with different addresses,
+ * which is the whole reason for doing it this way. */
+static void test_finds_a_device_by_compatible(void) {
+    static struct fdtb b;
+    struct fdt f;
+    char path[64];
+    phys_t base = 0;
+    uint64_t size = 0;
+    uint32_t len = fdtb_board_with_uart(&b, 0x10000000ull, 0x100ull);
+    KTEST_CHECK(fdt_open(&f, b.blob, len) == KERR_OK);
+    /* Either of the node's compatible strings finds it: a list is "most
+     * specific first", and a generic driver binds on the generic name. */
+    KTEST_CHECK(fdt_find_compatible(&f, "ns16550a", path, sizeof path) == KERR_OK);
+    KTEST_CHECK_STR(path, "/soc/serial@10000000");
+    KTEST_CHECK(fdt_find_compatible(&f, "snps,dw-apb-uart", path, sizeof path) == KERR_OK);
+    KTEST_CHECK_STR(path, "/soc/serial@10000000");
+    /* And the pin controller beside it, so the scan is not merely finding
+     * the first node with a compatible property. */
+    KTEST_CHECK(fdt_find_compatible(&f, "starfive,jh7110-sys-pinctrl", path, sizeof path) == KERR_OK);
+    KTEST_CHECK_STR(path, "/soc/gpio@13040000");
+    KTEST_CHECK(fdt_device_reg(&f, path, 0, &base, &size) == KERR_OK);
+    KTEST_CHECK(base == 0x13040000ull && size == 0x10000ull);
+}
+
+static void test_a_device_that_is_not_there(void) {
+    static struct fdtb b;
+    struct fdt f;
+    char path[64];
+    uint32_t len = fdtb_board_with_uart(&b, 0x10000000ull, 0x100ull);
+    KTEST_CHECK(fdt_open(&f, b.blob, len) == KERR_OK);
+    KTEST_CHECK(fdt_find_compatible(&f, "nothing,at-all", path, sizeof path) == KERR_NOENT);
+    /* A prefix of a real string is not a match: "ns16550" must not find
+     * "ns16550a", or a driver binds to a part it does not understand. */
+    KTEST_CHECK(fdt_find_compatible(&f, "ns16550", path, sizeof path) == KERR_NOENT);
+    KTEST_CHECK(fdt_find_compatible(&f, "", path, sizeof path) == KERR_NOENT);
+}
+
+/* A path that does not fit is **refused**, not truncated: half a path names a
+ * different node, and a driver that bound to it would drive the wrong
+ * registers. */
+static void test_a_path_too_long_is_refused(void) {
+    static struct fdtb b;
+    struct fdt f;
+    char path[8];
+    uint32_t len = fdtb_board_with_uart(&b, 0x10000000ull, 0x100ull);
+    KTEST_CHECK(fdt_open(&f, b.blob, len) == KERR_OK);
+    KTEST_CHECK(fdt_find_compatible(&f, "ns16550a", path, sizeof path) == KERR_NOMEM);
+    KTEST_CHECK(fdt_find_compatible(&f, "ns16550a", path, 0) == KERR_INVAL);
+}
+
+/* A device above 4 GiB, which a two-cell address can describe and a 32-bit
+ * reader could not. The JH7110's own peripherals are low, but a PCIe window
+ * — which is where the NVMe slot lives — is not. */
+static void test_a_device_above_four_gibibytes(void) {
+    static struct fdtb b;
+    struct fdt f;
+    char path[64];
+    phys_t base = 0;
+    uint64_t size = 0;
+    uint32_t len = fdtb_board_with_uart(&b, 0x900000000ull, 0x10000000ull);
+    KTEST_CHECK(fdt_open(&f, b.blob, len) == KERR_OK);
+    KTEST_CHECK(fdt_find_compatible(&f, "ns16550a", path, sizeof path) == KERR_OK);
+    KTEST_CHECK(fdt_device_reg(&f, path, 0, &base, &size) == KERR_OK);
+    KTEST_CHECK(base == 0x900000000ull && size == 0x10000000ull);
+}
+
 int main(void) {
     KTEST_RUN(test_opens_and_finds);
     KTEST_RUN(test_absent_is_noent);
@@ -145,5 +214,9 @@ int main(void) {
     KTEST_RUN(test_unbalanced_and_deep_trees_are_rejected);
     KTEST_RUN(test_cells);
     KTEST_RUN(test_unterminated_bootargs_ignored);
+    KTEST_RUN(test_finds_a_device_by_compatible);
+    KTEST_RUN(test_a_device_that_is_not_there);
+    KTEST_RUN(test_a_path_too_long_is_refused);
+    KTEST_RUN(test_a_device_above_four_gibibytes);
     return ktest_failures();
 }

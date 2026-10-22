@@ -22,11 +22,13 @@
 #include "arch/riscv/trap.h"
 #include "board/jh7110/console.h"
 #include "board/jh7110/selftest.h"
+#include "board/jh7110/uart.h"
 #include "board/jh7110/version.h"
 #include "core/bootinfo.h"
 #include "core/cmdline.h"
 #include "core/console.h"
 #include "core/errno.h"
+#include "core/fdt.h"
 #include "core/ports.h"
 
 #include <stdbool.h>
@@ -104,6 +106,28 @@ static void bring_up_translation(const struct bootinfo *info) {
     kprintf("mmu: sv39 on, %u table pages, kernel text read-execute\n", mmu_table_pages_used());
 }
 
+/* Takes the board's own UART over from the firmware's console.
+ *
+ * Deliberately after translation is on, because the UART's registers have to
+ * be mapped — and deliberately **not** fatal: a board whose tree names no
+ * 16550 keeps the SBI console, which is slower and works. A kernel that goes
+ * silent because it could not find a better way to speak has made the
+ * situation worse. */
+static void adopt_the_real_uart(uint64_t dtb) {
+    struct console_port port;
+    struct fdt fdt;
+    if (fdt_open(&fdt, (const void *)(uintptr_t)dtb, FDT_MAX_BYTES) != KERR_OK) {
+        return;
+    }
+    if (jh7110_uart_init(&fdt, &port) != KERR_OK) {
+        kprintf("uart: no 16550 in the device tree; keeping the firmware's console\n");
+        return;
+    }
+    console_attach(&port);
+    kprintf("uart: %s at %016llx, taken over from sbi\n", jh7110_uart_path(),
+            (unsigned long long)jh7110_uart_base());
+}
+
 /* True when the operator asked the machine to switch itself off at the end,
  * which is what makes a boot test a test rather than a timeout. */
 static bool halt_requested(void) {
@@ -122,6 +146,7 @@ void kmain(uint64_t hart, uint64_t dtb) {
      * address zero. */
     trap_init_cpu();
     bring_up_translation(&info);
+    adopt_the_real_uart(dtb);
     (void)selftest_run(boot_cmdline);
     kprintf("minikern: boot complete\n");
     if (halt_requested()) {

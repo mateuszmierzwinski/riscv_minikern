@@ -109,6 +109,45 @@ static inline void fdtb_prop_cells4(struct fdtb *b, const char *name, uint64_t b
     fdtb_prop(b, name, v, sizeof v);
 }
 
+/* A `compatible` property: a list of NUL-separated strings, which is how a
+ * device names what it is, most specific first. */
+static inline void fdtb_prop_compatible(struct fdtb *b, const char *first, const char *second) {
+    uint8_t v[128];
+    uint32_t at = 0;
+    for (const char *s = first; s != NULL; s = (s == first) ? second : NULL) {
+        for (uint32_t i = 0; s[i] != '\0' && at + 1u < sizeof v; i++) {
+            v[at++] = (uint8_t)s[i];
+        }
+        v[at++] = 0;
+        if (second == NULL) {
+            break;
+        }
+    }
+    fdtb_prop(b, "compatible", v, at);
+}
+
+/* A board with a device on it: a 16550 at `base`, named the way the JH7110's
+ * tree names one, inside a /soc node — so the test exercises a device that is
+ * not at the root, which is where every real one is. */
+static inline uint32_t fdtb_board_with_uart(struct fdtb *b, uint64_t base, uint64_t size) {
+    memset(b, 0, sizeof *b);
+    fdtb_begin(b, "");
+    fdtb_prop_u32(b, "#address-cells", 2);
+    fdtb_prop_u32(b, "#size-cells", 2);
+    fdtb_begin(b, "soc");
+    fdtb_begin(b, "serial@10000000");
+    fdtb_prop_compatible(b, "snps,dw-apb-uart", "ns16550a");
+    fdtb_prop_cells4(b, "reg", base, size);
+    fdtb_end(b);
+    fdtb_begin(b, "gpio@13040000");
+    fdtb_prop_compatible(b, "starfive,jh7110-sys-pinctrl", NULL);
+    fdtb_prop_cells4(b, "reg", 0x13040000ull, 0x10000ull);
+    fdtb_end(b);
+    fdtb_end(b);
+    fdtb_end(b);
+    return fdtb_finish(b);
+}
+
 /* The shape a RISC-V board's firmware passes: two cells for both, DRAM at
  * 0x4000_0000 as the JH7110 has it, and a size the caller chooses so that
  * the 8 GiB case can be tested. */

@@ -78,6 +78,7 @@ QEMU 10.1.5 `qemu-system-riscv64`, measured 2026-10-22:
 | An M-mode CSR read from S-mode | **illegal instruction** | it killed the first spike before its first character. What a supervisor may know about its ISA comes from the device tree |
 | Instruction width | **2 or 4 bytes** (`rv64gc` includes compressed instructions) | "skip the faulting instruction" must read the instruction, not assume a width — see the progress record for what assuming cost |
 | Sv39 identity map of 1 GiB | **3 table pages** | gigapage leaves make the kernel's own map nearly free |
+| QEMU `virt`'s UART | an `ns16550a` at `0x10000000`, in `/soc/serial@10000000` | the same driver binds to it and to the JH7110's `snps,dw-apb-uart`, because it asks the tree rather than being compiled for a board |
 
 ### From the JH7110 documentation — each to be verified when first used
 

@@ -245,3 +245,134 @@ uint32_t fdt_get_u32(const struct fdt *fdt, const char *path, const char *prop, 
     }
     return (uint32_t)v;
 }
+
+/* ── finding a device rather than a path ─────────────────────────────────── */
+
+/* One open node, while scanning for a device: its name, so a path can be
+ * rebuilt when a match is found. */
+struct open_node {
+    const char *name;
+    uint32_t len;
+};
+
+/* True when a `compatible` value — a list of NUL-separated strings — names
+ * `want`. A node is compatible with several things, most specific first, and
+ * matching any of them is the point: a driver for `ns16550a` must bind to a
+ * node that says "snps,dw-apb-uart", "ns16550a". */
+static bool compatible_lists(const struct fdt_prop *p, const char *want) {
+    uint32_t at = 0;
+    while (at < p->len) {
+        const char *s = (const char *)p->value + at;
+        uint32_t n = 0;
+        while (at + n < p->len && s[n] != '\0') {
+            n++;
+        }
+        if (at + n >= p->len && s[n] != '\0') {
+            return false; /* unterminated: a malformed value matches nothing */
+        }
+        if (str_equal(s, want)) {
+            return true;
+        }
+        at += n + 1u;
+    }
+    return false;
+}
+
+/* Writes "/a/b@1" for the currently open chain. False when it does not fit,
+ * which is a refusal rather than a truncation: half a path would name the
+ * wrong node. */
+static bool build_path(const struct open_node *stack, uint32_t depth, char *out, uint32_t cap) {
+    uint32_t at = 0;
+    if (depth == 0) {
+        return cap >= 2u && (out[0] = '/', out[1] = '\0', true);
+    }
+    for (uint32_t i = 0; i < depth; i++) {
+        if (at + 1u + stack[i].len + 1u > cap) {
+            return false;
+        }
+        out[at++] = '/';
+        for (uint32_t k = 0; k < stack[i].len; k++) {
+            out[at++] = stack[i].name[k];
+        }
+    }
+    out[at] = '\0';
+    return true;
+}
+
+int fdt_find_compatible(const struct fdt *fdt, const char *compat, char *path, uint32_t cap) {
+    struct open_node stack[FDT_MAX_DEPTH];
+    const uint8_t *blk = fdt->base + fdt->struct_off;
+    uint32_t at = 0, depth = 0;
+    if (compat == NULL || path == NULL || cap == 0) {
+        return KERR_INVAL;
+    }
+    for (;;) {
+        uint32_t token;
+        if (!fits(at, 4, fdt->struct_size)) {
+            return KERR_INVAL;
+        }
+        token = be32(blk + at);
+        at += 4;
+        if (token == FDT_END) {
+            return depth == 0 ? KERR_NOENT : KERR_INVAL;
+        }
+        if (token == FDT_NOP) {
+            continue;
+        }
+        if (token == FDT_BEGIN_NODE) {
+            int32_t len = bounded_strlen(blk, at, fdt->struct_size);
+            if (len < 0 || depth == FDT_MAX_DEPTH) {
+                return KERR_INVAL;
+            }
+            stack[depth] = (struct open_node){.name = (const char *)blk + at, .len = (uint32_t)len};
+            depth++;
+            at = align4(at + (uint32_t)len + 1u);
+            continue;
+        }
+        if (token == FDT_END_NODE) {
+            if (depth == 0) {
+                return KERR_INVAL;
+            }
+            depth--;
+            continue;
+        }
+        if (token != FDT_PROP) {
+            return KERR_INVAL;
+        }
+        {
+            uint32_t len, nameoff;
+            struct fdt_prop value;
+            if (depth == 0 || !fits(at, 8, fdt->struct_size)) {
+                return KERR_INVAL;
+            }
+            len = be32(blk + at);
+            nameoff = be32(blk + at + 4);
+            if (!fits(at + 8, len, fdt->struct_size) ||
+                bounded_strlen(fdt->base + fdt->strings_off, nameoff, fdt->strings_size) < 0) {
+                return KERR_INVAL;
+            }
+            value = (struct fdt_prop){.value = blk + at + 8, .len = len};
+            at = align4(at + 8 + len);
+            if (str_equal((const char *)fdt->base + fdt->strings_off + nameoff, "compatible") &&
+                compatible_lists(&value, compat)) {
+                /* The root is depth 1 with an empty name, so the chain above
+                 * the match is what names it. */
+                return build_path(&stack[1], depth - 1u, path, cap) ? KERR_OK : KERR_NOMEM;
+            }
+        }
+    }
+}
+
+int fdt_device_reg(const struct fdt *fdt, const char *path, uint32_t which, phys_t *base,
+                   uint64_t *size) {
+    uint32_t acells = fdt_get_u32(fdt, "/", "#address-cells", 2);
+    uint32_t scells = fdt_get_u32(fdt, "/", "#size-cells", 2);
+    struct fdt_prop reg;
+    uint32_t at = which * (acells + scells);
+    int rc = fdt_get_prop(fdt, path, "reg", &reg);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    rc = fdt_prop_cells(&reg, at, acells, base);
+    return rc != KERR_OK ? rc : fdt_prop_cells(&reg, at + acells, scells, size);
+}

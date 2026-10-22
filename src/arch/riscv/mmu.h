@@ -37,6 +37,16 @@ void mmu_set_table_arena(phys_t base, uint64_t bytes);
  * a failure here leaves the machine exactly as it was rather than halfway. */
 int mmu_init(phys_t ram_base, uint64_t ram_bytes);
 
+/* Maps a device's registers into the kernel's address space, identically,
+ * read-write and **not** executable.
+ *
+ * In 4 KiB pages even when a larger one would fit: device registers sit next
+ * to other devices' registers, and a 2 MiB mapping of a 4 KiB UART would
+ * quietly make a megabyte of other peripherals reachable — and on some parts,
+ * reachable means a stray write away from reprogrammed. Safe to call twice
+ * for the same device; the second call is a no-op rather than an error. */
+int mmu_map_device(phys_t base, uint64_t bytes);
+
 /* The kernel's table, for anything that needs to add to it. */
 struct pgtable *mmu_kernel_table(void);
 
