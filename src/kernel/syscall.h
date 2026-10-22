@@ -29,6 +29,7 @@
 #define SYS_EPOLL_CREATE1 20u
 #define SYS_EPOLL_CTL 21u
 #define SYS_EPOLL_PWAIT 22u
+#define SYS_DUP 23u
 #define SYS_FCNTL 25u
 #define SYS_IOCTL 29u
 #define SYS_FACCESSAT 48u
@@ -95,6 +96,12 @@ void syscall_trace_sleeps(bool on);
 /* Whether `tgkill` really raises a signal. Off drops it, which costs a
  * runtime its asynchronous preemption and nothing else. */
 void syscall_allow_tgkill(bool on);
+
+/* The socket domain's own table, in `sys_socket.c`, terminated by a zero
+ * entry. A table per domain is how this grows without one file becoming the
+ * place every syscall lives: the dispatcher searches the domains in turn,
+ * and a new domain is a new file and one line here. */
+extern const struct syscall_entry sys_socket_table[];
 
 /* Dispatches one call. Returns true when it was handled — which includes
  * being handled by returning an error. False only for `exit`, which does

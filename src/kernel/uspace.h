@@ -80,6 +80,33 @@ void uspace_release_address_space(void);
 /* A secondary hart joining a running process; returns when it is over. */
 void uspace_join(struct uproc *p);
 
+/* ── reading and writing a process's memory ────────────────────────────────
+ *
+ * **The kernel should not dereference a user pointer.** It can — `sstatus.SUM`
+ * is set while a syscall runs and the process's own table is loaded — and
+ * that is exactly the problem: a pointer that is wrong faults *in the
+ * kernel*, where a fault is a panic. A program that passes a bad pointer to
+ * a syscall would then stop the machine, which is a denial of service any
+ * user can perform with one line.
+ *
+ * These check the range against the process's page table, a page at a time,
+ * for the rights the direction needs, and copy through it. A bad pointer is
+ * `KERR_FAULT` returned to the caller, which is what the ABI promises.
+ *
+ * The architecture this migrated from had this property from early on and
+ * named it: "the kernel never dereferences a user pointer". This kernel grew
+ * the other way round, so the older syscalls still dereference directly and
+ * are being moved over; the sockets, which take the most pointers, use these
+ * from the start.
+ */
+int uspace_copy_in(void *to, virt_t from, uint32_t n);
+int uspace_copy_out(virt_t to, const void *from, uint32_t n);
+
+/* Whether a range is readable, or writable, by the process — for a caller
+ * that wants to check before doing something it cannot undo. */
+bool uspace_can_read(virt_t at, uint32_t n);
+bool uspace_can_write(virt_t at, uint32_t n);
+
 /* The process a syscall is being made by, or NULL outside one. There is one
  * at a time until there is a scheduler. */
 struct uproc *uspace_current(void);

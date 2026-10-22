@@ -501,12 +501,21 @@ cc_library(
         "src/arch/riscv/switch.S",
         "src/arch/riscv/uspace_entry.S",
         "src/kernel/sched.c",
+        "src/kernel/fdobjects.c",
+        "src/kernel/sock_tcp.c",
+        "src/kernel/sys_socket.c",
+        "src/kernel/sock_udp.c",
+        "src/kernel/socket.c",
+        "src/kernel/file.c",
         "src/kernel/signal.c",
         "src/kernel/syscall.c",
         "src/kernel/uspace.c",
     ],
     hdrs = [
         "src/arch/riscv/sigframe.h",
+        "src/kernel/fdobjects.h",
+        "src/kernel/socket.h",
+        "src/kernel/file.h",
         "src/kernel/signal.h",
         "src/kernel/sched.h",
         "src/kernel/syscall.h",
@@ -519,8 +528,10 @@ cc_library(
         ":console",
         ":exec",
         ":kernel_mem",
+        ":kernel_net",
         ":kernel_random",
         ":klock",
+        ":net",
         ":pgtable",
     ],
 )
@@ -834,6 +845,23 @@ sh_test(
     tags = ["manual"],
 )
 
+# P7: Go's net package, which needs the descriptor layer, a real epoll and
+# sockets over the carried-over stack.
+sh_test(
+    name = "netgo_qemu_test",
+    size = "large",
+    srcs = ["test/netgo_qemu_test.sh"],
+    args = [
+        "$(rootpath :minikern)",
+        "$(rootpath //src/userland/netgo:netgo)",
+    ],
+    data = [
+        ":minikern",
+        "//src/userland/netgo:netgo",
+    ],
+    tags = ["manual"],
+)
+
 test_suite(
     name = "qemu_tests",
     tags = ["manual"],
@@ -843,6 +871,7 @@ test_suite(
         ":go_qemu_test",
         ":init_qemu_test",
         ":net_qemu_test",
+        ":netgo_qemu_test",
         ":selftest_qemu_test",
         ":smp_qemu_test",
         ":user_qemu_test",

@@ -74,6 +74,18 @@ static void unlink_backlog(struct tcp_conn *c) {
     c->listener = NULL;
 }
 
+void tcp_detach(struct tcp_conn *c) {
+    if (c == NULL || !c->used) {
+        return;
+    }
+    c->notify = NULL;
+    if (c->state == TCP_CLOSED || c->state == TCP_LISTEN) {
+        tcp_free(c); /* nothing left to finish */
+        return;
+    }
+    c->detached = true;
+}
+
 void tcp_free(struct tcp_conn *c) {
     if (c == NULL || !c->used) {
         return;
@@ -87,6 +99,7 @@ void tcp_free(struct tcp_conn *c) {
     }
     unlink_backlog(c);
     c->used = false;
+    c->detached = false;
     c->state = TCP_CLOSED;
     c->notify = NULL;
 }
@@ -258,6 +271,16 @@ void tcp_tick(struct tcp_stack *s, uint64_t now_ms) {
         }
         if (c->state == TCP_TIME_WAIT && now_ms >= c->linger_at_ms) {
             tcp_enter(c, TCP_CLOSED);
+            /* A detached connection that has finished is reclaimed here,
+             * which is the other half of `tcp_detach`: nobody owns it, so
+             * nobody else will. */
+            if (c->detached) {
+                tcp_free(c);
+            }
+            continue;
+        }
+        if (c->detached && c->state == TCP_CLOSED) {
+            tcp_free(c);
             continue;
         }
         if (c->rto_at_ms != 0 && now_ms >= c->rto_at_ms) {

@@ -135,6 +135,38 @@ void sched_yield_now(void);
  * interrupts still off through the syscall that window does not exist. */
 bool sched_futex_wait(virt_t addr, uint64_t deadline_ns);
 
+/* The key a thread waiting for descriptor readiness is blocked on.
+ *
+ * It must be wakeable, because a runtime **interrupts its own poller**: it
+ * writes to an eventfd to say "stop waiting, something changed". A poller
+ * that cannot be woken sleeps out the delay it was originally given, and the
+ * runtime's timers are then as late as that delay — a correct-but-slow
+ * kernel, which is the hard kind to diagnose because every individual sleep
+ * is accurate.
+ *
+ * 1 rather than a real address: it shares the futex key space, and no user
+ * futex lives at 1 because the lowest page is never mapped. */
+#define SCHED_POLLER_KEY 1ull
+
+/* ── kernel wait channels ───────────────────────────────────────────────────
+ *
+ * The same idea as a futex, keyed on a **kernel** pointer: a thread sleeps
+ * on the address of whatever it is waiting for — a socket, a queue — and
+ * whatever changes that thing wakes it.
+ *
+ * A separate key space from the futex addresses on purpose. A futex key is a
+ * *user* address, and this kernel's user space reaches 256 GiB, which
+ * includes every address a kernel pointer could have. Sharing one space
+ * would let a program's futex alias a kernel object's wait channel, and a
+ * spurious wake-up is the *good* outcome of that: the bad one is a wake
+ * going to the wrong sleeper.
+ *
+ * `deadline_ns` of 0 waits with no deadline. Returns KERR_OK when woken,
+ * KERR_TIMEDOUT when the deadline passed.
+ */
+int sched_wait_on(const void *chan, uint64_t deadline_ns);
+uint32_t sched_wake_on(const void *chan, uint32_t max);
+
 /* Sleeps until a deadline with nothing able to wake it early — the tick
  * ends it. For `nanosleep` and for an idle runtime's poller, both of which
  * would otherwise spin on the clock. False when there is no thread or no

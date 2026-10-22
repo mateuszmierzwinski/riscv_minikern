@@ -803,20 +803,99 @@ Three things in it are *not* architecture-neutral and were fixed on the way in:
 
 ## P7 — Finishing
 
-- [ ] **P7.1 Remove the ARM project from the monorepo** once this one reaches
-      parity on the things that matter (Go unchanged, SMP, storage, network).
-      It is published and tagged, so removal loses nothing — but it happens
-      *after* the replacement works, not before.
 - [ ] **P7.4 The documents a reader wants.** `GOALS.md`, `FEATURES.md` and
       this file are the published record; the agent ruleset (`CLAUDE.md`) and
       session state (`MEMORY.md`) are working documents and stay out of the
       repository, because a public tree carrying an instruction file addressed
       to a tool is confusing rather than transparent.
-- [ ] **P7.2 The CVE suites**, which are the largest test surface in the ARM
-      project and carry over: hostile syscalls from a Go program, malformed
-      and attacking packets under ASan and UBSan, and the server's own
-      adversarial tests.
 - [ ] **P7.3 The hardware report.** `minikern.hwreport=1` prints every value
       taken from a datasheet beside what it should be, so powering a board up
       produces one checkable artefact instead of a vague instruction. It was
       the most useful thing the ARM project built late; here it belongs early.
+
+## P7 — sockets: Go's `net` package
+
+- [x] **P7.1 A descriptor layer (2026-10-22).** Until now there were five
+      *pseudo*-descriptors — three for the console and two the netpoller asked
+      for — each recognised by its number in a `switch`. That was honest while
+      nothing else could be opened and stopped being honest the moment a
+      socket existed: **a socket is a descriptor whose readiness changes, and
+      a number in a `switch` cannot be waited on.**
+      So a table, with per-object operations: read, write, poll, release. Four,
+      because that is what the things this kernel has can do. `poll` is the
+      one that matters — it reports what an object could do *now*, which is
+      what makes an `epoll` possible at all.
+- [x] **P7.2 A real epoll (2026-10-22).** Registrations with the caller's
+      token, readiness collected by asking each watched object, and a wait
+      that sleeps until the timeout **or until something changes**. The stub
+      before it reported no events for ever, which is a kernel on which a
+      network program waits for ever.
+      `EPOLLERR` and `EPOLLHUP` are reported whether or not they were asked
+      for, as the interface requires: a runtime uses them to notice a
+      connection that failed rather than one that became readable.
+      **The bug worth keeping: `struct epoll_event` is packed only on
+      x86-64.** The kernel's header carries `__attribute__((packed))` under
+      `#ifdef __x86_64__`; everywhere else the 4-byte event mask is followed
+      by **4 bytes of padding** and then the 8-byte token — 16 bytes, not 12.
+      This was written packed first, with a comment asserting that the ABI
+      packs it. The token is the pointer a runtime identifies a descriptor by,
+      so writing it four bytes early made the runtime dereference half a
+      pointer joined to half a flag word: a segmentation fault inside
+      `runtime.netpoll`, which is a confident-looking crash a long way from
+      the mistake. Verified against what the runtime declares for *this*
+      architecture rather than against the one this was ported from.
+- [x] **P7.3 Checked user copies (2026-10-22).** The kernel *could*
+      dereference a user pointer — `sstatus.SUM` is set and the process's
+      table is loaded — and that is the problem: a pointer that is wrong
+      faults in the kernel, where a fault is a panic. **A program could stop
+      the machine with one bad pointer.** `uspace_copy_in`/`_out` check the
+      range against the page table, a page at a time, for the rights the
+      direction needs. The architecture this came from had the property from
+      early on and named it; this kernel grew the other way round, and the
+      sockets — which take the most pointers — use the checked form from the
+      start.
+- [x] **P7.4 Sockets, and Go's `net` package (2026-10-22).** The socket layer
+      carried over: a socket is a file whose operations forward to a
+      per-protocol table, UDP and TCP, over the stack that had already
+      carried over. What had to change was **the ABI, not the logic**:
+      • **The numbers.** Sockets are a contiguous block from 198 here. On the
+        architecture this came from they were 281..297 with `accept4` stranded
+        at 366, because they were added to a 32-bit ABI one at a time over a
+        decade.
+      • **Every user pointer was a `uint32_t`.** Truncating one on a machine
+        whose user space reaches 256 GiB gives a different address entirely;
+        the first symptom was `bind` refusing `127.0.0.1` because it had
+        parsed a `sockaddr` out of unrelated memory.
+      • **`struct msghdr` is a different shape, not a wider one.** On LP64 the
+        pointers are 8 bytes, `msg_namelen` is 4 followed by 4 of padding, and
+        the two length fields are 8 rather than 4: 56 bytes against 28, with
+        every field after the first at a new offset. The 32-bit layout read
+        `msg_iov` out of the middle of `msg_name`. It is read field by field
+        at named offsets now, because the padding is the part that is easy to
+        get wrong.
+      **And one real bug in the carried-over stack**, which the architecture
+      it came from shares: closing a socket called `tcp_free`, and `tcp_free`
+      **sends a reset** for anything not already closed — it is an abort
+      primitive. So a graceful close aborted the connection while the peer was
+      still completing the FIN exchange, and `io.ReadAll` on a half-closed
+      connection reported "connection reset by peer" at the end of a transfer
+      that had succeeded. The stack's counters showed it exactly: five
+      segments arriving for a connection that no longer existed, five resets
+      going back. A closed socket now `tcp_detach`es — the shutdown finishes
+      without an owner and the stack reclaims the slot when it is done.
+      Working, with Go's own calls and nothing written for this kernel: a UDP
+      round trip, a TCP connect/accept/half-close/read-to-EOF, and **64 KiB
+      transferred byte for byte**.
+      Two measurements recorded rather than tidied away. Retransmissions are
+      about four per connection and do **not** scale with the data — 24 for a
+      66-segment exchange, 15 for a 217-segment one — so they are a cost of
+      starting and ending a connection where both ends are local and progress
+      on the 10 ms tick, not loss. And one reset still happens in some runs
+      *after* the program has finished, when a detached connection's
+      TIME_WAIT expires and a late retransmission finds nothing: nothing
+      observes it here, but a real peer would, so it is bounded by the test
+      rather than called zero.
+- [ ] **P7.5 An HTTP exchange inside the guest**, which is the next thing to
+      ask of this: `http.Client` against `http.Server`, both in the same
+      program, which adds nothing to the kernel but proves the socket layer
+      under a protocol that uses it in earnest.

@@ -6,6 +6,8 @@
 #include "core/elf.h"
 #include "core/errno.h"
 #include "kernel/random.h"
+#include "kernel/fdobjects.h"
+#include "kernel/file.h"
 #include "kernel/sched.h"
 #include "kernel/signal.h"
 #include "arch/riscv/timer.h"
@@ -51,46 +53,6 @@ static uint64_t complained[8];
 #define MAP_FIXED 0x10u
 #define MAP_ANONYMOUS 0x20u
 
-/* ── the descriptors a Go runtime makes for itself ──────────────────────────
- *
- * A Go runtime builds a **netpoller** during initialisation — before any
- * network code is reached, because its timers go through it: the first
- * `time.Sleep` calls `netpollinit`, which creates an epoll instance and an
- * eventfd and fails fatally if either is refused. That is why a kernel with
- * no network stack still has to answer these.
- *
- * What is implemented is the shape, not the mechanism: an epoll instance
- * that never reports an event, and an eventfd that counts. Nothing is
- * watchable yet, so "no events" is the true answer, and a runtime treats it
- * as such — it is the answer a poller gets whenever nothing is ready.
- *
- * The state is the kernel's rather than the process's because there is one
- * process. When there is a second, this moves into `struct uproc`, and the
- * fact that it has not is recorded here rather than discovered then. */
-#define FD_FIRST_ALLOCATED 3u
-#define FD_EPOLL 3u
-#define FD_EVENT 4u
-#define FD_LIMIT 5u
-
-static uint64_t eventfd_count;
-static bool epoll_created;
-static bool eventfd_created;
-
-/* The key a thread waiting in `epoll_pwait` is blocked on.
- *
- * It needs to be wakeable, because a runtime **interrupts its own poller**:
- * `netpollBreak` writes to the eventfd to say "stop waiting, there is a
- * sooner timer than the one you were given". A poller that ignores that
- * sleeps out the delay it was originally told, and the runtime's timers are
- * then as late as that delay — which is a correct-but-slow kernel of exactly
- * the kind that is hard to diagnose, because every individual sleep is
- * accurate.
- *
- * 1 rather than a real address: it is a key in the same space as a futex
- * address, and no user futex lives at 1 (the lowest page is never mapped),
- * so the two cannot collide. */
-#define POLLER_WAIT_KEY 1ull
-
 /* The clocks `clock_gettime` knows. Both come from the same tick here: this
  * kernel has no wall clock, and inventing one would be worse than a
  * monotonic count that is honest about what it is. */
@@ -110,65 +72,6 @@ struct user_iovec {
     uint64_t base;
     uint64_t len;
 };
-
-/* Writes `n` bytes of the running process's memory to the console.
- *
- * Reading user memory directly is safe **only because `sstatus.SUM` is set
- * while a syscall runs and the process's own table is still loaded** — the
- * kernel is addressing the same page the process was. A length is clamped
- * rather than trusted: it arrived from user space. */
-static int64_t write_user_bytes(uint64_t addr, uint64_t n) {
-    const char *from = (const char *)(uintptr_t)addr;
-    if (addr == 0 || addr >= USER_TOP) {
-        return KERR_FAULT;
-    }
-    n = n > 1u << 20 ? 1u << 20 : n;
-    console_write(from, (size_t)n);
-    return (int64_t)n;
-}
-
-static int64_t sys_write(struct trapframe *tf) {
-    uint64_t fd = sysarg(tf, 0);
-    const uint64_t *value = (const uint64_t *)(uintptr_t)sysarg(tf, 1);
-    /* Writing to the eventfd is how a runtime interrupts its own poller —
-     * `netpollBreak` — and it **throws a fatal error if the write fails**.
-     * It adds to the counter, which is the whole of an eventfd's semantics
-     * on the write side. */
-    if (fd == FD_EVENT && eventfd_created) {
-        if (value == NULL || (uint64_t)(uintptr_t)value >= USER_TOP || sysarg(tf, 2) != 8u) {
-            return KERR_INVAL;
-        }
-        eventfd_count += *value;
-        /* This is the whole point of the eventfd: waking the poller. */
-        (void)sched_futex_wake(POLLER_WAIT_KEY, 64u);
-        return 8;
-    }
-    if (fd != 1u && fd != 2u) {
-        return KERR_BADF;
-    }
-    return write_user_bytes(sysarg(tf, 1), sysarg(tf, 2));
-}
-
-/* The scattered form, which a Go runtime uses for everything it prints. */
-static int64_t sys_writev(struct trapframe *tf) {
-    const struct user_iovec *iov = (const struct user_iovec *)(uintptr_t)sysarg(tf, 1);
-    uint64_t count = sysarg(tf, 2);
-    int64_t total = 0;
-    if (sysarg(tf, 0) != 1u && sysarg(tf, 0) != 2u) {
-        return KERR_BADF;
-    }
-    if (iov == NULL || count > 1024u) {
-        return KERR_INVAL;
-    }
-    for (uint64_t i = 0; i < count; i++) {
-        int64_t wrote = iov[i].len == 0 ? 0 : write_user_bytes(iov[i].base, iov[i].len);
-        if (wrote < 0) {
-            return total > 0 ? total : wrote;
-        }
-        total += wrote;
-    }
-    return total;
-}
 
 static int64_t sys_exit(struct trapframe *tf) {
     uspace_exit((int64_t)(int32_t)sysarg(tf, 0));
@@ -273,131 +176,180 @@ static int64_t sys_sched_getaffinity(struct trapframe *tf) {
     return (int64_t)(bytes < 8u ? bytes : 8u);
 }
 
-static int64_t sys_epoll_create1(struct trapframe *tf) {
-    (void)tf;
-    epoll_created = true;
-    return FD_EPOLL;
-}
-
-static int64_t sys_eventfd2(struct trapframe *tf) {
-    eventfd_count = sysarg(tf, 0);
-    eventfd_created = true;
-    return FD_EVENT;
-}
-
-/* Registering interest in a descriptor. Accepted and recorded nowhere:
- * there is nothing that can become ready, so there is nothing to remember.
- * Refusing it would stop the runtime starting. */
-static int64_t sys_epoll_ctl(struct trapframe *tf) {
-    return sysarg(tf, 0) == FD_EPOLL ? 0 : KERR_BADF;
-}
-
-/* Waiting for an event that cannot arrive.
+/* ── descriptors ───────────────────────────────────────────────────────────
  *
- * The timeout is **honoured** rather than ignored, which matters: a runtime
- * whose idle threads are told "no events" instantly spins a core at the
- * speed of the syscall, and on one hart that starves every other thread.
- * Waiting for the timeout makes an idle program idle. A negative timeout
- * means "for ever", which here is bounded — nothing can arrive, so sleeping
- * for ever would be a deadlock this kernel caused. */
-static int64_t sys_epoll_pwait(struct trapframe *tf) {
-    int64_t timeout_ms = (int64_t)(int32_t)sysarg(tf, 3);
-    uint64_t deadline;
-    if (sysarg(tf, 0) != FD_EPOLL) {
-        return KERR_BADF;
-    }
-    if (timeout_ms == 0) {
-        return 0;
-    }
-    /* A negative timeout means "for ever", which here is bounded: nothing
-     * can arrive, so sleeping for ever would be a deadlock this kernel
-     * caused. Ten milliseconds is short enough that a runtime's timers stay
-     * accurate and long enough that an idle machine is idle. */
-    /* An event already waiting means there is something to report, and the
-     * caller should come back round rather than sleep. */
-    if (eventfd_count != 0) {
-        return 0;
-    }
-    trace_sleep(timeout_ms < 0 ? "epoll_pwait (indefinite)" : "epoll_pwait",
-                timeout_ms < 0 ? 10000000ull : (uint64_t)timeout_ms * 1000000ull);
-    deadline = timer_ns() + (timeout_ms < 0 ? 10000000ull
-                                            : (uint64_t)timeout_ms * 1000000ull);
-    /* Waiting on a **key**, not just a clock, so `netpollBreak` can end it
-     * early. The deadline is still honoured, so a poller nobody breaks is
-     * not left asleep. */
-    (void)sched_futex_wait(POLLER_WAIT_KEY, deadline);
-    return 0;
-}
+ * Everything goes through the file layer now. It used to be a `switch` on
+ * the descriptor number, which was honest while only the console and the
+ * netpoller's two objects could be opened and stopped being honest the
+ * moment a socket existed: a socket is a descriptor whose readiness changes,
+ * and a number in a `switch` cannot be waited on.
+ */
 
-/* The three descriptors that exist. A runtime **checks them before it does
- * anything else** — `runtime.checkfds` asks `fcntl(F_GETFD)` of each of 0, 1
- * and 2, and anything other than success or `EBADF` makes it abort with
- * "cannot open standard fds" before `main` is reached. That was the first
- * thing a real Go binary did here, and it is why this exists. */
+/* A runtime **checks descriptors 0, 1 and 2 before it does anything else** —
+ * `runtime.checkfds` asks `fcntl(F_GETFD)` of each — and anything other than
+ * success or EBADF makes it abort with "cannot open standard fds" before
+ * `main` is reached. That was the first thing a real Go binary did here. */
+#define F_DUPFD 0u
 #define F_GETFD 1u
 #define F_SETFD 2u
 #define F_GETFL 3u
-
-static bool is_standard_fd(uint64_t fd) {
-    return fd <= 2u;
-}
-
-/* A descriptor this kernel knows: the console's three, plus the two the
- * netpoller asked for. */
-static bool is_known_fd(uint64_t fd) {
-    return is_standard_fd(fd) || (fd == FD_EPOLL && epoll_created) ||
-           (fd == FD_EVENT && eventfd_created);
-}
+#define F_SETFL 4u
 
 static int64_t sys_fcntl(struct trapframe *tf) {
-    if (!is_known_fd(sysarg(tf, 0))) {
+    struct file *f = fd_get((int32_t)sysarg(tf, 0));
+    if (f == NULL) {
         return KERR_BADF;
     }
     switch (sysarg(tf, 1)) {
+    case F_DUPFD:
+        return fd_dup((int32_t)sysarg(tf, 0));
     case F_GETFD:
+        return (f->flags & O_CLOEXEC) != 0 ? 1 : 0;
     case F_SETFD:
-        return 0; /* not close-on-exec, and setting that changes nothing */
+        f->flags = (f->flags & ~O_CLOEXEC) | ((sysarg(tf, 2) & 1u) != 0 ? O_CLOEXEC : 0u);
+        return 0;
     case F_GETFL:
-        return 2; /* O_RDWR: a console is both */
+        return (int64_t)(f->flags & (O_NONBLOCK | O_CLOEXEC)) | 2; /* O_RDWR */
+    case F_SETFL:
+        /* Only the status flags a caller may change. A runtime sets
+         * O_NONBLOCK on every socket it opens, so this is not optional. */
+        f->flags = (f->flags & ~O_NONBLOCK) | (sysarg(tf, 2) & O_NONBLOCK);
+        return 0;
     default:
         return KERR_INVAL;
     }
 }
 
-/* Reading from the console. There is no input device wired to a process
- * yet, so standard input is at end of file — which is a true answer and one
- * a runtime handles, where an error would not be. */
 static int64_t sys_read(struct trapframe *tf) {
-    uint64_t *out = (uint64_t *)(uintptr_t)sysarg(tf, 1);
-    /* Draining the eventfd. A counter of zero is `EAGAIN` and not a short
-     * read, because a reader that got 0 bytes would take it for end of
-     * file and stop polling. */
-    if (sysarg(tf, 0) == FD_EVENT && eventfd_created) {
-        if (out == NULL || (uint64_t)(uintptr_t)out >= USER_TOP || sysarg(tf, 2) < 8u) {
-            return KERR_INVAL;
-        }
-        if (eventfd_count == 0) {
-            return KERR_AGAIN;
-        }
-        *out = eventfd_count;
-        eventfd_count = 0;
-        return 8;
+    struct file *f = fd_get((int32_t)sysarg(tf, 0));
+    void *to = (void *)(uintptr_t)sysarg(tf, 1);
+    uint64_t n = sysarg(tf, 2);
+    if (f == NULL) {
+        return KERR_BADF;
     }
-    return is_standard_fd(sysarg(tf, 0)) ? 0 : KERR_BADF;
+    if (f->ops->read == NULL) {
+        return KERR_INVAL;
+    }
+    if (n != 0 && ((uint64_t)(uintptr_t)to == 0 || (uint64_t)(uintptr_t)to >= USER_TOP)) {
+        return KERR_FAULT;
+    }
+    return f->ops->read(f, to, (uint32_t)(n > (1u << 20) ? (1u << 20) : n));
+}
+
+static int64_t sys_write(struct trapframe *tf) {
+    struct file *f = fd_get((int32_t)sysarg(tf, 0));
+    const void *from = (const void *)(uintptr_t)sysarg(tf, 1);
+    uint64_t n = sysarg(tf, 2);
+    if (f == NULL) {
+        return KERR_BADF;
+    }
+    if (f->ops->write == NULL) {
+        return KERR_INVAL;
+    }
+    if (n != 0 && ((uint64_t)(uintptr_t)from == 0 || (uint64_t)(uintptr_t)from >= USER_TOP)) {
+        return KERR_FAULT;
+    }
+    return f->ops->write(f, from, (uint32_t)(n > (1u << 20) ? (1u << 20) : n));
+}
+
+/* The scattered form, which a Go runtime uses for everything it prints. */
+static int64_t sys_writev(struct trapframe *tf) {
+    const struct user_iovec *iov = (const struct user_iovec *)(uintptr_t)sysarg(tf, 1);
+    struct file *f = fd_get((int32_t)sysarg(tf, 0));
+    uint64_t count = sysarg(tf, 2);
+    int64_t total = 0;
+    if (f == NULL) {
+        return KERR_BADF;
+    }
+    if (iov == NULL || (uint64_t)(uintptr_t)iov >= USER_TOP || count > 1024u) {
+        return KERR_INVAL;
+    }
+    if (f->ops->write == NULL) {
+        return KERR_INVAL;
+    }
+    for (uint64_t i = 0; i < count; i++) {
+        int32_t wrote;
+        if (iov[i].len == 0) {
+            continue;
+        }
+        if (iov[i].base == 0 || iov[i].base >= USER_TOP) {
+            return total > 0 ? total : KERR_FAULT;
+        }
+        wrote = f->ops->write(f, (const void *)(uintptr_t)iov[i].base, (uint32_t)iov[i].len);
+        if (wrote < 0) {
+            return total > 0 ? total : wrote;
+        }
+        total += wrote;
+    }
+    return total;
 }
 
 static int64_t sys_close(struct trapframe *tf) {
-    return is_known_fd(sysarg(tf, 0)) ? 0 : KERR_BADF;
+    return fd_close((int32_t)sysarg(tf, 0));
 }
 
-/* There is no filesystem in a process's view of the world yet: the kernel
- * reads its program off the disk, but a process has no path namespace. So
- * every path is absent, which is what a runtime probing for
+static int64_t sys_dup(struct trapframe *tf) {
+    return fd_dup((int32_t)sysarg(tf, 0));
+}
+
+/* There is no path namespace in a process's view of the world: the kernel
+ * reads its program off the disk, but a process has no filesystem. So every
+ * path is absent, which is what a runtime probing for
  * `/sys/kernel/mm/transparent_hugepage/hpage_pmd_size` or `/proc/self/maps`
  * expects to be told when the file is not there. */
 static int64_t sys_openat(struct trapframe *tf) {
     (void)tf;
     return KERR_NOENT;
+}
+
+static int64_t sys_eventfd2(struct trapframe *tf) {
+    return fdobjects_open_eventfd(sysarg(tf, 0), (uint32_t)sysarg(tf, 1) & O_NONBLOCK);
+}
+
+static int64_t sys_epoll_create1(struct trapframe *tf) {
+    return fdobjects_open_epoll((uint32_t)sysarg(tf, 0) & O_CLOEXEC);
+}
+
+static int64_t sys_epoll_ctl(struct trapframe *tf) {
+    const struct user_epoll_event *event =
+        (const struct user_epoll_event *)(uintptr_t)sysarg(tf, 3);
+    if (event != NULL && (uint64_t)(uintptr_t)event >= USER_TOP) {
+        return KERR_FAULT;
+    }
+    return fdobjects_epoll_ctl((int32_t)sysarg(tf, 0), (int32_t)sysarg(tf, 1),
+                               (int32_t)sysarg(tf, 2), event);
+}
+
+/* Waiting for readiness, properly: what is ready is reported, and when
+ * nothing is the caller sleeps until the timeout **or until something
+ * changes**. Both halves matter. Reporting nothing instantly spins a core at
+ * the speed of the syscall; sleeping through a change makes every event as
+ * late as the timeout. */
+static int64_t sys_epoll_pwait(struct trapframe *tf) {
+    struct user_epoll_event *out = (struct user_epoll_event *)(uintptr_t)sysarg(tf, 1);
+    uint32_t max = (uint32_t)sysarg(tf, 2);
+    int64_t timeout_ms = (int64_t)(int32_t)sysarg(tf, 3);
+    int32_t epfd = (int32_t)sysarg(tf, 0);
+    uint64_t deadline;
+    int found;
+    if (out == NULL || (uint64_t)(uintptr_t)out >= USER_TOP || max == 0) {
+        return KERR_FAULT;
+    }
+    max = max > 64u ? 64u : max;
+    found = fdobjects_epoll_collect(epfd, out, max);
+    if (found != 0 || timeout_ms == 0) {
+        return found;
+    }
+    /* A negative timeout means "for ever", which here is bounded: with
+     * nothing able to arrive from outside, sleeping for ever would be a
+     * deadlock this kernel caused. */
+    trace_sleep(timeout_ms < 0 ? "epoll_pwait (indefinite)" : "epoll_pwait",
+                timeout_ms < 0 ? 10000000ull : (uint64_t)timeout_ms * 1000000ull);
+    deadline = timer_ns() + (timeout_ms < 0 ? 10000000ull : (uint64_t)timeout_ms * 1000000ull);
+    /* Waiting on a **key**, so an eventfd write — a runtime interrupting its
+     * own poller — ends it early. */
+    (void)sched_futex_wait(SCHED_POLLER_KEY, deadline);
+    return fdobjects_epoll_collect(epfd, out, max);
 }
 
 /* `riscv_hwprobe` — the architecture's own feature query, and something the
@@ -706,6 +658,7 @@ static const struct syscall_entry table[] = {
     {SYS_FCNTL, "fcntl", sys_fcntl},
     {SYS_READ, "read", sys_read},
     {SYS_CLOSE, "close", sys_close},
+    {SYS_DUP, "dup", sys_dup},
     {SYS_OPENAT, "openat", sys_openat},
     {SYS_RISCV_HWPROBE, "riscv_hwprobe", sys_riscv_hwprobe},
     {SYS_NANOSLEEP, "nanosleep", sys_nanosleep},
@@ -725,14 +678,27 @@ static void complain_once(uint64_t nr) {
     kprintf("syscall: %llu is not implemented\n", (unsigned long long)nr);
 }
 
-/* The name of a number, for the trace and for the complaint. */
-static const char *name_of(uint64_t nr) {
+/* Every domain's table, searched in turn. The core one first because it
+ * holds what every program uses. */
+/* The entry for a number, or NULL. */
+static const struct syscall_entry *entry_of(uint64_t nr) {
     for (uint32_t i = 0; i < sizeof table / sizeof table[0]; i++) {
         if (table[i].nr == nr) {
-            return table[i].name;
+            return &table[i];
         }
     }
-    return "?";
+    for (const struct syscall_entry *d = sys_socket_table; d->call != NULL; d++) {
+        if (d->nr == nr) {
+            return d;
+        }
+    }
+    return NULL;
+}
+
+/* The name of a number, for the trace and for the complaint. */
+static const char *name_of(uint64_t nr) {
+    const struct syscall_entry *e = entry_of(nr);
+    return e == NULL ? "?" : e->name;
 }
 
 /* Whether the dispatcher should step `sepc` past the `ecall` afterwards.
@@ -756,9 +722,10 @@ bool syscall_dispatch(struct trapframe *tf) {
                 (unsigned long long)sysarg(tf, 0), (unsigned long long)sysarg(tf, 1),
                 (unsigned long long)sysarg(tf, 2));
     }
-    for (uint32_t i = 0; i < sizeof table / sizeof table[0]; i++) {
-        if (table[i].nr == nr) {
-            tf->x[10] = (uint64_t)table[i].call(tf);
+    {
+        const struct syscall_entry *e = entry_of(nr);
+        if (e != NULL) {
+            tf->x[10] = (uint64_t)e->call(tf);
             if (tracing) {
                 kprintf("call:   -> %lld\n", (long long)(int64_t)tf->x[10]);
             }

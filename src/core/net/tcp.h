@@ -67,6 +67,9 @@ struct tcp_held {
 };
 
 struct tcp_conn {
+    /* Nobody owns this any more, but its shutdown is unfinished: the tick
+     * reclaims it when it reaches CLOSED. See `tcp_detach`. */
+    bool detached;
     struct tcp_stack *stack;
     enum tcp_state state;
     ip4_t local_ip, remote_ip;
@@ -178,8 +181,27 @@ int tcp_init(struct tcp_stack *s, struct netif *nif, uint32_t seed);
 /* A fresh, unbound connection, or NULL when the table is full. */
 struct tcp_conn *tcp_alloc(struct tcp_stack *s);
 
-/* Gives a connection back (closing it first when needed). */
+/* Gives a connection back, **aborting** it if it was still open: anything
+ * not CLOSED, LISTEN or TIME_WAIT gets a reset, because the caller has said
+ * it is finished with the connection whatever state it was in. That is the
+ * right primitive for an abort and the wrong one for an ordinary close —
+ * see `tcp_detach`. */
 void tcp_free(struct tcp_conn *c);
+
+/* The owner is gone, but the connection is not: finish the shutdown and
+ * reclaim the slot when it reaches CLOSED.
+ *
+ * This is what closing a socket should do after `tcp_close`. Freeing instead
+ * sends a reset, and the peer — which is still completing the FIN exchange,
+ * or still has data in flight — sees "connection reset by peer" at the end
+ * of a transfer that had in fact succeeded. That was a real failure here:
+ * Go's `io.ReadAll` on a half-closed connection reported a reset, and the
+ * stack's counters showed five segments arriving for a connection that no
+ * longer existed and five resets going back.
+ *
+ * A connection already CLOSED or LISTEN has nothing to finish, so this frees
+ * it at once. */
+void tcp_detach(struct tcp_conn *c);
 
 /* Binds the local address. KERR_OK, KERR_INVAL or KERR_EXIST. */
 int tcp_bind(struct tcp_conn *c, ip4_t ip, uint16_t port);

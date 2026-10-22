@@ -34,6 +34,7 @@ struct thread {
     uint64_t tid;
     enum thread_state state;
     virt_t futex_addr;
+    const void *wait_chan;  /* a kernel object being waited on; see sched.h */
     uint64_t futex_deadline;
     bool woken;
     bool owns_stack;
@@ -354,6 +355,7 @@ bool sched_futex_wait(virt_t addr, uint64_t deadline_ns) {
         return false;
     }
     t->futex_addr = addr;
+    t->wait_chan = NULL;
     t->futex_deadline = deadline_ns;
     t->woken = false;
     t->state = THREAD_BLOCKED;
@@ -400,6 +402,7 @@ bool sched_sleep_until(uint64_t deadline_ns) {
         return false;
     }
     t->futex_addr = 0;
+    t->wait_chan = NULL;
     t->futex_deadline = deadline_ns;
     t->woken = false;
     t->state = THREAD_BLOCKED;
@@ -437,12 +440,47 @@ uint32_t sched_futex_wake(virt_t addr, uint32_t count) {
         return 0; /* no futex lives at address 0; a sleeper's slot does */
     }
     for (uint32_t i = 0; i < SCHED_MAX_THREADS && woke < count; i++) {
-        if (threads[i].state == THREAD_BLOCKED && threads[i].futex_addr == addr) {
+        if (threads[i].state == THREAD_BLOCKED && threads[i].wait_chan == NULL &&
+            threads[i].futex_addr == addr) {
             threads[i].state = THREAD_RUNNABLE;
             threads[i].woken = true;
             threads[i].futex_addr = 0;
             woke++;
             trace("woken on", i, addr);
+        }
+    }
+    return woke;
+}
+
+int sched_wait_on(const void *chan, uint64_t deadline_ns) {
+    struct thread *t = running_thread();
+    if (t == NULL || chan == NULL) {
+        return KERR_INVAL;
+    }
+    t->futex_addr = 0;
+    t->wait_chan = chan;
+    t->futex_deadline = deadline_ns;
+    t->woken = false;
+    t->state = THREAD_BLOCKED;
+    if (deadline_ns != 0) {
+        timer_wake_at(deadline_ns);
+    }
+    yield_to_scheduler();
+    t->wait_chan = NULL;
+    return t->woken ? KERR_OK : KERR_TIMEDOUT;
+}
+
+uint32_t sched_wake_on(const void *chan, uint32_t max) {
+    uint32_t woke = 0;
+    if (chan == NULL) {
+        return 0;
+    }
+    for (uint32_t i = 0; i < SCHED_MAX_THREADS && woke < max; i++) {
+        if (threads[i].state == THREAD_BLOCKED && threads[i].wait_chan == chan) {
+            threads[i].state = THREAD_RUNNABLE;
+            threads[i].woken = true;
+            threads[i].wait_chan = NULL;
+            woke++;
         }
     }
     return woke;

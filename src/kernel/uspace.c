@@ -11,6 +11,8 @@
 #include "core/ustack.h"
 #include "kernel/mem.h"
 #include "kernel/random.h"
+#include "kernel/fdobjects.h"
+#include "kernel/file.h"
 #include "kernel/klock.h"
 #include "kernel/sched.h"
 #include "arch/riscv/sigframe.h"
@@ -429,6 +431,13 @@ int64_t uspace_run(struct uproc *p) {
     first.sepc = p->entry;
     first.sstatus = SSTATUS_SUM;
     signal_reset();
+    fd_reset();
+    /* Descriptors 0, 1 and 2 before the program starts: a runtime checks
+     * all three before it does anything else and aborts if one is missing. */
+    if (fdobjects_open_console() != KERR_OK) {
+        running = NULL;
+        return KERR_NOMEM;
+    }
     rc = sched_init(&first, p->stack_top, &p->main_tid);
     if (rc != KERR_OK) {
         running = NULL;
@@ -458,6 +467,7 @@ int64_t uspace_run(struct uproc *p) {
     trap_set_user_return_hook(NULL);
     timer_remove_tick_hook(sched_tick);
     sched_shutdown();
+    fd_reset();
     running = NULL;
     return exit_status;
 }
@@ -652,6 +662,57 @@ uint64_t uspace_syscalls(void) {
      * the difference since it started, and conflating the two makes the
      * second process on a machine report the first one's work as well. */
     return syscall_count() - calls_at_start;
+}
+
+/* Whether every page of a range carries the given rights in the running
+ * process's table. A zero-length range is vacuously fine, which matters
+ * because a caller may legitimately pass one. */
+static bool range_has(virt_t at, uint32_t n, uint64_t want) {
+    if (n == 0) {
+        return true;
+    }
+    if (running == NULL || at == 0 || at >= USER_TOP || n > USER_TOP - at) {
+        return false;
+    }
+    for (virt_t va = at & ~(PAGE_SIZE - 1u); va < at + n; va += PAGE_SIZE) {
+        phys_t phys = 0;
+        uint64_t flags = 0, size = 0;
+        if (!pgtable_lookup(&running->pt, va, &phys, &flags, &size)) {
+            return false;
+        }
+        if ((flags & want) != want || (flags & PTE_U) == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool uspace_can_read(virt_t at, uint32_t n) {
+    return range_has(at, n, PTE_R);
+}
+
+bool uspace_can_write(virt_t at, uint32_t n) {
+    return range_has(at, n, PTE_W);
+}
+
+int uspace_copy_in(void *to, virt_t from, uint32_t n) {
+    if (!uspace_can_read(from, n)) {
+        return KERR_FAULT;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        ((uint8_t *)to)[i] = ((const volatile uint8_t *)(uintptr_t)from)[i];
+    }
+    return KERR_OK;
+}
+
+int uspace_copy_out(virt_t to, const void *from, uint32_t n) {
+    if (!uspace_can_write(to, n)) {
+        return KERR_FAULT;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        ((volatile uint8_t *)(uintptr_t)to)[i] = ((const uint8_t *)from)[i];
+    }
+    return KERR_OK;
 }
 
 struct uproc *uspace_current(void) {

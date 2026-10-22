@@ -25,6 +25,9 @@ is named. The phase-by-phase record is `DEVELOPMENT_PROGRESS.md`.
 | **8 GiB of RAM**, read and tracked: 2 Mi frames | `boot_qemu_test` (an `-m 8G` boot), `pmm_test` (frames at 9 GiB) |
 | **Interrupts** through the PLIC, with each hart's *context* resolved from the tree rather than assumed to be its hart id | `boot_qemu_test` |
 | **A tick** through SBI's timer, keeping time: 50 ticks in 499 ms at 100 Hz | `boot_qemu_test` |
+| **Go's `net` package, unchanged** — UDP round trip, TCP connect/accept/half-close, a 64 KiB bulk transfer byte for byte, with zero resets | `netgo_qemu_test` |
+| **Descriptors**: a real table with per-object operations, and a **real `epoll`** that reports readiness rather than nothing | `netgo_qemu_test` |
+| **Checked user copies**: a syscall validates a user pointer instead of dereferencing it, so a bad one is `EFAULT` rather than a kernel fault | `netgo_qemu_test` |
 | **Signals**: `rt_sigaction`, masks and a per-thread alternate stack, delivery with a real frame, a kernel-supplied return trampoline — so a nil pointer dereference is a **recoverable Go panic** | `go_qemu_test`, `smp_qemu_test` |
 | **Floating-point state** saved per thread and per signal frame | `go_qemu_test` |
 | **Networking**: Ethernet, ARP, IPv4, ICMP, UDP, DHCP and TCP over virtio-net — a lease, a gateway that answers, and a datagram echoed back through the adapter | `net_qemu_test`, `net_test`, `tcp_test`, `tcp_hostile_test` |

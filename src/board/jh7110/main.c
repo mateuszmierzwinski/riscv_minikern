@@ -669,6 +669,13 @@ static void run_init_from_disk(const char *path) {
             path, (long long)status, (unsigned long long)uspace_syscalls(),
             (unsigned long long)uspace_stale_faults());
     report_hart_usage();
+    /* The stack's own counters after a program that used it. A reset or a
+     * drop is the difference between "the program's logic is wrong" and
+     * "the stack refused something", and they are indistinguishable from
+     * the program's error message alone. */
+    if (cmdline_has(boot_cmdline, "minikern.netstat")) {
+        knet_report();
+    }
     uspace_destroy(&proc);
 }
 
