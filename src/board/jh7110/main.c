@@ -39,12 +39,14 @@
 #include "kernel/disk.h"
 #include "kernel/irq.h"
 #include "kernel/mem.h"
+#include "arch/riscv/fp.h"
 #include "arch/riscv/smp.h"
 #include "drivers/virtio_net.h"
 #include "kernel/klock.h"
 #include "kernel/net.h"
 #include "kernel/random.h"
 #include "kernel/sched.h"
+#include "kernel/signal.h"
 #include "kernel/syscall.h"
 #include "kernel/uspace.h"
 #include "kernel/xfsmount.h"
@@ -358,6 +360,7 @@ static void report_hart_usage(void);
 
 void smp_secondary_main(uint64_t hart, uint64_t satp) {
     smp_set_this_hart(hart);
+    fp_enable();
     trap_init_cpu();
     /* The boot hart's page tables, which map the kernel globally — so this
      * hart can reach the kernel's code and data the moment translation is
@@ -610,10 +613,21 @@ static void run_one_user_program(const char *name, const char *from, const char 
  * satisfiable by a core that had never left its idle loop, which is why
  * this counts switches rather than asking whether a hart is up. */
 static void report_hart_usage(void) {
-    kprintf("smp: thread switches by hart:");
+    {
+        uint64_t sleeps = 0, average = 0, worst = 0;
+        sched_sleep_report(&sleeps, &average, &worst);
+        kprintf("signal: %llu delivered, %llu frames overwritten\n",
+                (unsigned long long)signal_delivered(),
+                (unsigned long long)signal_clobbered_frames());
+        kprintf("sched: %llu sleeps, woken %llu us late on average, %llu us at worst\n",
+                (unsigned long long)sleeps, (unsigned long long)average,
+                (unsigned long long)worst);
+    }
+    kprintf("smp: switches/ticks by hart:");
     for (uint32_t i = 0; i < smp_hart_count(); i++) {
         const struct smp_hart *h = smp_hart(i);
-        kprintf(" %llu=%u", (unsigned long long)h->id, sched_hart_switches(i));
+        kprintf(" %llu=%u/%llut", (unsigned long long)h->id, sched_hart_switches(i),
+                (unsigned long long)timer_ticks_of(i));
     }
     kprintf("\n");
 }
@@ -639,8 +653,15 @@ static void run_init_from_disk(const char *path) {
      * once the address space is built. */
     kfree(image);
     if (rc != KERR_OK) {
+        /* Each refusal says which one it was. "Headers refused" for
+         * everything made a collision while building the address space look
+         * like a bad executable, which sent the search to the wrong file. */
         kprintf("init: %s will not load (rc %d: %s)\n", path, rc,
-                rc == KERR_NOEXEC ? "not a static RISC-V 64 executable" : "headers refused");
+                rc == KERR_NOEXEC  ? "not a static RISC-V 64 executable"
+                : rc == KERR_INVAL ? "the headers contradict the file"
+                : rc == KERR_EXIST ? "its address space collides with the kernel's mappings"
+                : rc == KERR_NOMEM ? "out of memory"
+                                   : "refused");
         return;
     }
     status = uspace_run(&proc);
@@ -657,6 +678,9 @@ static void run_user_programs(void) {
      * looks quiet. */
     sched_set_trace(cmdline_has(boot_cmdline, "minikern.trace"));
     syscall_set_trace(cmdline_has(boot_cmdline, "minikern.calls") ? 400u : 0u);
+    syscall_trace_sleeps(cmdline_has(boot_cmdline, "minikern.sleeps"));
+    signal_set_delivery(!cmdline_has(boot_cmdline, "minikern.nosignals"));
+    syscall_allow_tgkill(!cmdline_has(boot_cmdline, "minikern.nopreempt"));
     if (cmdline_has(boot_cmdline, "minikern.user")) {
         run_one_user_program("hello", user_program_start, user_program_end);
         run_one_user_program("faulter", user_faulter_start, user_faulter_end);
@@ -677,6 +701,10 @@ void kmain(uint64_t hart, uint64_t dtb) {
      * through it, and the kernel lock asks who holds it. The firmware passed
      * it in `a0` because there is no register a supervisor can ask. */
     smp_set_this_hart(hart);
+    /* Floating point, before anything might need to save it: `sstatus.FS`
+     * gates those instructions in the kernel too, so a kernel that saves a
+     * thread's floating-point state has to enable it for itself first. */
+    fp_enable();
     /* The kernel lock, before anything can trap. Wiring it up later — after
      * a program had already run — left every syscall taking the "no lock
      * configured" path while the scheduler still released one, and the

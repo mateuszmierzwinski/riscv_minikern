@@ -384,13 +384,63 @@ Three things in it are *not* architecture-neutral and were fixed on the way in:
       events" instantly: a runtime whose idle threads are answered
       immediately spins a core at the speed of the syscall, and on one hart
       that starves every other thread.
-- [ ] **P2.5 Signals**, including what Go's runtime actually needs. Not yet
-      required: everything above runs without them, because `tgkill` is
-      answered and a missed preemption signal is a slower runtime rather than
-      a broken one. This is the one item with a known unknown: on ARM, Go set
-      `SA_RESTORER` with a zero restorer and needed a kernel-provided
-      trampoline page, which cost a day to discover. RISC-V does it
-      differently and the difference has to be measured, not assumed.
+- [x] **P2.5 Signals (2026-10-22).** What they are *for*: a Go runtime turns
+      a **fault into a recoverable panic**. A nil pointer dereference is a page
+      fault, the kernel delivers SIGSEGV, and the runtime reads the faulting
+      address out of the frame and raises a Go panic that `recover` catches.
+      Without signals the same program dies, and the difference shows up in
+      ordinary code. The test asserts the recovery *and* that the program is
+      healthy afterwards, which is what signal **return** proves.
+      The plan called this the one item with a known unknown, and the unknown
+      resolved the same way the ARM project's did, by a different mechanism.
+      Measured from the runtime's own source: it sets the `SA_RESTORER`
+      **flag** but leaves `sa_restorer` zero — only x86 gets a real one — so
+      there is no address in the request to return through. The kernel maps a
+      page of its own containing `li a7, 139; ecall` and points `ra` at it,
+      which is what Linux does through its VDSO. One page below the stack,
+      derived from the stack's own constants: a literal address a page under
+      the stack *top* landed **inside** the 64-page stack, and the collision
+      presented as "this program's headers were refused".
+      The frame layout is an ABI fact, taken from what the runtime reads. The
+      register block is **`pc` followed by `x1`..`x31`** — not `x0`..`x31`,
+      because `x0` is hard-wired to zero and the ABI spends its slot on the
+      program counter. `uc_mcontext` is at offset 176, and a static assertion
+      says so.
+      **Five bugs, and only a 36-run stress loop under parallel load found
+      four of them.** Each presented as a Go program failing its *own*
+      consistency checks — "sync: WaitGroup misuse" on code that misuses
+      nothing, "panic while printing panic value", a corrupted `sudog` cache
+      — never as anything to do with signals:
+      • The **mask and the alternate stack were per process, not per thread.**
+        A shared mask lets one thread unblock a signal inside another's
+        critical section; a shared stack lets two handlers run on the same
+        memory. They live in the thread now, and a new thread inherits only
+        the mask, as the ABI requires — not the stack, which is its creator's
+        own memory.
+      • **The floating-point registers were saved nowhere** — not across a
+        context switch and not in a signal frame. They are a thread's state
+        exactly as the integer registers are, and a handler is ordinary code
+        that uses them. This had been written down as a known limitation; the
+        limitation was a corruption bug.
+      • **A load-reserved could outlive its thread.** A thread preempted
+        between `lr` and `sc` left the reservation on the *hart*, so the next
+        thread's `sc` could succeed against a reservation somebody else took
+        before the value changed — every `lr`/`sc` atomic occasionally not
+        atomic. One `sc` to a scratch word in the context switch drops it.
+      • **A nested signal restarted its frame at the top of the alternate
+        stack**, on top of the frame the outer handler would return through.
+        This was the big one: fixing it took the failure rate from one run in
+        twelve to **0 in 96**. A second signal must continue *below* the
+        current pointer, and asynchronous preemption makes nested signals
+        ordinary rather than rare.
+      • **A fault whose signal could not be delivered retried for ever.** A
+        blocked or unhandled SIGSEGV meant the faulting instruction ran again,
+        and again: four million identical fault lines in one run. A fault's
+        signal is forced, as Linux forces it.
+      A cookie in a word the ABI does not read is checked on every return and
+      counted in the report, because "the frame came back changed" is
+      otherwise invisible — the program just behaves as though its registers
+      were nearly right.
 
 ## P3 — SMP, the JH7110's way
 

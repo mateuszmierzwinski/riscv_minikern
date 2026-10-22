@@ -7,6 +7,7 @@
 #include "core/errno.h"
 #include "kernel/random.h"
 #include "kernel/sched.h"
+#include "kernel/signal.h"
 #include "arch/riscv/timer.h"
 #include "kernel/uspace.h"
 
@@ -16,6 +17,26 @@ static uint32_t trace_budget;
 void syscall_set_trace(uint32_t budget) {
     trace_budget = budget;
 }
+
+/* The three calls a runtime sleeps in, logged with the duration they asked
+ * for when tracing. The arguments are pointers, so the ordinary trace shows
+ * an address where the interesting number is a length of time — and a sleep
+ * that takes twenty times longer than asked is invisible without it. Its own
+ * switch rather than the general trace's budget, because a sleep happens
+ * after hundreds of other calls and a budget is long gone by then. */
+static bool tracing_sleeps;
+
+void syscall_trace_sleeps(bool on) {
+    tracing_sleeps = on;
+}
+
+static void trace_sleep(const char *what, uint64_t ns) {
+    if (!tracing_sleeps) {
+        return;
+    }
+    kprintf("sleep: %s for %llu us\n", what, (unsigned long long)(ns / 1000u));
+}
+
 static uint64_t refused;
 
 /* Which numbers have already been complained about, so that a runtime
@@ -54,6 +75,21 @@ static uint64_t complained[8];
 static uint64_t eventfd_count;
 static bool epoll_created;
 static bool eventfd_created;
+
+/* The key a thread waiting in `epoll_pwait` is blocked on.
+ *
+ * It needs to be wakeable, because a runtime **interrupts its own poller**:
+ * `netpollBreak` writes to the eventfd to say "stop waiting, there is a
+ * sooner timer than the one you were given". A poller that ignores that
+ * sleeps out the delay it was originally told, and the runtime's timers are
+ * then as late as that delay — which is a correct-but-slow kernel of exactly
+ * the kind that is hard to diagnose, because every individual sleep is
+ * accurate.
+ *
+ * 1 rather than a real address: it is a key in the same space as a futex
+ * address, and no user futex lives at 1 (the lowest page is never mapped),
+ * so the two cannot collide. */
+#define POLLER_WAIT_KEY 1ull
 
 /* The clocks `clock_gettime` knows. Both come from the same tick here: this
  * kernel has no wall clock, and inventing one would be worse than a
@@ -103,6 +139,8 @@ static int64_t sys_write(struct trapframe *tf) {
             return KERR_INVAL;
         }
         eventfd_count += *value;
+        /* This is the whole point of the eventfd: waking the poller. */
+        (void)sched_futex_wake(POLLER_WAIT_KEY, 64u);
         return 8;
     }
     if (fd != 1u && fd != 2u) {
@@ -275,9 +313,19 @@ static int64_t sys_epoll_pwait(struct trapframe *tf) {
      * can arrive, so sleeping for ever would be a deadlock this kernel
      * caused. Ten milliseconds is short enough that a runtime's timers stay
      * accurate and long enough that an idle machine is idle. */
+    /* An event already waiting means there is something to report, and the
+     * caller should come back round rather than sleep. */
+    if (eventfd_count != 0) {
+        return 0;
+    }
+    trace_sleep(timeout_ms < 0 ? "epoll_pwait (indefinite)" : "epoll_pwait",
+                timeout_ms < 0 ? 10000000ull : (uint64_t)timeout_ms * 1000000ull);
     deadline = timer_ns() + (timeout_ms < 0 ? 10000000ull
                                             : (uint64_t)timeout_ms * 1000000ull);
-    (void)sched_sleep_until(deadline);
+    /* Waiting on a **key**, not just a clock, so `netpollBreak` can end it
+     * early. The deadline is still honoured, so a poller nobody breaks is
+     * not left asleep. */
+    (void)sched_futex_wait(POLLER_WAIT_KEY, deadline);
     return 0;
 }
 
@@ -408,6 +456,7 @@ static int64_t sys_nanosleep(struct trapframe *tf) {
         return KERR_INVAL;
     }
     want = (uint64_t)req->sec * 1000000000ull + (uint64_t)req->nsec;
+    trace_sleep("nanosleep", want);
     want = want > 1000000000ull ? 1000000000ull : want;
     deadline = timer_ns() + want;
     if (!sched_sleep_until(deadline)) {
@@ -488,7 +537,9 @@ static int64_t sys_futex(struct trapframe *tf) {
         return KERR_AGAIN;
     }
     if (ts != NULL && (uint64_t)(uintptr_t)ts < USER_TOP) {
-        deadline = timer_ns() + (uint64_t)ts->sec * 1000000000ull + (uint64_t)ts->nsec;
+        uint64_t ns = (uint64_t)ts->sec * 1000000000ull + (uint64_t)ts->nsec;
+        trace_sleep("futex", ns);
+        deadline = timer_ns() + ns;
     }
     return sched_futex_wait(sysarg(tf, 0), deadline) ? 0 : KERR_AGAIN;
 }
@@ -507,12 +558,35 @@ static int64_t sys_sched_yield(struct trapframe *tf) {
     return 0;
 }
 
-/* Signalling a thread. There are no signals yet, so the only honest answers
- * are "that thread does not exist" and "it does, and nothing happened" —
- * and a runtime uses this to preempt a goroutine, where nothing happening
- * is a missed preemption rather than a failure. */
+/* Signalling a thread. A runtime uses it to preempt a goroutine that is not
+ * cooperating, by sending SIGURG to the thread running it. */
+/* Whether a runtime may signal its own threads (`minikern.nopreempt` turns
+ * it off). Async preemption is the one signal that arrives at an arbitrary
+ * instruction in ordinary code, so when something corrupts user data under
+ * load it is the first thing worth subtracting. */
+static bool tgkill_allowed = true;
+
+void syscall_allow_tgkill(bool on) {
+    tgkill_allowed = on;
+}
+
 static int64_t sys_tgkill(struct trapframe *tf) {
-    (void)tf;
+    uint64_t tid = sysarg(tf, 1);
+    uint32_t signo = (uint32_t)sysarg(tf, 2);
+    struct thread_signals *target = sched_signals_of(tid);
+    if (!tgkill_allowed) {
+        return 0; /* accepted and dropped: a missed preemption, not an error */
+    }
+    if (signo == 0) {
+        return target != NULL ? 0 : KERR_SRCH; /* the "does it exist?" probe */
+    }
+    if (target == NULL) {
+        return KERR_SRCH;
+    }
+    /* **The named thread**, not the process. A runtime preempting a
+     * goroutine has chosen which thread to interrupt, and delivering to a
+     * different one preempts the wrong goroutine. */
+    signal_raise_on(target, signo, 0, 0);
     return 0;
 }
 
@@ -544,6 +618,60 @@ static int64_t sys_prlimit64(struct trapframe *tf) {
     return 0;
 }
 
+/* ── signals ───────────────────────────────────────────────────────────────
+ *
+ * These were answered with "yes, fine" until now, which was the right
+ * answer while nothing could be delivered: a runtime that is refused
+ * `rt_sigaction` aborts during initialisation. Now that delivery works they
+ * do what they say, and the one thing that must not be got wrong is the
+ * **size argument**: `rt_sigaction` and `rt_sigprocmask` both take the size
+ * of a signal set, and a caller passing 8 for a 64-bit set is agreeing about
+ * the layout. Anything else is a disagreement, not a detail. */
+#define SIGSET_BYTES 8u
+
+static int64_t sys_rt_sigaction(struct trapframe *tf) {
+    const struct user_sigaction *in = (const struct user_sigaction *)(uintptr_t)sysarg(tf, 1);
+    struct user_sigaction *out = (struct user_sigaction *)(uintptr_t)sysarg(tf, 2);
+    if (sysarg(tf, 3) != SIGSET_BYTES) {
+        return KERR_INVAL;
+    }
+    if ((uint64_t)(uintptr_t)in >= USER_TOP || (uint64_t)(uintptr_t)out >= USER_TOP) {
+        return KERR_FAULT;
+    }
+    return signal_action((uint32_t)sysarg(tf, 0), in, out);
+}
+
+static int64_t sys_rt_sigprocmask(struct trapframe *tf) {
+    const uint64_t *set = (const uint64_t *)(uintptr_t)sysarg(tf, 1);
+    uint64_t *old = (uint64_t *)(uintptr_t)sysarg(tf, 2);
+    if (sysarg(tf, 3) != SIGSET_BYTES) {
+        return KERR_INVAL;
+    }
+    if ((uint64_t)(uintptr_t)set >= USER_TOP || (uint64_t)(uintptr_t)old >= USER_TOP) {
+        return KERR_FAULT;
+    }
+    return signal_mask((uint32_t)sysarg(tf, 0), set, old);
+}
+
+static int64_t sys_sigaltstack(struct trapframe *tf) {
+    const struct user_sigaltstack *in =
+        (const struct user_sigaltstack *)(uintptr_t)sysarg(tf, 0);
+    struct user_sigaltstack *out = (struct user_sigaltstack *)(uintptr_t)sysarg(tf, 1);
+    if ((uint64_t)(uintptr_t)in >= USER_TOP || (uint64_t)(uintptr_t)out >= USER_TOP) {
+        return KERR_FAULT;
+    }
+    return signal_altstack_at(tf->x[2], in, out);
+}
+
+/* Returning from a handler. It restores the whole register set, so there is
+ * no result to report — and the dispatcher must **not** step `sepc` past the
+ * `ecall` afterwards, because `sepc` is now the interrupted instruction's,
+ * not this call's. That is what `SYSCALL_NO_STEP` is for. */
+static int64_t sys_rt_sigreturn(struct trapframe *tf) {
+    (void)signal_return(tf);
+    return (int64_t)tf->x[10]; /* a0 as restored: the interrupted value */
+}
+
 static const struct syscall_entry table[] = {
     {SYS_WRITE, "write", sys_write},
     {SYS_WRITEV, "writev", sys_writev},
@@ -560,9 +688,10 @@ static const struct syscall_entry table[] = {
     {SYS_GETTID, "gettid", sys_getpid},
     {SYS_SET_TID_ADDRESS, "set_tid_address", sys_getpid},
     {SYS_SET_ROBUST_LIST, "set_robust_list", sys_ok},
-    {SYS_SIGALTSTACK, "sigaltstack", sys_ok},
-    {SYS_RT_SIGACTION, "rt_sigaction", sys_ok},
-    {SYS_RT_SIGPROCMASK, "rt_sigprocmask", sys_ok},
+    {SYS_SIGALTSTACK, "sigaltstack", sys_sigaltstack},
+    {SYS_RT_SIGACTION, "rt_sigaction", sys_rt_sigaction},
+    {SYS_RT_SIGPROCMASK, "rt_sigprocmask", sys_rt_sigprocmask},
+    {SYS_RT_SIGRETURN, "rt_sigreturn", sys_rt_sigreturn},
     {SYS_SCHED_GETAFFINITY, "sched_getaffinity", sys_sched_getaffinity},
     {SYS_SCHED_YIELD, "sched_yield", sys_sched_yield},
     {SYS_CLONE, "clone", sys_clone},
@@ -604,6 +733,16 @@ static const char *name_of(uint64_t nr) {
         }
     }
     return "?";
+}
+
+/* Whether the dispatcher should step `sepc` past the `ecall` afterwards.
+ *
+ * Everything does, except `rt_sigreturn`: it has replaced `sepc` with the
+ * interrupted instruction's address, and adding 4 to that would skip an
+ * instruction of the program every time a handler returned — a corruption
+ * that only shows up as the program behaving slightly wrongly later. */
+bool syscall_steps_over_ecall(const struct trapframe *tf) {
+    return tf->x[17] != SYS_RT_SIGRETURN;
 }
 
 bool syscall_dispatch(struct trapframe *tf) {

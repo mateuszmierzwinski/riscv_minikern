@@ -1,5 +1,6 @@
 #include "kernel/sched.h"
 
+#include "arch/riscv/fp.h"
 #include "arch/riscv/smp.h"
 #include "arch/riscv/timer.h"
 #include "core/console.h"
@@ -36,6 +37,11 @@ struct thread {
     uint64_t futex_deadline;
     bool woken;
     bool owns_stack;
+    struct thread_signals signals;
+    /* The floating-point registers, which are this thread's state as much
+     * as the integer ones. Aligned because the save instructions address it
+     * directly. */
+    uint8_t fp[FP_AREA_BYTES] __attribute__((aligned(8)));
 };
 
 /* What a hart is doing.
@@ -64,6 +70,11 @@ static struct thread threads[SCHED_MAX_THREADS];
 static struct hartstate harts[SMP_MAX_HARTS];
 static volatile bool accepting_harts;
 static volatile bool process_over;
+static uint32_t idle_ticks;
+static uint64_t sleeps;
+static uint64_t late_total;
+static uint64_t worst_late;
+static bool deadlock_reported;
 static uint64_t next_tid = 1;
 static bool preempt_pending;
 static bool tracing;
@@ -111,6 +122,11 @@ int sched_init(const struct trapframe *frame, uint64_t sp, uint64_t *tid) {
     next_tid = 1;
     preempt_pending = false;
     process_over = false;
+    idle_ticks = 0;
+    deadlock_reported = false;
+    sleeps = 0;
+    late_total = 0;
+    worst_late = 0;
     /* The first thread is an ordinary one. It used to be the stack
      * `uspace_run` was called on, which made it the only thread that could
      * not be scheduled by another hart — and with four harts that
@@ -203,6 +219,15 @@ static int spawn(const struct trapframe *frame, uint64_t sp, bool is_child, uint
                                     .tid = next_tid++,
                                     .state = THREAD_RUNNABLE,
                                     .owns_stack = true};
+    /* A new thread **inherits its creator's signal mask**, as the ABI
+     * requires, and nothing else: not its pending signals, and not its
+     * alternate stack, which is the creator's own memory and would be shared
+     * if it were copied. A runtime sets a stack per thread for exactly that
+     * reason. */
+    {
+        const struct thread_signals *parent = sched_current_signals();
+        threads[slot].signals.blocked = parent != NULL ? parent->blocked : 0u;
+    }
     prepare_stack(&threads[slot], frame, sp, is_child);
     *tid = threads[slot].tid;
     trace("created, entering at", slot, frame->sepc);
@@ -235,6 +260,20 @@ static uint32_t claim_runnable(void) {
     return SCHED_NO_THREAD;
 }
 
+/* The soonest deadline any blocked thread is waiting for, or 0 when none
+ * is. What an idle hart should set its timer to. */
+static uint64_t earliest_deadline(void) {
+    uint64_t soonest = 0;
+    for (uint32_t i = 0; i < SCHED_MAX_THREADS; i++) {
+        uint64_t at = threads[i].futex_deadline;
+        if (threads[i].state != THREAD_BLOCKED || at == 0) {
+            continue;
+        }
+        soonest = soonest == 0 || at < soonest ? at : soonest;
+    }
+    return soonest;
+}
+
 /* Gives the hart back to its scheduling loop. The caller has already set
  * its own state, and the lock is held across the switch — handed on, in the
  * sense `klock.h` describes: the loop resumes owning what this thread
@@ -242,6 +281,9 @@ static uint32_t claim_runnable(void) {
 static void yield_to_scheduler(void) {
     struct hartstate *h = me();
     uint32_t was = h->current;
+    /* The floating-point registers go with the thread. Saved here, where
+     * the thread stops running, and restored where it starts again. */
+    fp_save(threads[was].fp);
     h->current = SCHED_NO_THREAD;
     h->switches++;
     context_switch(&threads[was].ksp, h->idle_ksp);
@@ -268,10 +310,22 @@ void sched_run(void) {
     while (!process_over) {
         uint32_t t = claim_runnable();
         if (t == SCHED_NO_THREAD) {
+            /* Arm this hart for the earliest deadline anything is waiting
+             * on, before idling. `timer_wake_at` arms the hart that *asks*,
+             * and the hart that ends up idle is often a different one — so
+             * without this the deadline is registered on a comparator that
+             * is busy and the sleeper waits for the next ordinary tick
+             * instead. It is the difference between a 200-microsecond
+             * average lateness and a 9-millisecond worst case. */
+            uint64_t soonest = earliest_deadline();
+            if (soonest != 0) {
+                timer_wake_at(soonest);
+            }
             klock_idle_wait();
             continue;
         }
         h->current = t;
+        fp_restore(threads[t].fp);
         /* Into the thread, and back here when it yields, blocks or ends.
          * `idle_ksp` is written before the switch because the thread will
          * use it to come back. */
@@ -304,6 +358,22 @@ bool sched_futex_wait(virt_t addr, uint64_t deadline_ns) {
     t->woken = false;
     t->state = THREAD_BLOCKED;
     trace("waits on", me()->current, addr);
+    if (deadline_ns != 0) {
+        timer_wake_at(deadline_ns);
+    }
+    /* **Always** give the hart up, even when nothing else is runnable.
+     *
+     * An earlier version spun on the clock here in that case, to avoid
+     * sleeping on a one-hart machine with nothing to wake it — and it did
+     * that **holding the kernel lock**, which shut every other hart out of
+     * the kernel for the whole timeout. The symptom was a `time.Sleep(50ms)`
+     * taking 940 ms on four harts and 55 ms on one: the sleeping hart was
+     * not slow, it was holding the thing every other hart needed.
+     *
+     * Giving the hart up instead lets its scheduling loop idle properly,
+     * which releases the lock across the wait. A machine with nothing
+     * runnable and nothing with a deadline is a deadlock in the program, and
+     * `report_deadlock_once` says so rather than hanging silently. */
     yield_to_scheduler();
     /* Back here only because something made this thread runnable again:
      * a wake, or the tick noticing the deadline. */
@@ -325,6 +395,7 @@ bool sched_futex_wait(virt_t addr, uint64_t deadline_ns) {
  * costs one switch. */
 bool sched_sleep_until(uint64_t deadline_ns) {
     struct thread *t = running_thread();
+    uint64_t late;
     if (t == NULL || deadline_ns == 0) {
         return false;
     }
@@ -332,8 +403,27 @@ bool sched_sleep_until(uint64_t deadline_ns) {
     t->futex_deadline = deadline_ns;
     t->woken = false;
     t->state = THREAD_BLOCKED;
+    /* Ask for an interrupt at the deadline rather than waiting for the next
+     * tick. Without this a 20-microsecond sleep costs up to 10 milliseconds,
+     * and a runtime that makes a hundred of them in a row pays for every
+     * one. */
+    timer_wake_at(deadline_ns);
     yield_to_scheduler();
+    /* How late the wake-up was, which is the kernel's own contribution to a
+     * sleep and the only way to tell it apart from a runtime that chose not
+     * to sleep. The tick is 10 ms, so a few milliseconds late is the floor;
+     * anything much larger is this kernel's fault and not the program's. */
+    late = timer_ns() > deadline_ns ? timer_ns() - deadline_ns : 0u;
+    sleeps++;
+    late_total += late;
+    worst_late = late > worst_late ? late : worst_late;
     return true;
+}
+
+void sched_sleep_report(uint64_t *count, uint64_t *average_late_us, uint64_t *worst_late_us) {
+    *count = sleeps;
+    *average_late_us = sleeps == 0 ? 0u : late_total / sleeps / 1000u;
+    *worst_late_us = worst_late / 1000u;
 }
 
 uint32_t sched_futex_wake(virt_t addr, uint32_t count) {
@@ -369,6 +459,20 @@ uint32_t sched_live_threads(void) {
 uint64_t sched_current_tid(void) {
     struct thread *t = running_thread();
     return t == NULL ? 0 : t->tid;
+}
+
+struct thread_signals *sched_current_signals(void) {
+    struct thread *t = running_thread();
+    return t == NULL ? NULL : &t->signals;
+}
+
+struct thread_signals *sched_signals_of(uint64_t tid) {
+    for (uint32_t i = 0; i < SCHED_MAX_THREADS; i++) {
+        if (threads[i].state != THREAD_FREE && threads[i].tid == tid) {
+            return &threads[i].signals;
+        }
+    }
+    return NULL;
 }
 
 uint32_t sched_hart_switches(uint32_t hart_index) {
@@ -434,8 +538,56 @@ void sched_set_accepting(bool on) {
     accepting_harts = on;
 }
 
+/* Whether anything could still make progress: a runnable thread, or one
+ * blocked with a deadline the clock will reach. */
+static bool something_can_progress(void) {
+    for (uint32_t i = 0; i < SCHED_MAX_THREADS; i++) {
+        if (threads[i].state == THREAD_RUNNABLE || threads[i].state == THREAD_RUNNING) {
+            return true;
+        }
+        if (threads[i].state == THREAD_BLOCKED && threads[i].futex_deadline != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Reports a deadlock instead of hanging on it.
+ *
+ * Every thread blocked with no deadline means nothing will ever wake any of
+ * them: a program that has deadlocked, or a kernel that lost a wake-up. The
+ * ARM project needed a flag to find exactly this, because a lost wakeup is
+ * indistinguishable from a wedged machine from outside — so this is on by
+ * default and says which it was. Ten seconds, because a short threshold
+ * would fire on a machine that is merely slow. */
+#define DEADLOCK_TICKS 1000u
+
+static void watch_for_deadlock(void) {
+    if (something_can_progress()) {
+        idle_ticks = 0;
+        return;
+    }
+    if (sched_live_threads() == 0 || deadlock_reported) {
+        return;
+    }
+    if (++idle_ticks < DEADLOCK_TICKS) {
+        return;
+    }
+    deadlock_reported = true;
+    kprintf("\nsched: every one of %u threads is blocked with no deadline — nothing can wake"
+            " them, so this is a deadlock rather than a slow machine\n",
+            sched_live_threads());
+    for (uint32_t i = 0; i < SCHED_MAX_THREADS; i++) {
+        if (threads[i].state == THREAD_BLOCKED) {
+            kprintf("sched:   tid %llu waits on %llx\n", (unsigned long long)threads[i].tid,
+                    (unsigned long long)threads[i].futex_addr);
+        }
+    }
+}
+
 void sched_tick(void) {
     uint64_t now = timer_ns();
+    watch_for_deadlock();
     for (uint32_t i = 0; i < SCHED_MAX_THREADS; i++) {
         if (threads[i].state == THREAD_BLOCKED && threads[i].futex_deadline != 0 &&
             now >= threads[i].futex_deadline) {

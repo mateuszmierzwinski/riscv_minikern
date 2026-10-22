@@ -88,10 +88,23 @@ struct syscall_entry {
  * is its own denial of service on the console. */
 void syscall_set_trace(uint32_t budget);
 
+/* Logs every sleep with the duration it asked for. Separate from the call
+ * trace because a sleep happens long after any sensible call budget. */
+void syscall_trace_sleeps(bool on);
+
+/* Whether `tgkill` really raises a signal. Off drops it, which costs a
+ * runtime its asynchronous preemption and nothing else. */
+void syscall_allow_tgkill(bool on);
+
 /* Dispatches one call. Returns true when it was handled — which includes
  * being handled by returning an error. False only for `exit`, which does
  * not return at all. */
 bool syscall_dispatch(struct trapframe *tf);
+
+/* Whether the caller should advance `sepc` past the `ecall` after this
+ * call. False for `rt_sigreturn`, which has replaced `sepc` with the
+ * interrupted instruction's address. */
+bool syscall_steps_over_ecall(const struct trapframe *tf);
 
 /* How many calls have been made, and how many were refused as
  * unimplemented. The second number is the one to watch while bringing a

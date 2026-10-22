@@ -102,11 +102,38 @@ grep -qF "go: channel values [1 4 9 16 25 36]" "$log" ||
 
 # The sleep really slept. "true" is the program's own comparison against
 # 50 ms, so a clock that does not move fails here rather than silently.
-grep -qE '^go: slept for [0-9]+ms \(at least 50ms: true\)$' "$log" ||
-    fail "the sleep returned early, or the clock does not agree with the hardware"
+# **Both bounds.** The lower one catches a broken clock; the upper one
+# catches a kernel that made the runtime wait — and that is the half that
+# found two real bugs. A 50 ms sleep took 950 ms twice over: once because
+# the tick was 100 Hz and every sleep was rounded up to it, and once because
+# the runtime's own way of interrupting its poller early was ignored. Neither
+# is visible to a test that only asks "was it at least 50 ms?".
+grep -qE '^go: slept for [0-9]+ms \(at least 50ms: true, under 500ms: true\)$' "$log" ||
+    fail "the sleep was too short (a broken clock) or far too long (the kernel made it wait)"
 
 grep -qF "go: recovered from assignment to entry in nil map" "$log" ||
     fail "panic and recover did not work"
+
+# **A fault recovered**, which is the kernel's half: a nil pointer
+# dereference is a page fault, and it only becomes a Go panic if the kernel
+# delivers SIGSEGV with the faulting address in a frame the runtime can
+# read. Without signals the process dies here instead.
+grep -qF "go: recovered from a fault: runtime error: invalid memory address or nil pointer dereference" "$log" ||
+    fail "a nil pointer dereference did not become a recoverable panic — signal delivery is broken"
+
+# And the program is healthy afterwards, which is what signal **return**
+# proves: the handler ran, the runtime unwound, and unrelated code carried on.
+grep -qE '^go: still running after the fault, 76127 primes below 1000$' "$log" ||
+    fail "it did not survive the fault, or came back with the wrong state"
+
+# No handler's frame was overwritten while it ran. Zero is the only
+# acceptable number: a frame that comes back changed hands ordinary code a
+# register set that is nearly right, and the failures that causes look like
+# anything but signals. A second signal arriving inside a handler used to
+# restart its frame at the top of the alternate stack, on top of the outer
+# handler's.
+grep -qE '^signal: [0-9]+ delivered, 0 frames overwritten$' "$log" ||
+    fail "a signal frame was overwritten while its handler ran: $(grep -m1 'frames overwritten' "$log")"
 
 # No goroutine leaked, and it reached its own last line.
 #

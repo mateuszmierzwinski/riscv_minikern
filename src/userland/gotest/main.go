@@ -159,10 +159,18 @@ func main() {
 	slept := time.Now()
 	time.Sleep(50 * time.Millisecond)
 	elapsed := time.Since(slept)
-	fmt.Printf("go: slept for %v (at least 50ms: %v)\n", elapsed.Round(time.Millisecond),
-		elapsed >= 50*time.Millisecond)
+	// Both bounds matter, and the upper one is the interesting half. A sleep
+	// that is too *short* is a broken clock; a sleep that is twenty times too
+	// long is a kernel that made the runtime wait for something — a tick it
+	// rounded up to, or a poller it would not let the runtime interrupt. Both
+	// of those happened here, and neither showed up in a lower bound.
+	fmt.Printf("go: slept for %v (at least 50ms: %v, under 500ms: %v)\n",
+		elapsed.Round(time.Millisecond), elapsed >= 50*time.Millisecond,
+		elapsed < 500*time.Millisecond)
 
-	// A panic, recovered: the runtime unwinding its own stack.
+	// A panic, recovered: the runtime unwinding its own stack. This one is
+	// a runtime check — the runtime notices the nil map itself and panics,
+	// with no help from the kernel.
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
@@ -172,6 +180,28 @@ func main() {
 		var m map[string]int
 		m["this map is nil"] = 1
 	}()
+
+	// **A fault, recovered.** This one is the kernel's: dereferencing a nil
+	// pointer is a page fault, and it only becomes a Go panic if the kernel
+	// delivers SIGSEGV with the faulting address, through a frame the
+	// runtime can read. Without signals the process dies here instead, and
+	// the recover never runs — so this line is the whole proof that signal
+	// delivery and signal return both work.
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Printf("go: recovered from a fault: %v\n", r)
+			}
+		}()
+		var p *int
+		_ = *p
+	}()
+
+	// And the program is still healthy afterwards, which is what signal
+	// *return* proves: the handler ran, the runtime unwound, and execution
+	// carried on in code that had nothing to do with the fault.
+	fmt.Printf("go: still running after the fault, %d primes below 1000\n",
+		sumOfPrimesBelow(1000))
 
 	fmt.Printf("go: %d goroutines at the end (%d at the start), total time %v\n",
 		runtime.NumGoroutine(), before, time.Since(start).Round(time.Millisecond))

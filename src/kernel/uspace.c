@@ -13,6 +13,8 @@
 #include "kernel/random.h"
 #include "kernel/klock.h"
 #include "kernel/sched.h"
+#include "arch/riscv/sigframe.h"
+#include "kernel/signal.h"
 #include "kernel/syscall.h"
 
 /* The generic Linux syscall numbers, which is the set RISC-V uses — and the
@@ -238,10 +240,27 @@ void uspace_destroy(struct uproc *p) {
  * trap return carries on, which is the whole point of a kernel stack per
  * thread. */
 static void on_user_return(struct trapframe *tf) {
-    (void)tf;
+    uint32_t fatal = 0;
     if (sched_take_preempt_request()) {
         sched_yield_now();
     }
+    /* A signal raised by something other than a fault — `tgkill`, which is
+     * how a runtime preempts a goroutine — is delivered **here**, on the way
+     * out, rather than where it was raised. A signal raised inside a syscall
+     * must not rewrite the frame that syscall is still using, and the frame
+     * is only finished with at this point.
+     *
+     * A fault's signal is the exception and is delivered where it happens,
+     * because the handler must start *instead of* the faulting instruction
+     * rather than after it. */
+    if (signal_is_fatal(&fatal)) {
+        kprintf("\nuspace: killed by signal %u\n", fatal);
+        exit_status = -(int64_t)fatal;
+        exited = true;
+        sched_exit_process();
+        return;
+    }
+    (void)signal_deliver(tf);
 }
 
 /* A fault on an address that **is** mapped, which means this hart's TLB had
@@ -283,20 +302,67 @@ static bool retry_after_stale_translation(struct trapframe *tf) {
     return true;
 }
 
+/* A fault the program has asked to be told about.
+ *
+ * This is what makes a nil pointer dereference a **recoverable panic** in Go
+ * rather than a dead process: the runtime installs a SIGSEGV handler, reads
+ * the faulting address out of the frame this builds, and raises a Go panic.
+ * Without it the same program dies, and the difference shows up in ordinary
+ * code — any `recover` around a nil dereference.
+ *
+ * `SEGV_MAPERR` means "nothing is mapped there", which is exactly what a
+ * nil dereference is, and a runtime treats that code differently from an
+ * access violation. */
+static bool fault_becomes_a_signal(struct trapframe *tf) {
+    uint64_t code = tf->scause & ~SCAUSE_INTERRUPT;
+    uint32_t signo;
+    int32_t si_code;
+    switch (code) {
+    case EXC_INSN_PAGE_FAULT:
+    case EXC_LOAD_PAGE_FAULT:
+    case EXC_STORE_PAGE_FAULT:
+        signo = SIGSEGV;
+        si_code = SEGV_MAPERR;
+        break;
+    case EXC_LOAD_MISALIGNED:
+    case EXC_STORE_MISALIGNED:
+        signo = SIGBUS;
+        si_code = BUS_ADRALN;
+        break;
+    case EXC_ILLEGAL_INSN:
+        signo = SIGILL;
+        si_code = ILL_ILLOPC;
+        break;
+    default:
+        return false;
+    }
+    signal_raise_fault(signo, tf->stval, si_code);
+    /* Delivered here rather than on the way out, because the frame this
+     * rewrites is the faulting one: the handler must start instead of the
+     * instruction that faulted, not after it. */
+    return signal_deliver(tf);
+}
+
 static bool on_user_trap(struct trapframe *tf) {
     if ((tf->scause & SCAUSE_INTERRUPT) != 0) {
         return false; /* an interrupt: the trap layer deals with those */
     }
     if ((tf->scause & ~SCAUSE_INTERRUPT) == EXC_ECALL_FROM_U) {
+        bool step = syscall_steps_over_ecall(tf);
         (void)syscall_dispatch(tf);
         /* Past the `ecall`, or the process makes the same call for ever.
-         * Compressed instructions mean this is 2 bytes or 4, so the
-         * instruction itself has to be read — `ecall` is a 4-byte one, but
-         * a kernel that assumes that has assumed it everywhere. */
-        tf->sepc += 4u;
+         * `ecall` is always 4 bytes, unlike most of this ISA.
+         *
+         * Asked **before** the call, because `rt_sigreturn` replaces the
+         * whole register set — including the syscall number this would be
+         * read from afterwards. */
+        tf->sepc += step ? 4u : 0u;
         return true;
     }
     if (retry_after_stale_translation(tf)) {
+        return true;
+    }
+    if (fault_becomes_a_signal(tf)) {
         return true;
     }
     /* A fault in user code is the process's problem, not the kernel's: it
@@ -362,6 +428,7 @@ int64_t uspace_run(struct uproc *p) {
      * thread's, which is copied from its parent's. */
     first.sepc = p->entry;
     first.sstatus = SSTATUS_SUM;
+    signal_reset();
     rc = sched_init(&first, p->stack_top, &p->main_tid);
     if (rc != KERR_OK) {
         running = NULL;
@@ -477,6 +544,30 @@ static uint32_t build_auxv(const struct elf_image *img, struct auxv_pair *out) {
     return n;
 }
 
+/* Maps the kernel's signal-return trampoline into the process.
+ *
+ * Two instructions, `li a7, 139; ecall`, at a fixed address, read-execute
+ * and reachable from user mode. It exists because a handler is an ordinary
+ * function that returns, and on this architecture there is no address in the
+ * request to return through: a runtime sets the `SA_RESTORER` flag but
+ * leaves `sa_restorer` zero. Linux maps the same thing in its VDSO.
+ *
+ * Right below the stack, so it is nowhere near anything a program places
+ * itself. */
+static int map_signal_trampoline(struct uproc *p) {
+    uint32_t bytes = 0;
+    const uint8_t *code = signal_trampoline_code(&bytes);
+    phys_t page = 0;
+    int rc = mem_alloc_pages(1, 1, &page);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    for (uint32_t i = 0; i < PAGE_SIZE; i++) {
+        ((volatile uint8_t *)(uintptr_t)page)[i] = i < bytes ? code[i] : 0u;
+    }
+    return pgtable_map(&p->pt, SIGNAL_TRAMPOLINE, page, PAGE_SIZE, PTE_R | PTE_X | PTE_U);
+}
+
 /* Builds the stack: the block is assembled in the page that will be the top
  * of the stack, then mapped. Assembling it in place would need the process's
  * address space to be loaded, which it is not yet. */
@@ -530,6 +621,7 @@ int uspace_build_elf(struct uproc *p, const uint8_t *image, uint32_t bytes, cons
         rc = load_segment(p, &img.loads[i], image);
     }
     rc = rc != KERR_OK ? rc : build_start_state(p, &img, path);
+    rc = rc != KERR_OK ? rc : map_signal_trampoline(p);
     rc = rc != KERR_OK ? rc : share_kernel_mappings(&p->pt);
     if (rc != KERR_OK) {
         return rc;

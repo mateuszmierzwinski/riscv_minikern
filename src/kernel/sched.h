@@ -30,6 +30,37 @@
 #include "arch/riscv/trap.h"
 #include "core/types.h"
 
+/* A thread's signal state.
+ *
+ * **Per thread, and that is not a detail.** The mask and the alternate stack
+ * belong to a thread, not to a process: a runtime blocks signals around a
+ * critical section on the thread that is in it, and gives each thread its
+ * own handler stack. Sharing either is a bug that shows up as corrupted user
+ * data rather than as anything about signals — two threads taking a signal
+ * at once ran their handlers on the same stack and clobbered each other's
+ * saved registers, and the symptom was a Go program panicking with
+ * "WaitGroup misuse" on code that misuses nothing. It took a 36-run stress
+ * loop to see it once.
+ *
+ * The *actions* are the process's, which is correct: a handler is installed
+ * for the program, not for a thread.
+ *
+ * One pending fault's address rather than an array: a second fault while one
+ * is pending means the process is dying anyway. */
+struct thread_signals {
+    uint64_t blocked;
+    uint64_t pending;
+    uint64_t altstack_sp;
+    uint64_t altstack_size;
+    int32_t altstack_flags;
+    virt_t fault_address;
+    int32_t fault_code;
+    /* The signal number of a pending **fault**, which may not be ignored or
+     * blocked away: the faulting instruction would be retried for ever. 0
+     * when none is pending. */
+    uint32_t forced;
+};
+
 /* Go starts one thread per CPU it believes in, plus a few: a handful is
  * enough while `sched_getaffinity` reports one CPU, and running out is
  * reported as `EAGAIN` rather than ignored. */
@@ -71,6 +102,15 @@ uint32_t sched_joined_harts(void);
 bool sched_wants_harts(void);
 void sched_set_accepting(bool on);
 
+/* The running thread's signal state, or NULL outside a thread. The signal
+ * code works through this rather than keeping its own, so that a thread's
+ * mask and stack stay the thread's. */
+struct thread_signals *sched_current_signals(void);
+
+/* A given thread's, by id — for `tgkill`, which names the thread it means.
+ * NULL when no live thread has that id. */
+struct thread_signals *sched_signals_of(uint64_t tid);
+
 /* How many thread switches a hart has made, by enumeration index. The
  * measurement that distinguishes "four harts available" from "four harts
  * used" — a hart that never switched never ran a thread. */
@@ -100,6 +140,14 @@ bool sched_futex_wait(virt_t addr, uint64_t deadline_ns);
  * would otherwise spin on the clock. False when there is no thread or no
  * deadline. */
 bool sched_sleep_until(uint64_t deadline_ns);
+
+/* How many sleeps there were, and how late the kernel woke them — the
+ * average and the worst, in microseconds. The tick is the floor: a sleep
+ * cannot end sooner than the next one. It is reported because "the sleep
+ * took twenty times too long" has two possible causes, and this separates
+ * them: a late wake-up is the kernel's, an on-time one means the program
+ * never asked to sleep. */
+void sched_sleep_report(uint64_t *count, uint64_t *average_late_us, uint64_t *worst_late_us);
 
 /* Wakes up to `count` threads waiting on `addr`. Reports how many. */
 uint32_t sched_futex_wake(virt_t addr, uint32_t count);

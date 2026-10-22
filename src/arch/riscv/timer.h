@@ -48,11 +48,35 @@ uint64_t timer_ticks(void);
  * machine is awake rather than of time. */
 uint64_t timer_ticks_all_harts(void);
 
+/* A given hart's ticks, by enumeration index. For a report that has to
+ * distinguish "the other harts are idle" from "the other harts are not
+ * being interrupted at all" — which look the same from outside and have
+ * completely different causes. */
+uint64_t timer_ticks_of(uint32_t hart_index);
+
 /* Arms **this hart's** timer and enables its interrupt. Every hart calls it
  * for itself, because the comparator is per-hart: `timer_init` reads the
  * frequency from the tree once, and this is the part that is each hart's
  * own. */
 int timer_init_cpu(void);
+
+/* Asks this hart to take a timer interrupt no later than `ns`, in addition
+ * to its periodic tick.
+ *
+ * **Why this exists.** The tick is 100 Hz, so a thread that sleeps waits for
+ * the next one: a request for 20 microseconds costs up to 10 milliseconds.
+ * That is fine until something asks for a great many short sleeps — a Go
+ * runtime's backoff does exactly that, 134 of them in one program, and each
+ * rounded up to the tick turned a 50 ms `time.Sleep` into 950 ms. The
+ * kernel's own measurements said its wake-ups were at most 9.9 ms late,
+ * which is the tick doing precisely what it was told; the fault was in
+ * asking the tick to do it at all.
+ *
+ * Arming earlier does not change the **rate**: the periodic schedule is kept
+ * separately, so an early wake-up is not counted as a tick and the next tick
+ * still falls where it would have. A clock that drifted every time someone
+ * slept would be a worse bargain than the latency it fixed. */
+void timer_wake_at(uint64_t ns);
 uint32_t timer_hz(void);
 uint64_t timer_frequency(void);
 bool timer_ready(void);

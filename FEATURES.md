@@ -25,6 +25,8 @@ is named. The phase-by-phase record is `DEVELOPMENT_PROGRESS.md`.
 | **8 GiB of RAM**, read and tracked: 2 Mi frames | `boot_qemu_test` (an `-m 8G` boot), `pmm_test` (frames at 9 GiB) |
 | **Interrupts** through the PLIC, with each hart's *context* resolved from the tree rather than assumed to be its hart id | `boot_qemu_test` |
 | **A tick** through SBI's timer, keeping time: 50 ticks in 499 ms at 100 Hz | `boot_qemu_test` |
+| **Signals**: `rt_sigaction`, masks and a per-thread alternate stack, delivery with a real frame, a kernel-supplied return trampoline — so a nil pointer dereference is a **recoverable Go panic** | `go_qemu_test`, `smp_qemu_test` |
+| **Floating-point state** saved per thread and per signal frame | `go_qemu_test` |
 | **Networking**: Ethernet, ARP, IPv4, ICMP, UDP, DHCP and TCP over virtio-net — a lease, a gateway that answers, and a datagram echoed back through the adapter | `net_qemu_test`, `net_test`, `tcp_test`, `tcp_hostile_test` |
 | **TLB maintenance across harts** — the firmware's cross-hart fence on every mapping *removed*, local-only on every mapping added, with a spurious fault retried | `go_qemu_test` under load |
 | **Four harts, all running user threads** — enumerated from the device tree (ids are not positions), started through the firmware's hart-state interface, scheduled behind one kernel lock; `GOMAXPROCS=4`, 1.6x on 8 units of work | `smp_qemu_test` |

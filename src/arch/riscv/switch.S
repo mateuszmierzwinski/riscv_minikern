@@ -34,6 +34,25 @@ context_switch:
     sd      s10, SW_S(10)(sp)
     sd      s11, SW_S(11)(sp)
 
+    /* **Drop any outstanding load-reserved.**
+     *
+     * A thread can be preempted between its `lr` and its `sc`. The
+     * reservation is the *hart's*, not the thread's, so without this the
+     * next thread to run on this hart can inherit it — and a
+     * store-conditional that should have failed succeeds, because the
+     * reservation it checks was taken by somebody else before the value
+     * changed. Every atomic read-modify-write built on `lr`/`sc` is then
+     * occasionally not atomic.
+     *
+     * The symptom is nothing to do with locking: a Go program panicking with
+     * "sync: WaitGroup misuse" on code that misuses nothing, in about one
+     * run in twelve under load. An `sc` invalidates this hart's reservation
+     * whether it succeeds or fails, so one instruction to a scratch word is
+     * the whole fix. The result is deliberately discarded.
+     */
+    la      t0, reservation_scratch
+    sc.w    zero, zero, (t0)
+
     sd      sp, 0(a0)               /* where this thread left off */
     mv      sp, a1                  /* the other thread's stack */
 
@@ -116,3 +135,12 @@ uspace_enter_frame:
     ld      x2, FRAME_X(2)(a0)
     ld      x10, FRAME_X(10)(a0)
     sret
+
+    .section .bss
+    .align 3
+    .globl reservation_scratch
+/* A word an `sc` can be aimed at to drop a reservation. Its contents are
+ * never read; one word is enough, because what matters is that the
+ * instruction executes, not where it writes. */
+reservation_scratch:
+    .space 8

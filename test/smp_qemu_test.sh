@@ -75,14 +75,35 @@ grep -qF "go: GOMAXPROCS=4 NumCPU=4" "$log" ||
 
 # **Every hart ran threads.** The structural proof that work was spread: a
 # zero here is a hart that stayed in its idle loop for the whole run.
-usage=$(sed -n 's/^smp: thread switches by hart: //p' "$log" | head -1)
+# Each entry is `<hart>=<switches>/<ticks>t`. **Both numbers matter, and for
+# different reasons:** zero switches is a hart that stayed in its idle loop
+# for the whole run, and zero ticks is a hart that is not being interrupted
+# at all — which look identical from outside and have completely different
+# causes. The second one was a real bug: a hart whose per-hart timer state
+# was indexed through a corrupted register stopped ticking after one
+# interrupt.
+usage=$(sed -n 's/^smp: switches\/ticks by hart: //p' "$log" | head -1)
 [ -n "$usage" ] || fail "no per-hart usage was reported"
 for pair in $usage; do
     hart="${pair%%=*}"
-    switches="${pair##*=}"
+    counts="${pair##*=}"
+    switches="${counts%%/*}"
+    ticks="${counts##*/}"
+    ticks="${ticks%t}"
     [ "$switches" -gt 0 ] || fail "hart $hart never ran a thread (it only idled)"
+    [ "$ticks" -gt 0 ] || fail "hart $hart took no timer interrupts at all"
 done
 [ "$(printf '%s\n' $usage | wc -l)" = "4" ] || fail "usage was not reported for four harts"
+
+# The kernel's own account of how late its wake-ups were. It is measured
+# inside the guest, so it does not move with the host's load, and it is the
+# assertion that catches a sleep rounded up to the tick: before the timer was
+# armed for real deadlines this averaged 3.7 ms, and now it is well under
+# one.
+late=$(sed -n 's/^sched: [0-9]* sleeps, woken \([0-9]*\) us late on average.*/\1/p' "$log" | head -1)
+[ -n "$late" ] || fail "the sleep report is missing"
+[ "$late" -lt 2000 ] ||
+    fail "wake-ups averaged ${late}us late — a sleep is being rounded up to the tick"
 
 # The parallel measurement is printed, with its ratio, and the work came out
 # right — correctness under four harts is the thing that would break if the
