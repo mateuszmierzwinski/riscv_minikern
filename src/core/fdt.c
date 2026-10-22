@@ -319,7 +319,8 @@ static bool matches_phandle(const struct fdt_prop *value, const void *want) {
 /* Walks every node until the matcher is satisfied, and writes the path of
  * the node whose property matched. One implementation, because "find the
  * node that says X" is the only question a driver ever asks of a tree. */
-static int scan_for(const struct fdt *fdt, const struct matcher *m, char *path, uint32_t cap) {
+static int scan_for(const struct fdt *fdt, const struct matcher *m, uint32_t skip, char *path,
+                    uint32_t cap) {
     struct open_node stack[FDT_MAX_DEPTH];
     const uint8_t *blk = fdt->base + fdt->struct_off;
     uint32_t at = 0, depth = 0;
@@ -375,9 +376,13 @@ static int scan_for(const struct fdt *fdt, const struct matcher *m, char *path, 
             at = align4(at + 8 + len);
             if (str_equal((const char *)fdt->base + fdt->strings_off + nameoff, m->prop) &&
                 m->matches(&value, m->want)) {
-                /* The root is depth 1 with an empty name, so the chain above
-                 * the match is what names it. */
-                return build_path(&stack[1], depth - 1u, path, cap) ? KERR_OK : KERR_NOMEM;
+                if (skip > 0) {
+                    skip--;        /* a match, but not the one asked for */
+                } else {
+                    /* The root is depth 1 with an empty name, so the chain
+                     * above the match is what names it. */
+                    return build_path(&stack[1], depth - 1u, path, cap) ? KERR_OK : KERR_NOMEM;
+                }
             }
         }
     }
@@ -385,12 +390,18 @@ static int scan_for(const struct fdt *fdt, const struct matcher *m, char *path, 
 
 int fdt_find_compatible(const struct fdt *fdt, const char *compat, char *path, uint32_t cap) {
     struct matcher m = {.prop = "compatible", .matches = matches_compatible, .want = compat};
-    return compat == NULL ? KERR_INVAL : scan_for(fdt, &m, path, cap);
+    return compat == NULL ? KERR_INVAL : scan_for(fdt, &m, 0, path, cap);
+}
+
+int fdt_find_compatible_nth(const struct fdt *fdt, const char *compat, uint32_t skip, char *path,
+                            uint32_t cap) {
+    struct matcher m = {.prop = "compatible", .matches = matches_compatible, .want = compat};
+    return compat == NULL ? KERR_INVAL : scan_for(fdt, &m, skip, path, cap);
 }
 
 int fdt_find_phandle(const struct fdt *fdt, uint32_t phandle, char *path, uint32_t cap) {
     struct matcher m = {.prop = "phandle", .matches = matches_phandle, .want = &phandle};
-    return scan_for(fdt, &m, path, cap);
+    return scan_for(fdt, &m, 0, path, cap);
 }
 
 /* Cuts the last component off a path, in place: "/a/b/c" becomes "/a/b".

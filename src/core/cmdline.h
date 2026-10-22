@@ -19,4 +19,12 @@ const char *cmdline_next(const char *cmdline, size_t *at, size_t *len);
 
 bool cmdline_equals(const char *cmdline, const char *key, const char *value);
 
+/* True when the key is there at all, whatever its value.
+ *
+ * It exists because the alternative was `cmdline_value(cmdline, key, NULL)`,
+ * and that length out-parameter is written unconditionally: passing NULL
+ * stored to address zero. A function that cannot be called wrongly beats a
+ * comment telling callers not to. */
+bool cmdline_has(const char *cmdline, const char *key);
+
 #endif

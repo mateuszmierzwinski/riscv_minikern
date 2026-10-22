@@ -25,12 +25,14 @@
 #include "board/jh7110/console.h"
 #include "board/jh7110/selftest.h"
 #include "board/jh7110/uart.h"
+#include "drivers/virtio_blk.h"
 #include "board/jh7110/version.h"
 #include "core/bootinfo.h"
 #include "core/cmdline.h"
 #include "core/console.h"
 #include "core/errno.h"
 #include "core/fdt.h"
+#include "kernel/disk.h"
 #include "kernel/irq.h"
 #include "kernel/mem.h"
 #include "core/ports.h"
@@ -223,6 +225,33 @@ static void wait_for_ticks(void) {
             (unsigned long long)irq_count(), (unsigned long long)irq_spurious());
 }
 
+/* Storage, and a round trip through it if asked.
+ *
+ * A machine with no disk is the ordinary case for a kernel that netboots, so
+ * that is reported once and is not a failure. `minikern.disktest` writes a
+ * pattern to the **last** sector, reads it back and restores the original —
+ * the last, because a filesystem lives at the beginning and a test that
+ * scribbles on sector 0 destroys what the next test wants to read. */
+static void bring_up_storage(uint64_t dtb) {
+    struct fdt fdt;
+    const struct blockdev *dev;
+    if (fdt_open(&fdt, (const void *)(uintptr_t)dtb, FDT_MAX_BYTES) != KERR_OK) {
+        return;
+    }
+    if (disk_attach(&fdt) != KERR_OK) {
+        kprintf("disk: none attached\n");
+        return;
+    }
+    dev = disk_device();
+    kprintf("disk: %s, %llu sectors of %u bytes (%llu MiB)\n", virtio_blk_path(),
+            (unsigned long long)dev->blocks, dev->block_size,
+            (unsigned long long)(dev->blocks * dev->block_size / (1024u * 1024u)));
+    if (cmdline_has(boot_cmdline, "minikern.disktest")) {
+        int rc = disk_selftest();
+        kprintf("disk: round trip %s\n", rc == KERR_OK ? "ok" : "FAILED");
+    }
+}
+
 /* True when the operator asked the machine to switch itself off at the end,
  * which is what makes a boot test a test rather than a timeout. */
 static bool halt_requested(void) {
@@ -244,6 +273,7 @@ void kmain(uint64_t hart, uint64_t dtb) {
     adopt_the_real_uart(dtb);
     bring_up_memory(&info);
     bring_up_interrupts(dtb, hart);
+    bring_up_storage(dtb);
     wait_for_ticks();
     (void)selftest_run(boot_cmdline);
     kprintf("minikern: boot complete\n");

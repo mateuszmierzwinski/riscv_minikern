@@ -25,6 +25,7 @@ is named. The phase-by-phase record is `DEVELOPMENT_PROGRESS.md`.
 | **8 GiB of RAM**, read and tracked: 2 Mi frames | `boot_qemu_test` (an `-m 8G` boot), `pmm_test` (frames at 9 GiB) |
 | **Interrupts** through the PLIC, with each hart's *context* resolved from the tree rather than assumed to be its hart id | `boot_qemu_test` |
 | **A tick** through SBI's timer, keeping time: 50 ticks in 499 ms at 100 Hz | `boot_qemu_test` |
+| **A real block device** over virtio, with the carried-over buffer cache on top — written, read back, and the image byte-for-byte unchanged | `disk_qemu_test`, `bcache_test` |
 | A printf-style formatter, command-line parsing, CRC-32C, SHA-256, SHA-512, Ed25519 verification | host tests, carried over |
 
 ## Carried over, not yet wired up
@@ -47,7 +48,7 @@ In the order it will be built, because each step needs the one before it:
 | **Processes** | user address spaces, the timer through SBI, threads |
 | **The syscall interface** | the generic table, ELF64, the process start state, signals — then Go binaries unchanged |
 | **SMP** | harts started through SBI's hart-state extension, enumerated **from the device tree** because this SoC's application cores are 1–4 |
-| **Storage** | virtio-blk first (so XFS is exercised under the emulator), then the SD card, then **NVMe** over PCIe for the M.2 slot |
+| **Storage** | the SD card, then **NVMe** over PCIe for the M.2 slot; XFS over the block device that exists now |
 | **Network** | virtio-net first, then the DesignWare GMAC |
 | **The board's hardware** | GPIO, clocks and resets, the temperature sensor and frequency scaling |
 | **The real boot path** | an SD-card image with U-Boot, and the documented flash procedure |

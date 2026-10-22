@@ -228,10 +228,42 @@ Three things in it are *not* architecture-neutral and were fixed on the way in:
 
 ## P4 — Storage, which is what this board is for
 
-- [ ] **P4.1 virtio-blk**, so the block layer, the buffer cache and XFS are
-      exercised under the emulator before any hardware driver exists. The
-      block device port and the cache carry over; this is a new adapter under
-      them.
+- [x] **P4.1 virtio-blk: a real disk (2026-10-22).** The modern MMIO
+      transport (version 2) and a block device over it, presenting the same
+      `blockdev` port every later storage adapter will. Legacy version 1 is
+      **refused and said so**, rather than half-supported: its queue layout
+      differs, and a driver that half-supports what it cannot test is worse
+      than one that says no.
+      The kernel writes a pattern to the last sector, reads it back and
+      restores the original — the last, because a filesystem lives at the
+      start and a test that scribbles on sector 0 destroys what the next test
+      reads. The test checks the image's digest from **outside**, which is the
+      check the kernel's own opinion of itself cannot fool.
+      **Three bugs, and the first one is the serious one.**
+      *The frame allocator was handing out the firmware's memory.* Everything
+      below the kernel's load address belongs to whoever loaded it: OpenSBI
+      sits at the base of RAM with the kernel 2 MiB above, and it is still
+      running — every SBI call, including the one that prints, executes there.
+      The virtio queue landed on top of it and the store was refused by the
+      physical memory protection OpenSBI sets up to defend itself. **That
+      refusal was luck**: on a machine without it the write would have landed
+      and the failure would have appeared later, elsewhere, for no visible
+      reason. The rule is now positional and needs no agreement with the
+      firmware — the kernel knows where it was loaded.
+      *A descriptor cursor that never gave anything back*, which worked for
+      exactly one request and then timed out, because the second chain was
+      built from descriptors the device still owned. This driver is
+      synchronous, so the same descriptors are reused every time and there is
+      nothing to reclaim; a cursor is right for a driver with several requests
+      in flight, and that driver would need a free list too.
+      *A `NULL` passed for an out-parameter.* `cmdline_value(…, NULL)` for
+      "is this key present" stored to address zero, because the length is
+      written unconditionally. There is a `cmdline_has` now: a function that
+      cannot be called wrongly beats a comment telling callers not to.
+      And one diagnostic that earned its place: refusing a legacy transport
+      now prints why. Without it, an emulator full of legacy transports looked
+      exactly like a machine with no devices at all, and the silence was the
+      bug.
 - [ ] **P4.2 The SD card (`mmc`).** The JH7110 has a Cadence SDHCI-compatible
       host controller. Read-only first — enough to mount a root filesystem —
       then writes.

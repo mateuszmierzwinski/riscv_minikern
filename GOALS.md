@@ -80,6 +80,8 @@ QEMU 10.1.5 `qemu-system-riscv64`, measured 2026-10-22:
 | Sv39 identity map of 1 GiB | **3 table pages** | gigapage leaves make the kernel's own map nearly free |
 | **A hart's PLIC context is not its hart id** | on `virt`, hart 0's supervisor context is **1** — context 0 is its machine-mode context, the firmware's | the context is a position in the controller's own `interrupts-extended` list, so it is resolved by walking that list and following each phandle to the hart it names. Assuming they match enables another context's sources |
 | Counter frequency on `virt` | 10 MHz, from `/cpus/timebase-frequency` | the rate is the machine's and the ISA does not state it, so it comes from the tree — the same lesson as the ARM timer that ran at 62.5 MHz under one boot path and 24 MHz under another |
+| **Everything in RAM below the kernel's load address is the firmware's** | OpenSBI sits at the base of RAM with the kernel 2 MiB above, and is still executing — every SBI call runs there | handing those frames out put a device's queue on top of the firmware; its own physical memory protection refused the store. On a machine without that protection the write would have landed and failed later for no visible reason |
+| QEMU's virtio-mmio | **legacy (version 1) by default**; `-global virtio-mmio.force-legacy=false` gives version 2 | a driver that refuses legacy must *say so*, or an emulator full of legacy transports is indistinguishable from a machine with no devices |
 | QEMU `virt`'s UART | an `ns16550a` at `0x10000000`, in `/soc/serial@10000000` | the same driver binds to it and to the JH7110's `snps,dw-apb-uart`, because it asks the tree rather than being compiled for a board |
 
 ### From the JH7110 documentation — each to be verified when first used

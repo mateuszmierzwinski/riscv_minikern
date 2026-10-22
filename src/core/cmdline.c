@@ -70,3 +70,8 @@ bool cmdline_equals(const char *cmdline, const char *key, const char *value) {
     }
     return i == len && value[i] == '\0';
 }
+
+bool cmdline_has(const char *cmdline, const char *key) {
+    size_t len = 0;
+    return cmdline_value(cmdline, key, &len) != NULL;
+}

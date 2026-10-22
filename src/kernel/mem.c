@@ -53,18 +53,37 @@ struct page_port mem_page_port(void) {
     return p;
 }
 
-/* What must never be handed out: the kernel image, the device tree the
- * firmware left in RAM (the command line still points into it), and the
- * arena the page tables came from. */
+/* What must never be handed out.
+ *
+ * **Everything below the kernel's load address belongs to the firmware.**
+ * OpenSBI loads itself at the base of RAM and the kernel 2 MiB above it, so
+ * that gap is the firmware's text, data and stacks — and it is still running:
+ * every SBI call this kernel makes, including the one that prints, executes
+ * there. Handing those frames out meant the virtio driver's queue landed on
+ * top of the firmware, and the store was refused by the physical memory
+ * protection OpenSBI sets up to defend itself. That refusal is luck: on a
+ * machine with no such protection the write would have landed, and the
+ * machine would have failed later, somewhere else, for no visible reason.
+ *
+ * The rule is therefore positional and needs no agreement with the
+ * firmware: the kernel knows where it was loaded, and anything in RAM below
+ * that was put there by whoever loaded it.
+ *
+ * Also reserved: the kernel image itself, the page-table arena, and the
+ * device tree the firmware left in RAM — the command line still points into
+ * it. */
 static void reserve_what_is_in_use(const struct bootinfo *info, phys_t arena_base,
                                    uint64_t arena_bytes) {
     phys_t kernel_lo = (phys_t)(uintptr_t)__kernel_start;
     phys_t kernel_hi = (phys_t)(uintptr_t)__kernel_end;
+    if (info->mem_base < kernel_lo) {
+        pmm_reserve(&frames, info->mem_base, kernel_lo - info->mem_base);
+    }
     pmm_reserve(&frames, kernel_lo, kernel_hi - kernel_lo);
     pmm_reserve(&frames, arena_base, arena_bytes);
     if (info->block_size != 0) {
         /* The blob's own address is not in the boot info — what is kept is
-         * its size — so the arena's neighbour below it is reserved
+         * its size — so the arena's neighbour above it is reserved
          * generously rather than precisely. A frame lost is better than a
          * frame handed out twice. */
         pmm_reserve(&frames, arena_base + arena_bytes, info->block_size);

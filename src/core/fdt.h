@@ -67,6 +67,12 @@ uint32_t fdt_get_u32(const struct fdt *fdt, const char *path, const char *prop, 
  * truncation, because half a path names the wrong node. */
 int fdt_find_compatible(const struct fdt *fdt, const char *compat, char *path, uint32_t cap);
 
+/* The `skip`-th match rather than the first, for a tree that lists many of
+ * the same thing — a board advertises a row of virtio transport slots, most
+ * of them empty, and each has to be probed to see what it holds. */
+int fdt_find_compatible_nth(const struct fdt *fdt, const char *compat, uint32_t skip, char *path,
+                            uint32_t cap);
+
 /* Finds the node carrying a given `phandle`, which is how one node in a
  * device tree refers to another — an interrupt controller, a clock, a
  * regulator. Resolving them is what makes a tree a graph rather than a list.

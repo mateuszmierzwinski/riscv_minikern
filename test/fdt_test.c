@@ -204,6 +204,37 @@ static void test_a_device_above_four_gibibytes(void) {
     KTEST_CHECK(base == 0x900000000ull && size == 0x10000000ull);
 }
 
+/* A board advertises a **row** of identical transport slots, most of them
+ * empty, so a driver has to walk them and probe each. Getting the n-th match
+ * right is therefore load-bearing: a scan that returns the first one every
+ * time finds only the first device, and one that skips wrongly reads a
+ * neighbour's registers. */
+static void test_finds_the_nth_match(void) {
+    static struct fdtb b;
+    struct fdt f;
+    char path[64];
+    uint32_t len = fdtb_board_with_slots(&b, 4);
+    KTEST_CHECK(fdt_open(&f, b.blob, len) == KERR_OK);
+    KTEST_CHECK(fdt_find_compatible_nth(&f, "virtio,mmio", 0, path, sizeof path) == KERR_OK);
+    KTEST_CHECK_STR(path, "/soc/virtio_mmio@10001000");
+    KTEST_CHECK(fdt_find_compatible_nth(&f, "virtio,mmio", 1, path, sizeof path) == KERR_OK);
+    KTEST_CHECK_STR(path, "/soc/virtio_mmio@10002000");
+    KTEST_CHECK(fdt_find_compatible_nth(&f, "virtio,mmio", 3, path, sizeof path) == KERR_OK);
+    KTEST_CHECK_STR(path, "/soc/virtio_mmio@10004000");
+    /* Past the end is "not there", not the last one again. */
+    KTEST_CHECK(fdt_find_compatible_nth(&f, "virtio,mmio", 4, path, sizeof path) == KERR_NOENT);
+    /* And every one of them must yield its own registers — this is what a
+     * driver does next, and the step that was failing when this was written. */
+    for (uint32_t i = 0; i < 4u; i++) {
+        phys_t base = 0;
+        uint64_t size = 0;
+        KTEST_CHECK(fdt_find_compatible_nth(&f, "virtio,mmio", i, path, sizeof path) == KERR_OK);
+        KTEST_CHECK(fdt_device_reg(&f, path, 0, &base, &size) == KERR_OK);
+        KTEST_CHECK(base == 0x10001000ull + (uint64_t)i * 0x1000ull);
+        KTEST_CHECK(size == 0x200ull);
+    }
+}
+
 int main(void) {
     KTEST_RUN(test_opens_and_finds);
     KTEST_RUN(test_absent_is_noent);
@@ -218,5 +249,6 @@ int main(void) {
     KTEST_RUN(test_a_device_that_is_not_there);
     KTEST_RUN(test_a_path_too_long_is_refused);
     KTEST_RUN(test_a_device_above_four_gibibytes);
+    KTEST_RUN(test_finds_the_nth_match);
     return ktest_failures();
 }

@@ -177,6 +177,38 @@ static inline uint32_t fdtb_riscv_board(struct fdtb *b, const char *bootargs, ui
     return fdtb_finish(b);
 }
 
+/* A row of transport slots, the way a board advertises virtio: several nodes
+ * with the same compatible string, each at its own address. */
+static inline uint32_t fdtb_board_with_slots(struct fdtb *b, uint32_t count) {
+    memset(b, 0, sizeof *b);
+    fdtb_begin(b, "");
+    fdtb_prop_u32(b, "#address-cells", 2);
+    fdtb_prop_u32(b, "#size-cells", 2);
+    fdtb_begin(b, "soc");
+    fdtb_prop_u32(b, "#address-cells", 2);
+    fdtb_prop_u32(b, "#size-cells", 2);
+    for (uint32_t i = 0; i < count; i++) {
+        char name[32];
+        uint32_t at = 0;
+        const char *prefix = "virtio_mmio@";
+        uint64_t base = 0x10001000ull + (uint64_t)i * 0x1000ull;
+        for (const char *c = prefix; *c != '\0'; c++) {
+            name[at++] = *c;
+        }
+        for (int shift = 28; shift >= 0; shift -= 4) {
+            name[at++] = "0123456789abcdef"[(base >> shift) & 0xf];
+        }
+        name[at] = '\0';
+        fdtb_begin(b, name);
+        fdtb_prop_compatible(b, "virtio,mmio", NULL);
+        fdtb_prop_cells4(b, "reg", base, 0x200ull);
+        fdtb_end(b);
+    }
+    fdtb_end(b);
+    fdtb_end(b);
+    return fdtb_finish(b);
+}
+
 /* The NanoPi NEO's shape as U-Boot passes it, trimmed to what we read. */
 static inline uint32_t fdtb_neo(struct fdtb *b, const char *bootargs) {
     memset(b, 0, sizeof *b);

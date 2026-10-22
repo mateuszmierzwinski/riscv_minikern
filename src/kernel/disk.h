@@ -1,0 +1,40 @@
+/* disk — the one block device the kernel has, and the cache over it.
+ *
+ * `core/bcache.h` is pure and host-tested; this is the live instance, over
+ * whatever storage adapter the machine turned out to have — virtio today,
+ * the SD host controller and NVMe next. Nothing above here knows which.
+ */
+#ifndef MINIKERN_KERNEL_DISK_H
+#define MINIKERN_KERNEL_DISK_H
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#include "core/bcache.h"
+#include "core/blockdev.h"
+#include "core/fdt.h"
+
+/* Attaches the first storage device the machine offers and builds a cache
+ * over it. KERR_NOENT when there is none, which is not an error: a kernel
+ * that netboots has no disk and should say so once rather than fail. */
+int disk_attach(const struct fdt *fdt);
+
+/* The cache, for a filesystem to read through. NULL when there is no disk. */
+struct bcache *disk_cache(void);
+
+/* The device itself, for anything that wants whole sectors. */
+const struct blockdev *disk_device(void);
+
+bool disk_present(void);
+
+/* A self-test: writes a pattern to a sector near the end of the device,
+ * reads it back through the cache, and restores what was there.
+ *
+ * It uses the **last** sector on purpose — a filesystem lives at the
+ * beginning, and a test that scribbles on sector 0 destroys exactly the
+ * thing the next test wants to read. It restores the original contents, and
+ * reports whether the restore itself succeeded, because a test that leaves a
+ * disk changed has broken the next one. */
+int disk_selftest(void);
+
+#endif

@@ -80,6 +80,29 @@ cc_test(
     ],
 )
 
+# The block layer and the filesystem, carried over whole: a block device
+# port, a buffer cache over it, and XFS. All pure, all host-tested.
+cc_library(
+    name = "storage",
+    srcs = ["src/core/bcache.c"],
+    hdrs = [
+        "src/core/bcache.h",
+        "src/core/blockdev.h",
+    ],
+    strip_include_prefix = "src",
+    deps = [":core_boot"],
+)
+
+cc_test(
+    name = "bcache_test",
+    size = "small",
+    srcs = ["test/bcache_test.c"],
+    deps = [
+        ":ktest",
+        ":storage",
+    ],
+)
+
 # Sv39 translation, as pure arithmetic: no CSR is touched here, which is what
 # lets it be tested on the host before any hardware installs a table.
 cc_library(
@@ -167,6 +190,46 @@ cc_library(
     ],
 )
 
+# Drivers for devices an emulator models faithfully. They exist so that the
+# storage and network stacks — carried over with host tests but never run
+# against a real device on this architecture — are exercised before the
+# board's own controllers are written, which means a later failure in an SD
+# or NVMe driver is in that driver rather than in the filesystem above it.
+cc_library(
+    name = "drivers_virtio",
+    srcs = [
+        "src/drivers/virtio.c",
+        "src/drivers/virtio_blk.c",
+    ],
+    hdrs = [
+        "src/drivers/virtio.h",
+        "src/drivers/virtio_blk.h",
+    ],
+    strip_include_prefix = "src",
+    target_compatible_with = ["//platforms:riscv64"],
+    deps = [
+        ":arch_riscv",
+        ":console",
+        ":kernel_mem",
+        ":storage",
+    ],
+)
+
+# The live block device and the cache over it.
+cc_library(
+    name = "kernel_disk",
+    srcs = ["src/kernel/disk.c"],
+    hdrs = ["src/kernel/disk.h"],
+    strip_include_prefix = "src",
+    target_compatible_with = ["//platforms:riscv64"],
+    deps = [
+        ":console",
+        ":drivers_virtio",
+        ":kernel_mem",
+        ":storage",
+    ],
+)
+
 # ── the kernel ─────────────────────────────────────────────────────────────
 
 # memset and friends: the kernel links no libc, and the compiler emits calls
@@ -236,6 +299,7 @@ cc_library(
         ":arch_riscv",
         ":console",
         ":core_boot",
+        ":kernel_disk",
         ":kernel_mem",
     ],
     alwayslink = True,
@@ -247,6 +311,8 @@ kernel_binary(
     deps = [
         ":arch_riscv",
         ":board_jh7110",
+        ":drivers_virtio",
+        ":kernel_disk",
         ":kernel_mem",
         ":kmem",
     ],
@@ -284,11 +350,23 @@ sh_test(
     tags = ["manual"],
 )
 
+# P4.1: a real block device, and the first thing on this architecture to
+# exercise the carried-over buffer cache against one.
+sh_test(
+    name = "disk_qemu_test",
+    size = "medium",
+    srcs = ["test/disk_qemu_test.sh"],
+    args = ["$(rootpath :minikern)"],
+    data = [":minikern"],
+    tags = ["manual"],
+)
+
 test_suite(
     name = "qemu_tests",
     tags = ["manual"],
     tests = [
         ":boot_qemu_test",
+        ":disk_qemu_test",
         ":selftest_qemu_test",
     ],
 )
