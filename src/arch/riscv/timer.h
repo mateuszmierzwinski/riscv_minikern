@@ -60,8 +60,16 @@ bool timer_ready(void);
 /* Called from the trap handler when a timer interrupt arrives. */
 void timer_on_tick(void);
 
-/* A callback run on every tick, for whatever wants to know — the scheduler
- * does, to preempt. NULL to remove it. */
-void timer_set_tick_hook(void (*hook)(void));
+/* Callbacks run on every tick, for whatever wants to know: the scheduler
+ * does, to preempt, and the network stack does, to run its timers. A list
+ * rather than one slot because there are two of them — and a single slot
+ * silently replaced one with the other, which is a feature that stops
+ * working rather than a build error.
+ *
+ * Hooks run in the order they were added. `timer_clear_tick_hooks` removes
+ * them all, for a kernel tearing something down. KERR_NOSPC when the list
+ * is full. */
+int timer_add_tick_hook(void (*hook)(void));
+void timer_remove_tick_hook(void (*hook)(void));
 
 #endif

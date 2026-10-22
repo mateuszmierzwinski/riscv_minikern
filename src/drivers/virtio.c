@@ -69,26 +69,27 @@ uint64_t virtio_config_u64(const struct virtio_dev *d, uint32_t offset) {
  * on the first, the used ring on the second. Whole pages because the
  * specification wants each aligned, and an allocation that is aligned by
  * construction cannot be misaligned by an arithmetic slip. */
-static int build_queue(struct virtio_dev *d) {
+static int build_queue(struct virtio_dev *d, uint32_t queue) {
     phys_t first = 0, second = 0;
     int rc = mem_alloc_pages(1, 1, &first);
     rc = rc != KERR_OK ? rc : mem_alloc_pages(1, 1, &second);
     if (rc != KERR_OK) {
         return rc;
     }
-    d->q.desc = (struct virtq_desc *)(uintptr_t)first;
-    d->q.avail = (struct virtq_avail *)(uintptr_t)(first + 2048u);
-    d->q.used = (struct virtq_used *)(uintptr_t)second;
+    struct virtq *q = &d->q[queue];
+    q->desc = (struct virtq_desc *)(uintptr_t)first;
+    q->avail = (struct virtq_avail *)(uintptr_t)(first + 2048u);
+    q->used = (struct virtq_used *)(uintptr_t)second;
     for (uint32_t i = 0; i < sizeof(struct virtq_desc) * VIRTIO_QUEUE_SIZE; i++) {
-        ((volatile uint8_t *)d->q.desc)[i] = 0;
+        ((volatile uint8_t *)q->desc)[i] = 0;
     }
-    d->q.avail->flags = 0;
-    d->q.avail->idx = 0;
-    d->q.used->flags = 0;
-    d->q.used->idx = 0;
-    d->q.last_used = 0;
-    d->q.free_head = 0;
-    write_reg(d, VIRTIO_QUEUE_SEL, 0);
+    q->avail->flags = 0;
+    q->avail->idx = 0;
+    q->used->flags = 0;
+    q->used->idx = 0;
+    q->last_used = 0;
+    q->free_head = 0;
+    write_reg(d, VIRTIO_QUEUE_SEL, queue);
     write_reg(d, VIRTIO_QUEUE_NUM, VIRTIO_QUEUE_SIZE);
     write_reg(d, VIRTIO_QUEUE_DESC_LOW, (uint32_t)first);
     write_reg(d, VIRTIO_QUEUE_DESC_HIGH, (uint32_t)(first >> 32));
@@ -174,7 +175,8 @@ static int probe_each(const struct fdt *fdt, uint32_t device_id, struct virtio_d
     return KERR_OK;
 }
 
-int virtio_find(const struct fdt *fdt, uint32_t device_id, struct virtio_dev *out) {
+int virtio_find(const struct fdt *fdt, uint32_t device_id, uint32_t queues,
+                struct virtio_dev *out) {
     uint32_t slots = 0, occupied = 0;
     /* The tree lists every transport slot, most of them empty. Each
      * candidate is probed and the first that holds the wanted device wins.
@@ -196,7 +198,11 @@ int virtio_find(const struct fdt *fdt, uint32_t device_id, struct virtio_dev *ou
             continue;
         }
         rc = negotiate(out);
-        rc = rc != KERR_OK ? rc : build_queue(out);
+        out->queues = 0;
+        for (uint32_t qi = 0; rc == KERR_OK && qi < queues && qi < VIRTIO_MAX_QUEUES; qi++) {
+            rc = build_queue(out, qi);
+            out->queues += rc == KERR_OK ? 1u : 0u;
+        }
         if (rc != KERR_OK) {
             return rc;
         }
@@ -222,37 +228,44 @@ int virtio_find(const struct fdt *fdt, uint32_t device_id, struct virtio_dev *ou
  * cursor is the right answer for a driver with several requests in flight,
  * and that driver would also need to free them; neither is worth having
  * until something asks for the concurrency. */
-static uint16_t chain(struct virtio_dev *d, const void *const *bufs, const uint32_t *lens,
-                      const bool *writable, uint32_t count) {
+static uint16_t chain(struct virtio_dev *d, uint32_t queue, const void *const *bufs,
+                      const uint32_t *lens, const bool *writable, uint32_t count) {
+    struct virtq *q = &d->q[queue];
     for (uint32_t i = 0; i < count; i++) {
-        d->q.desc[i].addr = (uint64_t)(uintptr_t)bufs[i];
-        d->q.desc[i].len = lens[i];
-        d->q.desc[i].flags = (uint16_t)((writable[i] ? VIRTQ_DESC_F_WRITE : 0u) |
+        q->desc[i].addr = (uint64_t)(uintptr_t)bufs[i];
+        q->desc[i].len = lens[i];
+        q->desc[i].flags = (uint16_t)((writable[i] ? VIRTQ_DESC_F_WRITE : 0u) |
                                         (i + 1u < count ? VIRTQ_DESC_F_NEXT : 0u));
-        d->q.desc[i].next = (uint16_t)(i + 1u);
+        q->desc[i].next = (uint16_t)(i + 1u);
     }
     return 0;
 }
 
 int virtio_request(struct virtio_dev *d, const void *const *bufs, const uint32_t *lens,
                    const bool *writable, uint32_t count) {
+    return virtio_request_on(d, 0, bufs, lens, writable, count);
+}
+
+int virtio_request_on(struct virtio_dev *d, uint32_t queue, const void *const *bufs,
+                      const uint32_t *lens, const bool *writable, uint32_t count) {
+    struct virtq *q = &d->q[queue];
     uint16_t head;
-    if (count == 0 || count > VIRTIO_QUEUE_SIZE) {
+    if (count == 0 || count > VIRTIO_QUEUE_SIZE || queue >= d->queues) {
         return KERR_INVAL;
     }
-    head = chain(d, bufs, lens, writable, count);
-    d->q.avail->ring[d->q.avail->idx % VIRTIO_QUEUE_SIZE] = head;
+    head = chain(d, queue, bufs, lens, writable, count);
+    q->avail->ring[q->avail->idx % VIRTIO_QUEUE_SIZE] = head;
     /* The ring must be visible before the index that publishes it, and the
      * index before the notification. Two fences, because the device may be
      * another core or a model running on one. */
     __asm__ volatile("fence w, w" : : : "memory");
-    d->q.avail->idx++;
+    q->avail->idx++;
     __asm__ volatile("fence w, w" : : : "memory");
-    write_reg(d, VIRTIO_QUEUE_NOTIFY, 0);
+    write_reg(d, VIRTIO_QUEUE_NOTIFY, queue);
     for (uint32_t spin = 0; spin < WAIT_SPINS; spin++) {
         __asm__ volatile("fence r, r" : : : "memory");
-        if (d->q.used->idx != d->q.last_used) {
-            d->q.last_used = d->q.used->idx;
+        if (q->used->idx != q->last_used) {
+            q->last_used = q->used->idx;
             return KERR_OK;
         }
     }
@@ -265,5 +278,47 @@ bool virtio_ack_interrupt(struct virtio_dev *d) {
         return false;
     }
     write_reg(d, VIRTIO_INTERRUPT_ACK, status);
+    return true;
+}
+
+void virtio_post_buffer(struct virtio_dev *d, uint32_t queue, uint16_t index, phys_t buf,
+                        uint32_t len) {
+    struct virtq *q = &d->q[queue];
+    if (queue >= d->queues || index >= VIRTIO_QUEUE_SIZE) {
+        return;
+    }
+    q->desc[index].addr = buf;
+    q->desc[index].len = len;
+    q->desc[index].flags = VIRTQ_DESC_F_WRITE; /* the device writes a frame into it */
+    q->desc[index].next = 0;
+    q->avail->ring[q->avail->idx % VIRTIO_QUEUE_SIZE] = index;
+    /* The ring entry before the index that publishes it. */
+    __asm__ volatile("fence w, w" : : : "memory");
+    q->avail->idx++;
+}
+
+void virtio_kick(struct virtio_dev *d, uint32_t queue) {
+    if (queue >= d->queues) {
+        return;
+    }
+    __asm__ volatile("fence w, w" : : : "memory");
+    write_reg(d, VIRTIO_QUEUE_NOTIFY, queue);
+}
+
+bool virtio_take_completion(struct virtio_dev *d, uint32_t queue, uint16_t *index,
+                            uint32_t *len) {
+    struct virtq *q = &d->q[queue];
+    const struct virtq_used_elem *e;
+    if (queue >= d->queues) {
+        return false;
+    }
+    __asm__ volatile("fence r, r" : : : "memory");
+    if (q->used->idx == q->last_used) {
+        return false;
+    }
+    e = &q->used->ring[q->last_used % VIRTIO_QUEUE_SIZE];
+    *index = (uint16_t)e->id;
+    *len = e->len;
+    q->last_used++;
     return true;
 }

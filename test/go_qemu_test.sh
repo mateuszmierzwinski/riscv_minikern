@@ -118,7 +118,7 @@ grep -qF "go: recovered from assignment to entry in nil map" "$log" ||
 grep -qE '^go: 1 goroutines at the end \(1 at the start\), total time .+$' "$log" ||
     fail "goroutines leaked, or the final line is missing"
 grep -qF "go: done" "$log" || fail "it did not reach its end"
-grep -qE '^init: /init exited with 0 after [0-9]+ syscalls$' "$log" ||
+grep -qE '^init: /init exited with 0 after [0-9]+ syscalls \([0-9]+ stale-translation faults\)$' "$log" ||
     fail "it did not exit cleanly"
 echo "ok: a stock gc Go binary for linux/riscv64, unchanged, off a filesystem — threads, GC, channels and all"
 echo PASS

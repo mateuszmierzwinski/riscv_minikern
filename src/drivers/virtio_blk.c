@@ -104,7 +104,7 @@ static int blk_flush(void *self) {
 }
 
 int virtio_blk_init(const struct fdt *fdt, struct blockdev *out) {
-    int rc = virtio_find(fdt, VIRTIO_ID_BLOCK, &blk.dev);
+    int rc = virtio_find(fdt, VIRTIO_ID_BLOCK, 1u, &blk.dev);
     if (rc != KERR_OK) {
         return rc;
     }

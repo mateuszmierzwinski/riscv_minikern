@@ -145,4 +145,10 @@ int64_t uspace_run(struct uproc *p);
  * against rather than trusting a single line of output. */
 uint64_t uspace_syscalls(void);
 
+/* How many faults were spurious — an access the page tables allowed, on a
+ * hart whose cached translations had not caught up. It is the price of not
+ * broadcasting a fence on every mapping, and worth being able to see: if it
+ * ever grew large, the trade would be the wrong way round. */
+uint64_t uspace_stale_faults(void);
+
 #endif

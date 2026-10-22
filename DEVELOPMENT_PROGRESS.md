@@ -618,8 +618,59 @@ Three things in it are *not* architecture-neutral and were fixed on the way in:
 
 ## P5 — Network
 
-- [ ] **P5.1 virtio-net**, for the same reason as virtio-blk: the whole IPv4
-      and TCP stack carries over and can be proven on the emulator.
+- [x] **P5.1 The IPv4 stack, carried over (2026-10-22).** Ethernet, ARP,
+      IPv4 with a loopback path, ICMP echo, UDP, a DHCP client and TCP —
+      **2,300 lines moved across unchanged**, and its three host suites
+      (`net_test`, `tcp_test`, `tcp_hostile_test`, the last of which is
+      malformed and attacking packets) passed on the first build here. It
+      includes only `core/` and `lib/`, so the architecture it runs on is not
+      a fact it knows. That is what the hexagon is for, and this is the
+      largest piece of evidence that this one holds.
+- [x] **P5.2 virtio-net (2026-10-22).** The adapter underneath, which is the
+      part that is genuinely new. **Two queues**, which is the difference from
+      the block device: a receive buffer is handed to the device and waits
+      there for a frame that may never come, so it cannot share a queue with
+      transmit — a send would wait behind a packet that has not arrived. The
+      receive side is a fixed set of buffers, **one per descriptor index**,
+      each re-posted as its frame is handed up, which removes the free list
+      and with it the bug class where a descriptor is reused while the device
+      still owns it.
+      The 12-byte header is on **both** directions: the device writes one in
+      front of every frame and expects one in front of every frame it is
+      given. The length it reports includes it, so handing the whole length
+      up would feed the stack 12 bytes of rubbish per packet.
+      Working first try, end to end: a DHCP lease (`10.0.2.15/24`, gateway,
+      resolver, 86400 s), a ping the gateway answered, and a datagram from
+      the host echoed back unchanged through the forwarded port — so a frame
+      crosses the adapter both ways with the kernel choosing the reply's
+      source address and checksum.
+- [x] **P5.3 TLB maintenance across harts (2026-10-22).** Found by a fault,
+      and the most instructive bug of the networking round even though it has
+      nothing to do with networking: running the whole suite at once, the Go
+      program died on a **wild pointer, `0x2148f0180003`**, in the middle of
+      its heap.
+      `sfence.vma` affects only the hart that executes it, and **there is no
+      broadcast flush instruction on this architecture**. So a page table
+      changed on one hart left every other hart reading through what it had
+      cached — and a stale translation does not fault, it reads the *wrong
+      page*. The program got a value that was never written there and died
+      later somewhere else. The firmware's RFENCE extension does the
+      cross-hart part.
+      **The two directions are not symmetrical, and that is the whole
+      performance story.** Removing or narrowing a mapping must reach every
+      hart at once: a stale entry grants access that is supposed to be gone,
+      and the page may already belong to something else — so the page is
+      freed *after* the fence, not before. Adding one need only reach this
+      hart, because the worst a stale entry can say is "absent" for something
+      now present, and the hart that trips over that fences locally and
+      retries the instruction. Broadcasting on every `mmap` as well turned
+      the 1.6x parallel speedup into **0.6x**, slower than one hart, because
+      a garbage collector maps constantly and unmaps rarely.
+      Verified: 48 runs under heavy parallel load, all clean, with **zero**
+      spurious faults — so on this emulator the local-only path for additions
+      costs nothing, and the retry exists for hardware that does cache the
+      absence of a translation. The count is reported, because if it ever
+      grew large the trade would be the wrong way round.
 - [ ] **P5.2 The DesignWare GMAC**, which is the JH7110's Ethernet. The
       largest single new driver in the port, and a standard IP block, so its
       descriptor format and reset sequence can be checked against independent

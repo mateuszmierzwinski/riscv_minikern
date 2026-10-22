@@ -170,6 +170,119 @@ cc_library(
     deps = [":core_boot"],
 )
 
+# The IPv4 stack: Ethernet, ARP, IPv4 with a loopback path, ICMP echo, UDP, a
+# DHCP client and TCP. **Carried over unchanged from the ARM project** — it is
+# pure, it includes only core/ and lib/, and it was already host-tested with
+# crafted and hostile frames, so the architecture it runs on is not a fact it
+# knows. That is what a hexagon is for, and this is the largest piece of
+# evidence that this one holds.
+# The adapter under the stack: a virtio network device, which the emulator
+# models. Two queues, because a receive buffer waits in the device's hands
+# for a frame that may never come and must not hold up a transmit.
+# The live interface: the device's frames into the stack, the stack's 10 ms
+# tick, a DHCP client and a boot-time ping. Carried over from the ARM
+# project; what changed is where time comes from and that waiting for a
+# lease is a `wfi` rather than a kernel service this kernel does not have.
+cc_library(
+    name = "kernel_net",
+    srcs = ["src/kernel/net.c"],
+    hdrs = ["src/kernel/net.h"],
+    strip_include_prefix = "src",
+    target_compatible_with = ["//platforms:riscv64"],
+    deps = [
+        ":arch_riscv",
+        ":console",
+        ":kernel_random",
+        ":net",
+        ":virtio_net",
+    ],
+)
+
+cc_library(
+    name = "virtio_net",
+    srcs = ["src/drivers/virtio_net.c"],
+    hdrs = ["src/drivers/virtio_net.h"],
+    strip_include_prefix = "src",
+    target_compatible_with = ["//platforms:riscv64"],
+    deps = [
+        ":console",
+        ":kernel_mem",
+        ":net",
+        ":drivers_virtio",
+    ],
+)
+
+cc_library(
+    name = "net",
+    srcs = [
+        "src/core/net/net_arp.c",
+        "src/core/net/net_dhcp.c",
+        "src/core/net/net_echo.c",
+        "src/core/net/net_eth.c",
+        "src/core/net/net_ipv4.c",
+        "src/core/net/net_tcp.c",
+        "src/core/net/net_tcp_in.c",
+        "src/core/net/net_tcp_out.c",
+        "src/core/net/net_udp.c",
+        "src/core/net/net_util.c",
+    ],
+    hdrs = [
+        # The two private headers are `hdrs` rather than `srcs` because
+        # `strip_include_prefix` only rewrites the include path of headers it
+        # is told about — a private header left in `srcs` is compiled against
+        # its own path and is then unfindable by `#include "core/net/..."`.
+        "src/core/net/net.h",
+        "src/core/net/net_internal.h",
+        "src/core/net/tcp.h",
+        "src/core/net/tcp_internal.h",
+        "src/core/ports.h",
+    ],
+    strip_include_prefix = "src",
+    deps = [
+        ":core_boot",
+        ":kfmt",
+    ],
+)
+
+cc_test(
+    name = "net_test",
+    size = "small",
+    srcs = [
+        "test/net_frames.h",
+        "test/net_test.c",
+    ],
+    deps = [
+        ":ktest",
+        ":net",
+    ],
+)
+
+cc_test(
+    name = "tcp_test",
+    size = "small",
+    srcs = [
+        "test/net_frames.h",
+        "test/tcp_test.c",
+    ],
+    deps = [
+        ":ktest",
+        ":net",
+    ],
+)
+
+cc_test(
+    name = "tcp_hostile_test",
+    size = "small",
+    srcs = [
+        "test/net_frames.h",
+        "test/tcp_hostile_test.c",
+    ],
+    deps = [
+        ":ktest",
+        ":net",
+    ],
+)
+
 cc_library(
     name = "pgtable",
     srcs = ["src/arch/riscv/pgtable.c"],
@@ -545,7 +658,9 @@ cc_library(
         ":drivers_virtio",
         ":kernel_disk",
         ":kernel_mem",
+        ":kernel_net",
         ":kernel_uspace",
+        ":virtio_net",
         ":kernel_xfs",
     ],
     alwayslink = True,
@@ -703,6 +818,16 @@ sh_test(
     tags = ["manual"],
 )
 
+# P5: the network — the carried-over stack on a new adapter.
+sh_test(
+    name = "net_qemu_test",
+    size = "large",
+    srcs = ["test/net_qemu_test.sh"],
+    args = ["$(rootpath :minikern)"],
+    data = [":minikern"],
+    tags = ["manual"],
+)
+
 test_suite(
     name = "qemu_tests",
     tags = ["manual"],
@@ -711,6 +836,7 @@ test_suite(
         ":disk_qemu_test",
         ":go_qemu_test",
         ":init_qemu_test",
+        ":net_qemu_test",
         ":selftest_qemu_test",
         ":smp_qemu_test",
         ":user_qemu_test",

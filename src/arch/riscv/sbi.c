@@ -60,3 +60,19 @@ long sbi_hart_status(uint64_t hartid) {
     struct sbi_ret r = sbi_call(SBI_EXT_HSM, SBI_HSM_HART_STATUS, (long)hartid, 0, 0, 0);
     return r.error == SBI_SUCCESS ? r.value : r.error;
 }
+
+/* RFENCE: "RFNC" as four ASCII bytes, which is how the specification names
+ * its extensions. */
+#define SBI_EXT_RFENCE 0x52464E43u
+#define SBI_RFENCE_SFENCE_VMA 1u
+
+long sbi_remote_sfence_vma(uint64_t hart_mask, uint64_t hart_mask_base, uint64_t start,
+                           uint64_t size) {
+    struct sbi_ret r = sbi_call(SBI_EXT_RFENCE, SBI_RFENCE_SFENCE_VMA, (long)hart_mask,
+                                (long)hart_mask_base, (long)start, (long)size);
+    return r.error;
+}
+
+bool sbi_has_rfence(void) {
+    return sbi_probe_extension(SBI_EXT_RFENCE) > 0;
+}

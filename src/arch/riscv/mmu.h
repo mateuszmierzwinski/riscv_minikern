@@ -57,4 +57,38 @@ bool mmu_enabled(void);
  * honest measure of what the kernel's own map costs. */
 uint32_t mmu_table_pages_used(void);
 
+/* Discards cached translations on **every** hart, after a page table has
+ * been changed.
+ *
+ * Local first with `sfence.vma`, because this hart's own TLB is not covered
+ * by the firmware call, and then the others through RFENCE. Both halves are
+ * needed and neither is optional: adding a mapping may need a fence even
+ * locally, since an implementation is permitted to cache the fact that a
+ * translation was absent.
+ *
+ * It is a whole-address-space flush rather than a single page. A page-at-a-
+ * time flush is cheaper and would be worth having once a profile asks for
+ * it; what it is not worth is being clever about *which* harts, because a
+ * thread of this process can be on any of them.
+ */
+void mmu_flush_tlb_everywhere(void);
+
+/* This hart only, which is enough when a mapping has been **added**.
+ *
+ * The asymmetry is the whole performance story. Removing or narrowing a
+ * mapping must reach every hart at once, because a stale entry grants access
+ * that is supposed to be gone. *Adding* one does not: the worst a stale
+ * entry can do is say "absent" for something that is now present, and a hart
+ * that faults on it fences locally and retries. So a broadcast belongs on
+ * unmap and not on map — and that matters, because a garbage collector maps
+ * constantly and unmaps rarely. Measured here: flushing every hart on every
+ * `mmap` turned a 1.6x parallel speedup into 0.6x, which is slower than one
+ * hart. */
+void mmu_flush_tlb_local(void);
+
+/* Whether the cross-hart part is actually available. A machine whose
+ * firmware has no RFENCE cannot be made safe for more than one hart by this
+ * kernel. */
+bool mmu_can_flush_remotely(void);
+
 #endif

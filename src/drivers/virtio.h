@@ -81,12 +81,23 @@ struct virtq {
     uint16_t free_head;   /* the next descriptor to hand out */
 };
 
+/* How many queues a device here may have. A block device uses one; a
+ * network device uses two, receive and transmit, and they are **separate
+ * queues rather than two uses of one** — a receive buffer sits in the
+ * device's hands indefinitely waiting for a frame, so sharing a queue with
+ * transmit would mean a send waiting behind a packet that has not arrived. */
+#define VIRTIO_MAX_QUEUES 2u
+
+#define VIRTIO_QUEUE_RX 0u
+#define VIRTIO_QUEUE_TX 1u
+
 struct virtio_dev {
     volatile uint32_t *regs;
     phys_t base;
     uint32_t irq;
     uint32_t device_id;
-    struct virtq q;
+    struct virtq q[VIRTIO_MAX_QUEUES];
+    uint32_t queues;  /* how many were brought up */
     char path[64];
 };
 
@@ -97,7 +108,8 @@ struct virtio_dev {
  * KERR_NOENT when the tree has no such device — which is the ordinary case
  * on a machine without one, not an error. KERR_NOTSUP for a legacy version-1
  * device. */
-int virtio_find(const struct fdt *fdt, uint32_t device_id, struct virtio_dev *out);
+int virtio_find(const struct fdt *fdt, uint32_t device_id, uint32_t queues,
+                struct virtio_dev *out);
 
 /* The device's own configuration space, which every device type reads
  * differently (a disk's capacity, a NIC's MAC address). */
@@ -115,6 +127,37 @@ uint64_t virtio_config_u64(const struct virtio_dev *d, uint32_t offset);
  * what went wrong. */
 int virtio_request(struct virtio_dev *d, const void *const *bufs, const uint32_t *lens,
                    const bool *writable, uint32_t count);
+
+/* The same, on a chosen queue. `virtio_request` is the facade for queue 0,
+ * which is what a block device wants; a network device's transmit queue is
+ * queue 1 and otherwise identical. */
+int virtio_request_on(struct virtio_dev *d, uint32_t queue, const void *const *bufs,
+                      const uint32_t *lens, const bool *writable, uint32_t count);
+
+/* ── the asynchronous half, which a receive queue needs ─────────────────────
+ *
+ * A receive buffer is handed to the device and stays there until a frame
+ * arrives, which may be never. So the receive path cannot be a request that
+ * waits: the buffers are posted once and completions are collected whenever
+ * the driver looks or an interrupt says to.
+ *
+ * Descriptors are used **one per buffer at a fixed index** — descriptor `i`
+ * always describes buffer `i`. That removes the free-list this would
+ * otherwise need, and with it the bug class where a descriptor is reused
+ * while the device still owns it. */
+
+/* Posts buffer `index`'s single descriptor, pointing at `buf` of `len`
+ * bytes, writable by the device. For filling a receive queue. */
+void virtio_post_buffer(struct virtio_dev *d, uint32_t queue, uint16_t index, phys_t buf,
+                        uint32_t len);
+
+/* Notifies the device that a queue has work. */
+void virtio_kick(struct virtio_dev *d, uint32_t queue);
+
+/* Takes one completion, if there is one: which descriptor, and how many
+ * bytes the device wrote. False when the queue is empty. */
+bool virtio_take_completion(struct virtio_dev *d, uint32_t queue, uint16_t *index,
+                            uint32_t *len);
 
 /* Acknowledges a device interrupt. Returns true when this device raised it. */
 bool virtio_ack_interrupt(struct virtio_dev *d);

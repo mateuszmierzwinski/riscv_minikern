@@ -1,5 +1,7 @@
 #include "arch/riscv/timer.h"
 
+#include <stddef.h>
+
 #include "arch/riscv/sbi.h"
 #include "arch/riscv/smp.h"
 #include "core/errno.h"
@@ -79,10 +81,29 @@ void timer_rearm(void) {
     sbi_set_timer(next_deadline[me]);
 }
 
-static void (*tick_hook)(void);
+#define TICK_HOOKS 4u
 
-void timer_set_tick_hook(void (*hook)(void)) {
-    tick_hook = hook;
+static void (*tick_hooks[TICK_HOOKS])(void);
+
+int timer_add_tick_hook(void (*hook)(void)) {
+    for (uint32_t i = 0; i < TICK_HOOKS; i++) {
+        if (tick_hooks[i] == NULL) {
+            tick_hooks[i] = hook;
+            return KERR_OK;
+        }
+        if (tick_hooks[i] == hook) {
+            return KERR_OK; /* already there: adding twice is not two ticks */
+        }
+    }
+    return KERR_NOSPC;
+}
+
+void timer_remove_tick_hook(void (*hook)(void)) {
+    for (uint32_t i = 0; i < TICK_HOOKS; i++) {
+        if (tick_hooks[i] == hook) {
+            tick_hooks[i] = NULL;
+        }
+    }
 }
 
 void timer_on_tick(void) {
@@ -92,8 +113,10 @@ void timer_on_tick(void) {
     /* Rearmed first, then the hook: a scheduler's tick may not return for a
      * long time — it is where a thread switch happens — and a timer that is
      * rearmed afterwards would stop ticking for exactly as long. */
-    if (tick_hook != NULL) {
-        tick_hook();
+    for (uint32_t i = 0; i < TICK_HOOKS; i++) {
+        if (tick_hooks[i] != NULL) {
+            tick_hooks[i]();
+        }
     }
 }
 

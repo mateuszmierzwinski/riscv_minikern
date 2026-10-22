@@ -40,7 +40,10 @@
 #include "kernel/irq.h"
 #include "kernel/mem.h"
 #include "arch/riscv/smp.h"
+#include "drivers/virtio_net.h"
 #include "kernel/klock.h"
+#include "kernel/net.h"
+#include "kernel/random.h"
 #include "kernel/sched.h"
 #include "kernel/syscall.h"
 #include "kernel/uspace.h"
@@ -431,6 +434,61 @@ static void bring_up_other_harts(uint64_t dtb, uint64_t boot_hart) {
             harts_arrived, want, smp_running_count());
 }
 
+/* The network: the device, the stack, and a lease.
+ *
+ * `minikern.net=off` leaves it down. Otherwise the device is found in the
+ * tree, the stack is given its hardware address, and DHCP runs — and the
+ * kernel waits for the lease, because almost everything a network is for
+ * needs an address first and a kernel that carried on would report "no
+ * address" for a lease that arrived a millisecond later.
+ *
+ * The frames arrive two ways on purpose: the device's interrupt, and the
+ * tick. An interrupt-only driver loses whatever arrived while it was not
+ * looking, which on this transport is possible because the device may
+ * coalesce — the ARM project's EMAC had to be re-kicked for the same
+ * reason. */
+static void on_net_interrupt(void *self) {
+    (void)self;
+    virtio_net_poll(knet_interface());
+}
+
+static void poll_net_from_tick(void) {
+    virtio_net_poll(knet_interface());
+}
+
+static void bring_up_network(uint64_t dtb) {
+    struct fdt fdt;
+    const struct netdev_port *port = NULL;
+    uint8_t mac[ETH_ALEN];
+    uint32_t xid = 0;
+    int rc;
+    if (cmdline_has(boot_cmdline, "minikern.net=off")) {
+        kprintf("net: left down (minikern.net=off)\n");
+        return;
+    }
+    if (fdt_open(&fdt, (const void *)(uintptr_t)dtb, FDT_MAX_BYTES) != KERR_OK) {
+        return;
+    }
+    rc = virtio_net_init(&fdt, &port, mac);
+    if (rc != KERR_OK) {
+        kprintf("net: no network device in the tree (rc %d)\n", rc);
+        return;
+    }
+    (void)knet_init(mac, port);
+    {
+        static const struct irq_handler handler = {.handle = on_net_interrupt, .self = NULL};
+        (void)irq_register(virtio_net_irq(), &handler);
+    }
+    (void)timer_add_tick_hook(poll_net_from_tick);
+    random_fill(&xid, sizeof xid);
+    knet_start(xid);
+    if (knet_wait_address(5000u) != KERR_OK) {
+        kprintf("net: no address after 5 s — carrying on without one\n");
+        return;
+    }
+    knet_report();
+}
+
 /* The board's pins.
  *
  * Reports what it found and nothing more: driving a pin is something only a
@@ -586,8 +644,9 @@ static void run_init_from_disk(const char *path) {
         return;
     }
     status = uspace_run(&proc);
-    kprintf("init: %s exited with %lld after %llu syscalls\n", path, (long long)status,
-            (unsigned long long)uspace_syscalls());
+    kprintf("init: %s exited with %lld after %llu syscalls (%llu stale-translation faults)\n",
+            path, (long long)status, (unsigned long long)uspace_syscalls(),
+            (unsigned long long)uspace_stale_faults());
     report_hart_usage();
     uspace_destroy(&proc);
 }
@@ -643,6 +702,7 @@ void kmain(uint64_t hart, uint64_t dtb) {
     bring_up_filesystem();
     bring_up_gpio(dtb);
     bring_up_other_harts(dtb, hart);
+    bring_up_network(dtb);
     wait_for_ticks();
     run_user_programs();
     (void)selftest_run(boot_cmdline);

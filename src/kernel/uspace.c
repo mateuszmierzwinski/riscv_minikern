@@ -35,6 +35,7 @@ static int64_t exit_status;
 static bool exited;
 static uint64_t kernel_satp_saved;
 static uint64_t calls_at_start;
+static uint64_t stale_faults;
 
 /* The pair in arch/riscv/uspace_entry.S. `uspace_leave` does not return to
  * its caller: control reappears wherever `uspace_enter` was called from. */
@@ -243,6 +244,45 @@ static void on_user_return(struct trapframe *tf) {
     }
 }
 
+/* A fault on an address that **is** mapped, which means this hart's TLB had
+ * not caught up.
+ *
+ * It is the other half of only flushing locally when a mapping is added: a
+ * hart that was not told fences itself here and retries the instruction, and
+ * the cost is one spurious fault instead of a machine-wide fence on every
+ * `mmap`. The fault is genuinely spurious — the tables say the access is
+ * allowed — so retrying is not a guess.
+ *
+ * `sepc` is deliberately left alone: the faulting instruction runs again.
+ */
+static bool retry_after_stale_translation(struct trapframe *tf) {
+    uint64_t code = tf->scause & ~SCAUSE_INTERRUPT;
+    uint64_t want;
+    phys_t phys = 0;
+    uint64_t flags = 0, size = 0;
+    if (code == EXC_INSN_PAGE_FAULT) {
+        want = PTE_X;
+    } else if (code == EXC_LOAD_PAGE_FAULT) {
+        want = PTE_R;
+    } else if (code == EXC_STORE_PAGE_FAULT) {
+        want = PTE_W;
+    } else {
+        return false;
+    }
+    if (running == NULL || !pgtable_lookup(&running->pt, tf->stval, &phys, &flags, &size)) {
+        return false;
+    }
+    /* Mapped, for user mode, with the right to do what was attempted — so
+     * the tables and the hardware disagree, and the hardware is the one
+     * holding something out of date. */
+    if ((flags & want) == 0 || (flags & PTE_U) == 0) {
+        return false;
+    }
+    stale_faults++;
+    mmu_flush_tlb_local();
+    return true;
+}
+
 static bool on_user_trap(struct trapframe *tf) {
     if ((tf->scause & SCAUSE_INTERRUPT) != 0) {
         return false; /* an interrupt: the trap layer deals with those */
@@ -254,6 +294,9 @@ static bool on_user_trap(struct trapframe *tf) {
          * instruction itself has to be read — `ecall` is a 4-byte one, but
          * a kernel that assumes that has assumed it everywhere. */
         tf->sepc += 4u;
+        return true;
+    }
+    if (retry_after_stale_translation(tf)) {
         return true;
     }
     /* A fault in user code is the process's problem, not the kernel's: it
@@ -325,7 +368,7 @@ int64_t uspace_run(struct uproc *p) {
         return rc;
     }
     report_lock_state();
-    timer_set_tick_hook(sched_tick);
+    (void)timer_add_tick_hook(sched_tick);
     /* Secondary harts may now join. They were waiting for exactly this,
      * because a hart with no process has nothing to claim. */
     sched_set_accepting(true);
@@ -346,7 +389,7 @@ int64_t uspace_run(struct uproc *p) {
     uspace_release_address_space();
     trap_set_expected(NULL);
     trap_set_user_return_hook(NULL);
-    timer_set_tick_hook(NULL);
+    timer_remove_tick_hook(sched_tick);
     sched_shutdown();
     running = NULL;
     return exit_status;
@@ -507,6 +550,10 @@ int uspace_build_elf(struct uproc *p, const uint8_t *image, uint32_t bytes, cons
     return KERR_OK;
 }
 
+uint64_t uspace_stale_faults(void) {
+    return stale_faults;
+}
+
 uint64_t uspace_syscalls(void) {
     /* **This process's** calls, not the kernel's total. The table counts
      * cumulatively, which is what a kernel wants; a process's own count is
@@ -620,6 +667,35 @@ static virt_t place_mapping(struct uproc *p, virt_t at, uint64_t pages) {
     return chosen;
 }
 
+/* A page-table change must reach the harts that could be using it.
+ *
+ * This is the one piece of SMP that is invisible until it is wrong. A stale
+ * translation does not fault: the hart reads the **wrong page**, so the
+ * program sees a value that was never written there and faults later, at an
+ * address that means nothing. It cost one such fault to find — a wild
+ * pointer `0x2148f0180003` in the middle of the heap, reproducible only
+ * under load, on a machine where the hart that changed the mapping was the
+ * only one that could see the change.
+ *
+ * **Two functions, because the two directions are not symmetrical.**
+ * Removing or narrowing a mapping must reach every hart at once: a stale
+ * entry there grants access that is supposed to be gone, and the page may
+ * already have been handed to something else. Adding one need only reach
+ * this hart: the worst a stale entry can say is "absent" for something that
+ * is now present, and the hart that trips over that fences locally and
+ * retries (`retry_after_stale_translation`).
+ *
+ * The difference is not a micro-optimisation. A garbage collector maps
+ * constantly and unmaps rarely, and broadcasting on every map turned a 1.6x
+ * parallel speedup into 0.6x — slower than running on one hart. */
+static void published_removal(void) {
+    mmu_flush_tlb_everywhere();
+}
+
+static void published_addition(void) {
+    mmu_flush_tlb_local();
+}
+
 int uspace_map_anon(struct uproc *p, virt_t at, uint64_t bytes, uint32_t prot, bool fixed,
                     virt_t *out) {
     uint64_t pages = 0;
@@ -647,11 +723,13 @@ int uspace_map_anon(struct uproc *p, virt_t at, uint64_t bytes, uint32_t prot, b
         }
     }
     *out = base;
+    published_addition();
     return KERR_OK;
 }
 
 int uspace_unmap(struct uproc *p, virt_t at, uint64_t bytes) {
     uint64_t pages = 0;
+    bool changed = false;
     if ((at & (PAGE_SIZE - 1u)) != 0 || !page_count(bytes, &pages)) {
         return KERR_INVAL;
     }
@@ -660,8 +738,23 @@ int uspace_unmap(struct uproc *p, virt_t at, uint64_t bytes) {
         uint64_t flags = 0, size = 0;
         if (pgtable_lookup(&p->pt, at + i * PAGE_SIZE, &phys, &flags, &size)) {
             (void)pgtable_unmap(&p->pt, at + i * PAGE_SIZE);
+            /* The mapping is gone from the tables, but another hart may
+             * still have it cached — so the page cannot be handed back to
+             * the allocator until every hart has been told. Freeing first
+             * would let a hart write through a stale translation into memory
+             * that now belongs to something else. */
+            /* The mapping is gone from the tables, but another hart may
+             * still have it cached — so the page cannot be handed back to
+             * the allocator until every hart has been told. Freeing first
+             * would let a hart write through a stale translation into
+             * memory that now belongs to something else. */
+            changed = true;
+            published_removal();
             mem_free_pages(phys, 1);
         }
+    }
+    if (changed) {
+        published_removal();
     }
     return KERR_OK;
 }
@@ -690,6 +783,10 @@ int uspace_protect(struct uproc *p, virt_t at, uint64_t bytes, uint32_t prot) {
             return rc;
         }
     }
+    /* `mprotect` both adds and takes away, and which one it did is not
+     * tracked here — so it takes the safe side. It is rare compared with
+     * `mmap`, so there is nothing to win by being clever. */
+    published_removal();
     return KERR_OK;
 }
 
@@ -708,5 +805,8 @@ virt_t uspace_brk(struct uproc *p, virt_t want) {
         (void)uspace_unmap(p, to, from - to);
     }
     p->brk = want;
+    /* The break only ever grows here (a shrink unmaps, and that path
+     * broadcasts for itself), so this hart is enough. */
+    published_addition();
     return p->brk;
 }

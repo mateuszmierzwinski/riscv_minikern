@@ -90,7 +90,7 @@ grep -qE '^init: sp=0x[0-9a-f]+ \(16-byte aligned\)$' "$log" ||
 # And it ran to completion: its own last line, then the status and the
 # syscall count the kernel counted.
 grep -qF "init: done" "$log" || fail "the program did not reach its end"
-grep -qE '^init: /init exited with 42 after [0-9]+ syscalls$' "$log" ||
+grep -qE '^init: /init exited with 42 after [0-9]+ syscalls \([0-9]+ stale-translation faults\)$' "$log" ||
     fail "the exit status or the syscall count is wrong"
 echo "ok: an ELF off an XFS filesystem on NVMe, loaded, started correctly, and run to completion"
 echo PASS

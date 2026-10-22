@@ -94,7 +94,7 @@ grep -qF "go: contended counter reached 16000" "$log" ||
 grep -qF "go: sum of primes below 200000 is 1709600813" "$log" ||
     fail "a long computation gave the wrong answer"
 grep -qF "go: channel values [1 4 9 16 25 36]" "$log" || fail "channels are wrong on four harts"
-grep -qE '^init: /init exited with 0 after [0-9]+ syscalls$' "$log" ||
+grep -qE '^init: /init exited with 0 after [0-9]+ syscalls \([0-9]+ stale-translation faults\)$' "$log" ||
     fail "it did not exit cleanly"
 echo "ok: four harts from the device tree, all running Go threads — $usage"
 echo "    $(sed -n 's/^go: \(8 units.*\)$/\1/p' "$log" | head -1)"

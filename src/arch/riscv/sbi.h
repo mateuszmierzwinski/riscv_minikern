@@ -76,4 +76,29 @@ long sbi_hart_stop(void);
 /* A hart's state: started, stopped, or somewhere in between. */
 long sbi_hart_status(uint64_t hartid);
 
+/* Makes every other hart discard its cached translations.
+ *
+ * **There is no broadcast TLB flush instruction on this architecture.**
+ * `sfence.vma` affects only the hart that executes it, so a kernel that
+ * changes a page table on one hart leaves every other hart reading through
+ * whatever it had cached. The firmware's RFENCE extension does the
+ * cross-hart part — it sends the other harts an interrupt and they fence
+ * themselves — and it is the only portable way to do it: an IPI and a
+ * hand-written handler would be the same mechanism, written twice.
+ *
+ * `hart_mask_base` of -1 means every hart, which is what a kernel wants: a
+ * thread can be anywhere, so there is no subset that is safe to skip.
+ *
+ * This is the one piece of SMP that is invisible until it is wrong. A stale
+ * translation does not fault — it reads the **wrong page**, so a program
+ * gets a value that was never written and faults later somewhere else, on
+ * an address that means nothing. */
+long sbi_remote_sfence_vma(uint64_t hart_mask, uint64_t hart_mask_base, uint64_t start,
+                           uint64_t size);
+
+/* Whether the firmware offers RFENCE. A machine without it cannot be made
+ * safe for more than one hart by this kernel, and says so rather than
+ * running on luck. */
+bool sbi_has_rfence(void);
+
 #endif

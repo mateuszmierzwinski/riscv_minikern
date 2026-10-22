@@ -2,6 +2,7 @@
 
 #include <stddef.h>
 
+#include "arch/riscv/sbi.h"
 #include "core/console.h"
 #include "core/errno.h"
 
@@ -158,4 +159,26 @@ bool mmu_enabled(void) {
 
 uint32_t mmu_table_pages_used(void) {
     return arena.used;
+}
+
+void mmu_flush_tlb_local(void) {
+    __asm__ volatile("sfence.vma zero, zero" : : : "memory");
+}
+
+void mmu_flush_tlb_everywhere(void) {
+    /* This hart, then the rest. The local fence is not redundant: the
+     * firmware call covers the other harts, and an implementation may cache
+     * the absence of a translation, so even a newly *added* mapping needs
+     * one here. */
+    __asm__ volatile("sfence.vma zero, zero" : : : "memory");
+    if (sbi_has_rfence()) {
+        /* `hart_mask_base` of -1 means every hart; a size of -1 means the
+         * whole address space. A subset would be wrong: a thread of this
+         * process can be running on any hart. */
+        (void)sbi_remote_sfence_vma(0, (uint64_t)-1, 0, (uint64_t)-1);
+    }
+}
+
+bool mmu_can_flush_remotely(void) {
+    return sbi_has_rfence();
 }
