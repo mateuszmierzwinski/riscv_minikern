@@ -31,8 +31,21 @@ NM = "/usr/bin/nm"
 # instead of quietly producing a file nobody can boot.
 UNAVAILABLE = "/bin/false"
 
-# The target triple and ISA. rv64gc is what the U74 cores in the JH7110
-# implement (RV64GC = IMAFDC), and what QEMU's virt machine offers by default.
+# The target triple, the core, and the ABI.
+#
+# **`-mcpu=sifive-u74` rather than a bare `-march`**, because the JH7110's
+# application cores *are* U74s and naming the core tells the compiler two
+# things a bare ISA string cannot: the instruction set it implements
+# (RV64GC — IMAFDC, which is what `rv64gc` would have said) **and its
+# pipeline**, which is what scheduling instructions well depends on. The U74
+# is a dual-issue in-order core, so the order of independent instructions is
+# worth something; on an out-of-order core it would not be.
+#
+# The ISA is left exactly as the core defines it. The temptation is to add
+# extensions — bit manipulation, vectors — but a JH7110 has neither, and an
+# image built with them does not fault helpfully: it takes an illegal
+# instruction somewhere in the middle of whatever used them, which is the
+# worst way to find out.
 TARGET_TRIPLE = "riscv64-unknown-elf"
-MARCH = "rv64gc"
+MCPU = "sifive-u74"
 MABI = "lp64d"

@@ -38,6 +38,7 @@
 #include "kernel/disk.h"
 #include "kernel/irq.h"
 #include "kernel/mem.h"
+#include "kernel/xfsmount.h"
 #include "core/ports.h"
 
 #include <stdbool.h>
@@ -268,6 +269,39 @@ static void bring_up_storage(uint64_t dtb) {
     }
 }
 
+/* The filesystem, if the disk has one.
+ *
+ * A disk with no XFS on it is not a failure — it is a blank disk, which is
+ * what a board ships with — so each refusal is reported as the diagnosis it
+ * is rather than as "mount failed". The implementation **refuses a dirty
+ * log** rather than replaying it, and that refusal is the one most worth
+ * naming: it means the filesystem was not unmounted cleanly and this kernel
+ * will not guess at what was in flight (kernel/xfsmount.h). */
+static void bring_up_filesystem(void) {
+    int rc = xfsmount_attach();
+    int32_t entries;
+    if (rc == KERR_NODEV) {
+        return; /* no disk: already said so */
+    }
+    if (rc != KERR_OK) {
+        /* No paraphrase. The filesystem prints the precise reason it
+         * refused — an unsupported feature bit, a dirty log, a bad magic —
+         * and an earlier version of this line guessed a different reason
+         * from the error code and printed "a dirty log" over the top of
+         * "unsupported read-only features". Restating someone else's
+         * diagnosis in your own words is how a log starts lying. */
+        kprintf("xfs: not mounted (rc %d; the reason is above)\n", rc);
+        return;
+    }
+    entries = xfsmount_list_root();
+    if (entries < 0) {
+        kprintf("xfs: mounted, but the root directory would not read (rc %d)\n", entries);
+        return;
+    }
+    kprintf("xfs: mounted read-only, %d entries in /\n", entries);
+    (void)xfsmount_show_file("/hello.txt");
+}
+
 /* The board's pins.
  *
  * Reports what it found and nothing more: driving a pin is something only a
@@ -317,6 +351,7 @@ void kmain(uint64_t hart, uint64_t dtb) {
     bring_up_memory(&info);
     bring_up_interrupts(dtb, hart);
     bring_up_storage(dtb);
+    bring_up_filesystem();
     bring_up_gpio(dtb);
     wait_for_ticks();
     (void)selftest_run(boot_cmdline);

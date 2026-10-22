@@ -84,13 +84,61 @@ cc_test(
 # port, a buffer cache over it, and XFS. All pure, all host-tested.
 cc_library(
     name = "storage",
-    srcs = ["src/core/bcache.c"],
+    srcs = [
+        "src/core/bcache.c",
+        "src/core/blockscale.c",
+    ],
     hdrs = [
         "src/core/bcache.h",
         "src/core/blockdev.h",
+        "src/core/blockscale.h",
     ],
     strip_include_prefix = "src",
     deps = [":core_boot"],
+)
+
+# XFS, carried over whole: mount, read, logged writes, create, remove, grow.
+# Pure over the buffer cache, and host-tested against filesystems mkfs.xfs
+# made — which is the property that matters, because the authority on whether
+# this implementation is right is the vendor's own checker, not this project.
+cc_library(
+    name = "xfs",
+    srcs = glob(["src/core/xfs/*.c"]),
+    hdrs = glob(["src/core/xfs/*.h"]),
+    strip_include_prefix = "src",
+    deps = [
+        ":console",
+        ":core_boot",
+        ":crypto",
+        ":storage",
+    ],
+)
+
+cc_library(
+    name = "crypto",
+    srcs = ["src/lib/crc32c.c"],
+    hdrs = ["src/lib/crc32c.h"],
+    strip_include_prefix = "src",
+)
+
+cc_test(
+    name = "xfs_test",
+    size = "small",
+    srcs = ["test/xfs_test.c"],
+    deps = [
+        ":ktest",
+        ":xfs",
+    ],
+)
+
+cc_test(
+    name = "blockscale_test",
+    size = "small",
+    srcs = ["test/blockscale_test.c"],
+    deps = [
+        ":ktest",
+        ":storage",
+    ],
 )
 
 cc_test(
@@ -291,6 +339,21 @@ cc_library(
     ],
 )
 
+# The filesystem on the disk: the carried-over XFS over the live cache.
+cc_library(
+    name = "kernel_xfs",
+    srcs = ["src/kernel/xfsmount.c"],
+    hdrs = ["src/kernel/xfsmount.h"],
+    strip_include_prefix = "src",
+    target_compatible_with = ["//platforms:riscv64"],
+    deps = [
+        ":console",
+        ":kernel_disk",
+        ":kernel_mem",
+        ":xfs",
+    ],
+)
+
 # ── the kernel ─────────────────────────────────────────────────────────────
 
 # memset and friends: the kernel links no libc, and the compiler emits calls
@@ -365,6 +428,7 @@ cc_library(
         ":drivers_virtio",
         ":kernel_disk",
         ":kernel_mem",
+        ":kernel_xfs",
     ],
     alwayslink = True,
 )
@@ -380,6 +444,7 @@ kernel_binary(
         ":drivers_virtio",
         ":kernel_disk",
         ":kernel_mem",
+        ":kernel_xfs",
         ":kmem",
     ],
 )
@@ -427,6 +492,17 @@ sh_test(
     tags = ["manual"],
 )
 
+# P4.4: XFS on a real device — the whole stack, judged against filesystems
+# the vendor's own tools made and call clean.
+sh_test(
+    name = "xfs_qemu_test",
+    size = "large",
+    srcs = ["test/xfs_qemu_test.sh"],
+    args = ["$(rootpath :minikern)"],
+    data = [":minikern"],
+    tags = ["manual"],
+)
+
 test_suite(
     name = "qemu_tests",
     tags = ["manual"],
@@ -434,5 +510,6 @@ test_suite(
         ":boot_qemu_test",
         ":disk_qemu_test",
         ":selftest_qemu_test",
+        ":xfs_qemu_test",
     ],
 )

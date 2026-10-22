@@ -2,6 +2,7 @@
 
 #include <stddef.h>
 
+#include "core/blockscale.h"
 #include "core/console.h"
 #include "core/errno.h"
 #include "drivers/nvme.h"
@@ -14,8 +15,17 @@
  * is enough for a filesystem's metadata to stay resident and small enough
  * that a board with 512 MiB does not notice. */
 #define CACHE_SLOTS 64u
-#define CACHE_BLOCK 4096u
 
+/* The device as the controller presents it (512-byte sectors, usually), and
+ * the view the filesystem wants (4 KiB blocks). Something must bridge them:
+ * XFS asks its cache in **filesystem blocks**, and without the bridge every
+ * metadata read returns an eighth of one — the filesystem mounts, because a
+ * superblock fits in the first sector, and then the first directory read
+ * fails with an I/O error and nothing else visibly wrong. */
+#define FILESYSTEM_BLOCK 4096u
+
+static struct blockdev raw;
+static struct blockscale scale;
 static struct blockdev device;
 static struct bcache cache;
 static bool present;
@@ -34,15 +44,15 @@ const char *disk_kind(void) {
  * ordinary case for a kernel that netboots. */
 static int attach_any(const struct fdt *fdt) {
     bool pci = pci_init(fdt) == KERR_OK;
-    if (pci && nvme_init(&device) == KERR_OK) {
+    if (pci && nvme_init(&raw) == KERR_OK) {
         attached_kind = "nvme";
         return KERR_OK;
     }
-    if (sdhci_init(fdt, &device) == KERR_OK) {
+    if (sdhci_init(fdt, &raw) == KERR_OK) {
         attached_kind = sdhci_kind();
         return KERR_OK;
     }
-    if (virtio_blk_init(fdt, &device) == KERR_OK) {
+    if (virtio_blk_init(fdt, &raw) == KERR_OK) {
         attached_kind = "virtio";
         return KERR_OK;
     }
@@ -55,16 +65,40 @@ int disk_attach(const struct fdt *fdt) {
     if (rc != KERR_OK) {
         return rc;
     }
-    /* The cache's storage comes from the frame allocator rather than .bss:
-     * 256 KiB of a kernel image is 256 KiB that every board pays for whether
-     * or not it has a disk. */
-    mem = kzalloc(CACHE_SLOTS * (CACHE_BLOCK + 64u));
-    if (mem == NULL) {
+    /* The filesystem's block over the controller's sector. A device whose
+     * sector size does not divide it is refused rather than rounded: a
+     * ratio that is not whole cannot be a block device. */
+    rc = blockscale_wrap(&raw, FILESYSTEM_BLOCK, &scale, &device);
+    if (rc != KERR_OK) {
+        kprintf("disk: %u-byte sectors cannot present %u-byte blocks\n", raw.block_size,
+                FILESYSTEM_BLOCK);
+        return rc;
+    }
+    /* **Whole pages, not heap bytes.** The cache's slots are handed
+     * straight to a DMA engine, and a controller's data pointer has
+     * alignment rules the heap knows nothing about: NVMe describes a
+     * transfer as a page-offset plus a length, so a buffer that straddles a
+     * page boundary needs a second pointer the driver does not supply. The
+     * heap returns 8-byte-aligned memory, so slots landed across page
+     * boundaries and the controller refused the read — the filesystem
+     * mounted and then its root directory would not load, with an I/O error
+     * and nothing else wrong.
+     *
+     * Page-aligned pages make every 512-byte slot page-contained by
+     * construction, which is a property rather than a hope. */
+    phys_t pages = 0;
+    uint32_t bytes = CACHE_SLOTS * device.block_size;
+    uint32_t npages = (bytes + 4095u) / 4096u;
+    if (mem_alloc_pages(npages, 1, &pages) != KERR_OK) {
         return KERR_NOMEM;
+    }
+    mem = (void *)(uintptr_t)pages;
+    for (uint32_t i = 0; i < npages * 4096u; i++) {
+        ((volatile uint8_t *)mem)[i] = 0;
     }
     rc = bcache_init(&cache, &device, mem, CACHE_SLOTS);
     if (rc != KERR_OK) {
-        kfree(mem);
+        (void)mem_free_pages(pages, npages);
         return rc;
     }
     present = true;

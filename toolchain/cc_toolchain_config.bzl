@@ -1,9 +1,14 @@
-"""A freestanding RV64GC (SiFive U74) C toolchain over the host's clang."""
+"""A freestanding C toolchain for the SiFive U74, over the host's clang.
+
+The core is named rather than the ISA (toolchain/paths.bzl): `-mcpu=sifive-u74`
+gives both the instruction set the JH7110's application cores implement and
+the pipeline model its scheduler should assume.
+"""
 
 load("@rules_cc//cc:action_names.bzl", "ACTION_NAMES")
 load("@rules_cc//cc:cc_toolchain_config_lib.bzl", "feature", "flag_group", "flag_set", "tool_path")
 load("@rules_cc//cc:defs.bzl", "CcToolchainConfigInfo", "cc_common")
-load(":paths.bzl", "AR", "CLANG", "CLANG_INCLUDE", "LLD", "MABI", "MARCH", "NM", "TARGET_TRIPLE", "UNAVAILABLE")
+load(":paths.bzl", "AR", "CLANG", "CLANG_INCLUDE", "LLD", "MABI", "MCPU", "NM", "TARGET_TRIPLE", "UNAVAILABLE")
 
 _COMPILE_ACTIONS = [
     ACTION_NAMES.assemble,
@@ -27,7 +32,7 @@ _LINK_ACTIONS = [ACTION_NAMES.cpp_link_executable]
 #     script places by hand.
 _COMPILE_FLAGS = [
     "--target=" + TARGET_TRIPLE,
-    "-march=" + MARCH,
+    "-mcpu=" + MCPU,
     "-mabi=" + MABI,
     "-mcmodel=medany",
     "-mno-relax",
@@ -52,7 +57,7 @@ _COMPILE_FLAGS = [
 
 _LINK_FLAGS = [
     "--target=" + TARGET_TRIPLE,
-    "-march=" + MARCH,
+    "-mcpu=" + MCPU,
     "-mabi=" + MABI,
     "-mno-relax",
     "-nostdlib",

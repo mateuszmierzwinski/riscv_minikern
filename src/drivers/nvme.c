@@ -38,6 +38,10 @@
 
 #define READY_SPINS 10000000u
 
+/* The page size the controller is configured for: CC.MPS of 0 means 4 KiB,
+ * which is what this kernel sets. A PRP entry addresses within one of these. */
+#define PAGE_BYTES 4096u
+
 /* A 64-byte submission entry, as the specification lays it out. Only the
  * fields this driver sets are named; the rest must be zero, which is why
  * every command starts from a cleared structure. */
@@ -251,14 +255,34 @@ static int create_io_queues(void) {
     return submit(&nvme.admin, &cmd, NULL);
 }
 
-/* One transfer. A single page per command, which bounds a request to a page
- * and needs no scatter list: the buffer cache reads a block at a time, and a
- * driver that supports more without a caller asking is untested code. */
+/* One transfer.
+ *
+ * **A PRP entry addresses from its offset to the end of its page, and no
+ * further.** That is the whole of the subtlety here, and it is easy to miss
+ * because a page-aligned buffer hides it completely: `prp1` then covers a
+ * full page and a 4 KiB request needs nothing else. Hand the same driver a
+ * buffer eight bytes into a page — which is exactly what a kernel heap
+ * returns, since it puts a header in front of what it hands out — and the
+ * first entry covers 4088 bytes while the last eight go nowhere. The symptom
+ * was precisely that: byte 4088 of a 4 KiB block read back as zero.
+ *
+ * So `prp2` is set whenever the transfer runs past the end of `prp1`'s page,
+ * where it addresses the **next page**. Two entries cover any transfer up to
+ * two pages from any offset, which is every request this kernel makes; a
+ * longer one would need a PRP *list* in memory, and is refused rather than
+ * silently truncated. */
 static int transfer(uint8_t opcode, uint64_t lba, uint32_t blocks, void *buf) {
     struct nvme_command cmd = {0};
+    uint64_t at = (uint64_t)(uintptr_t)buf;
+    uint64_t bytes = (uint64_t)blocks * nvme.block_size;
+    uint64_t first_page_has = PAGE_BYTES - (at & (PAGE_BYTES - 1u));
+    if (bytes > first_page_has + PAGE_BYTES) {
+        return KERR_INVAL; /* would need a PRP list, which this does not build */
+    }
     cmd.opcode = opcode;
     cmd.namespace_id = 1;
-    cmd.prp1 = (uint64_t)(uintptr_t)buf;
+    cmd.prp1 = at;
+    cmd.prp2 = bytes > first_page_has ? ((at & ~(uint64_t)(PAGE_BYTES - 1u)) + PAGE_BYTES) : 0;
     cmd.cdw10 = (uint32_t)lba;
     cmd.cdw11 = (uint32_t)(lba >> 32);
     cmd.cdw12 = blocks - 1u; /* zero-based, as the specification has it */

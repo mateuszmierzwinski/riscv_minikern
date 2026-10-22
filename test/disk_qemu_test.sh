@@ -52,9 +52,11 @@ fail() { echo "FAIL: $1" >&2; exit 1; }
 
 # It found the device through the transport, and read its capacity from the
 # device's own configuration space rather than from the tree.
-# The line names the adapter as well as the geometry: "a 64 MiB disk" is
-# much less useful than knowing which controller produced it.
-grep -qE '^disk: virtio /soc/virtio_mmio@[0-9a-f]+, 131072 sectors of 512 bytes \(64 MiB\)$' "$log" ||
+# The line names the adapter as well as the geometry: "a 64 MiB disk" is much
+# less useful than knowing which controller produced it. The blocks are 4 KiB
+# because the device is presented to the filesystem in *its* block size, not
+# the controller's 512-byte sectors — 16384 of them is the same 64 MiB.
+grep -qE '^disk: virtio /soc/virtio_mmio@[0-9a-f]+, 16384 sectors of 4096 bytes \(64 MiB\)$' "$log" ||
     fail "the disk was not found, or reported the wrong capacity"
 grep -qF "disk: round trip ok" "$log" || fail "the write/read-back round trip failed"
 
@@ -94,7 +96,7 @@ grep -qE '^pci: ecam at [0-9a-f]{16}, [0-9]+ functions$' "$nvmelog" ||
 # The model comes from the drive's own identify data, not from the tree —
 # which is the proof that the admin queue works, not merely that a device
 # was found.
-grep -qE '^disk: nvme QEMU NVMe Ctrl, 262144 sectors of 512 bytes \(128 MiB\)$' "$nvmelog" ||
+grep -qE '^disk: nvme QEMU NVMe Ctrl, 32768 sectors of 4096 bytes \(128 MiB\)$' "$nvmelog" ||
     fail "the NVMe controller was not identified, or reported the wrong geometry"
 grep -qF "disk: round trip ok" "$nvmelog" || fail "the NVMe round trip failed"
 [ "$nvme_before" = "$(sha256sum < "$nvme" | cut -d' ' -f1)" ] ||
@@ -148,7 +150,7 @@ cat "$sdlog"
 
 # 64 MiB exactly: a standard-capacity card, whose size comes from a geometry
 # to multiply out rather than from a block count.
-grep -qE '^disk: SD card, 131072 sectors of 512 bytes \(64 MiB\)$' "$sdlog" ||
+grep -qE '^disk: SD card, 16384 sectors of 4096 bytes \(64 MiB\)$' "$sdlog" ||
     fail "the card's capacity was read wrongly"
 grep -qF "disk: round trip ok" "$sdlog" || fail "the SD round trip failed"
 [ "$sd_before" = "$(sha256sum < "$sdimg" | cut -d' ' -f1)" ] ||

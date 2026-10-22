@@ -25,6 +25,9 @@ is named. The phase-by-phase record is `DEVELOPMENT_PROGRESS.md`.
 | **8 GiB of RAM**, read and tracked: 2 Mi frames | `boot_qemu_test` (an `-m 8G` boot), `pmm_test` (frames at 9 GiB) |
 | **Interrupts** through the PLIC, with each hart's *context* resolved from the tree rather than assumed to be its hart id | `boot_qemu_test` |
 | **A tick** through SBI's timer, keeping time: 50 ticks in 499 ms at 100 Hz | `boot_qemu_test` |
+| **XFS on a real device** — mounted off NVMe, directory listed, file contents read; and every feature it does not understand refused | `xfs_qemu_test`, `xfs_test` |
+| **A block-size adapter**: a filesystem's 4 KiB blocks over a controller's 512-byte sectors | `blockscale_test` |
+| Built with **`-mcpu=sifive-u74`**: the JH7110's own core and pipeline, not a generic RV64GC | the whole suite runs on it |
 | **GPIO** on both JH7110 pin controllers: found, mapped, and the pin-to-register arithmetic proved (a *byte* per pin, not a bit) — no pin is driven yet, see below | `gpio_jh7110_test` |
 | **An SD card** through a standard host controller — found, powered up, addressed, sized correctly, read and written | `disk_qemu_test` |
 | **NVMe over PCIe** — the M.2 slot: the bus walked, BARs assigned, bus mastering enabled, the controller identified and read/written | `disk_qemu_test` |
@@ -52,7 +55,6 @@ In the order it will be built, because each step needs the one before it:
 | **Processes** | user address spaces, the timer through SBI, threads |
 | **The syscall interface** | the generic table, ELF64, the process start state, signals — then Go binaries unchanged |
 | **SMP** | harts started through SBI's hart-state extension, enumerated **from the device tree** because this SoC's application cores are 1–4 |
-| **Storage** | XFS over the block devices that work now |
 | **Network** | virtio-net first, then the DesignWare GMAC |
 | **The board's hardware** | clocks and resets — which GPIO needs before it drives a pin — then the temperature sensor and frequency scaling |
 | **The real boot path** | an SD-card image with U-Boot, and the documented flash procedure |

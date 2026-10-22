@@ -32,6 +32,20 @@ Three things in it are *not* architecture-neutral and were fixed on the way in:
 
 ---
 
+## P-opt — Built for the JH7110
+
+- [x] **The core, not just the ISA (2026-10-22).** `-mcpu=sifive-u74` rather
+      than a bare `-march=rv64gc`. Naming the core tells the compiler two
+      things an ISA string cannot: the instruction set those cores implement
+      (which is the same RV64GC) **and the pipeline**, which is what
+      instruction scheduling depends on — the U74 is dual-issue in-order, so
+      the order of independent instructions is worth something, where on an
+      out-of-order core it would not be.
+      The ISA is left exactly as the core defines it. The temptation is to add
+      extensions — bit manipulation, vectors — but a JH7110 has neither, and
+      an image built with them does not fail helpfully: it takes an illegal
+      instruction in the middle of whatever used them.
+
 ## P0 — Boot
 
 - [x] **P0.1 S-mode entry, SBI console, device tree, power-off (2026-10-22).**
@@ -322,9 +336,40 @@ Three things in it are *not* architecture-neutral and were fixed on the way in:
       digest unchanged from outside. And **with both a virtio disk and an NVMe
       drive present, the NVMe drive is chosen**, because on a board with the
       M.2 slot filled that is the storage anyone would want.
-- [ ] **P4.4 XFS on real storage.** The implementation carries over whole —
-      mount, read, logged writes, create, remove, grow — and `xfs_repair -n`
-      staying clean after every test remains the rule.
+- [x] **P4.4 XFS on real storage (2026-10-22).** The whole stack at once: a
+      controller, a block-size adapter, a buffer cache, and the filesystem —
+      reading an image `mkfs.xfs` made and `xfs_repair -n` calls clean, off an
+      **NVMe drive**. The root directory lists every entry, and
+      `/hello.txt` reads back as 43 bytes of *"hello from a real XFS
+      filesystem on RISC-V"*. Populated with `mkfs.xfs -p`, a proto file,
+      because mounting an image to copy files in needs root and this does not.
+      **What it refuses is tested as carefully as what it reads**, because a
+      filesystem whose layout you have guessed at is how data is lost quietly:
+      reflink and rmapbt are turned away, so are sparse inodes, and the kernel
+      **defers to the filesystem's own diagnosis** instead of paraphrasing it —
+      an earlier version of the boot path guessed a cause from the error code
+      and printed "a dirty log" over the top of "unsupported read-only
+      features".
+      **Two real bugs, both in the layer between the filesystem and the
+      device.**
+      *A filesystem's block size and a device's sector size are different
+      facts.* XFS asks its cache in **filesystem blocks**, and every
+      controller here presents 512-byte sectors, so each metadata read
+      returned an eighth of a block: the filesystem **mounted** — a superblock
+      fits in one sector — and then the first directory read failed with an
+      I/O error and nothing else visibly wrong. The ARM kernel never needed a
+      bridge, because its only device was a network one whose block size the
+      caller chose. `core/blockscale.c` is that bridge, pure and host-tested,
+      and it refuses a ratio that is not a whole number rather than rounding
+      one into place.
+      *And an NVMe PRP entry addresses from its offset to the end of its page,
+      no further.* A page-aligned buffer hides this completely; hand the driver
+      one eight bytes into a page — which is exactly what a kernel heap
+      returns, since it puts a header in front — and the first entry covers
+      4088 bytes while the last eight go nowhere. The symptom was precisely
+      that: **byte 4088 of a 4 KiB block read back as zero.** `prp2` is set
+      whenever a transfer runs past the first page, and anything that would
+      need a PRP *list* is refused rather than silently truncated.
 
 ## P5 — Network
 
