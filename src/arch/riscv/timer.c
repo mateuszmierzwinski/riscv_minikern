@@ -53,9 +53,21 @@ void timer_rearm(void) {
     sbi_set_timer(timer.next);
 }
 
+static void (*tick_hook)(void);
+
+void timer_set_tick_hook(void (*hook)(void)) {
+    tick_hook = hook;
+}
+
 void timer_on_tick(void) {
     timer.ticks++;
     timer_rearm();
+    /* Rearmed first, then the hook: a scheduler's tick may not return for a
+     * long time — it is where a thread switch happens — and a timer that is
+     * rearmed afterwards would stop ticking for exactly as long. */
+    if (tick_hook != NULL) {
+        tick_hook();
+    }
 }
 
 uint64_t timer_ns(void) {

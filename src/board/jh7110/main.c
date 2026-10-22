@@ -39,6 +39,8 @@
 #include "kernel/disk.h"
 #include "kernel/irq.h"
 #include "kernel/mem.h"
+#include "kernel/sched.h"
+#include "kernel/syscall.h"
 #include "kernel/uspace.h"
 #include "kernel/xfsmount.h"
 #include "kernel/xfsmount.h"
@@ -305,6 +307,8 @@ static void bring_up_filesystem(void) {
     (void)xfsmount_show_file("/hello.txt");
 }
 
+static void drive_a_pin(void);
+
 /* The board's pins.
  *
  * Reports what it found and nothing more: driving a pin is something only a
@@ -339,6 +343,60 @@ static void bring_up_gpio(uint64_t dtb) {
                     (unsigned long long)gpio_jh7110_base(i));
         }
     }
+    drive_a_pin();
+}
+
+/* Drives a pin and reads it back.
+ *
+ * `minikern.gpio=<controller>:<pin>` sets the pin high, reads the
+ * controller's input register, sets it low, and reads again — which on real
+ * hardware is a loopback through the pad and the only way to show that a
+ * write reached the pin rather than merely reaching a register.
+ *
+ * It is **opt-in and names the pin**, because driving one on a board whose
+ * schematic the kernel has not seen is how a kernel shorts something: a pin
+ * that is an input with a pull-up, or wired to a power-enable, does not
+ * forgive being driven low. So the operator says which pin, having looked.
+ *
+ * This cannot run under an emulator — nothing models this controller — so a
+ * machine without one says so and does nothing, which is the honest
+ * outcome rather than a test that appears to pass. */
+static void drive_a_pin(void) {
+    size_t len = 0;
+    const char *spec = cmdline_value(boot_cmdline, "minikern.gpio", &len);
+    uint32_t controller = 0, pin = 0, at = 0;
+    bool high = false;
+    int rc;
+    if (spec == NULL) {
+        return;
+    }
+    while (at < len && spec[at] >= '0' && spec[at] <= '9') {
+        controller = controller * 10u + (uint32_t)(spec[at++] - '0');
+    }
+    at += at < len && spec[at] == ':' ? 1u : 0u;
+    while (at < len && spec[at] >= '0' && spec[at] <= '9') {
+        pin = pin * 10u + (uint32_t)(spec[at++] - '0');
+    }
+    kprintf("gpio: driving controller %u pin %u\n", controller, pin);
+    for (uint32_t step = 0; step < 2u; step++) {
+        bool want = step == 0;
+        rc = gpio_jh7110_set_output(controller, pin, want);
+        if (rc != KERR_OK) {
+            kprintf("gpio: could not drive it %s (rc %d)\n", want ? "high" : "low", rc);
+            return;
+        }
+        rc = gpio_jh7110_read(controller, pin, &high);
+        if (rc != KERR_OK) {
+            kprintf("gpio: could not read it back (rc %d)\n", rc);
+            return;
+        }
+        kprintf("gpio: drove %s, reads back %s%s\n", want ? "high" : "low", high ? "high" : "low",
+                high == want ? "" : " — which does not match, so the write did not reach the pin");
+    }
+    /* Left as an input afterwards: a pin this kernel was asked to poke at
+     * once should not stay driven for the rest of the machine's life. */
+    (void)gpio_jh7110_set_input(controller, pin);
+    kprintf("gpio: left pin %u as an input\n", pin);
 }
 
 /* Runs the user-mode programs, if asked.
@@ -400,6 +458,8 @@ static void run_user_programs(void) {
         run_one_user_program("hello", user_program_start, user_program_end);
         run_one_user_program("faulter", user_faulter_start, user_faulter_end);
     }
+    sched_set_trace(cmdline_has(boot_cmdline, "minikern.trace"));
+    syscall_set_trace(cmdline_has(boot_cmdline, "minikern.calls") ? 400u : 0u);
     if (cmdline_has(boot_cmdline, "minikern.init")) {
         run_init_from_disk("/init");
     }

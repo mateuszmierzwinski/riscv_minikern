@@ -83,4 +83,11 @@ void trap_disable_interrupts(void);
  * reports it and stops. NULL clears it. */
 void trap_set_expected(bool (*handler)(struct trapframe *tf));
 
+/* A hook run on the way back to user mode, after a trap that came from
+ * there has been handled. This is where a preemption belongs: inside the
+ * interrupt handler the controller has not been told the interrupt is
+ * finished, so a thread switch from there resumes the other thread with the
+ * interrupt still pending. NULL to remove it. */
+void trap_set_user_return_hook(void (*hook)(struct trapframe *tf));
+
 #endif

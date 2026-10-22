@@ -3,6 +3,7 @@
 #include <stddef.h>
 
 #include "arch/riscv/mmu.h"
+#include "arch/riscv/timer.h"
 #include "arch/riscv/trap.h"
 #include "core/console.h"
 #include "core/elf.h"
@@ -10,6 +11,8 @@
 #include "core/ustack.h"
 #include "kernel/mem.h"
 #include "kernel/random.h"
+#include "kernel/sched.h"
+#include "kernel/syscall.h"
 
 /* The generic Linux syscall numbers, which is the set RISC-V uses — and the
  * modern one: there is no `mmap2`, no `_llseek`, no `stat64`, no
@@ -24,11 +27,13 @@
 #define SSTATUS_SPIE (1ull << 5)  /* interrupts enabled after sret */
 #define SSTATUS_SUM (1ull << 18)  /* the kernel may read user memory */
 
+static uint64_t prot_bits(uint32_t prot);
+
 static struct uproc *running;
 static int64_t exit_status;
 static bool exited;
-static uint64_t syscalls;
 static uint64_t kernel_satp_saved;
+static uint64_t calls_at_start;
 
 /* The pair in arch/riscv/uspace_entry.S. `uspace_leave` does not return to
  * its caller: control reappears wherever `uspace_enter` was called from. */
@@ -182,53 +187,30 @@ void uspace_destroy(struct uproc *p) {
     p->built = false;
 }
 
-/* What a syscall from user mode does. Only what the first user program
- * needs: say something, and stop. */
-static void handle_syscall(struct trapframe *tf) {
-    uint64_t nr = tf->x[17];  /* a7 */
-    syscalls++;
-    switch (nr) {
-    case SYS_WRITE: {
-        /* write(fd, buf, len). The buffer is a *user* address, and the
-         * kernel can read it only because SUM is set in sstatus — without
-         * that bit a supervisor load from a user page faults, which is a
-         * deliberate guard against dereferencing a user pointer by
-         * accident. */
-        const char *buf = (const char *)(uintptr_t)tf->x[11]; /* a1 */
-        uint64_t len = tf->x[12];                             /* a2 */
-        for (uint64_t i = 0; i < len && i < 4096u; i++) {
-            kprintf("%c", buf[i]);
-        }
-        tf->x[10] = len; /* a0: bytes written */
-        break;
+/* On the way back to user mode: take the preemption the tick asked for.
+ *
+ * `sched_yield_now` may not come back for a while — another thread runs on
+ * its own kernel stack — but when it does, this frame is intact and the
+ * trap return carries on, which is the whole point of a kernel stack per
+ * thread. */
+static void on_user_return(struct trapframe *tf) {
+    (void)tf;
+    if (sched_take_preempt_request()) {
+        sched_yield_now();
     }
-    case SYS_EXIT:
-    case SYS_EXIT_GROUP:
-        exit_status = (int64_t)tf->x[10];
-        exited = true;
-        /* Does not return: it unwinds to uspace_run, abandoning this trap
-         * frame — which is correct, because the process it belongs to is
-         * gone. */
-        uspace_leave(running->context);
-        break;
-    default:
-        kprintf("\nuspace: syscall %llu is not implemented\n", (unsigned long long)nr);
-        tf->x[10] = (uint64_t)(int64_t)KERR_NOTSUP;
-        break;
-    }
-    /* Past the `ecall`, which is always 4 bytes — returning to it would
-     * make the syscall again, for ever. */
-    tf->sepc += 4u;
 }
 
-/* The expected-fault hook is how a user trap reaches this module without
- * the trap layer knowing what a process is. */
 static bool on_user_trap(struct trapframe *tf) {
     if ((tf->scause & SCAUSE_INTERRUPT) != 0) {
         return false; /* an interrupt: the trap layer deals with those */
     }
     if ((tf->scause & ~SCAUSE_INTERRUPT) == EXC_ECALL_FROM_U) {
-        handle_syscall(tf);
+        (void)syscall_dispatch(tf);
+        /* Past the `ecall`, or the process makes the same call for ever.
+         * Compressed instructions mean this is 2 bytes or 4, so the
+         * instruction itself has to be read — `ecall` is a 4-byte one, but
+         * a kernel that assumes that has assumed it everywhere. */
+        tf->sepc += 4u;
         return true;
     }
     /* A fault in user code is the process's problem, not the kernel's: it
@@ -263,8 +245,11 @@ int64_t uspace_run(struct uproc *p) {
     running = p;
     exited = false;
     exit_status = 0;
-    syscalls = 0;
     trap_set_expected(on_user_trap);
+    trap_set_user_return_hook(on_user_return);
+    calls_at_start = syscall_count();
+    sched_init(&p->main_tid);
+    timer_set_tick_hook(sched_tick);
     __asm__ volatile("csrr %0, satp" : "=r"(kernel_satp_saved));
     /* SUM so the kernel may read the process's memory for a syscall's
      * arguments. Without it a supervisor load from a user page faults —
@@ -283,6 +268,9 @@ int64_t uspace_run(struct uproc *p) {
                      : "memory");
     __asm__ volatile("csrc sstatus, %0" : : "r"(SSTATUS_SUM));
     trap_set_expected(NULL);
+    trap_set_user_return_hook(NULL);
+    timer_set_tick_hook(NULL);
+    sched_shutdown();
     running = NULL;
     return exit_status;
 }
@@ -411,7 +399,9 @@ static int build_start_state(struct uproc *p, const struct elf_image *img, const
 int uspace_build_elf(struct uproc *p, const uint8_t *image, uint32_t bytes, const char *path) {
     struct pt_mem mem = {.alloc = proc_alloc, .free = proc_free, .to_virt = proc_to_virt};
     struct elf_image img;
-    int rc = elf_parse(image, bytes, USER_TOP, &img);
+    int rc;
+    *p = (struct uproc){0};
+    rc = elf_parse(image, bytes, USER_TOP, &img);
     if (rc != KERR_OK) {
         return rc;
     }
@@ -426,9 +416,182 @@ int uspace_build_elf(struct uproc *p, const uint8_t *image, uint32_t bytes, cons
     }
     p->entry = img.entry;
     p->built = true;
+    /* The break starts above the last segment, page-aligned, and anonymous
+     * mappings start far above it so that neither can grow into the other.
+     * A program that uses `brk` and `mmap` both, as a Go runtime does, is
+     * entitled to assume they are not the same region. */
+    for (uint32_t i = 0; i < img.nloads; i++) {
+        virt_t end = img.loads[i].vaddr + img.loads[i].memsz;
+        p->brk = end > p->brk ? end : p->brk;
+    }
+    p->brk = (p->brk + PAGE_SIZE - 1u) & ~(PAGE_SIZE - 1u);
+    p->brk_floor = p->brk;
+    p->mmap_next = USER_MMAP_BASE;
     return KERR_OK;
 }
 
 uint64_t uspace_syscalls(void) {
-    return syscalls;
+    /* **This process's** calls, not the kernel's total. The table counts
+     * cumulatively, which is what a kernel wants; a process's own count is
+     * the difference since it started, and conflating the two makes the
+     * second process on a machine report the first one's work as well. */
+    return syscall_count() - calls_at_start;
+}
+
+struct uproc *uspace_current(void) {
+    return running;
+}
+
+void uspace_exit(int64_t status) {
+    exit_status = status;
+    exited = true;
+    uspace_leave(running->context);
+}
+
+/* Rounds a byte count up to whole pages, refusing a request so large that
+ * rounding it would wrap. */
+static bool page_count(uint64_t bytes, uint64_t *pages) {
+    if (bytes == 0 || bytes > USER_TOP) {
+        return false;
+    }
+    *pages = (bytes + PAGE_SIZE - 1u) / PAGE_SIZE;
+    return true;
+}
+
+/* Backs one page of a mapping, or records a reservation by doing nothing.
+ *
+ * A reservation (`PROT_NONE`) deliberately leaves the range unmapped rather
+ * than mapping it without permissions: an Sv39 leaf with no R, W or X is a
+ * pointer to a next-level table, not a page, so "mapped but inaccessible"
+ * is not something the format can express at a leaf. Leaving it absent
+ * gives the same behaviour — a touch faults — without the page tables. */
+static int back_one_page(struct uproc *p, virt_t va, uint32_t prot) {
+    phys_t page = 0;
+    int rc;
+    if (prot == 0) {
+        return KERR_OK;
+    }
+    rc = mem_alloc_pages(1, 1, &page);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    for (uint32_t i = 0; i < PAGE_SIZE; i++) {
+        ((volatile uint8_t *)(uintptr_t)page)[i] = 0;
+    }
+    rc = pgtable_map(&p->pt, va, page, PAGE_SIZE, prot_bits(prot));
+    if (rc != KERR_OK) {
+        mem_free_pages(page, 1);
+    }
+    return rc;
+}
+
+/* Where to put a mapping the caller did not insist on. The hint is honoured
+ * when it is free and inside user space, because a runtime that places its
+ * heap by hint gets a tidier address space when the hint works — and must
+ * not fail when it does not. */
+static virt_t place_mapping(struct uproc *p, virt_t at, uint64_t pages) {
+    phys_t phys = 0;
+    uint64_t flags = 0, size = 0;
+    virt_t chosen;
+    if (at != 0 && (at & (PAGE_SIZE - 1u)) == 0 && at + pages * PAGE_SIZE <= USER_STACK_TOP &&
+        !pgtable_lookup(&p->pt, at, &phys, &flags, &size)) {
+        return at;
+    }
+    chosen = p->mmap_next;
+    if (chosen + pages * PAGE_SIZE > USER_STACK_TOP) {
+        return 0;
+    }
+    p->mmap_next = chosen + pages * PAGE_SIZE;
+    return chosen;
+}
+
+int uspace_map_anon(struct uproc *p, virt_t at, uint64_t bytes, uint32_t prot, bool fixed,
+                    virt_t *out) {
+    uint64_t pages = 0;
+    virt_t base;
+    if (!page_count(bytes, &pages)) {
+        return KERR_INVAL;
+    }
+    if (fixed && ((at & (PAGE_SIZE - 1u)) != 0 || at == 0 ||
+                  at + pages * PAGE_SIZE > USER_STACK_TOP)) {
+        return KERR_INVAL;
+    }
+    base = fixed ? at : place_mapping(p, at, pages);
+    if (base == 0) {
+        return KERR_NOMEM;
+    }
+    /* A fixed mapping replaces whatever is there, which is how a runtime
+     * commits part of a reservation it already holds. */
+    for (uint64_t i = 0; i < pages; i++) {
+        virt_t va = base + i * PAGE_SIZE;
+        int rc;
+        (void)uspace_unmap(p, va, PAGE_SIZE);
+        rc = back_one_page(p, va, prot);
+        if (rc != KERR_OK) {
+            return rc;
+        }
+    }
+    *out = base;
+    return KERR_OK;
+}
+
+int uspace_unmap(struct uproc *p, virt_t at, uint64_t bytes) {
+    uint64_t pages = 0;
+    if ((at & (PAGE_SIZE - 1u)) != 0 || !page_count(bytes, &pages)) {
+        return KERR_INVAL;
+    }
+    for (uint64_t i = 0; i < pages; i++) {
+        phys_t phys = 0;
+        uint64_t flags = 0, size = 0;
+        if (pgtable_lookup(&p->pt, at + i * PAGE_SIZE, &phys, &flags, &size)) {
+            (void)pgtable_unmap(&p->pt, at + i * PAGE_SIZE);
+            mem_free_pages(phys, 1);
+        }
+    }
+    return KERR_OK;
+}
+
+int uspace_protect(struct uproc *p, virt_t at, uint64_t bytes, uint32_t prot) {
+    uint64_t pages = 0;
+    if ((at & (PAGE_SIZE - 1u)) != 0 || !page_count(bytes, &pages)) {
+        return KERR_INVAL;
+    }
+    for (uint64_t i = 0; i < pages; i++) {
+        virt_t va = at + i * PAGE_SIZE;
+        phys_t phys = 0;
+        uint64_t flags = 0, size = 0;
+        int rc;
+        if (!pgtable_lookup(&p->pt, va, &phys, &flags, &size)) {
+            /* Making a reservation usable: there is nothing there yet, so
+             * this is the moment it gets a page. */
+            rc = back_one_page(p, va, prot);
+        } else if (prot == 0) {
+            rc = uspace_unmap(p, va, PAGE_SIZE);
+        } else {
+            (void)pgtable_unmap(&p->pt, va);
+            rc = pgtable_map(&p->pt, va, phys, PAGE_SIZE, prot_bits(prot));
+        }
+        if (rc != KERR_OK) {
+            return rc;
+        }
+    }
+    return KERR_OK;
+}
+
+virt_t uspace_brk(struct uproc *p, virt_t want) {
+    virt_t from = (p->brk + PAGE_SIZE - 1u) & ~(PAGE_SIZE - 1u);
+    virt_t to = (want + PAGE_SIZE - 1u) & ~(PAGE_SIZE - 1u);
+    if (want == 0 || want < p->brk_floor || want >= USER_MMAP_BASE) {
+        return p->brk;
+    }
+    for (virt_t va = from; va < to; va += PAGE_SIZE) {
+        if (back_one_page(p, va, PROT_READ | PROT_WRITE) != KERR_OK) {
+            return p->brk; /* refused, and the break has not moved */
+        }
+    }
+    if (to < from) {
+        (void)uspace_unmap(p, to, from - to);
+    }
+    p->brk = want;
+    return p->brk;
 }

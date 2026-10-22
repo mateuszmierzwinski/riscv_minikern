@@ -9,6 +9,17 @@ module(
 bazel_dep(name = "rules_cc", version = "0.2.17")
 bazel_dep(name = "rules_shell", version = "0.6.1")
 
-# rules_pkg (a root filesystem) and rules_go (the userland and the netboot
-# server) come back with the phases that need them; see DEVELOPMENT_PROGRESS.md. A module
-# that declares what it does not use is a dependency nobody checked.
+# The Go side: the test program that proves the goal — a stock gc binary for
+# linux/riscv64, pure and static, built by the ordinary Go rules. It is
+# standard library only, so there are no external modules to resolve and
+# gazelle is not needed.
+bazel_dep(name = "rules_go", version = "0.59.0", repo_name = "io_bazel_rules_go")
+
+# A downloaded SDK rather than the host's, so every machine builds the same Go
+# and the test does not quietly change version underneath it.
+go_sdk = use_extension("@io_bazel_rules_go//go:extensions.bzl", "go_sdk")
+go_sdk.download(version = "1.25.5")
+
+# rules_pkg (a root filesystem) comes back with the phase that needs it; see
+# DEVELOPMENT_PROGRESS.md. A module that declares what it does not use is a
+# dependency nobody checked.

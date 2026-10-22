@@ -32,12 +32,21 @@
 /* Where a user program and its stack live. Low addresses, well inside the
  * bottom half, and nowhere near the kernel's. */
 #define USER_TEXT 0x10000ull
-#define USER_STACK_TOP 0x80000ull
-#define USER_STACK_PAGES 4u
+#define USER_STACK_PAGES 64u
 
-/* The top of user space: everything a program may address. Well below the
- * sign-extension hole, and far below anything the kernel maps. */
-#define USER_TOP 0x40000000ull
+/* The top of user space, and the stack just under it.
+ *
+ * 256 GiB is **Sv39's whole user half**: bit 38 must be clear for an
+ * address to be a user address at all, so `0x40_0000_0000` is the limit the
+ * hardware imposes rather than a number chosen here. It matters because a
+ * Go runtime places its heap by hint, high up, and a kernel that offers
+ * only the bottom gigabyte makes every one of those hints fail.
+ *
+ * The stack sits just below the top, and `mmap` grows up from the middle,
+ * so the two cannot meet by accident. */
+#define USER_TOP 0x4000000000ull
+#define USER_STACK_TOP 0x3FFFFFF000ull
+#define USER_MMAP_BASE 0x2000000000ull
 
 /* The kernel registers that must survive a trip through user mode: the
  * return address, the stack pointer, and s0..s11 — exactly what a C caller
@@ -47,6 +56,10 @@
 /* One process: its address space, where it starts, and the kernel context
  * to come back to when it stops. */
 struct uproc {
+    uint64_t main_tid; /* the first thread's id */
+    virt_t brk;        /* the program break, past the last segment */
+    virt_t brk_floor;  /* where it started, which it may not go below */
+    virt_t mmap_next;  /* the cursor anonymous mappings are placed at */
     struct pgtable pt;
     virt_t entry;
     virt_t stack_top;
@@ -58,6 +71,47 @@ struct uproc {
  * program copied in at USER_TEXT, and a stack. KERR_NOMEM when pages run
  * out. For the hand-written test programs: no headers, no start state. */
 int uspace_build(struct uproc *p, const void *program, uint32_t bytes);
+
+/* The process a syscall is being made by, or NULL outside one. There is one
+ * at a time until there is a scheduler. */
+struct uproc *uspace_current(void);
+
+/* Ends the running process with a status, from inside a syscall. Does not
+ * return: it unwinds to whoever called `uspace_run`. */
+void uspace_exit(int64_t status);
+
+/* Maps anonymous zeroed pages into the running process.
+ *
+ * `at` of 0 lets the kernel choose, and a non-zero `at` is **a request, not
+ * a demand** unless `fixed` — which is what a runtime placing its heap by
+ * hint expects: an address it cannot have comes back as a different one, not
+ * as a failure.
+ *
+ * `prot` is PROT_* from `core/elf.h`. PROT_NONE is a **reservation**: an
+ * address range is promised and nothing is backed, because a Go runtime
+ * reserves its arenas before it uses any of them, and backing hundreds of
+ * gigabytes of address space with page tables would exhaust memory for
+ * nothing. The pages appear when the range is mapped again with real
+ * permissions.
+ *
+ * Reports the address it chose. KERR_NOMEM when pages or address space run
+ * out, KERR_INVAL for a length of zero or an unaligned fixed address. */
+int uspace_map_anon(struct uproc *p, virt_t at, uint64_t bytes, uint32_t prot, bool fixed,
+                    virt_t *out);
+
+/* Unmaps a range and frees whatever was backing it. A range that was only
+ * reserved unmaps successfully, having nothing to free — which is what a
+ * runtime releasing an arena it never touched expects. */
+int uspace_unmap(struct uproc *p, virt_t at, uint64_t bytes);
+
+/* Changes the permissions on a range that is already mapped, and backs a
+ * reservation that is being made usable. */
+int uspace_protect(struct uproc *p, virt_t at, uint64_t bytes, uint32_t prot);
+
+/* The program break. `want` of 0 asks where it is; anything else moves it
+ * and reports where it ended up — which is the old value when the move was
+ * refused, because that is how `brk` reports failure. */
+virt_t uspace_brk(struct uproc *p, virt_t want);
 
 /* Builds an address space from an **ELF image**: every loadable segment at
  * the address its header names, with the permissions its flags ask for, a

@@ -373,10 +373,17 @@ cc_library(
 cc_library(
     name = "kernel_uspace",
     srcs = [
+        "src/arch/riscv/switch.S",
         "src/arch/riscv/uspace_entry.S",
+        "src/kernel/sched.c",
+        "src/kernel/syscall.c",
         "src/kernel/uspace.c",
     ],
-    hdrs = ["src/kernel/uspace.h"],
+    hdrs = [
+        "src/kernel/sched.h",
+        "src/kernel/syscall.h",
+        "src/kernel/uspace.h",
+    ],
     strip_include_prefix = "src",
     target_compatible_with = ["//platforms:riscv64"],
     deps = [
@@ -388,6 +395,7 @@ cc_library(
         ":pgtable",
     ],
 )
+
 
 # A generator for AT_RANDOM and anything else that wants unpredictable
 # bytes. Carried over; what seeds it is a question for later (the ARM
@@ -646,12 +654,30 @@ sh_test(
     tags = ["manual"],
 )
 
+# P2.4: the goal. A stock gc Go binary for linux/riscv64, built by the
+# ordinary Go rules and knowing nothing about this kernel, running unchanged.
+sh_test(
+    name = "go_qemu_test",
+    size = "large",
+    srcs = ["test/go_qemu_test.sh"],
+    args = [
+        "$(rootpath :minikern)",
+        "$(rootpath //src/userland/gotest:gotest)",
+    ],
+    data = [
+        ":minikern",
+        "//src/userland/gotest:gotest",
+    ],
+    tags = ["manual"],
+)
+
 test_suite(
     name = "qemu_tests",
     tags = ["manual"],
     tests = [
         ":boot_qemu_test",
         ":disk_qemu_test",
+        ":go_qemu_test",
         ":init_qemu_test",
         ":selftest_qemu_test",
         ":user_qemu_test",

@@ -193,8 +193,29 @@ Three things in it are *not* architecture-neutral and were fixed on the way in:
       had not been initialised ticked for ever without entering the kernel.
       The tick re-arms from **the deadline that passed, not from now**, so a
       slow handler costs latency rather than clock drift.
-- [ ] **P1.3b The scheduler** over that tick: threads, a run queue,
-      preemption.
+- [x] **P1.3b The scheduler (2026-10-22).** Threads, a run queue, and
+      preemption on the tick. Written when it was, because a Go runtime is not
+      optional about it: it starts a thread during initialisation and then
+      waits on a futex for that thread to run, so a kernel with one thread
+      does not run Go slowly — it deadlocks before `main`.
+      **A kernel stack per thread**, which is the whole design. A thread
+      blocked in the kernel has a kernel call stack that must survive while
+      another thread runs on the same hart; one stack for all threads is the
+      mistake this is built to avoid. Switching is `context_switch`: the
+      callee-saved registers and the stack pointer, which is all a C call
+      expects to survive, and nothing touches `satp` because threads share an
+      address space.
+      Two bugs worth recording. A new thread's first trap frame was laid out
+      at the **base** of its kernel stack, and `uspace_enter_frame` records
+      the trap stack as the frame's address plus its size — so the next trap
+      had 288 bytes and then ran off the end into the previous allocation. It
+      sits at the top now. And preemption did nothing at all for an hour: the
+      tick hook was wired into `timer_on_tick` by a textual replacement that
+      matched nothing (`timer.ticks++`, not `ticks++`), so the hook was set
+      and never called, and one spinning thread starved every other one. A
+      silent no-op is the worst kind of wiring error, and the only reason it
+      was found is that the trace showed two threads alive and one running.
+
 - [ ] **P1.4 Threads, context switch, and the kernel lock.** The ARM design
       holds: one lock around the kernel, taken on entry and released on exit,
       so that structures written for one core stay correct on five. The
@@ -249,12 +270,30 @@ Three things in it are *not* architecture-neutral and were fixed on the way in:
       `stat64` and no `*_time64` duplicate of anything — the ARM kernel
       implemented all of those as separate entry points.
 
-- [ ] **P2.1 The generic syscall table.** RISC-V uses `asm-generic/unistd`,
-      which is the modern set: `mmap` with byte offsets rather than `mmap2`
-      with page offsets, one `lseek`, one `fcntl`, one `stat`, one `futex`.
-      Eight legacy ABI shapes the ARM kernel implemented simply do not exist
-      here. ~104 syscalls to renumber, and the handlers read their arguments
-      from a RISC-V frame (`a0..a5`, number in `a7`).
+- [x] **P2.1 The generic syscall table (2026-10-22).** RISC-V uses
+      `asm-generic/unistd`, the modern set: `mmap` with byte offsets rather
+      than `mmap2` with page offsets, one `lseek`, one `fcntl`, one `stat`,
+      one `futex`. Eight legacy ABI shapes the ARM kernel implemented simply
+      do not exist here.
+      **A table, not a `switch`** — and the reason is the log it makes: an
+      unimplemented call is reported once, by number and by name, and that
+      line is how the next thing a runtime needs gets found. The whole of
+      the Go bring-up below was done that way, one line at a time, which is
+      faster than reading a runtime's source and does not go out of date.
+      Thirty-six calls so far: the console, memory (`brk`, `mmap`, `munmap`,
+      `mprotect`, `madvise`), time, randomness, threads (`clone`, `futex`,
+      `sched_yield`, `tgkill`), limits, the architecture's own
+      `riscv_hwprobe`, and the netpoller's `epoll`/`eventfd` pair.
+      Memory is where the care went. A reservation (`PROT_NONE`) is
+      **recorded and not backed**, because a Go runtime reserves its arenas
+      before using any of them and backing hundreds of gigabytes of address
+      space with page tables would exhaust memory for nothing — the pages
+      appear when the range is mapped again with real permissions. A hint is
+      honoured when it is free and **ignored rather than refused** when it is
+      not, which is what a runtime placing its heap by hint expects.
+      `USER_TOP` is Sv39's whole user half, 256 GiB, because that is the
+      limit the hardware imposes: a kernel offering only the bottom gigabyte
+      makes every one of those hints fail.
 - [x] **P2.2 ELF64 (2026-10-22).** A **rewrite**, not a widening: ELF64 is
       not ELF32 with bigger fields. The header's layout differs, and a program
       header's **flags move from the end to the front** — in ELF32 they follow
@@ -301,14 +340,57 @@ Three things in it are *not* architecture-neutral and were fixed on the way in:
       adapter, a buffer cache, XFS, the ELF64 loader, a process address space
       and the start state — reading `/init` off the disk and running it to
       completion. This is the path a Go binary takes unchanged.
-- [ ] **P2.4 Signals**, including what Go's runtime actually needs. This is
-      the one item with a known unknown: on ARM, Go set `SA_RESTORER` with a
-      zero restorer and needed a kernel-provided trampoline page, which cost a
-      day to discover. RISC-V does it differently and the difference has to be
-      measured, not assumed.
-- [ ] **P2.5 Go runs unchanged.** `GOARCH=riscv64`, which is 64-bit and
-      first-class, so none of the 32-bit heap-reservation gymnastics applies.
-      Threads, futexes, `epoll` timers, preemption, the garbage collector.
+- [x] **P2.4 Go runs unchanged (2026-10-22).** **The project's goal, reached
+      on RISC-V.** A stock gc Go binary — `go1.25.5`, built by the ordinary
+      Go rules for `linux/riscv64`, with no build tags and no knowledge that
+      this kernel exists — read off an XFS filesystem on an NVMe drive and
+      run to completion:
+
+      ```
+      go: go1.25.5 on linux/riscv64
+      go: GOMAXPROCS=1 NumCPU=1
+      go: allocated 7 MiB total, 3 collections, 32 blocks kept
+      go: sum of primes below 200000 is 1709600813
+      go: 8 goroutines finished, first=21171191 last=37583560
+      go: contended counter reached 16000
+      go: channel values [1 4 9 16 25 36]
+      go: slept for 51ms (at least 50ms: true)
+      go: recovered from assignment to entry in nil map
+      go: 1 goroutines at the end (1 at the start), total time 56ms
+      ```
+
+      The test asserts all of it, because "hello" would prove only a loader.
+      The garbage collector means `mmap`/`munmap` over a heap that grows and
+      shrinks; eight goroutines at once means `clone`; a mutex contended by
+      all of them means futex waiting **and** waking; the 50 ms sleep means
+      `nanosleep` and `clock_gettime` agree with each other and the hardware;
+      the recovered panic means the runtime can walk its own stack. The test
+      also fails on **any** unimplemented syscall, even a survivable one,
+      because a test that lets one through hides the next.
+      **The bug worth remembering.** `futex`'s wake count is the *third*
+      argument — the same slot `FUTEX_WAIT` uses for the value it expects.
+      Read from the wrong slot it finds 0, wakes nobody, and **reports
+      success**: the runtime's `notewakeup` returned happily while the thread
+      it meant to start slept for ever. The program deadlocked after printing
+      nothing, and the only thing that could show it was a trace with a wake
+      and a wait on the same address and no wake-up in between. Three other
+      refusals had to be met first, each found from one log line: `fcntl` on
+      the standard descriptors (a runtime checks all three before anything
+      else and aborts with "cannot open standard fds"), `prlimit64` for the
+      stack limit, and the netpoller's `epoll_create1`/`eventfd2` — which a
+      kernel with no network stack still has to answer, because the first
+      `time.Sleep` initialises the poller.
+      Its `epoll_pwait` **honours the timeout** rather than returning "no
+      events" instantly: a runtime whose idle threads are answered
+      immediately spins a core at the speed of the syscall, and on one hart
+      that starves every other thread.
+- [ ] **P2.5 Signals**, including what Go's runtime actually needs. Not yet
+      required: everything above runs without them, because `tgkill` is
+      answered and a missed preemption signal is a slower runtime rather than
+      a broken one. This is the one item with a known unknown: on ARM, Go set
+      `SA_RESTORER` with a zero restorer and needed a kernel-provided
+      trampoline page, which cost a day to discover. RISC-V does it
+      differently and the difference has to be measured, not assumed.
 
 ## P3 — SMP, the JH7110's way
 

@@ -124,12 +124,39 @@ static bool handle_interrupt(uint64_t code) {
     }
 }
 
+static void (*user_return_hook)(struct trapframe *tf);
+
+void trap_set_user_return_hook(void (*hook)(struct trapframe *tf)) {
+    user_return_hook = hook;
+}
+
+/* Whether this trap came from user mode, which `sstatus.SPP` records: 0 for
+ * user, 1 for supervisor. It is the saved value in the frame and not the
+ * live register, because the handler itself is running in supervisor mode
+ * and the live bit would say so. */
+static bool came_from_user(const struct trapframe *tf) {
+    return (tf->sstatus & (1ull << 8)) == 0;
+}
+
+/* Runs whatever must happen on the way back to user mode — which is where a
+ * preemption belongs. Switching threads from **inside** the interrupt
+ * handler would resume the other thread with the interrupt not yet
+ * acknowledged at the controller, so the tick records the request and it is
+ * acted on here. */
+static void on_the_way_back(struct trapframe *tf) {
+    if (user_return_hook != NULL && came_from_user(tf)) {
+        user_return_hook(tf);
+    }
+}
+
 void trap_handle(struct trapframe *tf) {
     if ((tf->scause & SCAUSE_INTERRUPT) != 0 &&
         handle_interrupt(tf->scause & ~SCAUSE_INTERRUPT)) {
+        on_the_way_back(tf);
         return;
     }
     if (expected_handler != NULL && expected_handler(tf)) {
+        on_the_way_back(tf);
         return;
     }
     unexpected(tf);

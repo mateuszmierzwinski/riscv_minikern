@@ -50,4 +50,8 @@ bool timer_ready(void);
 /* Called from the trap handler when a timer interrupt arrives. */
 void timer_on_tick(void);
 
+/* A callback run on every tick, for whatever wants to know — the scheduler
+ * does, to preempt. NULL to remove it. */
+void timer_set_tick_hook(void (*hook)(void));
+
 #endif

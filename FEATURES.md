@@ -25,6 +25,10 @@ is named. The phase-by-phase record is `DEVELOPMENT_PROGRESS.md`.
 | **8 GiB of RAM**, read and tracked: 2 Mi frames | `boot_qemu_test` (an `-m 8G` boot), `pmm_test` (frames at 9 GiB) |
 | **Interrupts** through the PLIC, with each hart's *context* resolved from the tree rather than assumed to be its hart id | `boot_qemu_test` |
 | **A tick** through SBI's timer, keeping time: 50 ticks in 499 ms at 100 Hz | `boot_qemu_test` |
+| **A stock gc Go binary runs unchanged** — `go1.25.5` for `linux/riscv64`, off a filesystem: goroutines, a contended mutex, channels, the garbage collector, sleeps, panic/recover | `go_qemu_test` |
+| **Threads**: `clone`, a run queue, preemption on the tick, a kernel stack each | `go_qemu_test` |
+| **Futexes**: wait and wake, with timeouts | `go_qemu_test` |
+| **Memory syscalls**: `brk`, `mmap` with unbacked `PROT_NONE` reservations and honoured hints, `munmap`, `mprotect` | `go_qemu_test` |
 | **A real program off the filesystem**: `/init` read from XFS on NVMe, ELF64-loaded, started with `argc`/`argv`/`envp`/`auxv`, run to completion | `init_qemu_test` |
 | **An ELF64 loader** that refuses what it cannot run — 32-bit, wrong architecture, dynamically linked, headers that contradict the file | `elf_test` |
 | **User mode**: a process in its own address space, making syscalls, resumed after each — and a user fault that ends the process while the kernel carries on | `user_qemu_test` |

@@ -6,6 +6,15 @@ ordinary `GOOS=linux GOARCH=riscv64` Go binaries run on it unchanged.
 
 MIT licensed. Built and tested entirely with Bazel.
 
+## Status
+
+A stock **gc Go binary** for `linux/riscv64` — built by the ordinary Go
+toolchain, with no build tags and no knowledge of this kernel — is read off
+an XFS filesystem on an NVMe drive and runs unchanged: goroutines on real
+threads, a contended mutex, channels, the garbage collector, sleeps that
+really sleep, panic and recover. That was the goal of the ARM project this
+migrated from, and it is now reached on RISC-V.
+
 ## This is a migration, not a fresh start
 
 It is the continuation of
