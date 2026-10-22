@@ -25,6 +25,7 @@ is named. The phase-by-phase record is `DEVELOPMENT_PROGRESS.md`.
 | **8 GiB of RAM**, read and tracked: 2 Mi frames | `boot_qemu_test` (an `-m 8G` boot), `pmm_test` (frames at 9 GiB) |
 | **Interrupts** through the PLIC, with each hart's *context* resolved from the tree rather than assumed to be its hart id | `boot_qemu_test` |
 | **A tick** through SBI's timer, keeping time: 50 ticks in 499 ms at 100 Hz | `boot_qemu_test` |
+| **User mode**: a process in its own address space, making syscalls, resumed after each — and a user fault that ends the process while the kernel carries on | `user_qemu_test` |
 | **XFS on a real device** — mounted off NVMe, directory listed, file contents read; and every feature it does not understand refused | `xfs_qemu_test`, `xfs_test` |
 | **A block-size adapter**: a filesystem's 4 KiB blocks over a controller's 512-byte sectors | `blockscale_test` |
 | Built with **`-mcpu=sifive-u74`**: the JH7110's own core and pipeline, not a generic RV64GC | the whole suite runs on it |
@@ -54,7 +55,7 @@ In the order it will be built, because each step needs the one before it:
 | | |
 |---|---|
 | **Processes** | user address spaces, the timer through SBI, threads |
-| **The syscall interface** | the generic table, ELF64, the process start state, signals — then Go binaries unchanged |
+| **The syscall interface** | the rest of the generic table, ELF64, the process start state, signals — then Go binaries unchanged |
 | **SMP** | harts started through SBI's hart-state extension, enumerated **from the device tree** because this SoC's application cores are 1–4 |
 | **Network** | virtio-net first, then the DesignWare GMAC |
 | **The board's hardware** | clocks and resets — which GPIO needs before it drives a pin — then the temperature sensor and frequency scaling |

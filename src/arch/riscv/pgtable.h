@@ -111,6 +111,13 @@ uint64_t pgtable_unmap(struct pgtable *pt, virt_t va);
  * address-space id. */
 uint64_t pgtable_satp(const struct pgtable *pt, uint16_t asid);
 
+/* The physical address an entry points at — the next table, or the page.
+ * Exported because sharing the kernel's mappings into a process's table has
+ * to follow one (kernel/uspace.c). */
+static inline phys_t pte_phys_of(uint64_t pte) {
+    return ((pte >> 10) & ((1ull << 44) - 1u)) << 12;
+}
+
 /* True when a virtual address is canonical: bits 63:39 all copy bit 38.
  * Exported because callers that build addresses want to assert it. */
 bool pgtable_va_is_canonical(virt_t va);

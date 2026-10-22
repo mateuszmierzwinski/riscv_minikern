@@ -342,6 +342,24 @@ cc_library(
     ],
 )
 
+# User mode: an address space of its own, and the way in and out of it.
+cc_library(
+    name = "kernel_uspace",
+    srcs = [
+        "src/arch/riscv/uspace_entry.S",
+        "src/kernel/uspace.c",
+    ],
+    hdrs = ["src/kernel/uspace.h"],
+    strip_include_prefix = "src",
+    target_compatible_with = ["//platforms:riscv64"],
+    deps = [
+        ":arch_riscv",
+        ":console",
+        ":kernel_mem",
+        ":pgtable",
+    ],
+)
+
 # The live block device and the cache over it.
 cc_library(
     name = "kernel_disk",
@@ -425,6 +443,7 @@ cc_library(
         "src/board/jh7110/main.c",
         "src/board/jh7110/selftest.c",
         "src/board/jh7110/uart.c",
+        "src/board/jh7110/usertest.S",
     ],
     hdrs = [
         "src/board/jh7110/console.h",
@@ -447,6 +466,7 @@ cc_library(
         ":drivers_virtio",
         ":kernel_disk",
         ":kernel_mem",
+        ":kernel_uspace",
         ":kernel_xfs",
     ],
     alwayslink = True,
@@ -463,6 +483,7 @@ kernel_binary(
         ":drivers_virtio",
         ":kernel_disk",
         ":kernel_mem",
+        ":kernel_uspace",
         ":kernel_xfs",
         ":kmem",
     ],
@@ -522,6 +543,16 @@ sh_test(
     tags = ["manual"],
 )
 
+# P2: user mode — a process, its own address space, and syscalls.
+sh_test(
+    name = "user_qemu_test",
+    size = "medium",
+    srcs = ["test/user_qemu_test.sh"],
+    args = ["$(rootpath :minikern)"],
+    data = [":minikern"],
+    tags = ["manual"],
+)
+
 test_suite(
     name = "qemu_tests",
     tags = ["manual"],
@@ -529,6 +560,7 @@ test_suite(
         ":boot_qemu_test",
         ":disk_qemu_test",
         ":selftest_qemu_test",
+        ":user_qemu_test",
         ":xfs_qemu_test",
     ],
 )

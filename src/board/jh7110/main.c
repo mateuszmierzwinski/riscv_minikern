@@ -39,6 +39,7 @@
 #include "kernel/disk.h"
 #include "kernel/irq.h"
 #include "kernel/mem.h"
+#include "kernel/uspace.h"
 #include "kernel/xfsmount.h"
 #include "core/ports.h"
 
@@ -339,6 +340,37 @@ static void bring_up_gpio(uint64_t dtb) {
     }
 }
 
+/* Runs the user-mode programs, if asked.
+ *
+ * `minikern.user=1` is the proof that user mode works: a program of its own
+ * in an address space of its own, making syscalls, and a second one that
+ * faults on purpose so that a **user** fault can be seen to end the process
+ * rather than the kernel. */
+extern const char user_program_start[], user_program_end[];
+extern const char user_faulter_start[], user_faulter_end[];
+
+static void run_one_user_program(const char *name, const char *from, const char *to) {
+    struct uproc proc;
+    int64_t status;
+    int rc = uspace_build(&proc, from, (uint32_t)(to - from));
+    if (rc != KERR_OK) {
+        kprintf("uspace: could not build %s (rc %d)\n", name, rc);
+        return;
+    }
+    status = uspace_run(&proc);
+    kprintf("uspace: %s exited with %lld after %llu syscalls\n", name, (long long)status,
+            (unsigned long long)uspace_syscalls());
+    uspace_destroy(&proc);
+}
+
+static void run_user_programs(void) {
+    if (!cmdline_has(boot_cmdline, "minikern.user")) {
+        return;
+    }
+    run_one_user_program("hello", user_program_start, user_program_end);
+    run_one_user_program("faulter", user_faulter_start, user_faulter_end);
+}
+
 /* True when the operator asked the machine to switch itself off at the end,
  * which is what makes a boot test a test rather than a timeout. */
 static bool halt_requested(void) {
@@ -364,6 +396,7 @@ void kmain(uint64_t hart, uint64_t dtb) {
     bring_up_filesystem();
     bring_up_gpio(dtb);
     wait_for_ticks();
+    run_user_programs();
     (void)selftest_run(boot_cmdline);
     kprintf("minikern: boot complete\n");
     if (halt_requested()) {

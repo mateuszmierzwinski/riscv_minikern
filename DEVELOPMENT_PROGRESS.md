@@ -202,6 +202,53 @@ Three things in it are *not* architecture-neutral and were fixed on the way in:
 
 ## P2 — The syscall interface
 
+- [x] **P2.0 User mode (2026-10-22).** A process with its own Sv39 address
+      space, entered with `sret` — one instruction, where the architecture
+      this migrated from needed a mode switch, a banked register set and a
+      stack per mode. Proved with a page of hand-written instructions rather
+      than an ELF, deliberately: a loader on top of a mode switch that has
+      never been entered is two untested things at once, and on the ARM side
+      the first bug found this way was in the process *start state*, which a
+      loader has nothing to do with.
+      The trap path now serves both origins through one vector: `sscratch`
+      holds the kernel stack while user code runs and zero while the kernel
+      runs, so a single swap at the top both finds the right stack and says
+      where the trap came from. It is zeroed on entry, because a fault
+      *inside* the handler must take the kernel path and not swap to a stack
+      already in use.
+      Getting back out needed a pair of functions, and the shape is worth
+      naming: `sret` does not return, so `uspace_enter` saves the callee-saved
+      registers and goes, and the exit syscall calls `uspace_leave`, which
+      restores them so control reappears at the caller. The process did not
+      return; the kernel resumed.
+      **The bug, and it is a good one.** A trap does not change translation —
+      the *process's* `satp` is still loaded when the kernel runs — so the
+      handler's code, its stack **and the console's registers** must all be
+      addressable from the process's address space. Sharing the kernel's
+      top-level entries only where the process had none silently dropped the
+      console: the console's registers are at `0x10000000` and a process's
+      text at `0x10000`, which collide in root entry 0. The first `write`
+      syscall then faulted inside the kernel *while printing*, and the fault
+      handler faulted *while reporting that*, until the stack ran off the
+      end — a hang with **no output at all**, diagnosed by asking the monitor
+      for `scause`, `stval` and `satp`. Collisions are resolved one level
+      down now, and one deeper than that is refused rather than papered over.
+      All of which **disappears when the kernel moves to the top half**
+      (P0.4's remainder): above the sign-extension hole it cannot share a
+      root entry with user space at all.
+      Tested for three things a weaker test would miss: the program **comes
+      back** (it writes twice, with the kernel resuming it in between — a
+      kernel that reaches user mode once and never returns looks identical in
+      a log), the exit status *and* the syscall count both arrive, and a fault
+      in user code **ends the process and not the kernel** — the second
+      program reads the kernel's own text, which every address space maps and
+      no user page marks reachable, and the machine carries on to power itself
+      off.
+      The syscall numbers are the generic set RISC-V uses, which is the modern
+      one: `write` is 64 and `exit` 93, with no `mmap2`, no `_llseek`, no
+      `stat64` and no `*_time64` duplicate of anything — the ARM kernel
+      implemented all of those as separate entry points.
+
 - [ ] **P2.1 The generic syscall table.** RISC-V uses `asm-generic/unistd`,
       which is the modern set: `mmap` with byte offsets rather than `mmap2`
       with page offsets, one `lseek`, one `fcntl`, one `stat`, one `futex`.

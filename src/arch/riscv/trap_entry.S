@@ -3,10 +3,20 @@
  * Saves x1..x31 and the four CSRs that describe what happened, calls C with
  * a pointer to the frame, restores, and returns with `sret`.
  *
- * It runs on the stack that was already in use, which is correct for a trap
- * taken in S-mode. When user mode arrives (TASKS.md P2) this gains an
- * `sscratch` swap to find the kernel stack — one addition, where the ARM
- * equivalent had a different stack *and* a different register bank per mode.
+ * **Two origins, one path.** A trap from the kernel is already on a kernel
+ * stack; a trap from user mode is on the *user's* stack, which the kernel
+ * must not touch — so `sscratch` holds the kernel stack top while user code
+ * runs, and zero while the kernel runs. One swap at the top therefore both
+ * finds the right stack and says where the trap came from, and the same
+ * register saves the interrupted `sp` either way.
+ *
+ * Zeroing `sscratch` on entry matters: a fault *inside* the handler must
+ * take the kernel path, not swap to a stack that is already in use. And it
+ * is set again on the way out only when returning to user mode, which the
+ * saved `sstatus.SPP` says.
+ *
+ * The ARM equivalent of all this was a different stack *and* a different
+ * register bank per mode, with eight vectors to keep in step.
  */
 #include "arch/riscv/frame.h"
 
@@ -14,7 +24,13 @@
     .globl trap_entry
     .align 4                      /* stvec requires a 4-byte aligned address */
 trap_entry:
-    addi    sp, sp, -FRAME_SIZE
+    /* Swap in the kernel stack. From user mode sscratch holds it and sp
+     * becomes it; from the kernel sscratch is zero, so sp becomes zero and
+     * the old sp is in sscratch — recovered two instructions later. */
+    csrrw   sp, sscratch, sp
+    bnez    sp, 1f
+    csrr    sp, sscratch            /* came from the kernel: that was our sp */
+1:  addi    sp, sp, -FRAME_SIZE
 
     sd      x1, FRAME_X(1)(sp)
     sd      x3, FRAME_X(3)(sp)
@@ -47,10 +63,16 @@ trap_entry:
     sd      x30, FRAME_X(30)(sp)
     sd      x31, FRAME_X(31)(sp)
 
-    /* The stack pointer as it was before this frame, so a dump shows the
-     * interrupted sp rather than the handler's. */
+    /* The interrupted stack pointer. From user mode it is in sscratch (the
+     * swap put it there); from the kernel it is just above this frame. */
+    csrr    t0, sscratch
+    bnez    t0, 2f
     addi    t0, sp, FRAME_SIZE
-    sd      t0, FRAME_X(2)(sp)
+2:  sd      t0, FRAME_X(2)(sp)
+
+    /* In the kernel now, so a fault inside the handler takes the kernel
+     * path instead of swapping to a stack that is already in use. */
+    csrw    sscratch, zero
 
     csrr    t0, sepc
     sd      t0, FRAME_SEPC(sp)
@@ -71,6 +93,14 @@ trap_entry:
     csrw    sepc, t0
     ld      t0, FRAME_SSTATUS(sp)
     csrw    sstatus, t0
+
+    /* Returning to user mode? Then leave the kernel stack top in sscratch
+     * for the next entry. SPP is bit 8 of sstatus: 0 means user. */
+    andi    t1, t0, 0x100
+    bnez    t1, 3f
+    addi    t1, sp, FRAME_SIZE
+    csrw    sscratch, t1
+3:
 
     ld      x1, FRAME_X(1)(sp)
     ld      x3, FRAME_X(3)(sp)
@@ -103,5 +133,9 @@ trap_entry:
     ld      x30, FRAME_X(30)(sp)
     ld      x31, FRAME_X(31)(sp)
 
-    addi    sp, sp, FRAME_SIZE
+    /* The interrupted sp last, because everything above is addressed
+     * through this frame. For a kernel return it is this frame's top; for a
+     * user return it is the user's own stack, which is why it comes from the
+     * frame rather than from arithmetic. */
+    ld      sp, FRAME_X(2)(sp)
     sret
