@@ -899,3 +899,47 @@ Three things in it are *not* architecture-neutral and were fixed on the way in:
       ask of this: `http.Client` against `http.Server`, both in the same
       program, which adds nothing to the kernel but proves the socket layer
       under a protocol that uses it in earnest.
+
+## P8 — the ARM tree, and what is still owed
+
+- [x] **P8.1 The ARM tree removed from the monorepo (2026-10-22).**
+      `src/c/experiments/minikern` is gone. This project is the going
+      concern; carrying both was the duplication the migration exists to
+      end.
+      Nothing is lost, and that is worth being specific about rather than
+      reassuring about: the work is published at
+      `github.com/mateuszmierzwinski/arm_minikern` tagged `v1.0.0`, and the
+      monorepo's own history holds all 370 files at commit `e7c6425d5` —
+      `git show e7c6425d5:src/c/experiments/minikern/<path>` reads any of
+      them. The removal is one `git revert` away from undone.
+      It was deferred for several rounds on a self-imposed gate — "once
+      parity is reached" — which is not what was asked for and is not a gate
+      the operator set. The honest accounting is the list below rather than
+      the delay.
+- [ ] **P8.2 `fork`/`exec`**, which is what the removal actually costs: Go's
+      `os/exec` cannot run a program here. The ARM kernel did it with
+      `clone(CLONE_VM|CLONE_VFORK)`, its own pipes, `execve`, `wait4` and
+      zombies that keep an exit status for their parent, and it measured what
+      Go needs rather than guessing — including that refusing `CLONE_PIDFD`
+      makes Go fall back on its own.
+      The work here is mostly **making processes plural**: `struct uproc` is
+      a singleton, and the file table, the signal dispositions and the
+      address space all assume it. A thread would gain a process, a hart
+      would load a process's `satp` when the thread it picks belongs to a
+      different one, and `execve` would replace an address space while the
+      parent keeps the old one.
+- [ ] **P8.3 The board's own Ethernet.** virtio-net is what the emulator
+      models; the VisionFive 2 has a DesignWare GMAC. A standard IP block, so
+      its descriptor format can be checked against independent
+      implementations — but like every other JH7110 controller here it cannot
+      be verified without the board.
+- [ ] **P8.4 Netboot**, the ARM project's own protocol: a unicast sweep to
+      find a server, a windowed transfer, and the image verified against a
+      digest and an Ed25519 signature before anything is mounted. The
+      verification half carries over unchanged (it is pure); the client is
+      written against this kernel's sockets, which now exist.
+- [ ] **P8.5 Thermal and frequency control**, which on this SoC means the
+      `sfctemp` sensor and the clock tree. The ARM project's policy is pure
+      and carries over; what does not carry is any of the hardware, and its
+      own history says why that matters — a complete driver that was never
+      clocked, and a governor that believed an impossible −264 °C.

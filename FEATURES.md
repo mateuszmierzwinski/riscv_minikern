@@ -32,6 +32,7 @@ is named. The phase-by-phase record is `DEVELOPMENT_PROGRESS.md`.
 | **Floating-point state** saved per thread and per signal frame | `go_qemu_test` |
 | **Networking**: Ethernet, ARP, IPv4, ICMP, UDP, DHCP and TCP over virtio-net — a lease, a gateway that answers, and a datagram echoed back through the adapter | `net_qemu_test`, `net_test`, `tcp_test`, `tcp_hostile_test` |
 | **TLB maintenance across harts** — the firmware's cross-hart fence on every mapping *removed*, local-only on every mapping added, with a spurious fault retried | `go_qemu_test` under load |
+| **Built for the JH7110**: `-mcpu=sifive-u74` (exactly `rv64gc` + the U74 scheduling model, verified), and per-hart data padded to the U74's 64-byte cache line | unverifiable under an emulator that models no caches |
 | **Four harts, all running user threads** — enumerated from the device tree (ids are not positions), started through the firmware's hart-state interface, scheduled behind one kernel lock; `GOMAXPROCS=4`, 1.6x on 8 units of work | `smp_qemu_test` |
 | **A stock gc Go binary runs unchanged** — `go1.25.5` for `linux/riscv64`, off a filesystem: goroutines, a contended mutex, channels, the garbage collector, sleeps, panic/recover | `go_qemu_test` |
 | **Threads**: `clone`, a run queue, preemption on the tick, a kernel stack each | `go_qemu_test` |

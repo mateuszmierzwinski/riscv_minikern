@@ -1,5 +1,6 @@
 #include "kernel/sched.h"
 
+#include "arch/riscv/cache.h"
 #include "arch/riscv/fp.h"
 #include "arch/riscv/smp.h"
 #include "arch/riscv/timer.h"
@@ -63,7 +64,7 @@ struct hartstate {
     uint32_t current;   /* SCHED_NO_THREAD when it is idle */
     uint64_t switches;
     bool joined;
-};
+} CACHE_ALIGNED;
 
 #define SCHED_NO_THREAD 0xFFFFFFFFu
 

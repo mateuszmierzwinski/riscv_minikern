@@ -21,9 +21,20 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "arch/riscv/cache.h"
+
+/* The two counters are on **separate cache lines**, which matters on four
+ * cores and costs 128 bytes.
+ *
+ * `next` is written by every hart that arrives wanting the lock. `serving` is
+ * what every waiting hart spins on, reading it over and over. In one line,
+ * each arrival invalidates the line every waiter is spinning on — the two
+ * fields have opposite access patterns, which is the textbook case for
+ * splitting them. (Not measurable under an emulator that models no caches;
+ * see `cache.h`.) */
 struct spinlock {
-    uint32_t next;    /* the next ticket to hand out */
-    uint32_t serving; /* the ticket being served */
+    uint32_t next CACHE_ALIGNED;    /* the next ticket to hand out */
+    uint32_t serving CACHE_ALIGNED; /* the ticket being served */
 };
 
 #define SPINLOCK_INIT {0, 0}

@@ -2,6 +2,7 @@
 
 #include <stddef.h>
 
+#include "arch/riscv/cache.h"
 #include "arch/riscv/sbi.h"
 #include "arch/riscv/smp.h"
 #include "core/errno.h"
@@ -36,9 +37,19 @@ uint64_t timer_now(void) {
  * been asked for. Two numbers rather than one because the comparator holds
  * whichever comes first, and conflating them makes a sleep shift the clock:
  * the periodic deadline must survive an early wake-up untouched. */
-static uint64_t next_deadline[SMP_MAX_HARTS];
-static uint64_t extra_wake[SMP_MAX_HARTS];
-static uint64_t hart_ticks[SMP_MAX_HARTS];
+/* One struct per hart rather than three parallel arrays, **padded to a cache
+ * line**: three arrays indexed by hart put four harts' deadlines in one line,
+ * so each hart's rearm invalidated the line the other three read. One struct
+ * per hart puts each hart's three values together and nobody else's with
+ * them. (Not measurable under an emulator that models no caches; see
+ * `cache.h`.) */
+struct hart_timer {
+    uint64_t next_deadline; /* the periodic schedule */
+    uint64_t extra_wake;    /* a one-off wake that was asked for, or 0 */
+    uint64_t ticks;
+} CACHE_ALIGNED;
+
+static struct hart_timer per_hart[SMP_MAX_HARTS];
 
 /* Counter units for a time in nanoseconds. */
 static uint64_t counter_of_ns(uint64_t ns) {
@@ -49,9 +60,9 @@ static uint64_t counter_of_ns(uint64_t ns) {
 
 /* Arms the comparator for whichever of the two deadlines comes first. */
 static void arm_comparator(uint32_t me) {
-    uint64_t at = next_deadline[me];
-    if (extra_wake[me] != 0 && extra_wake[me] < at) {
-        at = extra_wake[me];
+    uint64_t at = per_hart[me].next_deadline;
+    if (per_hart[me].extra_wake != 0 && per_hart[me].extra_wake < at) {
+        at = per_hart[me].extra_wake;
     }
     sbi_set_timer(at);
 }
@@ -62,8 +73,8 @@ void timer_wake_at(uint64_t ns) {
     if (!timer.up || at == 0) {
         return;
     }
-    if (extra_wake[me] == 0 || at < extra_wake[me]) {
-        extra_wake[me] = at;
+    if (per_hart[me].extra_wake == 0 || at < per_hart[me].extra_wake) {
+        per_hart[me].extra_wake = at;
         arm_comparator(me);
     }
 }
@@ -78,7 +89,7 @@ int timer_init(const struct fdt *fdt, uint32_t hz) {
     timer.interval = freq / hz;
     timer.interval = timer.interval == 0 ? 1 : timer.interval;
     timer.up = true;
-    next_deadline[smp_hart_index()] = timer_now() + timer.interval;
+    per_hart[smp_hart_index()].next_deadline = timer_now() + timer.interval;
     arm_comparator(smp_hart_index());
     /* Enabling the source is separate from enabling interrupts at all: the
      * caller decides when the kernel is ready to be interrupted. */
@@ -93,8 +104,8 @@ int timer_init_cpu(void) {
     if (!timer.up) {
         return KERR_NODEV;
     }
-    next_deadline[me] = timer_now() + timer.interval;
-    extra_wake[me] = 0;
+    per_hart[me].next_deadline = timer_now() + timer.interval;
+    per_hart[me].extra_wake = 0;
     arm_comparator(me);
     __asm__ volatile("csrs sie, %0" : : "r"(SIE_STIMER));
     return KERR_OK;
@@ -104,22 +115,22 @@ void timer_rearm(void) {
     uint32_t me = smp_hart_index();
     /* A one-off wake has now happened, whichever deadline it was that
      * fired: it is not owed again. */
-    extra_wake[me] = 0;
+    per_hart[me].extra_wake = 0;
     /* Only advance the periodic schedule when its deadline has actually
      * passed. An early interrupt — one somebody asked for with
      * `timer_wake_at` — must leave the tick where it was, or every sleep
      * would shift the clock. */
-    if (timer_now() >= next_deadline[me]) {
+    if (timer_now() >= per_hart[me].next_deadline) {
         /* From the deadline that passed, not from now: a handler that took
          * a while must not push the next tick out by however long it took,
          * or the clock drifts by exactly the kernel's own cost. */
-        next_deadline[me] += timer.interval;
-        if (next_deadline[me] < timer_now()) {
+        per_hart[me].next_deadline += timer.interval;
+        if (per_hart[me].next_deadline < timer_now()) {
             /* Unless it fell so far behind that catching up would mean a
              * storm of back-to-back ticks. Then the clock has lost time,
              * which is honest, rather than spending the next second making
              * it up. */
-            next_deadline[me] = timer_now() + timer.interval;
+            per_hart[me].next_deadline = timer_now() + timer.interval;
         }
     }
     arm_comparator(me);
@@ -155,9 +166,9 @@ void timer_on_tick(void) {
     /* A **tick** only when the periodic deadline has passed. An early
      * interrupt somebody asked for is not one, and counting it would make
      * the clock look as though it ran faster whenever something slept. */
-    bool periodic = timer_now() >= next_deadline[me];
+    bool periodic = timer_now() >= per_hart[me].next_deadline;
     timer.ticks += periodic ? 1u : 0u;
-    hart_ticks[me] += periodic ? 1u : 0u;
+    per_hart[me].ticks += periodic ? 1u : 0u;
     timer_rearm();
     /* Rearmed first, then the hook: a scheduler's tick may not return for a
      * long time — it is where a thread switch happens — and a timer that is
@@ -180,7 +191,7 @@ uint64_t timer_ticks(void) {
      * would be four times the rate on four harts, so anything measuring
      * "ticks per second" against it would conclude the clock runs at 400 Hz
      * — and a tick count is read precisely to check the rate. */
-    return hart_ticks[smp_hart_index()];
+    return per_hart[smp_hart_index()].ticks;
 }
 
 uint64_t timer_ticks_all_harts(void) {
@@ -188,7 +199,7 @@ uint64_t timer_ticks_all_harts(void) {
 }
 
 uint64_t timer_ticks_of(uint32_t hart_index) {
-    return hart_index < SMP_MAX_HARTS ? hart_ticks[hart_index] : 0u;
+    return hart_index < SMP_MAX_HARTS ? per_hart[hart_index].ticks : 0u;
 }
 
 uint32_t timer_hz(void) {

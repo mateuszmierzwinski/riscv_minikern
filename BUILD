@@ -626,6 +626,7 @@ cc_library(
         "src/arch/riscv/layout.h",
         "src/arch/riscv/mmu.h",
         "src/arch/riscv/plic.h",
+        "src/arch/riscv/cache.h",
         "src/arch/riscv/fp.h",
         "src/arch/riscv/sbi.h",
         "src/arch/riscv/smp.h",
