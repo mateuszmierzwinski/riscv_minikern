@@ -38,4 +38,10 @@ int32_t xfsmount_list_root(void);
  * proves the extent map and the data path rather than just the metadata. */
 int xfsmount_show_file(const char *path);
 
+/* Reads a file into memory the caller must free with `kfree`. Reports the
+ * size. KERR_NOENT when it is not there, KERR_NOMEM when it does not fit,
+ * KERR_FBIG when it is larger than `limit` — which is a refusal and not a
+ * truncation, because half a program is not a program. */
+int xfsmount_read_file(const char *path, uint32_t limit, uint8_t **out, uint32_t *size);
+
 #endif

@@ -77,9 +77,19 @@ expect "minikern: powering off"
 grep -qE '^mmu: sv39 on, [0-9]+ table pages, kernel text read-execute$' "$log" ||
     { echo "FAIL: translation was not enabled" >&2; exit 1; }
 # The frame allocator over the memory the tree described, with the kernel
-# image, the device tree and the page-table arena reserved.
-grep -qE '^mem: 261[0-9]{3} of 262144 pages free \(10[0-9]{2} MiB of 1024 MiB\)$' "$log" ||
-    { echo "FAIL: the frame allocator did not come up over 1 GiB" >&2; exit 1; }
+# image, the firmware's memory, the device tree and the page-table arena
+# reserved.
+#
+# A **range**, not an exact count: the number of reserved pages tracks the
+# size of the kernel image, so pinning it makes an unrelated failure of every
+# commit that adds code. The range is still tight enough to catch what
+# matters — far fewer free pages means the map is wrong, and *more* than the
+# total minus the image means something that should be reserved is not,
+# which is how the firmware's own memory came to be handed out.
+read -r free total < <(sed -n 's/^mem: \([0-9]*\) of \([0-9]*\) pages free.*/\1 \2/p' "$log" | head -1)
+[ "${total:-0}" = "262144" ] || { echo "FAIL: 1 GiB is $total pages, not 262144" >&2; exit 1; }
+[ "${free:-0}" -ge 258000 ] && [ "${free:-0}" -le 261800 ] ||
+    { echo "FAIL: $free of $total pages free is outside what the reservations allow" >&2; exit 1; }
 echo "ok: firmware → S-mode → device tree → sv39 → the kernel's own UART → memory → power-off"
 
 # **Eight gibibytes**, which is a VisionFive 2 configuration and the case the
@@ -91,8 +101,11 @@ big="${log%.log}-8g.log"
 boot 8G "$big"
 grep -qE '^mem: 8192 MiB at 0000000080000000$' "$big" ||
     { cat "$big"; echo "FAIL: the 8 GiB memory node was not read" >&2; exit 1; }
-grep -qE '^mem: 209[0-9]{4} of 2097152 pages free \(818[0-9] MiB of 8192 MiB\)$' "$big" ||
-    { cat "$big"; echo "FAIL: the frame allocator did not come up over 8 GiB" >&2; exit 1; }
+read -r bigfree bigtotal < <(sed -n 's/^mem: \([0-9]*\) of \([0-9]*\) pages free.*/\1 \2/p' "$big" | head -1)
+[ "${bigtotal:-0}" = "2097152" ] ||
+    { cat "$big"; echo "FAIL: 8 GiB is $bigtotal pages, not 2097152" >&2; exit 1; }
+[ "${bigfree:-0}" -ge 2093000 ] ||
+    { cat "$big"; echo "FAIL: only $bigfree of $bigtotal pages free over 8 GiB" >&2; exit 1; }
 echo "ok: 8 GiB of RAM is read and tracked — 2 Mi frames, the case 32 bits could not express"
 
 # ── interrupts and the tick ────────────────────────────────────────────────

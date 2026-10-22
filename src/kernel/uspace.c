@@ -5,8 +5,11 @@
 #include "arch/riscv/mmu.h"
 #include "arch/riscv/trap.h"
 #include "core/console.h"
+#include "core/elf.h"
 #include "core/errno.h"
+#include "core/ustack.h"
 #include "kernel/mem.h"
+#include "kernel/random.h"
 
 /* The generic Linux syscall numbers, which is the set RISC-V uses — and the
  * modern one: there is no `mmap2`, no `_llseek`, no `stat64`, no
@@ -282,6 +285,148 @@ int64_t uspace_run(struct uproc *p) {
     trap_set_expected(NULL);
     running = NULL;
     return exit_status;
+}
+
+/* The permissions a segment's flags ask for, as page-table bits. A segment
+ * is always readable from user mode — a loadable segment the process cannot
+ * read is not a thing a linker emits — and write and execute follow the
+ * flags. */
+static uint64_t prot_bits(uint32_t prot) {
+    return PTE_R | PTE_U | ((prot & PROT_WRITE) != 0 ? PTE_W : 0u) |
+           ((prot & PROT_EXEC) != 0 ? PTE_X : 0u);
+}
+
+/* Maps and fills one segment, a page at a time.
+ *
+ * Page at a time because a segment's file bytes and its memory size differ:
+ * the tail beyond `filesz` must read as zero, which is where a `.bss` comes
+ * from. Allocating per page and zeroing it first makes that automatic
+ * rather than a separate step that can be forgotten.
+ *
+ * Segments are **page-aligned down** on the way in: a linker is entitled to
+ * start one part-way into a page, and two segments may share a page at
+ * their boundary — so a page that is already mapped is filled rather than
+ * mapped again. */
+static int load_segment(struct uproc *p, const struct elf_load *l, const uint8_t *image) {
+    uint64_t start = l->vaddr & ~(PAGE_SIZE - 1u);
+    uint64_t end = (l->vaddr + l->memsz + PAGE_SIZE - 1u) & ~(PAGE_SIZE - 1u);
+    for (uint64_t va = start; va < end; va += PAGE_SIZE) {
+        phys_t page = 0;
+        uint64_t have = 0, want = 0, size = 0;
+        int rc;
+        if (pgtable_lookup(&p->pt, va, &page, &have, &size)) {
+            /* A shared page at a segment boundary: widen its permissions to
+             * the union of both segments', because one page cannot be both
+             * read-only and writable and the linker put them together. */
+            (void)pgtable_unmap(&p->pt, va);
+            rc = pgtable_map(&p->pt, va, page, PAGE_SIZE, have | prot_bits(l->prot));
+        } else {
+            rc = mem_alloc_pages(1, 1, &page);
+            if (rc == KERR_OK) {
+                for (uint32_t i = 0; i < PAGE_SIZE; i++) {
+                    ((volatile uint8_t *)(uintptr_t)page)[i] = 0;
+                }
+                rc = pgtable_map(&p->pt, va, page, PAGE_SIZE, prot_bits(l->prot));
+            }
+        }
+        if (rc != KERR_OK) {
+            return rc;
+        }
+        /* Copy whatever of the file belongs on this page. */
+        for (uint64_t i = 0; i < PAGE_SIZE; i++) {
+            uint64_t at = va + i;
+            if (at >= l->vaddr && at < l->vaddr + l->filesz) {
+                ((volatile uint8_t *)(uintptr_t)page)[i] = image[l->offset + (at - l->vaddr)];
+            }
+        }
+        (void)want;
+    }
+    return KERR_OK;
+}
+
+/* The auxiliary vector a Go runtime reads. AT_PAGESZ and AT_RANDOM are the
+ * two it cannot do without; the rest describe the image it was loaded from.
+ *
+ * **No AT_HWCAP bit for thread-local storage**, unlike the architecture this
+ * migrated from, where a C runtime checked `HWCAP_TLS` to decide whether to
+ * read the thread pointer from a register or from a helper page the kernel
+ * had to map. Here `tp` is in the ABI, so there is nothing to advertise and
+ * no helper page to provide. */
+static uint32_t build_auxv(const struct elf_image *img, struct auxv_pair *out) {
+    uint32_t n = 0;
+    out[n++] = (struct auxv_pair){AT_PAGESZ, PAGE_SIZE};
+    out[n++] = (struct auxv_pair){AT_PHDR, img->phdr_vaddr};
+    out[n++] = (struct auxv_pair){AT_PHENT, img->phent};
+    out[n++] = (struct auxv_pair){AT_PHNUM, img->phnum};
+    out[n++] = (struct auxv_pair){AT_ENTRY, img->entry};
+    out[n++] = (struct auxv_pair){AT_UID, 0};
+    out[n++] = (struct auxv_pair){AT_EUID, 0};
+    out[n++] = (struct auxv_pair){AT_GID, 0};
+    out[n++] = (struct auxv_pair){AT_EGID, 0};
+    out[n++] = (struct auxv_pair){AT_CLKTCK, 100};
+    out[n++] = (struct auxv_pair){AT_HWCAP, 0};
+    out[n++] = (struct auxv_pair){AT_HWCAP2, 0};
+    return n;
+}
+
+/* Builds the stack: the block is assembled in the page that will be the top
+ * of the stack, then mapped. Assembling it in place would need the process's
+ * address space to be loaded, which it is not yet. */
+static int build_start_state(struct uproc *p, const struct elf_image *img, const char *path) {
+    struct auxv_pair auxv[USTACK_MAX_AUXV];
+    const char *argv[1];
+    const char *envp[2] = {"HOME=/", "PATH=/"};
+    struct ustack_args args = {.argv = argv, .argc = 1u, .envp = envp, .envc = 2u, .auxv = auxv,
+                               .execfn = path};
+    phys_t stack = 0;
+    virt_t sp = 0;
+    uint32_t used = 0;
+    int rc;
+    argv[0] = path;
+    args.nauxv = build_auxv(img, auxv);
+    random_fill(args.random, sizeof args.random);
+    rc = mem_alloc_pages(USER_STACK_PAGES, 1, &stack);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    for (uint32_t i = 0; i < USER_STACK_PAGES * PAGE_SIZE; i++) {
+        ((volatile uint8_t *)(uintptr_t)stack)[i] = 0;
+    }
+    /* The block lands at the very top of the stack, so it is built into the
+     * last page's worth of the allocation. */
+    rc = ustack_build((uint8_t *)(uintptr_t)stack, USER_STACK_PAGES * PAGE_SIZE, USER_STACK_TOP,
+                      &args, &sp, &used);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    for (uint32_t i = 0; rc == KERR_OK && i < USER_STACK_PAGES; i++) {
+        rc = pgtable_map(&p->pt, USER_STACK_TOP - (uint64_t)(i + 1u) * PAGE_SIZE,
+                         stack + (uint64_t)(USER_STACK_PAGES - 1u - i) * PAGE_SIZE, PAGE_SIZE,
+                         PT_PROT_RW | PT_PROT_USER);
+    }
+    p->stack_top = sp;
+    return rc;
+}
+
+int uspace_build_elf(struct uproc *p, const uint8_t *image, uint32_t bytes, const char *path) {
+    struct pt_mem mem = {.alloc = proc_alloc, .free = proc_free, .to_virt = proc_to_virt};
+    struct elf_image img;
+    int rc = elf_parse(image, bytes, USER_TOP, &img);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    rc = pgtable_create(&p->pt, &mem);
+    for (uint32_t i = 0; rc == KERR_OK && i < img.nloads; i++) {
+        rc = load_segment(p, &img.loads[i], image);
+    }
+    rc = rc != KERR_OK ? rc : build_start_state(p, &img, path);
+    rc = rc != KERR_OK ? rc : share_kernel_mappings(&p->pt);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    p->entry = img.entry;
+    p->built = true;
+    return KERR_OK;
 }
 
 uint64_t uspace_syscalls(void) {

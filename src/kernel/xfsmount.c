@@ -88,3 +88,38 @@ int xfsmount_show_file(const char *path) {
     kfree(buf);
     return rc;
 }
+
+int xfsmount_read_file(const char *path, uint32_t limit, uint8_t **out, uint32_t *size) {
+    struct xfs_inode ip;
+    uint8_t *buf;
+    uint32_t got = 0, at = 0;
+    int rc;
+    if (!mounted) {
+        return KERR_NODEV;
+    }
+    rc = xfs_path_lookup(&fs, path, &ip);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    if (ip.size > limit) {
+        return KERR_FBIG;
+    }
+    buf = kzalloc((uint32_t)ip.size);
+    if (buf == NULL) {
+        return KERR_NOMEM;
+    }
+    /* In whatever pieces the filesystem gives: a read may stop at an extent
+     * boundary, and a loop that assumes one call is enough works until the
+     * first file that is not contiguous. */
+    while (at < ip.size) {
+        rc = xfs_file_read(&fs, &ip, at, buf + at, (uint32_t)ip.size - at, &got);
+        if (rc != KERR_OK || got == 0) {
+            kfree(buf);
+            return rc != KERR_OK ? rc : KERR_IO;
+        }
+        at += got;
+    }
+    *out = buf;
+    *size = (uint32_t)ip.size;
+    return KERR_OK;
+}

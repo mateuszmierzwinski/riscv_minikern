@@ -255,11 +255,52 @@ Three things in it are *not* architecture-neutral and were fixed on the way in:
       Eight legacy ABI shapes the ARM kernel implemented simply do not exist
       here. ~104 syscalls to renumber, and the handlers read their arguments
       from a RISC-V frame (`a0..a5`, number in `a7`).
-- [ ] **P2.2 ELF64.** The loader carries over; the class, machine and header
-      sizes change.
-- [ ] **P2.3 The process start state** — `argc`, `argv`, `envp`, `auxv`. No
-      `AT_HWCAP` bit for TLS to advertise, because `tp` is in the ABI; no
-      sigpage, because RISC-V's signal return is its own.
+- [x] **P2.2 ELF64 (2026-10-22).** A **rewrite**, not a widening: ELF64 is
+      not ELF32 with bigger fields. The header's layout differs, and a program
+      header's **flags move from the end to the front** — in ELF32 they follow
+      the sizes, in ELF64 they sit immediately after the type. Patching
+      offsets would have read a segment's permissions out of its alignment.
+      What it refuses is the point, and is what the host test spends its time
+      on: a 32-bit binary, one for another architecture, an object file, a
+      shared library (there is no loader here to help it), a segment that runs
+      past the end of the file, one that reaches into the kernel's half, an
+      entry point outside user space, and an ELF32-sized program header. Each
+      of those, trusted, is a fault somewhere later with no obvious cause.
+- [x] **P2.3 The process start state (2026-10-22).** A Linux process does
+      not begin with empty registers: it begins with a stack already holding
+      `argc`, `argv`, the environment and an auxiliary vector, and a C runtime
+      reads all of it before `main`. Every word is 64-bit here, which is most
+      of why this is a separate implementation rather than a widening — a
+      pointer-sized word is the unit the whole structure is counted in.
+      No `AT_HWCAP` bit for thread-local storage, unlike the architecture this
+      came from, where a C runtime checked `HWCAP_TLS` to decide whether to
+      read the thread pointer from a register or from a helper page the kernel
+      had to map. Here `tp` is in the ABI: nothing to advertise, no page to
+      provide.
+      **Tested from the outside**, which is the only way this can be tested
+      honestly: `src/userland/init.c` is an ordinary static ELF64 built with
+      the same toolchain, depending on nothing from the kernel, which walks
+      the whole block and *reports what it found* — and the test asserts the
+      program's account, not the kernel's. A loader can place every segment
+      correctly and still start a program wrongly; on the ARM side that was
+      the first bug found in user mode, and it was invisible until something
+      actually read `argv`.
+      **The bug it caught immediately: `AT_PHDR` was 0.** The user link script
+      did not leave room for the ELF header and the program headers at the
+      start of the first segment, so the header table was in the *file* but in
+      no segment — there was no address at which those headers existed in
+      memory, so there was nothing to report. A Go runtime reads `AT_PHDR` to
+      find its own segments, so zero there is not a cosmetic gap.
+      `SIZEOF_HEADERS` fixed it, and the test now asserts the real address.
+      Also asserted: a 16-byte-aligned stack pointer at entry, which the ABI
+      requires and a runtime relies on when it spills a 128-bit value; and
+      that `AT_RANDOM`'s sixteen bytes are not all zero, which would be a
+      kernel supplying the tag without the bytes.
+- [x] **P2.3a A program off the filesystem (2026-10-22).** The whole machine
+      in one test: firmware, S-mode, paging, an NVMe controller, a block-size
+      adapter, a buffer cache, XFS, the ELF64 loader, a process address space
+      and the start state — reading `/init` off the disk and running it to
+      completion. This is the path a Go binary takes unchanged.
 - [ ] **P2.4 Signals**, including what Go's runtime actually needs. This is
       the one item with a known unknown: on ARM, Go set `SA_RESTORER` with a
       zero restorer and needed a kernel-provided trampoline page, which cost a

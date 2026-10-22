@@ -35,6 +35,10 @@
 #define USER_STACK_TOP 0x80000ull
 #define USER_STACK_PAGES 4u
 
+/* The top of user space: everything a program may address. Well below the
+ * sign-extension hole, and far below anything the kernel maps. */
+#define USER_TOP 0x40000000ull
+
 /* The kernel registers that must survive a trip through user mode: the
  * return address, the stack pointer, and s0..s11 — exactly what a C caller
  * expects a call to preserve. */
@@ -50,9 +54,23 @@ struct uproc {
     bool built;
 };
 
-/* Builds an address space with the kernel's half shared, `bytes` of program
- * copied in at USER_TEXT, and a stack. KERR_NOMEM when pages run out. */
+/* Builds an address space with the kernel's mappings shared, `bytes` of
+ * program copied in at USER_TEXT, and a stack. KERR_NOMEM when pages run
+ * out. For the hand-written test programs: no headers, no start state. */
 int uspace_build(struct uproc *p, const void *program, uint32_t bytes);
+
+/* Builds an address space from an **ELF image**: every loadable segment at
+ * the address its header names, with the permissions its flags ask for, a
+ * stack, and the start state a C runtime expects — `argc`, `argv`, the
+ * environment and an auxiliary vector.
+ *
+ * `argv[0]` and the path are what the program will see; the image itself is
+ * not kept, so the caller may free it the moment this returns.
+ *
+ * KERR_NOEXEC for something that is not a static RISC-V 64 executable,
+ * KERR_INVAL for headers that contradict the file, KERR_NOMEM when pages
+ * run out. */
+int uspace_build_elf(struct uproc *p, const uint8_t *image, uint32_t bytes, const char *path);
 
 /* Releases the process's pages and its table. */
 void uspace_destroy(struct uproc *p);

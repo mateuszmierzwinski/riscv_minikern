@@ -25,6 +25,8 @@ is named. The phase-by-phase record is `DEVELOPMENT_PROGRESS.md`.
 | **8 GiB of RAM**, read and tracked: 2 Mi frames | `boot_qemu_test` (an `-m 8G` boot), `pmm_test` (frames at 9 GiB) |
 | **Interrupts** through the PLIC, with each hart's *context* resolved from the tree rather than assumed to be its hart id | `boot_qemu_test` |
 | **A tick** through SBI's timer, keeping time: 50 ticks in 499 ms at 100 Hz | `boot_qemu_test` |
+| **A real program off the filesystem**: `/init` read from XFS on NVMe, ELF64-loaded, started with `argc`/`argv`/`envp`/`auxv`, run to completion | `init_qemu_test` |
+| **An ELF64 loader** that refuses what it cannot run — 32-bit, wrong architecture, dynamically linked, headers that contradict the file | `elf_test` |
 | **User mode**: a process in its own address space, making syscalls, resumed after each — and a user fault that ends the process while the kernel carries on | `user_qemu_test` |
 | **XFS on a real device** — mounted off NVMe, directory listed, file contents read; and every feature it does not understand refused | `xfs_qemu_test`, `xfs_test` |
 | **A block-size adapter**: a filesystem's 4 KiB blocks over a controller's 512-byte sectors | `blockscale_test` |

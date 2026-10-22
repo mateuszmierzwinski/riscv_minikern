@@ -41,6 +41,7 @@
 #include "kernel/mem.h"
 #include "kernel/uspace.h"
 #include "kernel/xfsmount.h"
+#include "kernel/xfsmount.h"
 #include "core/ports.h"
 
 #include <stdbool.h>
@@ -363,12 +364,45 @@ static void run_one_user_program(const char *name, const char *from, const char 
     uspace_destroy(&proc);
 }
 
-static void run_user_programs(void) {
-    if (!cmdline_has(boot_cmdline, "minikern.user")) {
+/* Runs a real program: an ELF read off the filesystem, loaded at the
+ * addresses its own headers name, started with the state a C runtime
+ * expects. This is the path a Go binary will take. */
+#define INIT_MAX_BYTES (4u * 1024u * 1024u)
+
+static void run_init_from_disk(const char *path) {
+    struct uproc proc;
+    uint8_t *image = NULL;
+    uint32_t size = 0;
+    int64_t status;
+    int rc = xfsmount_read_file(path, INIT_MAX_BYTES, &image, &size);
+    if (rc != KERR_OK) {
+        kprintf("init: cannot read %s (rc %d)\n", path, rc);
         return;
     }
-    run_one_user_program("hello", user_program_start, user_program_end);
-    run_one_user_program("faulter", user_faulter_start, user_faulter_end);
+    kprintf("init: %s is %u bytes\n", path, size);
+    rc = uspace_build_elf(&proc, image, size, path);
+    /* The image is copied into the process's pages, so it is not needed
+     * once the address space is built. */
+    kfree(image);
+    if (rc != KERR_OK) {
+        kprintf("init: %s will not load (rc %d: %s)\n", path, rc,
+                rc == KERR_NOEXEC ? "not a static RISC-V 64 executable" : "headers refused");
+        return;
+    }
+    status = uspace_run(&proc);
+    kprintf("init: %s exited with %lld after %llu syscalls\n", path, (long long)status,
+            (unsigned long long)uspace_syscalls());
+    uspace_destroy(&proc);
+}
+
+static void run_user_programs(void) {
+    if (cmdline_has(boot_cmdline, "minikern.user")) {
+        run_one_user_program("hello", user_program_start, user_program_end);
+        run_one_user_program("faulter", user_faulter_start, user_faulter_end);
+    }
+    if (cmdline_has(boot_cmdline, "minikern.init")) {
+        run_init_from_disk("/init");
+    }
 }
 
 /* True when the operator asked the machine to switch itself off at the end,

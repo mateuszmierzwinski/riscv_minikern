@@ -63,3 +63,24 @@ def kernel_binary(name, srcs, deps, **kwargs):
         deps = deps,
         **kwargs
     )
+
+def user_binary(name, srcs, **kwargs):
+    """A user-mode program: the same toolchain, a different address.
+
+    It links at 0x10000 with its own script and depends on nothing from the
+    kernel — which is the point. A program built out of the kernel's own
+    headers would prove the loader works on something tailored to it; this
+    one is an ordinary static ELF64 that happens to have been built here.
+    """
+    cc_binary(
+        name = name,
+        srcs = srcs,
+        additional_linker_inputs = ["src/userland/user.ld"],
+        linkopts = ["-Wl,-T,$(location src/userland/user.ld)"],
+        target_compatible_with = ["//platforms:riscv64"],
+        **kwargs
+    )
+
+def user_image(name, program):
+    """Builds a user program for the board platform and names its ELF."""
+    kernel_image(name = name, kernel = program)

@@ -1,7 +1,7 @@
 load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
 load("//:version.bzl", "MINIKERN_VERSION")
-load(":riscv_minikern.bzl", "kernel_binary", "kernel_image")
+load(":riscv_minikern.bzl", "kernel_binary", "kernel_image", "user_binary", "user_image")
 
 # minikern for RISC-V — a from-scratch kernel for the StarFive JH7110
 # (SiFive U74), implementing Linux's syscall interface so that Go binaries
@@ -153,6 +153,23 @@ cc_test(
 
 # Sv39 translation, as pure arithmetic: no CSR is touched here, which is what
 # lets it be tested on the host before any hardware installs a table.
+# Loading a program, and the state it starts in. Both pure, both
+# host-tested: an ELF64 parser that refuses what it cannot run, and the
+# argc/argv/envp/auxv block a C runtime reads before main.
+cc_library(
+    name = "exec",
+    srcs = [
+        "src/core/elf.c",
+        "src/core/ustack.c",
+    ],
+    hdrs = [
+        "src/core/elf.h",
+        "src/core/ustack.h",
+    ],
+    strip_include_prefix = "src",
+    deps = [":core_boot"],
+)
+
 cc_library(
     name = "pgtable",
     srcs = ["src/arch/riscv/pgtable.c"],
@@ -199,6 +216,16 @@ cc_test(
     srcs = ["test/fdt_test.c"],
     deps = [
         ":core_boot",
+        ":ktest",
+    ],
+)
+
+cc_test(
+    name = "elf_test",
+    size = "small",
+    srcs = ["test/elf_test.c"],
+    deps = [
+        ":exec",
         ":ktest",
     ],
 )
@@ -355,9 +382,37 @@ cc_library(
     deps = [
         ":arch_riscv",
         ":console",
+        ":exec",
         ":kernel_mem",
+        ":kernel_random",
         ":pgtable",
     ],
+)
+
+# A generator for AT_RANDOM and anything else that wants unpredictable
+# bytes. Carried over; what seeds it is a question for later (the ARM
+# project ended up harvesting interrupt arrival times, because its seed was
+# constant under emulation).
+cc_library(
+    name = "kernel_random",
+    srcs = [
+        "src/kernel/entropy.c",
+        "src/kernel/random.c",
+    ],
+    hdrs = [
+        "src/kernel/entropy.h",
+        "src/kernel/random.h",
+    ],
+    strip_include_prefix = "src",
+    deps = [":crypto_hash"],
+)
+
+# SHA-256, which the entropy pool reads itself through.
+cc_library(
+    name = "crypto_hash",
+    srcs = ["src/lib/sha256.c"],
+    hdrs = ["src/lib/sha256.h"],
+    strip_include_prefix = "src",
 )
 
 # The live block device and the cache over it.
@@ -495,6 +550,27 @@ kernel_image(
     tags = ["manual"],
 )
 
+# ── a user program ─────────────────────────────────────────────────────────
+#
+# An ordinary static ELF64, built with the same toolchain at a user address
+# and depending on nothing from the kernel. It reads the state the kernel
+# started it in — argc, argv, the environment, the auxiliary vector — and
+# reports it, so the test checks the kernel's work from outside rather than
+# trusting the kernel's own account of it.
+
+user_binary(
+    name = "init",
+    srcs = [
+        "src/userland/init.c",
+        "src/userland/start.S",
+    ],
+)
+
+user_image(
+    name = "init.elf",
+    program = ":init",
+)
+
 # ── the emulator ───────────────────────────────────────────────────────────
 #
 # Unlike the board this kernel targets, QEMU's virt machine models everything
@@ -553,12 +629,30 @@ sh_test(
     tags = ["manual"],
 )
 
+# P2.1: the whole machine — firmware to a program's own account of how it
+# was started.
+sh_test(
+    name = "init_qemu_test",
+    size = "large",
+    srcs = ["test/init_qemu_test.sh"],
+    args = [
+        "$(rootpath :minikern)",
+        "$(rootpath :init.elf)",
+    ],
+    data = [
+        ":init.elf",
+        ":minikern",
+    ],
+    tags = ["manual"],
+)
+
 test_suite(
     name = "qemu_tests",
     tags = ["manual"],
     tests = [
         ":boot_qemu_test",
         ":disk_qemu_test",
+        ":init_qemu_test",
         ":selftest_qemu_test",
         ":user_qemu_test",
         ":xfs_qemu_test",

@@ -5,122 +5,132 @@
 
 #include "core/errno.h"
 
-/* A downward cursor over buf; addr() names a buf offset as a user address. */
-struct ucursor {
+/* Everything on this stack is a pointer-sized word. */
+#define WORD 8u
+
+/* What is being filled: the buffer, where it will live, and a cursor that
+ * descends from the top. Strings are placed first, from the very top, and
+ * the word-aligned structure below them — so the two never collide and the
+ * arithmetic is one subtraction rather than two layouts. */
+struct builder {
     uint8_t *buf;
     uint32_t len;
-    uint32_t top;
-    uint32_t at;  /* offset of the lowest byte written so far */
-    bool overflow;
+    virt_t top;
+    uint32_t at;   /* bytes used from the top, downwards */
+    bool full;
 };
 
-static uint32_t uaddr(const struct ucursor *c) {
-    return c->top - c->len + c->at;
+/* Reserves n bytes at the current cursor and returns where they are, or
+ * NULL when the buffer is full — which is sticky: once a reservation has
+ * failed, every later one does too, so a caller can check once at the end
+ * instead of after every step. */
+static uint8_t *take(struct builder *b, uint32_t n) {
+    if (b->full || n > b->len - b->at) {
+        b->full = true;
+        return NULL;
+    }
+    b->at += n;
+    return b->buf + b->len - b->at;
 }
 
-/* Reserves n bytes below what is written; returns their user address. */
-static uint32_t push_bytes(struct ucursor *c, const void *data, uint32_t n) {
-    if (n > c->at) {
-        c->overflow = true;
-        return 0;
-    }
-    c->at -= n;
-    for (uint32_t i = 0; data != NULL && i < n; i++) {
-        c->buf[c->at + i] = ((const uint8_t *)data)[i];
-    }
-    return uaddr(c);
+/* The address a reserved block will have once the buffer is mapped. */
+static virt_t address_of(const struct builder *b, const uint8_t *p) {
+    return b->top - (virt_t)(b->buf + b->len - p);
 }
 
-static uint32_t push_string(struct ucursor *c, const char *s) {
+/* Copies a string in and returns the address it will have. */
+static virt_t put_string(struct builder *b, const char *s) {
     uint32_t n = 0;
+    uint8_t *at;
     while (s[n] != '\0') {
         n++;
     }
-    return push_bytes(c, s, n + 1);
+    at = take(b, n + 1u);
+    if (at == NULL) {
+        return 0;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        at[i] = (uint8_t)s[i];
+    }
+    at[n] = '\0';
+    return address_of(b, at);
 }
 
-static void put_word(struct ucursor *c, uint32_t offset, uint32_t v) {
-    c->buf[offset] = (uint8_t)v;
-    c->buf[offset + 1] = (uint8_t)(v >> 8);
-    c->buf[offset + 2] = (uint8_t)(v >> 16);
-    c->buf[offset + 3] = (uint8_t)(v >> 24);
+static virt_t put_bytes(struct builder *b, const uint8_t *data, uint32_t n) {
+    uint8_t *at = take(b, n);
+    if (at == NULL) {
+        return 0;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        at[i] = data[i];
+    }
+    return address_of(b, at);
 }
 
-/* The vector's word count: argc + argv + NULL + envp + NULL + auxv + AT_NULL. */
-static uint32_t vector_words(const struct ustack_args *a, uint32_t nauxv) {
-    return 1u + a->argc + 1u + a->envc + 1u + 2u * (nauxv + 1u);
-}
-
-/* Pushes strings (argv, envp) and records their user addresses. */
-static void push_strings(struct ucursor *c, const char *const *s, uint32_t n, uint32_t *addrs) {
-    for (uint32_t i = n; i-- > 0;) {
-        addrs[i] = push_string(c, s[i]);
+/* Writes one word of the structure. The structure is built from the bottom
+ * up in a block reserved all at once, because its size is known from the
+ * counts and a word written past the end is a corrupted auxiliary vector
+ * rather than a visible failure. */
+static void put_word(uint8_t *block, uint32_t index, uint64_t v) {
+    for (uint32_t i = 0; i < WORD; i++) {
+        block[index * WORD + i] = (uint8_t)(v >> (8u * i));
     }
 }
 
-/* Writes the vector at the cursor (already reserved and aligned). */
-static void write_vector(struct ucursor *c, const struct ustack_args *a, const uint32_t *argv_at,
-                         const uint32_t *envp_at, const struct auxv_pair *aux, uint32_t naux) {
-    uint32_t w = c->at;
-    put_word(c, w, a->argc);
-    w += 4;
-    for (uint32_t i = 0; i < a->argc; i++, w += 4) {
-        put_word(c, w, argv_at[i]);
-    }
-    put_word(c, w, 0);
-    w += 4;
-    for (uint32_t i = 0; i < a->envc; i++, w += 4) {
-        put_word(c, w, envp_at[i]);
-    }
-    put_word(c, w, 0);
-    w += 4;
-    for (uint32_t i = 0; i < naux; i++, w += 8) {
-        put_word(c, w, aux[i].type);
-        put_word(c, w + 4, aux[i].value);
-    }
-    put_word(c, w, AT_NULL);
-    put_word(c, w + 4, 0);
-}
-
-/* The caller's auxv plus the three entries that point into the stack. */
-static uint32_t full_auxv(const struct ustack_args *a, struct auxv_pair *aux, uint32_t random, uint32_t platform,
-                          uint32_t execfn) {
-    uint32_t n = 0;
-    for (; n < a->nauxv; n++) {
-        aux[n] = a->auxv[n];
-    }
-    aux[n++] = (struct auxv_pair){AT_RANDOM, random};
-    aux[n++] = (struct auxv_pair){AT_PLATFORM, platform};
-    aux[n++] = (struct auxv_pair){AT_EXECFN, execfn};
-    return n;
-}
-
-/* One top-down layout pass: strings and AT_RANDOM first, then the
- * vector below them, 16-byte aligned. */
-int ustack_build(uint8_t *buf, uint32_t len, uint32_t top, const struct ustack_args *a, uint32_t *sp,
+int ustack_build(uint8_t *buf, uint32_t len, virt_t top, const struct ustack_args *a, virt_t *sp,
                  uint32_t *used) {
-    struct ucursor c = {.buf = buf, .len = len, .top = top, .at = len};
-    uint32_t argv_at[USTACK_MAX_ARGS], envp_at[USTACK_MAX_ARGS];
-    struct auxv_pair aux[USTACK_MAX_AUXV];
-    uint32_t execfn, random, platform, naux, words;
-    if (a->nauxv + 3u > USTACK_MAX_AUXV || a->argc > USTACK_MAX_ARGS || a->envc > USTACK_MAX_ARGS ||
-        len % 16u != 0 || top % 16u != 0) {
-        return KERR_RANGE;
+    struct builder b = {.buf = buf, .len = len, .top = top};
+    virt_t argv_addr[32], envp_addr[32], random_addr, execfn_addr = 0;
+    uint32_t words, index = 0;
+    uint8_t *block;
+    if (a->argc > 32u || a->envc > 32u || a->nauxv + 3u > USTACK_MAX_AUXV) {
+        return KERR_INVAL;
     }
-    push_bytes(&c, NULL, 4);  /* a NULL word at the very top, as Linux leaves */
-    execfn = push_string(&c, a->argc > 0 ? a->argv[0] : "");
-    push_strings(&c, a->envp, a->envc, envp_at);
-    push_strings(&c, a->argv, a->argc, argv_at);
-    platform = push_string(&c, a->platform);
-    random = push_bytes(&c, a->random, 16);
-    naux = full_auxv(a, aux, random, platform, execfn);
-    words = vector_words(a, naux);
-    if (c.overflow || c.at < words * 4u) {
-        return KERR_RANGE;
+    /* The strings first, at the very top, so their addresses are known
+     * before the structure that points at them is written. */
+    for (uint32_t i = 0; i < a->argc; i++) {
+        argv_addr[i] = put_string(&b, a->argv[i]);
     }
-    c.at = (c.at - words * 4u) & ~15u;
-    write_vector(&c, a, argv_at, envp_at, aux, naux);
-    *sp = uaddr(&c);
-    *used = len - c.at;
-    return KERR_OK;
+    for (uint32_t i = 0; i < a->envc; i++) {
+        envp_addr[i] = put_string(&b, a->envp[i]);
+    }
+    random_addr = put_bytes(&b, a->random, 16u);
+    if (a->execfn != NULL) {
+        execfn_addr = put_string(&b, a->execfn);
+    }
+    /* argc, argv + NULL, envp + NULL, the given auxv pairs, AT_RANDOM,
+     * AT_EXECFN when there is one, and AT_NULL — two words each. */
+    words = 1u + a->argc + 1u + a->envc + 1u + (a->nauxv + 2u + (execfn_addr != 0 ? 1u : 0u)) * 2u;
+    /* The stack pointer must be 16-byte aligned when a program starts: the
+     * ABI requires it, and a runtime that spills a 128-bit value relative to
+     * it will fault if it is not. */
+    b.at = (b.at + 15u) & ~15u;
+    block = take(&b, words * WORD);
+    if (block == NULL) {
+        return KERR_NOMEM;
+    }
+    put_word(block, index++, a->argc);
+    for (uint32_t i = 0; i < a->argc; i++) {
+        put_word(block, index++, argv_addr[i]);
+    }
+    put_word(block, index++, 0);
+    for (uint32_t i = 0; i < a->envc; i++) {
+        put_word(block, index++, envp_addr[i]);
+    }
+    put_word(block, index++, 0);
+    for (uint32_t i = 0; i < a->nauxv; i++) {
+        put_word(block, index++, a->auxv[i].tag);
+        put_word(block, index++, a->auxv[i].value);
+    }
+    put_word(block, index++, AT_RANDOM);
+    put_word(block, index++, random_addr);
+    if (execfn_addr != 0) {
+        put_word(block, index++, AT_EXECFN);
+        put_word(block, index++, execfn_addr);
+    }
+    put_word(block, index++, AT_NULL);
+    put_word(block, index++, 0);
+    *sp = address_of(&b, block);
+    *used = b.at;
+    return (*sp % 16u) == 0 ? KERR_OK : KERR_INVAL;
 }
