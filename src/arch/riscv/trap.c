@@ -1,7 +1,10 @@
 #include "arch/riscv/trap.h"
 
 #include "arch/riscv/frame.h"
+#include "arch/riscv/plic.h"
+#include "arch/riscv/timer.h"
 #include "core/console.h"
+#include "kernel/irq.h"
 
 /* The frame the entry code writes and the structure the C reads are two
  * descriptions of one thing, so they are checked against each other here
@@ -93,11 +96,51 @@ void trap_set_expected(bool (*handler)(struct trapframe *tf)) {
     expected_handler = handler;
 }
 
+/* An interrupt, which is a normal event and not a fault: the timer ticks,
+ * or a device wants attention. Unlike an exception, `sepc` is left alone —
+ * the interrupted instruction has not run yet. */
+static bool handle_interrupt(uint64_t code) {
+    switch (code) {
+    case IRQ_S_TIMER:
+        timer_on_tick();
+        return true;
+    case IRQ_S_EXTERNAL: {
+        /* Claim and complete are one register, so a handler cannot end the
+         * interrupt without also being ready for the next — which the GIC
+         * on the architecture this came from allowed you to get wrong. */
+        uint32_t irq = plic_claim();
+        if (irq != 0) {
+            irq_dispatch(irq);
+            plic_complete(irq);
+        }
+        return true;
+    }
+    case IRQ_S_SOFTWARE:
+        /* Nothing sends one yet; it is how one hart will wake another. */
+        __asm__ volatile("csrc sip, %0" : : "r"(2ull));
+        return true;
+    default:
+        return false;
+    }
+}
+
 void trap_handle(struct trapframe *tf) {
+    if ((tf->scause & SCAUSE_INTERRUPT) != 0 &&
+        handle_interrupt(tf->scause & ~SCAUSE_INTERRUPT)) {
+        return;
+    }
     if (expected_handler != NULL && expected_handler(tf)) {
         return;
     }
     unexpected(tf);
+}
+
+void trap_enable_interrupts(void) {
+    __asm__ volatile("csrsi sstatus, 2" : : : "memory"); /* SIE */
+}
+
+void trap_disable_interrupts(void) {
+    __asm__ volatile("csrci sstatus, 2" : : : "memory");
 }
 
 void trap_init_cpu(void) {

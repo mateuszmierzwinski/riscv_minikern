@@ -18,6 +18,8 @@
 
 #include "arch/riscv/layout.h"
 #include "arch/riscv/mmu.h"
+#include "arch/riscv/plic.h"
+#include "arch/riscv/timer.h"
 #include "arch/riscv/sbi.h"
 #include "arch/riscv/trap.h"
 #include "board/jh7110/console.h"
@@ -29,6 +31,7 @@
 #include "core/console.h"
 #include "core/errno.h"
 #include "core/fdt.h"
+#include "kernel/irq.h"
 #include "kernel/mem.h"
 #include "core/ports.h"
 
@@ -82,6 +85,11 @@ static void read_bootinfo(uint64_t dtb, struct bootinfo *info) {
  * uses gigapages where it can), and it is reclaimed by nothing because the
  * kernel's own map lives as long as the machine. */
 #define TABLE_ARENA_BYTES (2u * 1024u * 1024u)
+
+/* Ticks a second. 100 is enough to schedule by and cheap enough that the
+ * handler's cost is noise; the ARM kernel used 1000 and spent measurably
+ * more time in the tick than in the work it was timing. */
+#define TICK_HZ 100u
 
 extern char __kernel_end[];
 
@@ -145,6 +153,76 @@ static void adopt_the_real_uart(uint64_t dtb) {
             (unsigned long long)jh7110_uart_base());
 }
 
+/* The interrupt controller and the tick.
+ *
+ * Both come from the device tree: the PLIC's address and — the part nobody
+ * can guess — **which context this hart's supervisor interrupts arrive in**,
+ * which is a position in the controller's own list and not the hart id. The
+ * timer's frequency likewise, because the counter's rate is a property of the
+ * machine and nothing in the ISA states it.
+ *
+ * Interrupts are enabled last, deliberately: a kernel that opens the gate
+ * before it has a handler for what comes through it crashes in the one place
+ * where it cannot explain itself. */
+static void bring_up_interrupts(uint64_t dtb, uint64_t hart) {
+    struct fdt fdt;
+    if (fdt_open(&fdt, (const void *)(uintptr_t)dtb, FDT_MAX_BYTES) != KERR_OK) {
+        return;
+    }
+    if (plic_init(&fdt, hart) != KERR_OK) {
+        kprintf("plic: not found in the device tree; devices cannot interrupt\n");
+    } else {
+        kprintf("plic: at %016llx, hart %llu uses context %u\n",
+                (unsigned long long)plic_base(), (unsigned long long)hart, plic_context());
+    }
+    if (timer_init(&fdt, TICK_HZ) != KERR_OK) {
+        kprintf("timer: the tree does not say the counter's frequency; no tick\n");
+        return;
+    }
+    kprintf("timer: %llu Hz counter, %u ticks a second\n",
+            (unsigned long long)timer_frequency(), timer_hz());
+    trap_enable_interrupts();
+}
+
+/* Waits for the tick to prove itself.
+ *
+ * `minikern.ticks=<n>` waits for n timer interrupts and reports how long
+ * they took by the counter, which is the only way to show that interrupts
+ * are *arriving* rather than merely that the timer was armed. A tick that is
+ * armed and never delivered looks identical in a boot log — and on the
+ * architecture this came from, that was the shape of a real bug: a core
+ * whose interrupt controller it had not initialised ticked for ever without
+ * ever entering the kernel.
+ *
+ * It gives up rather than hanging, because a kernel that waits for ever for
+ * an interrupt tells you nothing about why it never came. */
+static void wait_for_ticks(void) {
+    size_t len = 0;
+    const char *v = cmdline_value(boot_cmdline, "minikern.ticks", &len);
+    uint64_t want = 0, start_ns, deadline;
+    if (v == NULL) {
+        return;
+    }
+    for (size_t i = 0; i < len; i++) {
+        want = v[i] >= '0' && v[i] <= '9' ? want * 10u + (uint64_t)(v[i] - '0') : want;
+    }
+    start_ns = timer_ns();
+    /* Twice as long as it should take, by the counter — not by a spin count,
+     * which measures the host's speed rather than the guest's clock. */
+    deadline = timer_now() + 2u * want * (timer_frequency() / (timer_hz() == 0 ? 1 : timer_hz()));
+    while (timer_ticks() < want && timer_now() < deadline) {
+        __asm__ volatile("wfi");
+    }
+    if (timer_ticks() < want) {
+        kprintf("tick: only %llu of %llu ticks arrived — interrupts are not being delivered\n",
+                (unsigned long long)timer_ticks(), (unsigned long long)want);
+        return;
+    }
+    kprintf("tick: %llu ticks in %llu ms, %llu irqs dispatched, %llu spurious\n",
+            (unsigned long long)timer_ticks(), (unsigned long long)((timer_ns() - start_ns) / 1000000u),
+            (unsigned long long)irq_count(), (unsigned long long)irq_spurious());
+}
+
 /* True when the operator asked the machine to switch itself off at the end,
  * which is what makes a boot test a test rather than a timeout. */
 static bool halt_requested(void) {
@@ -165,6 +243,8 @@ void kmain(uint64_t hart, uint64_t dtb) {
     bring_up_translation(&info);
     adopt_the_real_uart(dtb);
     bring_up_memory(&info);
+    bring_up_interrupts(dtb, hart);
+    wait_for_ticks();
     (void)selftest_run(boot_cmdline);
     kprintf("minikern: boot complete\n");
     if (halt_requested()) {

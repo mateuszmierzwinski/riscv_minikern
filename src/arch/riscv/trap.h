@@ -70,6 +70,12 @@ void trap_dump(const struct trapframe *tf);
  * assembly calls it; not meant for anyone else. */
 void trap_handle(struct trapframe *tf);
 
+/* Lets interrupts reach the kernel at all (`sstatus.SIE`). Separate from
+ * enabling any particular source, so the kernel decides when it is ready to
+ * be interrupted rather than discovering it was not. */
+void trap_enable_interrupts(void);
+void trap_disable_interrupts(void);
+
 /* Installs a handler for faults the kernel is **expecting** — a self-test
  * taking a deliberate exception. It returns true when it has dealt with the
  * frame (typically by advancing `sepc` past the instruction), and the trap

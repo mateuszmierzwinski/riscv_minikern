@@ -22,10 +22,13 @@ command -v qemu-system-riscv64 >/dev/null || { echo "qemu-system-riscv64 is not 
 boot() {
     local memory="$1"
     local out="$2"
+    local extra="${3:-}"
     local status=0
+    # No trailing space when there is nothing extra: the kernel echoes its
+    # command line verbatim and a test asserts it verbatim.
+    local append="console=sbi minikern.halt=poweroff${extra:+ $extra}"
     timeout 60 qemu-system-riscv64 -M virt -smp 4 -m "$memory" -nographic \
-        -bios default -kernel "$image" \
-        -append "console=sbi minikern.halt=poweroff" > "$out" 2>&1 || status=$?
+        -bios default -kernel "$image" -append "$append" > "$out" 2>&1 || status=$?
     tr -d '\r' < "$out" > "$out.clean" && mv "$out.clean" "$out"
     [ "$status" -eq 0 ] || { cat "$out"; echo "FAIL: with $memory, qemu exited $status" >&2; exit 1; }
 }
@@ -91,4 +94,34 @@ grep -qE '^mem: 8192 MiB at 0000000080000000$' "$big" ||
 grep -qE '^mem: 209[0-9]{4} of 2097152 pages free \(818[0-9] MiB of 8192 MiB\)$' "$big" ||
     { cat "$big"; echo "FAIL: the frame allocator did not come up over 8 GiB" >&2; exit 1; }
 echo "ok: 8 GiB of RAM is read and tracked — 2 Mi frames, the case 32 bits could not express"
+
+# ── interrupts and the tick ────────────────────────────────────────────────
+#
+# A timer that is armed and one that is *delivering* look identical in a boot
+# log, and on the architecture this migrated from that difference was a real
+# bug: a core whose interrupt controller had not been initialised ticked for
+# ever without ever entering the kernel. So the kernel is made to wait for a
+# known number of ticks and report how long they took by the counter.
+ticks="${log%.log}-ticks.log"
+boot 1G "$ticks" "minikern.ticks=50"
+
+# The PLIC, and the part of it nobody can guess: a hart's **context** is a
+# position in the controller's own list, not its hart id. On this machine
+# hart 0's supervisor context is 1, because context 0 is its machine-mode
+# context — the firmware's. A kernel that assumed they matched would write
+# another context's enable bits.
+grep -qE '^plic: at [0-9a-f]{16}, hart [0-9]+ uses context [0-9]+$' "$ticks" ||
+    { cat "$ticks"; echo "FAIL: the PLIC was not found, or did not report its context" >&2; exit 1; }
+grep -qE '^timer: [0-9]+ Hz counter, 100 ticks a second$' "$ticks" ||
+    { cat "$ticks"; echo "FAIL: the timer did not read its frequency from the tree" >&2; exit 1; }
+
+# 50 ticks at 100 Hz is half a second. The window is wide enough for a loaded
+# host and narrow enough that a clock running at the wrong rate fails: a
+# frequency misread by a factor of two would land at 250 ms or 1000 ms.
+read -r got ms < <(sed -n 's/^tick: \([0-9]*\) ticks in \([0-9]*\) ms.*/\1 \2/p' "$ticks")
+[ "${got:-0}" = "50" ] ||
+    { cat "$ticks"; echo "FAIL: only ${got:-0} of 50 ticks arrived" >&2; exit 1; }
+[ "${ms:-0}" -ge 400 ] && [ "${ms:-0}" -le 700 ] ||
+    { cat "$ticks"; echo "FAIL: 50 ticks took ${ms} ms, which is not 100 Hz" >&2; exit 1; }
+echo "ok: the tick is delivered and keeps time — 50 ticks in ${ms} ms at 100 Hz"
 echo PASS

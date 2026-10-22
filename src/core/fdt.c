@@ -299,11 +299,31 @@ static bool build_path(const struct open_node *stack, uint32_t depth, char *out,
     return true;
 }
 
-int fdt_find_compatible(const struct fdt *fdt, const char *compat, char *path, uint32_t cap) {
+/* What a scan is looking for: a property name, and a test on its value. */
+struct matcher {
+    const char *prop;
+    bool (*matches)(const struct fdt_prop *value, const void *want);
+    const void *want;
+};
+
+static bool matches_compatible(const struct fdt_prop *value, const void *want) {
+    return compatible_lists(value, want);
+}
+
+static bool matches_phandle(const struct fdt_prop *value, const void *want) {
+    uint64_t v = 0;
+    return value->len == 4u && fdt_prop_cells(value, 0, 1, &v) == KERR_OK &&
+           v == *(const uint32_t *)want;
+}
+
+/* Walks every node until the matcher is satisfied, and writes the path of
+ * the node whose property matched. One implementation, because "find the
+ * node that says X" is the only question a driver ever asks of a tree. */
+static int scan_for(const struct fdt *fdt, const struct matcher *m, char *path, uint32_t cap) {
     struct open_node stack[FDT_MAX_DEPTH];
     const uint8_t *blk = fdt->base + fdt->struct_off;
     uint32_t at = 0, depth = 0;
-    if (compat == NULL || path == NULL || cap == 0) {
+    if (m->prop == NULL || path == NULL || cap == 0) {
         return KERR_INVAL;
     }
     for (;;) {
@@ -353,8 +373,8 @@ int fdt_find_compatible(const struct fdt *fdt, const char *compat, char *path, u
             }
             value = (struct fdt_prop){.value = blk + at + 8, .len = len};
             at = align4(at + 8 + len);
-            if (str_equal((const char *)fdt->base + fdt->strings_off + nameoff, "compatible") &&
-                compatible_lists(&value, compat)) {
+            if (str_equal((const char *)fdt->base + fdt->strings_off + nameoff, m->prop) &&
+                m->matches(&value, m->want)) {
                 /* The root is depth 1 with an empty name, so the chain above
                  * the match is what names it. */
                 return build_path(&stack[1], depth - 1u, path, cap) ? KERR_OK : KERR_NOMEM;
@@ -362,6 +382,31 @@ int fdt_find_compatible(const struct fdt *fdt, const char *compat, char *path, u
         }
     }
 }
+
+int fdt_find_compatible(const struct fdt *fdt, const char *compat, char *path, uint32_t cap) {
+    struct matcher m = {.prop = "compatible", .matches = matches_compatible, .want = compat};
+    return compat == NULL ? KERR_INVAL : scan_for(fdt, &m, path, cap);
+}
+
+int fdt_find_phandle(const struct fdt *fdt, uint32_t phandle, char *path, uint32_t cap) {
+    struct matcher m = {.prop = "phandle", .matches = matches_phandle, .want = &phandle};
+    return scan_for(fdt, &m, path, cap);
+}
+
+/* Cuts the last component off a path, in place: "/a/b/c" becomes "/a/b".
+ * False for a path with nothing to cut. */
+bool fdt_parent_path(char *path) {
+    uint32_t last = 0;
+    for (uint32_t i = 0; path[i] != '\0'; i++) {
+        last = path[i] == '/' ? i : last;
+    }
+    if (last == 0) {
+        return false;
+    }
+    path[last] = '\0';
+    return true;
+}
+
 
 int fdt_device_reg(const struct fdt *fdt, const char *path, uint32_t which, phys_t *base,
                    uint64_t *size) {

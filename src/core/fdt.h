@@ -10,6 +10,7 @@
 #define MINIKERN_CORE_FDT_H
 
 #include <stddef.h>
+#include <stdbool.h>
 #include <stdint.h>
 
 #include "core/types.h"
@@ -65,6 +66,18 @@ uint32_t fdt_get_u32(const struct fdt *fdt, const char *path, const char *prop, 
  * KERR_NOMEM when the path does not fit, which is a refusal rather than a
  * truncation, because half a path names the wrong node. */
 int fdt_find_compatible(const struct fdt *fdt, const char *compat, char *path, uint32_t cap);
+
+/* Finds the node carrying a given `phandle`, which is how one node in a
+ * device tree refers to another — an interrupt controller, a clock, a
+ * regulator. Resolving them is what makes a tree a graph rather than a list.
+ * KERR_NOENT when no node claims it. */
+int fdt_find_phandle(const struct fdt *fdt, uint32_t phandle, char *path, uint32_t cap);
+
+/* Cuts the last component off a path in place: "/cpus/cpu@1/x" becomes
+ * "/cpus/cpu@1". False when there is nothing to cut. Needed because a
+ * phandle usually names a child (a hart's interrupt controller) while the
+ * fact wanted is on its parent (the hart's `reg`). */
+bool fdt_parent_path(char *path);
 
 /* The `which`-th (base, size) pair of a node's `reg`, honouring the root's
  * `#address-cells` and `#size-cells`. Both are 64-bit, because on this

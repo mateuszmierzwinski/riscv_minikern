@@ -23,6 +23,8 @@ is named. The phase-by-phase record is `DEVELOPMENT_PROGRESS.md`.
 | Its own **16550 UART**, found that way, taking the console over from SBI | `boot_qemu_test` |
 | **A frame allocator and a kernel heap** over the memory the tree describes, with the kernel, the tree and the page tables reserved | `pmm_test`, `boot_qemu_test` |
 | **8 GiB of RAM**, read and tracked: 2 Mi frames | `boot_qemu_test` (an `-m 8G` boot), `pmm_test` (frames at 9 GiB) |
+| **Interrupts** through the PLIC, with each hart's *context* resolved from the tree rather than assumed to be its hart id | `boot_qemu_test` |
+| **A tick** through SBI's timer, keeping time: 50 ticks in 499 ms at 100 Hz | `boot_qemu_test` |
 | A printf-style formatter, command-line parsing, CRC-32C, SHA-256, SHA-512, Ed25519 verification | host tests, carried over |
 
 ## Carried over, not yet wired up

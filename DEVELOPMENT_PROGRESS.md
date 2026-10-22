@@ -152,10 +152,35 @@ Three things in it are *not* architecture-neutral and were fixed on the way in:
       that looks valid.
 - [ ] **P1.2 User address spaces**, lazy faults, `mmap`/`munmap`/`mprotect`.
       The VMA tree carries over; the page-table backing is Sv39.
-- [ ] **P1.3 The timer and the scheduler.** SBI's timer extension sets one
-      absolute deadline per hart against the `time` CSR — simpler than the
-      ARM generic timer's per-core comparator, and firmware-mediated so it is
-      the same on the emulator and the board.
+- [x] **P1.3a Interrupts and the tick (2026-10-22).** The PLIC, found in the
+      tree, and SBI's timer — one absolute deadline per hart against the
+      `time` CSR, firmware-mediated so it is identical on the emulator and the
+      board, where the ARM kernel programmed a comparator itself per core and
+      had to read `CNTFRQ` because the frequency differed between the two.
+      **The part nobody can guess, and the reason this is written the way it
+      is: a hart's PLIC *context* is a position in the controller's own
+      `interrupts-extended` list, not its hart id.** On QEMU's `virt`, hart 0's
+      supervisor context is **1**, because context 0 is its machine-mode
+      context — the firmware's. A kernel that assumed they matched would
+      enable another context's sources and wonder why nothing arrived. The
+      context is resolved by walking that list and following each phandle to
+      the hart it belongs to, which needed phandle resolution in the tree
+      reader (one scan, shared with `fdt_find_compatible`).
+      Claiming and completing are reads and writes of **one** register, so a
+      handler cannot end an interrupt without also being ready for the next —
+      which the GIC on the old architecture happily let you get wrong. A source
+      with no handler is **disabled** after one complaint, because an
+      unhandled interrupt re-asserts immediately and would otherwise starve
+      the machine while printing about it.
+      Proved by making the kernel wait for a known number of ticks and report
+      the elapsed time *by the counter*: **50 ticks in 499 ms** at 100 Hz. An
+      armed timer and a delivering one look identical in a boot log, and on the
+      old architecture that difference was a real bug — a core whose controller
+      had not been initialised ticked for ever without entering the kernel.
+      The tick re-arms from **the deadline that passed, not from now**, so a
+      slow handler costs latency rather than clock drift.
+- [ ] **P1.3b The scheduler** over that tick: threads, a run queue,
+      preemption.
 - [ ] **P1.4 Threads, context switch, and the kernel lock.** The ARM design
       holds: one lock around the kernel, taken on entry and released on exit,
       so that structures written for one core stay correct on five. The
