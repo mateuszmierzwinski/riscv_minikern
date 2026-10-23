@@ -1089,6 +1089,10 @@ static void run_init_from_disk(const char *path) {
     kprintf("init: %s exited with %lld after %llu syscalls (%llu stale-translation faults)\n",
             path, (long long)status, (unsigned long long)uspace_syscalls(),
             (unsigned long long)uspace_stale_faults());
+    /* Pages backed on first touch rather than at `mmap`. Zero would mean
+     * demand paging is not happening whatever the code says — the one
+     * number that tells "lazy" from "eager somewhere else". */
+    kprintf("mem: %llu pages backed on demand\n", (unsigned long long)uspace_demand_pages());
     report_hart_usage();
     /* The stack's own counters after a program that used it. A reset or a
      * drop is the difference between "the program's logic is wrong" and

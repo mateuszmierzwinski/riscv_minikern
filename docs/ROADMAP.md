@@ -161,9 +161,29 @@ Ordering inside a section is roughly by what unblocks the most.
 
 ## 2. Memory
 
-- [ ] **Demand paging.** (M) Pages are backed eagerly at `mmap` time, so a
-      large reservation that is never touched still costs nothing (it is
-      left unmapped), but a large *mapping* costs all of it immediately.
+- [x] **Demand paging.** (M) **Done.** A mapping now costs its pages when
+      they are *touched*: `mmap` records the region and backs nothing, and
+      the first fault on each page backs it with the region's rights.
+      It needs the **region record** rather than the page tables, which is
+      the whole reason this could not be done before `vma.c` was wired in:
+      to the page tables an unbacked page and an address nobody ever asked
+      for are identical, and backing the second would turn a wild pointer
+      into a silently working one. `vma_lookup` answers what the tables
+      cannot. A `PROT_NONE` reservation stays unbacked, and a write to a
+      read-only region still faults — the rights come from the region.
+      Measured on the board: **1396 pages** backed on first touch in a run
+      of the Go program, which is the number that tells "lazy" from "eager
+      somewhere else".
+      **One interaction, and it is the important part of this change.** The
+      kernel validates a user pointer by walking the process's page tables,
+      so a buffer the program has not written to yet had no entry and a
+      valid pointer read as `EFAULT`. The networking test caught it
+      immediately — a socket read failing with "bad address" into a freshly
+      allocated buffer. The validator now backs the page itself, which makes
+      "may the process touch this" and "will a touch succeed" the same
+      question. It backs rather than merely permitting because the kernel is
+      about to write through the pointer, and a kernel fault is a panic
+      where a program's would be ordinary.
 - [x] **Copy-on-write.** (L) **Done** for anonymous memory, with `fork`
       above. Not done for `MAP_PRIVATE` file mappings, which need
       file-backed mappings first.

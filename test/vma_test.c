@@ -127,6 +127,31 @@ static void test_a_full_window_has_no_room(void) {
     KTEST_CHECK(vma_find_free(&set, PAGE, 0, WINDOW_LO, WINDOW_HI, &at) == KERR_NOMEM);
 }
 
+/* Looking a region up by address, which demand paging needs: a fault is
+ * only worth backing if it lands in a region the process was given. */
+static void test_lookup_finds_the_region_an_address_is_in(void) {
+    struct vma_set s;
+    const struct vma *v;
+    memset(&s, 0, sizeof s);
+    KTEST_CHECK(vma_insert(&s, 0x10000u, 0x20000u, 1u, 0) == KERR_OK);
+    KTEST_CHECK(vma_insert(&s, 0x80000u, 0x90000u, 3u, 0) == KERR_OK);
+    v = vma_lookup(&s, 0x10000u);
+    KTEST_CHECK(v != NULL && v->start == 0x10000u);
+    /* Inside, not just at the start. */
+    v = vma_lookup(&s, 0x1ffffu);
+    KTEST_CHECK(v != NULL && v->start == 0x10000u);
+    /* The rights come back with it: that is what the fault handler needs. */
+    v = vma_lookup(&s, 0x85000u);
+    KTEST_CHECK(v != NULL && v->prot == 3u);
+    /* **Half-open**: the end address belongs to whatever is next, not to
+     * this region. Getting that wrong backs a page one past every mapping. */
+    KTEST_CHECK(vma_lookup(&s, 0x20000u) == NULL);
+    /* Outside everything, which is a wild pointer and must stay one. */
+    KTEST_CHECK(vma_lookup(&s, 0x5000u) == NULL);
+    KTEST_CHECK(vma_lookup(&s, 0x100000u) == NULL);
+    KTEST_CHECK(vma_lookup(NULL, 0x10000u) == NULL);
+}
+
 int main(void) {
     KTEST_RUN(test_insert_and_find);
     KTEST_RUN(test_overlap_is_refused);
@@ -138,5 +163,6 @@ int main(void) {
     KTEST_RUN(test_remove_splits_a_region);
     KTEST_RUN(test_removing_a_hole_is_not_an_error);
     KTEST_RUN(test_a_full_window_has_no_room);
+    KTEST_RUN(test_lookup_finds_the_region_an_address_is_in);
     return ktest_failures();
 }

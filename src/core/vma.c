@@ -1,5 +1,7 @@
 #include "core/vma.h"
 
+#include <stddef.h>
+
 #include <stdbool.h>
 
 #include "core/errno.h"
@@ -184,4 +186,19 @@ int vma_find_free(const struct vma_set *s, virt_t len, virt_t hint, virt_t lo, v
         return KERR_OK;
     }
     return highest_gap(s, len, lo, hi, addr);
+}
+
+const struct vma *vma_lookup(const struct vma_set *s, virt_t addr) {
+    if (s == NULL) {
+        return NULL;
+    }
+    for (uint32_t i = 0; i < s->n; i++) {
+        /* Half-open, like every range in this file: `end` is the first
+         * address *not* in the region, so an address exactly at `end`
+         * belongs to whatever comes next and not to this. */
+        if (addr >= s->v[i].start && addr < s->v[i].end) {
+            return &s->v[i];
+        }
+    }
+    return NULL;
 }

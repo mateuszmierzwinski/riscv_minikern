@@ -24,6 +24,16 @@
  * placement may hand out an address that is already in use. */
 static uint32_t unrecorded_regions;
 
+/* Pages backed on first touch rather than at `mmap`. The measure of whether
+ * demand paging is doing anything: zero means every mapping is still being
+ * backed up front. */
+static uint64_t demand_pages;
+
+/* Defined further down, next to the rest of the mapping machinery: the
+ * fault handler is above it because the trap path is read first. */
+static int back_one_page(struct uproc *p, virt_t va, uint32_t prot);
+static void published_addition(void);
+
 /* The generic Linux syscall numbers, which is the set RISC-V uses — and the
  * modern one: there is no `mmap2`, no `_llseek`, no `stat64`, no
  * `*_time64` duplicate of anything. The architecture this migrated from
@@ -399,6 +409,64 @@ static bool resolve_copy_on_write(struct trapframe *tf) {
     return true;
 }
 
+/* **Demand paging**: a fault inside a region the process was given, on a
+ * page that has no frame yet, is backed here rather than at `mmap`.
+ *
+ * Why it needs the region record and not the page tables: an unbacked page
+ * and an address nobody ever asked for are indistinguishable to the page
+ * tables, and backing the second would turn a wild pointer into a silently
+ * working one — the opposite of what a fault is for. `vma_lookup` answers
+ * the question the tables cannot.
+ *
+ * A `PROT_NONE` region stays unbacked on purpose: it is a reservation, and
+ * touching it is a fault the program has earned. So is a write to a region
+ * that is only readable — the rights come from the region, which is the
+ * whole reason they are recorded with it.
+ *
+ * What this buys is the thing the roadmap asked for: a mapping now costs
+ * its pages when they are *touched*, so a runtime that maps a large arena
+ * and uses a corner of it pays for the corner. What it costs is a fault per
+ * first touch, which is why `MAP_POPULATE` exists for callers that would
+ * rather pay up front.
+ */
+static bool back_on_demand(struct trapframe *tf) {
+    uint64_t code = tf->scause & ~SCAUSE_INTERRUPT;
+    struct uproc *me = uspace_current();
+    const struct vma *region;
+    virt_t page;
+    phys_t phys = 0;
+    uint64_t flags = 0, size = 0;
+    uint32_t want;
+    if (code != EXC_INSN_PAGE_FAULT && code != EXC_LOAD_PAGE_FAULT &&
+        code != EXC_STORE_PAGE_FAULT) {
+        return false;
+    }
+    if (me == NULL) {
+        return false;
+    }
+    page = tf->stval & ~(virt_t)(PAGE_SIZE - 1u);
+    /* Already mapped: this is somebody else's fault to handle — a
+     * copy-on-write store, or a stale translation. */
+    if (pgtable_lookup(&me->pt, page, &phys, &flags, &size)) {
+        return false;
+    }
+    region = vma_lookup(&me->vmas, tf->stval);
+    if (region == NULL || region->prot == 0) {
+        return false; /* not ours, or a reservation that must keep faulting */
+    }
+    want = code == EXC_INSN_PAGE_FAULT ? PROT_EXEC
+                                       : (code == EXC_STORE_PAGE_FAULT ? PROT_WRITE : PROT_READ);
+    if ((region->prot & want) == 0) {
+        return false; /* the region does not allow what was attempted */
+    }
+    if (back_one_page(me, page, region->prot) != KERR_OK) {
+        return false; /* out of memory: a fault the process must be told about */
+    }
+    demand_pages++;
+    published_addition();
+    return true;
+}
+
 static bool retry_after_stale_translation(struct trapframe *tf) {
     uint64_t code = tf->scause & ~SCAUSE_INTERRUPT;
     uint64_t want;
@@ -518,6 +586,11 @@ static bool on_user_trap(struct trapframe *tf) {
     if (resolve_copy_on_write(tf)) {
         handled_faults++;
         trace_handled_fault(tf, "copy-on-write");
+        return true;
+    }
+    if (back_on_demand(tf)) {
+        handled_faults++;
+        trace_handled_fault(tf, "demand paging");
         return true;
     }
     if (retry_after_stale_translation(tf)) {
@@ -764,6 +837,10 @@ static int map_signal_trampoline(struct uproc *p) {
 
 static void record_fixed_regions(struct uproc *p);
 
+
+uint64_t uspace_demand_pages(void) {
+    return demand_pages;
+}
 
 uint32_t uspace_unrecorded_regions(void) {
     return unrecorded_regions;
@@ -1120,6 +1197,44 @@ uint64_t uspace_syscalls(void) {
 /* Whether every page of a range carries the given rights in the running
  * process's table. A zero-length range is vacuously fine, which matters
  * because a caller may legitimately pass one. */
+/* Makes a page present if the process is entitled to it.
+ *
+ * **The interaction demand paging creates, and the reason it is here.** The
+ * kernel validates a user pointer by walking the process's page tables,
+ * which is the only honest test of "may this be touched". Once mappings are
+ * backed lazily, a buffer the program has not written to yet has no entry —
+ * so a perfectly valid pointer reads as `EFAULT`, and the first thing that
+ * happened was a socket read failing with "bad address" into a freshly
+ * allocated buffer.
+ *
+ * So the validator does what the fault handler would: if the address is
+ * inside a region with the rights being asked for, back it now. That makes
+ * "may the process touch this" and "will a touch succeed" the same
+ * question, which is what every caller already assumed.
+ *
+ * It backs rather than merely permitting, because the kernel is about to
+ * write through the pointer itself and a kernel fault is a panic. A program
+ * touching the page would have taken an ordinary fault; the kernel cannot.
+ */
+static bool make_present(struct uproc *p, virt_t va, uint64_t want) {
+    const struct vma *region = vma_lookup(&p->vmas, va);
+    uint32_t need;
+    if (region == NULL || region->prot == 0) {
+        return false;
+    }
+    /* The page-table bit asked for, as the region's rights spell it. */
+    need = (want & PTE_W) != 0 ? PROT_WRITE : ((want & PTE_X) != 0 ? PROT_EXEC : PROT_READ);
+    if ((region->prot & need) == 0) {
+        return false;
+    }
+    if (back_one_page(p, va & ~(virt_t)(PAGE_SIZE - 1u), region->prot) != KERR_OK) {
+        return false;
+    }
+    demand_pages++;
+    published_addition();
+    return true;
+}
+
 static bool range_has(virt_t at, uint32_t n, uint64_t want) {
     /* **The calling process's** tables, not the root program's. They were
      * the same thing while there was one process; with a child they are not,
@@ -1136,7 +1251,15 @@ static bool range_has(virt_t at, uint32_t n, uint64_t want) {
         phys_t phys = 0;
         uint64_t flags = 0, size = 0;
         if (!pgtable_lookup(&p->pt, va, &phys, &flags, &size)) {
-            return false;
+            /* Not mapped: either a page this process is entitled to and has
+             * not touched, or an address it has no claim on. The region
+             * record is what tells them apart. */
+            if (!make_present((struct uproc *)p, va, want)) {
+                return false;
+            }
+            if (!pgtable_lookup(&p->pt, va, &phys, &flags, &size)) {
+                return false;
+            }
         }
         if ((flags & want) != want || (flags & PTE_U) == 0) {
             return false;
@@ -1558,7 +1681,6 @@ int uspace_map_anon(struct uproc *p, virt_t at, uint64_t bytes, uint32_t prot, b
      * the program misbehaving later. */
     for (uint64_t i = 0; i < pages; i++) {
         virt_t va = base + i * PAGE_SIZE;
-        int rc;
         if (!fixed) {
             phys_t was = 0;
             uint64_t f = 0, sz = 0;
@@ -1566,11 +1688,19 @@ int uspace_map_anon(struct uproc *p, virt_t at, uint64_t bytes, uint32_t prot, b
                 replaced_pages++;
             }
         }
+        /* **Unmapped, and not re-backed.**
+         *
+         * This used to call `back_one_page` here, which is what made a
+         * large mapping cost all of its pages the moment it was asked for.
+         * The region is recorded below, and the first touch of each page
+         * faults into `back_on_demand`, which backs it with the region's
+         * rights.
+         *
+         * The unmap still has to happen: a fixed mapping replaces what was
+         * there, and leaving the old frame mapped under a new region's
+         * rights would be the previous contents showing through a fresh
+         * mapping — which a caller is entitled to assume is zero. */
         (void)uspace_unmap(p, va, PAGE_SIZE);
-        rc = back_one_page(p, va, prot);
-        if (rc != KERR_OK) {
-            return rc;
-        }
     }
     /* Recorded whatever its rights are: a reservation is a region of the
      * address space that is spoken for, and the whole point of the set is

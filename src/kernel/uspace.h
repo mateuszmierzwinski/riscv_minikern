@@ -405,6 +405,10 @@ uint32_t uspace_replaced_pages(void);
  * an address that is live. */
 uint32_t uspace_unrecorded_regions(void);
 
+/* How many pages were backed on first touch rather than at `mmap`. Zero
+ * means demand paging is not happening, whatever the code says. */
+uint64_t uspace_demand_pages(void);
+
 /* A child with an address space of its own, made of the parent's pages
  * copy-on-write. Unlike `uspace_fork_shared` (which is `vfork`), the two
  * processes are isolated from the moment it returns. */
