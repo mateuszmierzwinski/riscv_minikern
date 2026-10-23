@@ -36,6 +36,8 @@
 #define SYS_SETUID 146
 #define SYS_PRLIMIT64 261
 #define SYS_OPENAT 56
+#define SYS_MUNMAP 215
+#define SYS_MREMAP 216
 
 user_program_start:
     /* write(1, message, length) — the address comes from the program
@@ -536,6 +538,42 @@ user_hostile_start:
     bltz    a0, 5f
     ori     s1, s1, 16
 5:
+    /* 6: mremap() of the kernel's own text. The address is not read, so
+     * this is not the pointer class — it asks the kernel to *move* a
+     * mapping the process does not own, and the answer has to come from
+     * the process's own region record rather than from the page tables,
+     * which do map the kernel in every address space. */
+    li      a0, 0x80200000
+    li      a1, 4096
+    li      a2, 8192
+    li      a3, 1                /* MREMAP_MAYMOVE */
+    li      a4, 0
+    li      a7, SYS_MREMAP
+    ecall
+    bltz    a0, 6f
+    ori     s1, s1, 32
+6:
+    /* 7: and a mapping of its own moved *onto* the kernel. The destination
+     * is the dangerous direction: a move that landed there would map the
+     * kernel's frames into user space with the region's rights. */
+    li      a0, 0
+    li      a1, 4096
+    li      a2, 3
+    li      a3, 0x22
+    li      a4, -1
+    li      a5, 0
+    li      a7, SYS_MMAP
+    ecall
+    bltz    a0, 7f
+    li      a1, 4096
+    li      a2, 4096
+    li      a3, 3                /* MREMAP_MAYMOVE | MREMAP_FIXED */
+    li      a4, 0x80200000
+    li      a7, SYS_MREMAP
+    ecall
+    bltz    a0, 7f
+    ori     s1, s1, 64
+7:
     /* Surviving to here is most of the result: the kernel refused each one
      * rather than faulting inside itself. */
     mv      a0, s1
@@ -1032,3 +1070,180 @@ about_to:
     .ascii  "about to touch the kernel's memory\n"
 about_to_end:
 user_faulter_end:
+
+/* Roadmap §2: `mremap`, and the record `munmap` used to keep.
+ *
+ * Six independent checks, each setting one bit of the exit status, so a
+ * partial failure says *which* half works rather than only that something
+ * does not. **63 is a pass.**
+ *
+ * The shape of it is forced by what has to be proved. A mapping asked to
+ * grow will grow where it stands if the pages past its end are free, and
+ * that path moves nothing — so to see a move at all, the space above the
+ * mapping has to be occupied. The blocker is mapped **first** (placement
+ * takes the highest gap, so the blocker ends up above the subject) and is
+ * read-only, which keeps the record from merging the two into one region
+ * with the same rights and leaving nothing in the way.
+ *
+ *   1. the four markers written before the move are readable after it
+ *   2. the pages the growth added are usable
+ *   3. shrinking reports the same address
+ *   4. what the shrink kept still reads correctly
+ *   5. `mremap` of the address it moved **from** fails — the old range is
+ *      gone from the record, not merely unmapped
+ *   6. `mremap` of a range just handed to `munmap` fails, which is the
+ *      defect this found: nothing used to remove the record, so with demand
+ *      paging a read of returned memory was answered with a fresh zero page
+ *
+ * The last two are probes rather than faults on purpose: a program that
+ * proved the point by dying of SIGSEGV would take the other five bits with
+ * it.
+ */
+    .globl user_mremap_start
+    .globl user_mremap_end
+user_mremap_start:
+    li      s2, 0                /* the mask of checks that held */
+
+    /* The blocker: eight pages, read-only so it cannot merge with the
+     * subject, taking the highest gap in the window. */
+    li      a0, 0
+    li      a1, 8 * 4096
+    li      a2, 1                /* PROT_READ */
+    li      a3, 0x22             /* MAP_PRIVATE | MAP_ANONYMOUS */
+    li      a4, -1
+    li      a5, 0
+    li      a7, SYS_MMAP
+    ecall
+    bltz    a0, mr_no_memory
+    mv      s3, a0
+
+    /* The subject: four pages, immediately below the blocker. */
+    li      a0, 0
+    li      a1, 4 * 4096
+    li      a2, 3                /* PROT_READ | PROT_WRITE */
+    li      a3, 0x22
+    li      a4, -1
+    li      a5, 0
+    li      a7, SYS_MMAP
+    ecall
+    bltz    a0, mr_no_memory
+    mv      s4, a0
+
+    /* One marker per page: 1, 2, 3, 4. Writing them is also what makes the
+     * pages exist, since nothing is backed until it is touched. */
+    li      t3, 4096
+    mv      t1, s4
+    li      t2, 1
+    li      t4, 5
+mr_fill:
+    sd      t2, 0(t1)
+    add     t1, t1, t3
+    addi    t2, t2, 1
+    blt     t2, t4, mr_fill
+
+    /* Grow it to eight pages. The blocker is in the way, so this has to
+     * move — and `MREMAP_MAYMOVE` is the caller saying that is allowed. */
+    mv      a0, s4
+    li      a1, 4 * 4096
+    li      a2, 8 * 4096
+    li      a3, 1                /* MREMAP_MAYMOVE */
+    li      a4, 0
+    li      a7, SYS_MREMAP
+    ecall
+    bltz    a0, mr_refused
+    mv      s5, a0
+
+    /* 1: the markers survived the move. */
+    li      t3, 4096
+    mv      t1, s5
+    li      t2, 1
+    li      t4, 5
+mr_check:
+    ld      t5, 0(t1)
+    bne     t5, t2, mr_tail
+    add     t1, t1, t3
+    addi    t2, t2, 1
+    blt     t2, t4, mr_check
+    ori     s2, s2, 1
+
+    /* 2: the last of the added pages is usable. */
+mr_tail:
+    li      t3, 7 * 4096
+    add     t1, s5, t3
+    li      t2, 0x5a5a
+    sd      t2, 0(t1)
+    ld      t5, 0(t1)
+    bne     t5, t2, mr_shrink
+    ori     s2, s2, 2
+
+    /* 3: shrinking to two pages keeps the address. */
+mr_shrink:
+    mv      a0, s5
+    li      a1, 8 * 4096
+    li      a2, 2 * 4096
+    li      a3, 0
+    li      a4, 0
+    li      a7, SYS_MREMAP
+    ecall
+    bne     a0, s5, mr_head
+    ori     s2, s2, 4
+
+    /* 4: the two pages it kept still read 1 and 2. */
+mr_head:
+    ld      t5, 0(s5)
+    li      t2, 1
+    bne     t5, t2, mr_old
+    li      t3, 4096
+    add     t1, s5, t3
+    ld      t5, 0(t1)
+    li      t2, 2
+    bne     t5, t2, mr_old
+    ori     s2, s2, 8
+
+    /* 5: the address it moved from is gone from the record. */
+mr_old:
+    mv      a0, s4
+    li      a1, 4 * 4096
+    li      a2, 4 * 4096
+    li      a3, 0
+    li      a4, 0
+    li      a7, SYS_MREMAP
+    ecall
+    bgez    a0, mr_unmap
+    ori     s2, s2, 16
+
+    /* 6: and so is a range just unmapped. */
+mr_unmap:
+    mv      a0, s5
+    li      a1, 2 * 4096
+    li      a7, SYS_MUNMAP
+    ecall
+    bnez    a0, mr_done
+    mv      a0, s5
+    li      a1, 2 * 4096
+    li      a2, 2 * 4096
+    li      a3, 0
+    li      a4, 0
+    li      a7, SYS_MREMAP
+    ecall
+    bgez    a0, mr_done
+    ori     s2, s2, 32
+
+mr_done:
+    mv      a0, s2
+    li      a7, SYS_EXIT_GROUP
+    ecall
+mr_no_memory:
+    li      a0, 151
+    li      a7, SYS_EXIT_GROUP
+    ecall
+    /* A refused move reports **which** refusal: 200 plus the errno, so
+     * `EFAULT` is 214, `ENOMEM` 212 and `EINVAL` 222. A bare "it failed"
+     * costs a board run to narrow down, and the status is free. */
+mr_refused:
+    neg     a0, a0
+    addi    a0, a0, 200
+    li      a7, SYS_EXIT_GROUP
+    ecall
+5:  j       5b
+user_mremap_end:

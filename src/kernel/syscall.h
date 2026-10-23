@@ -73,6 +73,7 @@
 #define SYS_GETTID 178u
 #define SYS_BRK 214u
 #define SYS_MUNMAP 215u
+#define SYS_MREMAP 216u
 #define SYS_CLONE 220u
 #define SYS_MMAP 222u
 #define SYS_MPROTECT 226u

@@ -32,6 +32,8 @@ static uint64_t demand_pages;
 /* Defined further down, next to the rest of the mapping machinery: the
  * fault handler is above it because the trap path is read first. */
 static int back_one_page(struct uproc *p, virt_t va, uint32_t prot);
+static int drop_pages(struct uproc *p, virt_t at, uint64_t bytes);
+static void record_stack(struct uproc *p);
 static void published_addition(void);
 
 /* The generic Linux syscall numbers, which is the set RISC-V uses — and the
@@ -198,6 +200,22 @@ int uspace_build(struct uproc *p, const void *program, uint32_t bytes) {
         rc = pgtable_map(&p->pt, USER_STACK_TOP - (uint64_t)(i + 1u) * PAGE_SIZE,
                          stack + (uint64_t)i * PAGE_SIZE, PAGE_SIZE, PT_PROT_RW | PT_PROT_USER);
     }
+    /* **And the stack recorded too** — the same rule as the text page above,
+     * missed on the same path, and this one was live. Nothing recorded it
+     * here, so the 64 pages the program was running on were addresses
+     * `mmap` believed were free: the first mapping an embedded program asked
+     * for was placed on **the top eight pages of its own stack**, and
+     * `uspace_map_anon` drops the pages of the range before it records it,
+     * so the stack under the running program was handed back to the
+     * allocator. It was found by this section's `mremap` test, which is the
+     * first embedded program to both use its stack and call `mmap`; before
+     * it, every program did one or the other. The ELF path calls
+     * `record_fixed_regions`, which is why real programs were safe.
+     *
+     * Fourth instance of the rule, and the pattern is now unmistakable: it
+     * breaks once per *path* that builds an address space, because each one
+     * maps something the others do not. */
+    record_stack(p);
     if (rc != KERR_OK) {
         return rc;
     }
@@ -415,7 +433,7 @@ static bool resolve_copy_on_write(struct trapframe *tf) {
  * Why it needs the region record and not the page tables: an unbacked page
  * and an address nobody ever asked for are indistinguishable to the page
  * tables, and backing the second would turn a wild pointer into a silently
- * working one — the opposite of what a fault is for. `vma_lookup` answers
+ * working one — the opposite of what a fault is for. `vma_find` answers
  * the question the tables cannot.
  *
  * A `PROT_NONE` region stays unbacked on purpose: it is a reservation, and
@@ -450,7 +468,7 @@ static bool back_on_demand(struct trapframe *tf) {
     if (pgtable_lookup(&me->pt, page, &phys, &flags, &size)) {
         return false;
     }
-    region = vma_lookup(&me->vmas, tf->stval);
+    region = vma_find(&me->vmas, tf->stval);
     if (region == NULL || region->prot == 0) {
         return false; /* not ours, or a reservation that must keep faulting */
     }
@@ -1217,7 +1235,7 @@ uint64_t uspace_syscalls(void) {
  * touching the page would have taken an ordinary fault; the kernel cannot.
  */
 static bool make_present(struct uproc *p, virt_t va, uint64_t want) {
-    const struct vma *region = vma_lookup(&p->vmas, va);
+    const struct vma *region = vma_find(&p->vmas, va);
     uint32_t need;
     if (region == NULL || region->prot == 0) {
         return false;
@@ -1468,11 +1486,27 @@ uint32_t uspace_replaced_pages(void) {
  * first allocation a Go runtime made landed on the stack it was running on,
  * and the program jumped to nothing. A record of the address space has to
  * include everything in it, not everything the program requested. */
-static void record_fixed_regions(struct uproc *p) {
+/* The stack. **Every** build path makes one, at the same address, and no
+ * path asks `mmap` for it — which is exactly why it has to be recorded by
+ * each of them rather than by the one that happened to be written first. */
+static void record_stack(struct uproc *p) {
     virt_t stack_low = USER_STACK_TOP - (virt_t)USER_STACK_PAGES * PAGE_SIZE;
     (void)vma_insert(&p->vmas, stack_low, USER_STACK_TOP, PROT_READ | PROT_WRITE, VMA_GROWSDOWN);
+}
+
+/* The page signal handlers return through, which only the ELF path maps —
+ * so only that path records it. Recording it for a program that has none
+ * would be a region with nothing behind it, and demand paging answers a
+ * touch of such a region with a blank page instead of the fault it
+ * deserves. A record must describe the address space, in both directions. */
+static void record_trampoline(struct uproc *p) {
     (void)vma_insert(&p->vmas, SIGNAL_TRAMPOLINE, SIGNAL_TRAMPOLINE + PAGE_SIZE,
                      PROT_READ | PROT_EXEC, 0);
+}
+
+static void record_fixed_regions(struct uproc *p) {
+    record_stack(p);
+    record_trampoline(p);
 }
 
 /* ── fork ──────────────────────────────────────────────────────────────── */
@@ -1696,11 +1730,16 @@ int uspace_map_anon(struct uproc *p, virt_t at, uint64_t bytes, uint32_t prot, b
          * faults into `back_on_demand`, which backs it with the region's
          * rights.
          *
-         * The unmap still has to happen: a fixed mapping replaces what was
+         * The pages still have to go: a fixed mapping replaces what was
          * there, and leaving the old frame mapped under a new region's
          * rights would be the previous contents showing through a fresh
-         * mapping — which a caller is entitled to assume is zero. */
-        (void)uspace_unmap(p, va, PAGE_SIZE);
+         * mapping — which a caller is entitled to assume is zero.
+         *
+         * `drop_pages` and not `uspace_unmap`, because the record is this
+         * function's to rewrite: it removes and re-inserts the whole range
+         * below. Going through `munmap`'s half would remove the record a
+         * page at a time, splitting a region once per page on the way. */
+        (void)drop_pages(p, va, PAGE_SIZE);
     }
     /* Recorded whatever its rights are: a reservation is a region of the
      * address space that is spoken for, and the whole point of the set is
@@ -1717,7 +1756,7 @@ int uspace_map_anon(struct uproc *p, virt_t at, uint64_t bytes, uint32_t prot, b
     if (vma_remove(&p->vmas, base, base + pages * PAGE_SIZE, NULL, NULL) != KERR_OK ||
         vma_insert(&p->vmas, base, base + pages * PAGE_SIZE, prot, 0) != KERR_OK) {
         unrecorded_regions++;
-        (void)uspace_unmap(p, base, pages * PAGE_SIZE);
+        (void)drop_pages(p, base, pages * PAGE_SIZE);
         return KERR_NOMEM;
     }
     *out = base;
@@ -1725,9 +1764,17 @@ int uspace_map_anon(struct uproc *p, virt_t at, uint64_t bytes, uint32_t prot, b
     return KERR_OK;
 }
 
-int uspace_unmap(struct uproc *p, virt_t at, uint64_t bytes) {
+/* Drops the pages backing a range and leaves the address-space record
+ * alone.
+ *
+ * The two halves of unmapping are separate because its callers want
+ * different ones. A fixed `mmap` drops pages and then records a *new*
+ * region over the same addresses; `mprotect` to `PROT_NONE` drops the pages
+ * of a region that is still there as a reservation; a shrinking `brk` drops
+ * pages below the break, which the record never described. Only `munmap`
+ * wants both, and that is `uspace_unmap`. */
+static int drop_pages(struct uproc *p, virt_t at, uint64_t bytes) {
     uint64_t pages = 0;
-    bool changed = false;
     if ((at & (PAGE_SIZE - 1u)) != 0 || !page_count(bytes, &pages)) {
         return KERR_INVAL;
     }
@@ -1740,21 +1787,231 @@ int uspace_unmap(struct uproc *p, virt_t at, uint64_t bytes) {
              * still have it cached — so the page cannot be handed back to
              * the allocator until every hart has been told. Freeing first
              * would let a hart write through a stale translation into memory
-             * that now belongs to something else. */
-            /* The mapping is gone from the tables, but another hart may
-             * still have it cached — so the page cannot be handed back to
-             * the allocator until every hart has been told. Freeing first
-             * would let a hart write through a stale translation into
-             * memory that now belongs to something else. */
-            changed = true;
+             * that now belongs to something else. That is also why the flush
+             * is inside the loop and there is no second one after it: every
+             * removal is already published before its frame is reusable. */
             published_removal();
             mem_free_pages(phys, 1);
         }
     }
-    if (changed) {
-        published_removal();
-    }
     return KERR_OK;
+}
+
+/* `munmap`: the pages **and** the record.
+ *
+ * **Nothing used to remove the record**, and the cost of that grew. While
+ * mappings were backed eagerly it was an address-space leak: the range kept
+ * its entry for ever, so the gap search never offered those addresses again
+ * and a program that mapped and unmapped in a loop walked down the window
+ * until `mmap` returned `ENOMEM` with the address space nearly empty.
+ *
+ * Demand paging made it worse than a leak. A fault inside a recorded region
+ * is backed on the spot, so a read of memory the program had *returned*
+ * found a region that still claimed it and was handed a fresh zero page —
+ * a use-after-free that silently works, which is the opposite of what
+ * unmapping is for. The record is the authority on what a process may
+ * touch, so forgetting a range is not bookkeeping: it is the unmapping.
+ *
+ * The record goes first. It is the only step that can fail having changed
+ * nothing (a partial unmap splits a region, and the split needs a slot), so
+ * doing it first means a refusal leaves the mapping intact rather than
+ * leaving pages freed under a record that still promises them. */
+int uspace_unmap(struct uproc *p, virt_t at, uint64_t bytes) {
+    uint64_t pages = 0;
+    if ((at & (PAGE_SIZE - 1u)) != 0 || !page_count(bytes, &pages)) {
+        return KERR_INVAL;
+    }
+    if (vma_remove(&p->vmas, at, at + pages * PAGE_SIZE, NULL, NULL) != KERR_OK) {
+        return KERR_NOMEM;
+    }
+    return drop_pages(p, at, bytes);
+}
+
+/* ── mremap ────────────────────────────────────────────────────────────── */
+
+/* How many pages `mremap` has re-pointed rather than copied. */
+static uint64_t moved_pages;
+
+uint64_t uspace_moved_pages(void) {
+    return moved_pages;
+}
+
+/* Times a page was found mapped at an address the region record called
+ * free. Always a bug, in whatever put it there. */
+static uint32_t stale_records;
+
+uint32_t uspace_stale_records(void) {
+    return stale_records;
+}
+
+/* The one region the old range lies inside, or NULL.
+ *
+ * Linux's rule, and it is not a formality: a range spanning two regions has
+ * two sets of rights, and moving it would have to invent one for the
+ * result. The caller is told `EFAULT`, which is also the answer for a range
+ * that is not mapped at all — including one a program has already unmapped,
+ * now that `munmap` forgets it. */
+static const struct vma *whole_region(struct uproc *p, virt_t at, uint64_t bytes) {
+    const struct vma *r = vma_find(&p->vmas, at);
+    if (r == NULL || bytes > r->end - at) {
+        return NULL;
+    }
+    return r;
+}
+
+/* Re-points one page's frame at a new address, or does nothing when there is
+ * no frame there.
+ *
+ * **The flags come from the old entry, not from the region's rights.** A
+ * page can carry less than its region allows — a copy-on-write page is left
+ * read-only with `PTE_COW` set, so a child's and a parent's next store each
+ * fault — and recomputing the flags from `prot` would hand it back writable,
+ * which is two processes sharing a page each believes it owns. That is the
+ * kind of corruption this kernel has already paid for once.
+ *
+ * An absent page stays absent, and that is not a shortcut: with demand
+ * paging a mapping is mostly holes, and faulting them in to move them would
+ * make a move cost what the mapping would have cost eagerly. */
+static int move_one_frame(struct uproc *p, virt_t from, virt_t to) {
+    phys_t phys = 0;
+    uint64_t flags = 0, size = 0;
+    int rc;
+    if (!pgtable_lookup(&p->pt, from, &phys, &flags, &size)) {
+        return KERR_OK;
+    }
+    rc = pgtable_map(&p->pt, to, phys, PAGE_SIZE, flags);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    (void)pgtable_unmap(&p->pt, from);
+    moved_pages++;
+    return KERR_OK;
+}
+
+/* Moves a whole range's frames, all or nothing.
+ *
+ * Nothing is copied, which is the entire reason `mremap` exists: growing a
+ * 64 MiB arena costs the page-table entries for the pages that have been
+ * touched and not one byte of memcpy.
+ *
+ * Only the table levels can run out, and part-way through is the one state
+ * a caller cannot be told about — so what moved moves back, and the refusal
+ * leaves the mapping exactly where it was. Putting it back cannot fail in
+ * turn: unmapping leaves the intermediate tables behind, so the addresses
+ * being restored still have theirs. */
+static int move_frames(struct uproc *p, virt_t from, virt_t to, uint64_t pages) {
+    uint64_t before = moved_pages;
+    int rc = KERR_OK;
+    for (uint64_t i = 0; i < pages; i++) {
+        rc = move_one_frame(p, from + i * PAGE_SIZE, to + i * PAGE_SIZE);
+        if (rc == KERR_OK) {
+            continue;
+        }
+        while (i-- > 0) {
+            (void)move_one_frame(p, to + i * PAGE_SIZE, from + i * PAGE_SIZE);
+        }
+        moved_pages = before; /* a move and its undoing are not two moves */
+        return rc;
+    }
+    return rc;
+}
+
+/* Grows a mapping where it stands, by recording the pages past its end.
+ *
+ * Inserting the tail **is** the test of whether the space is free:
+ * `vma_insert` refuses a range that overlaps a region, and one that is
+ * adjacent with the same rights is merged into the region it extends. So
+ * the whole operation is a record change — demand paging means the new
+ * pages cost nothing until they are touched, which is what makes growing in
+ * place the cheap case rather than merely the convenient one. */
+static int grow_in_place(struct uproc *p, virt_t at, uint64_t old_bytes, uint64_t new_bytes,
+                         uint32_t prot) {
+    if (new_bytes > USER_STACK_TOP - at) {
+        return KERR_NOMEM;
+    }
+    return vma_insert(&p->vmas, at + old_bytes, at + new_bytes, prot, 0);
+}
+
+/* Moves a mapping somewhere it fits.
+ *
+ * The destination is recorded **first**, because that is the only step that
+ * can fail without having changed anything — and recording it is also what
+ * makes the destination unavailable to anything else that looks for a gap.
+ * A caller-chosen destination that overlaps the source is refused by the
+ * insert itself, which is `EINVAL` and the right answer. */
+static int move_mapping(struct uproc *p, virt_t at, uint64_t old_bytes, uint64_t new_bytes,
+                        uint32_t prot, virt_t to, virt_t *out) {
+    virt_t base = to != 0 ? to : place_mapping(p, 0, new_bytes / PAGE_SIZE);
+    int rc;
+    if (base == 0) {
+        return KERR_NOMEM; /* no gap in the window is large enough */
+    }
+    /* A caller-chosen destination has to be inside the window `mmap` places
+     * into. Below it lie the program's text and its break, and the break is
+     * **not** in the region record — so an overlap there is one `vma_insert`
+     * cannot see, and the move would map over live memory. */
+    if (base < USER_MMAP_BASE || base >= USER_STACK_TOP || new_bytes > USER_STACK_TOP - base) {
+        return KERR_INVAL;
+    }
+    rc = vma_insert(&p->vmas, base, base + new_bytes, prot, 0);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    rc = move_frames(p, at, base, old_bytes / PAGE_SIZE);
+    if (rc != KERR_OK) {
+        (void)vma_remove(&p->vmas, base, base + new_bytes, NULL, NULL);
+        /* **The destination was already mapped**, at an address the record
+         * said was free. That is not a reason to refuse a move; it is the
+         * record and the page tables disagreeing, and the move is the only
+         * thing in a position to notice. Counted rather than flattened into
+         * the caller's `ENOMEM`, because it is the symptom of a mapping that
+         * nothing recorded — which is how this kernel's worst class of bug
+         * presents, and it was this very path that found the last one. */
+        if (rc == KERR_EXIST) {
+            stale_records++;
+            rc = KERR_NOMEM; /* what `mremap` is allowed to say */
+        }
+        return rc;
+    }
+    (void)vma_remove(&p->vmas, at, at + old_bytes, NULL, NULL);
+    published_removal(); /* the old addresses no longer translate anywhere */
+    *out = base;
+    return KERR_OK;
+}
+
+int uspace_remap(struct uproc *p, virt_t at, uint64_t old_bytes, uint64_t new_bytes, bool may_move,
+                 virt_t to, virt_t *out) {
+    uint64_t old_pages = 0, new_pages = 0;
+    const struct vma *region;
+    uint32_t prot;
+    if (p == NULL || out == NULL || (at & (PAGE_SIZE - 1u)) != 0 || (to & (PAGE_SIZE - 1u)) != 0) {
+        return KERR_INVAL;
+    }
+    if (!page_count(old_bytes, &old_pages) || !page_count(new_bytes, &new_pages)) {
+        return KERR_INVAL;
+    }
+    old_bytes = old_pages * PAGE_SIZE;
+    new_bytes = new_pages * PAGE_SIZE;
+    region = whole_region(p, at, old_bytes);
+    if (region == NULL) {
+        return KERR_FAULT;
+    }
+    prot = region->prot; /* read now: the next insert or remove invalidates it */
+    *out = at;
+    if (new_bytes < old_bytes) {
+        return uspace_unmap(p, at + new_bytes, old_bytes - new_bytes);
+    }
+    if (to == 0 && new_bytes == old_bytes) {
+        return KERR_OK;
+    }
+    if (to == 0 && grow_in_place(p, at, old_bytes, new_bytes, prot) == KERR_OK) {
+        published_addition();
+        return KERR_OK;
+    }
+    if (!may_move) {
+        return KERR_NOMEM;
+    }
+    return move_mapping(p, at, old_bytes, new_bytes, prot, to, out);
 }
 
 int uspace_protect(struct uproc *p, virt_t at, uint64_t bytes, uint32_t prot) {
@@ -1776,7 +2033,7 @@ int uspace_protect(struct uproc *p, virt_t at, uint64_t bytes, uint32_t prot) {
              * this is the moment it gets a page. */
             rc = back_one_page(p, va, prot);
         } else if (prot == 0) {
-            rc = uspace_unmap(p, va, PAGE_SIZE);
+            rc = drop_pages(p, va, PAGE_SIZE);
         } else {
             (void)pgtable_unmap(&p->pt, va);
             rc = pgtable_map(&p->pt, va, phys, PAGE_SIZE, prot_bits(prot));
@@ -1804,7 +2061,7 @@ virt_t uspace_brk(struct uproc *p, virt_t want) {
         }
     }
     if (to < from) {
-        (void)uspace_unmap(p, to, from - to);
+        (void)drop_pages(p, to, from - to);
     }
     p->brk = want;
     /* The break only ever grows here (a shrink unmaps, and that path

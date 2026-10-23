@@ -116,6 +116,13 @@ static uint64_t complained[8];
 #define MAP_FIXED 0x10u
 #define MAP_ANONYMOUS 0x20u
 
+/* The flags `mremap` is called with. `MREMAP_FIXED` is the only one that
+ * reads the fifth argument, which is why the argument is not read without
+ * it: the register holds whatever the caller left there. */
+#define MREMAP_MAYMOVE 0x01u
+#define MREMAP_FIXED 0x02u
+#define MREMAP_DONTUNMAP 0x04u
+
 /* The clocks `clock_gettime` knows. Both come from the same tick here: this
  * kernel has no wall clock, and inventing one would be worse than a
  * monotonic count that is honest about what it is. */
@@ -159,6 +166,29 @@ static int64_t sys_mmap(struct trapframe *tf) {
 
 static int64_t sys_munmap(struct trapframe *tf) {
     return uspace_unmap(uspace_current(), sysarg(tf, 0), sysarg(tf, 1));
+}
+
+/* `mremap(old, old_size, new_size, flags, new_address)`.
+ *
+ * `MREMAP_DONTUNMAP` is **refused** rather than approximated: it asks for
+ * the mapping to move and the old range to stay mapped and empty, so a
+ * program can watch it being touched again. Treating it as an ordinary move
+ * would leave such a program faulting on addresses it was promised, and a
+ * flag honoured in name only is worse than one that is not there. */
+static int64_t sys_mremap(struct trapframe *tf) {
+    uint64_t flags = sysarg(tf, 3);
+    virt_t to = (flags & MREMAP_FIXED) != 0 ? sysarg(tf, 4) : 0;
+    virt_t out = 0;
+    int rc;
+    if ((flags & MREMAP_DONTUNMAP) != 0) {
+        return KERR_INVAL;
+    }
+    if ((flags & MREMAP_FIXED) != 0 && (flags & MREMAP_MAYMOVE) == 0) {
+        return KERR_INVAL; /* a destination the caller will not let it move to */
+    }
+    rc = uspace_remap(uspace_current(), sysarg(tf, 0), sysarg(tf, 1), sysarg(tf, 2),
+                      (flags & MREMAP_MAYMOVE) != 0, to, &out);
+    return rc == KERR_OK ? (int64_t)out : rc;
 }
 
 static int64_t sys_mprotect(struct trapframe *tf) {
@@ -1000,6 +1030,7 @@ static const struct syscall_entry table[] = {
     {SYS_BRK, "brk", sys_brk},
     {SYS_MMAP, "mmap", sys_mmap},
     {SYS_MUNMAP, "munmap", sys_munmap},
+    {SYS_MREMAP, "mremap", sys_mremap},
     {SYS_MPROTECT, "mprotect", sys_mprotect},
     {SYS_MADVISE, "madvise", sys_ok},
     {SYS_CLOCK_GETTIME, "clock_gettime", sys_clock_gettime},

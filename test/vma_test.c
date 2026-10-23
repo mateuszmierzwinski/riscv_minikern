@@ -129,27 +129,72 @@ static void test_a_full_window_has_no_room(void) {
 
 /* Looking a region up by address, which demand paging needs: a fault is
  * only worth backing if it lands in a region the process was given. */
-static void test_lookup_finds_the_region_an_address_is_in(void) {
+static void test_find_finds_the_region_an_address_is_in(void) {
     struct vma_set s;
     const struct vma *v;
     memset(&s, 0, sizeof s);
     KTEST_CHECK(vma_insert(&s, 0x10000u, 0x20000u, 1u, 0) == KERR_OK);
     KTEST_CHECK(vma_insert(&s, 0x80000u, 0x90000u, 3u, 0) == KERR_OK);
-    v = vma_lookup(&s, 0x10000u);
+    v = vma_find(&s, 0x10000u);
     KTEST_CHECK(v != NULL && v->start == 0x10000u);
     /* Inside, not just at the start. */
-    v = vma_lookup(&s, 0x1ffffu);
+    v = vma_find(&s, 0x1ffffu);
     KTEST_CHECK(v != NULL && v->start == 0x10000u);
     /* The rights come back with it: that is what the fault handler needs. */
-    v = vma_lookup(&s, 0x85000u);
+    v = vma_find(&s, 0x85000u);
     KTEST_CHECK(v != NULL && v->prot == 3u);
     /* **Half-open**: the end address belongs to whatever is next, not to
      * this region. Getting that wrong backs a page one past every mapping. */
-    KTEST_CHECK(vma_lookup(&s, 0x20000u) == NULL);
+    KTEST_CHECK(vma_find(&s, 0x20000u) == NULL);
     /* Outside everything, which is a wild pointer and must stay one. */
-    KTEST_CHECK(vma_lookup(&s, 0x5000u) == NULL);
-    KTEST_CHECK(vma_lookup(&s, 0x100000u) == NULL);
-    KTEST_CHECK(vma_lookup(NULL, 0x10000u) == NULL);
+    KTEST_CHECK(vma_find(&s, 0x5000u) == NULL);
+    KTEST_CHECK(vma_find(&s, 0x100000u) == NULL);
+    KTEST_CHECK(vma_find(NULL, 0x10000u) == NULL);
+}
+
+/* How `mremap` grows a mapping where it stands: it records the pages past
+ * the end, and the set merges the tail into the region it extends. One
+ * region afterwards, not two, which is what keeps a runtime that grows a
+ * mapping repeatedly from spending a slot per growth. */
+static void test_growing_in_place_is_an_insert_that_merges(void) {
+    const struct vma *v;
+    fresh();
+    KTEST_CHECK(vma_insert(&set, WINDOW_LO, WINDOW_LO + 4u * PAGE, 3u, 0) == KERR_OK);
+    KTEST_CHECK(vma_insert(&set, WINDOW_LO + 4u * PAGE, WINDOW_LO + 8u * PAGE, 3u, 0) == KERR_OK);
+    KTEST_CHECK(set.n == 1u);
+    v = vma_find(&set, WINDOW_LO + 7u * PAGE);
+    KTEST_CHECK(v != NULL && v->start == WINDOW_LO && v->end == WINDOW_LO + 8u * PAGE);
+}
+
+/* And how it finds out that it cannot: the insert *is* the test, because a
+ * range overlapping a region is refused. A growth that asked a separate
+ * "is it free?" question and then inserted would have two answers to keep
+ * in step. */
+static void test_an_occupied_tail_refuses_the_growth(void) {
+    fresh();
+    KTEST_CHECK(vma_insert(&set, WINDOW_LO, WINDOW_LO + 4u * PAGE, 3u, 0) == KERR_OK);
+    /* The blocker, with different rights so it cannot merge away. */
+    KTEST_CHECK(vma_insert(&set, WINDOW_LO + 4u * PAGE, WINDOW_LO + 8u * PAGE, 1u, 0) == KERR_OK);
+    KTEST_CHECK(vma_insert(&set, WINDOW_LO + 4u * PAGE, WINDOW_LO + 6u * PAGE, 3u, 0) ==
+                KERR_INVAL);
+    KTEST_CHECK(set.n == 2u);
+}
+
+/* What `munmap` has to do and did not: a range that is removed from the
+ * record is free again, so the gap search offers it. While nothing removed
+ * it, the addresses were spoken for for ever — and once pages are backed on
+ * demand, a region that still claims a range answers a touch of it with a
+ * fresh page instead of a fault. */
+static void test_a_removed_range_is_offered_again(void) {
+    virt_t at = 0;
+    fresh();
+    KTEST_CHECK(vma_insert(&set, WINDOW_HI - 4u * PAGE, WINDOW_HI, 3u, 0) == KERR_OK);
+    KTEST_CHECK(vma_find_free(&set, 4u * PAGE, 0, WINDOW_LO, WINDOW_HI, &at) == KERR_OK);
+    KTEST_CHECK(at == WINDOW_HI - 8u * PAGE);
+    KTEST_CHECK(vma_remove(&set, WINDOW_HI - 4u * PAGE, WINDOW_HI, NULL, NULL) == KERR_OK);
+    KTEST_CHECK(vma_find(&set, WINDOW_HI - PAGE) == NULL);
+    KTEST_CHECK(vma_find_free(&set, 4u * PAGE, 0, WINDOW_LO, WINDOW_HI, &at) == KERR_OK);
+    KTEST_CHECK(at == WINDOW_HI - 4u * PAGE);
 }
 
 int main(void) {
@@ -163,6 +208,9 @@ int main(void) {
     KTEST_RUN(test_remove_splits_a_region);
     KTEST_RUN(test_removing_a_hole_is_not_an_error);
     KTEST_RUN(test_a_full_window_has_no_room);
-    KTEST_RUN(test_lookup_finds_the_region_an_address_is_in);
+    KTEST_RUN(test_find_finds_the_region_an_address_is_in);
+    KTEST_RUN(test_growing_in_place_is_an_insert_that_merges);
+    KTEST_RUN(test_an_occupied_tail_refuses_the_growth);
+    KTEST_RUN(test_a_removed_range_is_offered_again);
     return ktest_failures();
 }

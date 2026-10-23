@@ -27,6 +27,21 @@ Ordering inside a section is roughly by what unblocks the most.
       **passes**, so what remains is something a Go runtime does that it
       does not. `CLAUDE.md` lists everything ruled out and the detectors
       left in the tree.
+- [x] **An embedded program's stack was not in its own address-space
+      record.** (S) **Found and fixed** by §2's `mremap` test, which is the
+      first embedded program to both use its stack and call `mmap`. The raw
+      program path mapped 64 stack pages and recorded none of them, so
+      placement believed those addresses were free and handed out **the top
+      eight pages of the running program's own stack** — and `mmap` drops the
+      pages of a range before recording it, so the stack under the program
+      went back to the allocator. The ELF path records them, which is why
+      real programs were never affected and this sat in the tree unseen.
+      Fourth instance of "the record has to include everything in the
+      address space", and the pattern is now clear: it breaks once per
+      **path** that builds one, because each maps something the others do
+      not. `uspace_stale_records` turns the next one into a report — it
+      counts a page found mapped at an address the record called free, which
+      only a move is in a position to notice.
 - [ ] **`sched_end_siblings` leaves threads running on other harts.** (S)
       It marks them `THREAD_DYING` and the process is torn down; a thread
       still executing on another hart runs until its next trap with its
@@ -190,13 +205,50 @@ Ordering inside a section is roughly by what unblocks the most.
 - [ ] **File-backed mappings.** (M) `mmap` of a file is not supported, so a
       dynamic loader cannot work and neither can anything that maps a file
       to read it.
-- [ ] **`mremap`.** (S) A runtime that grows a mapping has to unmap and
-      remap instead.
+- [x] **`mremap`.** (S) **Done.** Shrinking unmaps the tail; growing takes
+      the pages past the end when they are free and otherwise moves the
+      mapping, which needs `MREMAP_MAYMOVE` — a caller that cannot cope with
+      its memory changing address says so by withholding it. A caller-chosen
+      destination (`MREMAP_FIXED`) is honoured inside the window `mmap`
+      places into and refused outside it, because the program's break is not
+      in the region record and an overlap there is one nothing could see.
+      `MREMAP_DONTUNMAP` is refused rather than approximated.
+      **Nothing is copied**: the frames that exist are re-pointed at the new
+      addresses and the holes stay holes, so a move costs page-table entries
+      and no memcpy. `uspace_moved_pages` makes that a measurement rather
+      than a claim — on the board, a four-page mapping grown to eight across
+      a blocker reports **4 pages moved and none newly backed**.
+      Growing in place is `vma_insert` of the tail, and the insert **is** the
+      test of whether the space is free: a range that overlaps is refused and
+      one that is adjacent with the same rights is merged into the region it
+      extends. Two answers kept in step is how they drift apart.
+      Verified on the board (`minikern.mremap=1`), whose exit status is a
+      bitmask of six checks so a partial failure says which half works:
+      **63**.
+- [x] **The record `munmap` never cleared.** (S) **Done**, and it was a live
+      defect rather than a tidy-up. Nothing removed a region from the
+      address-space record when a program unmapped it. While mappings were
+      backed eagerly that was an address-space leak — the addresses stayed
+      spoken for, so the gap search never offered them again. Demand paging
+      made it worse than a leak: a fault inside a recorded region is backed
+      on the spot, so a read of memory the program had **returned** found a
+      region that still claimed it and was handed a fresh zero page. A
+      use-after-free that silently works is the opposite of what unmapping
+      is for.
+      The two halves of unmapping are now separate functions, because the
+      callers want different ones: a fixed `mmap` drops pages and records a
+      new region over the same addresses, `mprotect` to `PROT_NONE` drops the
+      pages of a region that is still there as a reservation, and a
+      shrinking `brk` drops pages the record never described. Only `munmap`
+      wants both. The record goes first, since it is the only step that can
+      fail having changed nothing.
 - [ ] **Swap.** (L) Not planned; listed so the absence is deliberate.
 - [ ] **Huge pages for user space.** (M) The kernel's own identity map uses
       1 GiB pages; user mappings are 4 KiB only.
 - [ ] **`MAP_FIXED_NOREPLACE`, `MAP_NORESERVE`, `MAP_POPULATE`.** (S) Flags
-      are largely ignored rather than honoured or refused.
+      are largely ignored rather than honoured or refused. `MAP_POPULATE` is
+      now owed rather than merely missing: it is how a caller asks for the
+      eager backing demand paging took away.
 
 ---
 

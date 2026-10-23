@@ -31,7 +31,22 @@ struct vma_set {
     uint32_t n;
 };
 
-/* The region holding addr, or NULL. */
+/* The region holding `addr`, or NULL.
+ *
+ * What demand paging is built on: a fault is only worth backing if the
+ * address is **inside a region the process was given**, and the region is
+ * what says with which rights. Without this the fault handler would have to
+ * ask the page tables, which cannot answer — an unbacked page and an
+ * address nobody ever asked for look identical there, and backing the
+ * second would turn a wild pointer into a silently working one.
+ *
+ * Half-open, like every range in this file: `end` is the first address
+ * *not* in the region, so an address exactly at `end` belongs to whatever
+ * comes next and not to this one.
+ *
+ * The pointer is into the set and is invalidated by any insert or remove,
+ * which is why it is const and why callers read what they need out of it
+ * and do not keep it. */
 const struct vma *vma_find(const struct vma_set *s, virt_t addr);
 
 /* Adds a region. KERR_INVAL when misaligned, empty or overlapping an
@@ -53,19 +68,5 @@ int vma_protect(struct vma_set *s, virt_t start, virt_t end, uint32_t prot);
  * exactly hint when [hint, hint+len) is free and inside the window.
  * KERR_OK with *addr, or KERR_NOMEM. */
 int vma_find_free(const struct vma_set *s, virt_t len, virt_t hint, virt_t lo, virt_t hi, virt_t *addr);
-
-/* The region containing `addr`, or NULL.
- *
- * What demand paging is built on: a fault is only worth backing if the
- * address is **inside a region the process was given**, and the region is
- * what says with which rights. Without this the fault handler would have to
- * ask the page tables, which cannot answer — an unbacked page and an
- * address nobody ever asked for look identical there, and backing the
- * second would turn a wild pointer into a silently working one.
- *
- * The pointer is into the set and is invalidated by any insert or remove,
- * which is why it is const and why callers read what they need and do not
- * keep it. */
-const struct vma *vma_lookup(const struct vma_set *s, virt_t addr);
 
 #endif

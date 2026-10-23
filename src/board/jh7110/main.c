@@ -563,6 +563,10 @@ static void bring_up_other_harts(uint64_t dtb, uint64_t boot_hart) {
         kprintf("uspace: **%u live pages replaced by an unfixed mapping**\n",
                 uspace_replaced_pages());
     }
+    if (uspace_stale_records() != 0) {
+        kprintf("uspace: **%u pages mapped at an address the record called free**\n",
+                uspace_stale_records());
+    }
     if (sched_spawn_failures() != 0 || sched_stack_overflows() != 0 ||
         sched_slot_aliases() != 0) {
         kprintf("sched: %u threads refused, %u stacks overflowed, %u slots aliased\n",
@@ -988,6 +992,7 @@ extern const char user_pgrp_start[], user_pgrp_end[];
 extern const char user_term_start[], user_term_end[];
 extern const char user_uid_start[], user_uid_end[];
 extern const char user_rlimit_start[], user_rlimit_end[];
+extern const char user_mremap_start[], user_mremap_end[];
 
 static void run_one_user_program(const char *name, const char *from, const char *to) {
     struct uproc *proc = uspace_alloc();
@@ -1092,7 +1097,9 @@ static void run_init_from_disk(const char *path) {
     /* Pages backed on first touch rather than at `mmap`. Zero would mean
      * demand paging is not happening whatever the code says — the one
      * number that tells "lazy" from "eager somewhere else". */
-    kprintf("mem: %llu pages backed on demand\n", (unsigned long long)uspace_demand_pages());
+    kprintf("mem: %llu pages backed on demand, %llu moved by mremap\n",
+            (unsigned long long)uspace_demand_pages(),
+            (unsigned long long)uspace_moved_pages());
     report_hart_usage();
     /* The stack's own counters after a program that used it. A reset or a
      * drop is the difference between "the program's logic is wrong" and
@@ -1210,6 +1217,16 @@ static void run_user_programs(void) {
      * raised again after dropping privilege. */
     if (cmdline_has(boot_cmdline, "minikern.rlimit")) {
         run_one_user_program("rlimit", user_rlimit_start, user_rlimit_end);
+    }
+    /* Roadmap §2: `mremap`, and the record `munmap` used to keep. The exit
+     * status is a bitmask of six checks, so **63** is a pass and a smaller
+     * number names the half that works. The `mremap` line below says how
+     * many pages were re-pointed rather than copied. */
+    if (cmdline_has(boot_cmdline, "minikern.mremap")) {
+        run_one_user_program("mremap", user_mremap_start, user_mremap_end);
+        kprintf("mem: %llu pages backed on demand, %llu moved by mremap\n",
+                (unsigned long long)uspace_demand_pages(),
+                (unsigned long long)uspace_moved_pages());
     }
     if (cmdline_has(boot_cmdline, "minikern.init")) {
         run_init_from_disk("/init");

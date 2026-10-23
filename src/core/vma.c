@@ -20,8 +20,12 @@ static uint32_t first_after(const struct vma_set *s, virt_t addr) {
 }
 
 const struct vma *vma_find(const struct vma_set *s, virt_t addr) {
-    uint32_t i = first_after(s, addr);
-    return (i < s->n && s->v[i].start <= addr) ? &s->v[i] : 0;
+    uint32_t i;
+    if (s == NULL) {
+        return NULL;
+    }
+    i = first_after(s, addr);
+    return (i < s->n && s->v[i].start <= addr) ? &s->v[i] : NULL;
 }
 
 static void open_slot(struct vma_set *s, uint32_t at) {
@@ -186,19 +190,4 @@ int vma_find_free(const struct vma_set *s, virt_t len, virt_t hint, virt_t lo, v
         return KERR_OK;
     }
     return highest_gap(s, len, lo, hi, addr);
-}
-
-const struct vma *vma_lookup(const struct vma_set *s, virt_t addr) {
-    if (s == NULL) {
-        return NULL;
-    }
-    for (uint32_t i = 0; i < s->n; i++) {
-        /* Half-open, like every range in this file: `end` is the first
-         * address *not* in the region, so an address exactly at `end`
-         * belongs to whatever comes next and not to this. */
-        if (addr >= s->v[i].start && addr < s->v[i].end) {
-            return &s->v[i];
-        }
-    }
-    return NULL;
 }

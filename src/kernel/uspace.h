@@ -338,6 +338,24 @@ int uspace_unmap(struct uproc *p, virt_t at, uint64_t bytes);
  * reservation that is being made usable. */
 int uspace_protect(struct uproc *p, virt_t at, uint64_t bytes, uint32_t prot);
 
+/* Resizes a mapping, and moves it when it cannot grow where it stands.
+ *
+ * `[at, at + old_bytes)` must lie inside **one** region, or the answer is
+ * `KERR_FAULT`: a range spanning two has two sets of rights and the result
+ * could only have one. Shrinking unmaps the tail. Growing takes the pages
+ * past the end when they are free, and otherwise needs `may_move`, without
+ * which the answer is `KERR_NOMEM` — a caller that cannot cope with its
+ * memory changing address says so by withholding it.
+ *
+ * `to` is a destination the caller insists on (`MREMAP_FIXED`), or 0 for
+ * wherever it fits; it must be inside the window `mmap` places into.
+ *
+ * Nothing is copied: the frames that exist are re-pointed at the new
+ * addresses and the holes stay holes. Reports where the mapping ended up,
+ * which is `at` itself in every case but a move. */
+int uspace_remap(struct uproc *p, virt_t at, uint64_t old_bytes, uint64_t new_bytes, bool may_move,
+                 virt_t to, virt_t *out);
+
 /* The program break. `want` of 0 asks where it is; anything else moves it
  * and reports where it ended up — which is the old value when the move was
  * refused, because that is how `brk` reports failure. */
@@ -408,6 +426,18 @@ uint32_t uspace_unrecorded_regions(void);
 /* How many pages were backed on first touch rather than at `mmap`. Zero
  * means demand paging is not happening, whatever the code says. */
 uint64_t uspace_demand_pages(void);
+
+/* How many pages `mremap` re-pointed at a new address rather than copying.
+ * It is what makes "nothing is copied" a measurement instead of a claim: a
+ * move of a touched 64 MiB mapping reports its pages here and leaves the
+ * demand-paging count alone. */
+uint64_t uspace_moved_pages(void);
+
+/* Times a page was found already mapped at an address the region record
+ * said was free — the record and the page tables disagreeing. Any value but
+ * zero means something mapped memory without recording it, which is this
+ * kernel's most expensive class of defect. */
+uint32_t uspace_stale_records(void);
 
 /* A child with an address space of its own, made of the parent's pages
  * copy-on-write. Unlike `uspace_fork_shared` (which is `vfork`), the two
