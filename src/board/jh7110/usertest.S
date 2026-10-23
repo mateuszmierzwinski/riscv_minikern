@@ -31,6 +31,9 @@
 #define SYS_GETPID 172
 #define SYS_IOCTL 29
 #define SYS_READ 63
+#define SYS_GETUID 174
+#define SYS_GETEUID 175
+#define SYS_SETUID 146
 
 user_program_start:
     /* write(1, message, length) — the address comes from the program
@@ -804,6 +807,75 @@ term_read_failed:
     ecall
 6:  j       6b
 user_term_end:
+
+/* An eleventh program: **dropping privilege, and not getting it back.**
+ *
+ * Roadmap §1's users-and-groups step. The permission *rule* is pure and
+ * host-tested; what only a running kernel can show is the identity model:
+ *
+ *   1. The first process is root — `getuid` and `geteuid` both 0. Something
+ *      has to be, or the machine cannot read its own filesystem to boot.
+ *   2. `setuid(1000)` succeeds, because root may become anybody.
+ *   3. Both ids changed. Setting only the effective one would leave a real
+ *      uid of 0, and a process with that can take privilege back — the
+ *      difference between dropping it and appearing to.
+ *   4. `setuid(0)` is now **refused**. This is the step that matters: a
+ *      drop that can be undone is not a drop.
+ *
+ * 0 means every step held; 131..134 name the one that did not.
+ */
+    .globl user_uid_start
+    .globl user_uid_end
+user_uid_start:
+    li      a7, SYS_GETUID
+    ecall
+    bnez    a0, uid_not_root
+    li      a7, SYS_GETEUID
+    ecall
+    bnez    a0, uid_not_root
+
+    /* Become 1000. */
+    li      a0, 1000
+    li      a7, SYS_SETUID
+    ecall
+    bnez    a0, uid_drop_failed
+
+    /* Both ids, not just the effective one. */
+    li      a7, SYS_GETUID
+    ecall
+    li      t0, 1000
+    bne     a0, t0, uid_real_unchanged
+    li      a7, SYS_GETEUID
+    ecall
+    bne     a0, t0, uid_real_unchanged
+
+    /* And back to root must fail. */
+    li      a0, 0
+    li      a7, SYS_SETUID
+    ecall
+    bgez    a0, uid_regained
+    li      a0, 0
+    li      a7, SYS_EXIT_GROUP
+    ecall
+
+uid_not_root:
+    li      a0, 131
+    li      a7, SYS_EXIT_GROUP
+    ecall
+uid_drop_failed:
+    li      a0, 132
+    li      a7, SYS_EXIT_GROUP
+    ecall
+uid_real_unchanged:
+    li      a0, 133
+    li      a7, SYS_EXIT_GROUP
+    ecall
+uid_regained:
+    li      a0, 134
+    li      a7, SYS_EXIT_GROUP
+    ecall
+5:  j       5b
+user_uid_end:
 
 /* A second program, which faults on purpose: it reads an address that is
  * mapped for the kernel and not for user mode. */

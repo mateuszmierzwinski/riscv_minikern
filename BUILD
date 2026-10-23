@@ -66,6 +66,27 @@ cc_test(
 # is a plausible behaviour that needs a human's fingers to notice — a
 # backspace that erases the prompt, an echo that prints a control character
 # as itself, a ^D that throws away the line it was meant to deliver.
+# The permission rule: three bits, three classes, and an exclusivity that is
+# easy to get backwards. Pure, because the cases that matter are the ones
+# nobody produces by hand — an owner denied by their own bits, root against
+# a mode that denies everybody.
+cc_library(
+    name = "access",
+    srcs = ["src/core/access.c"],
+    hdrs = ["src/core/access.h"],
+    strip_include_prefix = "src",
+)
+
+cc_test(
+    name = "access_test",
+    size = "small",
+    srcs = ["test/access_test.c"],
+    deps = [
+        ":access",
+        ":ktest",
+    ],
+)
+
 cc_library(
     name = "tty",
     srcs = ["src/core/tty.c"],
@@ -745,6 +766,7 @@ cc_library(
     target_compatible_with = ["//platforms:riscv64"],
     deps = [
         ":vma",
+        ":access",
         ":arch_riscv",
         ":tty",
         ":console",

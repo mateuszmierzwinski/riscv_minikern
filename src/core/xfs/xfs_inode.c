@@ -100,6 +100,8 @@ static int take(struct xfs *fs, const uint8_t *di, uint64_t ino, struct xfs_inod
         .size = xfs_be64(di + XFS_DI_SIZE),
         .nblocks = xfs_be64(di + XFS_DI_NBLOCKS),
         .mode = xfs_be16(di + XFS_DI_MODE),
+        .uid = xfs_be32(di + XFS_DI_UID),
+        .gid = xfs_be32(di + XFS_DI_GID),
         .nlink = xfs_be32(di + XFS_DI_NLINK),
         .nextents = big ? (uint32_t)xfs_be64(di + XFS_DI_BIG_NEXTENTS)
                         : xfs_be32(di + XFS_DI_NEXTENTS),

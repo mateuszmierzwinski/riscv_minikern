@@ -42,6 +42,10 @@ int xfsmount_show_file(const char *path);
  * size. KERR_NOENT when it is not there, KERR_NOMEM when it does not fit,
  * KERR_FBIG when it is larger than `limit` — which is a refusal and not a
  * truncation, because half a program is not a program. */
+/* A path's owner, group and mode. Reported, not enforced: the rule needs to
+ * know who is asking, and this layer does not know about processes. */
+int xfsmount_stat(const char *path, uint32_t *uid, uint32_t *gid, uint32_t *mode);
+
 int xfsmount_read_file(const char *path, uint32_t limit, uint8_t **out, uint32_t *size);
 
 /* Hashes a file **without holding it in memory**, and reports its size.

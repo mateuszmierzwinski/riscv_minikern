@@ -134,6 +134,41 @@ int xfsmount_show_file(const char *path) {
     return rc;
 }
 
+/* Who owns a path and what its mode is.
+ *
+ * Reported rather than enforced **here**, deliberately. This layer is the
+ * filesystem's and knows nothing about processes; the permission rule needs
+ * to know who is asking, which is the process layer's business. Putting the
+ * check in this function would have the hexagon reaching outward — and the
+ * dependency would be circular besides.
+ *
+ * So: ownership is parsed (it was not, until there was something to check
+ * it against) and handed up, `core/access.c` holds the rule, and the check
+ * belongs at whatever opens a file on behalf of a process. There is no such
+ * caller yet — regular-file `openat` is §3 of the roadmap — which is stated
+ * rather than papered over with a check that only ever sees root. */
+int xfsmount_stat(const char *path, uint32_t *uid, uint32_t *gid, uint32_t *mode) {
+    struct xfs_inode ip;
+    int rc;
+    if (!mounted) {
+        return KERR_NODEV;
+    }
+    rc = xfs_path_lookup(&fs, path, &ip);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    if (uid != NULL) {
+        *uid = ip.uid;
+    }
+    if (gid != NULL) {
+        *gid = ip.gid;
+    }
+    if (mode != NULL) {
+        *mode = ip.mode;
+    }
+    return KERR_OK;
+}
+
 int xfsmount_read_file(const char *path, uint32_t limit, uint8_t **out, uint32_t *size) {
     struct xfs_inode ip;
     uint8_t *buf;

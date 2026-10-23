@@ -92,6 +92,8 @@
 #define XFS_DI_MODE       2u   /* u16 */
 #define XFS_DI_VERSION    4u   /* u8: 3 for v5 */
 #define XFS_DI_FORMAT     5u   /* u8: XFS_DINODE_FMT_* */
+#define XFS_DI_UID        8u   /* u32: the owner */
+#define XFS_DI_GID        12u  /* u32: the owning group */
 #define XFS_DI_NLINK      16u  /* u32 */
 #define XFS_DI_ATIME      32u  /* two u32: seconds, then nanoseconds */
 #define XFS_DI_MTIME      40u

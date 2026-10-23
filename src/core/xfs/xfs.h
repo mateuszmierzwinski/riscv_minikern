@@ -103,6 +103,12 @@ struct xfs_inode {
     uint64_t size;
     uint64_t nblocks;
     uint32_t mode;
+    /* **Who owns it**, which this reader did not parse at all until there
+     * was something to check it against. The permission bits in `mode` are
+     * meaningless without them: "the owner may write" needs to know who the
+     * owner is. */
+    uint32_t uid;
+    uint32_t gid;
     uint32_t nlink;
     uint32_t nextents;
     /* This inode's extent counts are 64-bit and sit at different offsets.

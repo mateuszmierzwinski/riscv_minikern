@@ -7,6 +7,7 @@
 #include "arch/riscv/trap.h"
 #include "core/console.h"
 #include "core/elf.h"
+#include "core/access.h"
 #include "core/errno.h"
 #include "core/ustack.h"
 #include "kernel/mem.h"
@@ -904,6 +905,10 @@ int uspace_fork_shared(struct uproc *child, struct uproc *parent) {
     child->parent_pid = parent->pid;
     child->pgid = parent->pgid;
     child->sid = parent->sid;
+    child->uid = parent->uid;
+    child->gid = parent->gid;
+    child->euid = parent->euid;
+    child->egid = parent->egid;
     for (uint32_t i = 0; i < SIG_COUNT; i++) {
         child->actions[i] = parent->actions[i];
     }
@@ -916,6 +921,22 @@ uint32_t uspace_pid_of(const struct uproc *p) {
 
 uint32_t uspace_pgid_of(const struct uproc *p) {
     return p == NULL ? 0u : p->pgid;
+}
+
+uint32_t uspace_euid(void) {
+    const struct uproc *p = uspace_current();
+    return p == NULL ? 0u : p->euid;
+}
+
+uint32_t uspace_egid(void) {
+    const struct uproc *p = uspace_current();
+    return p == NULL ? 0u : p->egid;
+}
+
+bool uspace_may_access(uint32_t file_uid, uint32_t file_gid, uint32_t mode, uint32_t want) {
+    /* The rule itself is pure and host-tested in `core/access.c`; what this
+     * layer knows is who is asking. */
+    return access_permitted(uspace_euid(), uspace_egid(), file_uid, file_gid, mode, want);
 }
 
 static void raise_one(struct uproc *p, uint32_t signo) {
@@ -1009,6 +1030,10 @@ int uspace_exec(struct uproc *p, const uint8_t *image, uint32_t bytes, const cha
                             .parent_pid = p->parent_pid,
                             .pgid = p->pgid,
                             .sid = p->sid,
+                            .uid = p->uid,
+                            .gid = p->gid,
+                            .euid = p->euid,
+                            .egid = p->egid,
                             .used = true};
     rc = uspace_build_elf_args(fresh, image, bytes, path, argv, argc);
     if (rc != KERR_OK) {
@@ -1397,6 +1422,10 @@ int uspace_fork(struct uproc *child, struct uproc *parent) {
     child->parent_pid = parent->pid;
     child->pgid = parent->pgid;
     child->sid = parent->sid;
+    child->uid = parent->uid;
+    child->gid = parent->gid;
+    child->euid = parent->euid;
+    child->egid = parent->egid;
     for (uint32_t i = 0; i < SIG_COUNT; i++) {
         child->actions[i] = parent->actions[i];
     }

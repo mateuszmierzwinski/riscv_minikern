@@ -226,6 +226,74 @@ static int64_t sys_clone(struct trapframe *tf) {
     return (int64_t)child->pid;
 }
 
+/* ── who a process is ──────────────────────────────────────────────────────
+ *
+ * Real and effective ids, kept apart because the effective one is what a
+ * permission check consults and the real one is what a process may return
+ * to. That distinction is the whole reason a program can drop privilege for
+ * a while and take it back; a kernel with one uid per process cannot offer
+ * it at all.
+ *
+ * `setuid` here is the privileged form only: root may become anybody, and
+ * anybody else is refused. The unprivileged form — returning to a real uid
+ * one already has — is the next thing this needs and is not pretended at.
+ */
+static int64_t sys_getuid(struct trapframe *tf) {
+    struct uproc *me = uspace_current();
+    (void)tf;
+    return me == NULL ? 0 : (int64_t)me->uid;
+}
+
+static int64_t sys_geteuid(struct trapframe *tf) {
+    (void)tf;
+    return (int64_t)uspace_euid();
+}
+
+static int64_t sys_getgid(struct trapframe *tf) {
+    struct uproc *me = uspace_current();
+    (void)tf;
+    return me == NULL ? 0 : (int64_t)me->gid;
+}
+
+static int64_t sys_getegid(struct trapframe *tf) {
+    (void)tf;
+    return (int64_t)uspace_egid();
+}
+
+/* `setuid`: root may become anybody, and the change is to **both** ids.
+ *
+ * Setting only the effective one would leave the real uid as 0, and a
+ * process that has dropped privilege but kept a real uid of 0 can take it
+ * back — which is the difference between dropping privilege and appearing
+ * to. Anybody who is not root is refused rather than silently ignored. */
+static int64_t sys_setuid(struct trapframe *tf) {
+    uint32_t want = (uint32_t)sysarg(tf, 0);
+    struct uproc *me = uspace_current();
+    if (me == NULL) {
+        return KERR_SRCH;
+    }
+    if (me->euid != 0) {
+        return KERR_PERM;
+    }
+    me->uid = want;
+    me->euid = want;
+    return 0;
+}
+
+static int64_t sys_setgid(struct trapframe *tf) {
+    uint32_t want = (uint32_t)sysarg(tf, 0);
+    struct uproc *me = uspace_current();
+    if (me == NULL) {
+        return KERR_SRCH;
+    }
+    if (me->euid != 0) {
+        return KERR_PERM;
+    }
+    me->gid = want;
+    me->egid = want;
+    return 0;
+}
+
 /* ── process groups and sessions ───────────────────────────────────────────
  *
  * What a shell needs to interrupt a pipeline rather than one of its members.
@@ -431,6 +499,12 @@ const struct syscall_entry sys_proc_table[] = {
     {155, "getpgid", sys_getpgid},
     {156, "getsid", sys_getsid},
     {157, "setsid", sys_setsid},
+    {174, "getuid", sys_getuid},
+    {175, "geteuid", sys_geteuid},
+    {176, "getgid", sys_getgid},
+    {177, "getegid", sys_getegid},
+    {146, "setuid", sys_setuid},
+    {144, "setgid", sys_setgid},
     {173, "getppid", sys_getppid},
     {0, NULL, NULL},
 };

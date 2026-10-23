@@ -88,6 +88,18 @@ struct uproc {
      * a shell interrupts a pipeline rather than one of its members. */
     uint32_t pgid;
     uint32_t sid;
+    /* **Who this process is.** Real and effective kept apart because the
+     * effective one is what a permission check uses and the real one is
+     * what a process may return to — the distinction that makes dropping
+     * privilege temporarily possible, and the one a kernel that keeps a
+     * single uid can never offer.
+     *
+     * The first process is root, because something has to be: a machine
+     * whose first program cannot read its own filesystem does not boot. */
+    uint32_t uid;
+    uint32_t gid;
+    uint32_t euid;
+    uint32_t egid;
     bool used;
     bool zombie;        /* finished, and keeping its status for its parent */
     int64_t status;     /* what `wait4` will report */
@@ -190,6 +202,26 @@ uint32_t uspace_count_children(uint32_t parent_pid);
  * their processes but has no business reading a process's fields. */
 uint32_t uspace_pid_of(const struct uproc *p);
 uint32_t uspace_pgid_of(const struct uproc *p);
+
+/* The caller's effective identity, for a permission check. */
+uint32_t uspace_euid(void);
+uint32_t uspace_egid(void);
+
+/* Whether the caller may open something with these owners and mode, for
+ * `want` of `PERM_READ`/`PERM_WRITE`/`PERM_EXEC`.
+ *
+ * **Root bypasses**, which is not laziness but the definition: uid 0 is the
+ * identity the checks do not apply to, and a kernel that enforced them
+ * against it would have no way to administer anything.
+ *
+ * The three-way owner/group/other test is **exclusive** — if the caller is
+ * the owner, only the owner bits are consulted, and a mode of 0077 denies
+ * its owner on purpose. A check that fell through to the group bits for an
+ * owner who was denied would make that mode mean something else entirely. */
+#define PERM_READ 4u
+#define PERM_WRITE 2u
+#define PERM_EXEC 1u
+bool uspace_may_access(uint32_t file_uid, uint32_t file_gid, uint32_t mode, uint32_t want);
 
 /* Raises a signal on every process in a group, the way a terminal must: a
  * pipeline is several processes and a key reaching one of them leaves the

@@ -110,9 +110,32 @@ Ordering inside a section is roughly by what unblocks the most.
       raises it on the foreground group already; what is missing is
       anything that sets a foreground group, which is a shell's job and
       waits for one to exist.
-- [ ] **Users and groups.** (M) There is one privilege level: everything
-      runs as root with no checks. `getuid` and friends are absent; file
-      permissions are stored and ignored.
+- [x] **Users and groups.** (M) **Mostly done, and the gap is named.**
+      Real and effective uid/gid on every process, inherited at `fork` and
+      surviving `execve`, with `getuid`/`geteuid`/`getgid`/`getegid` and the
+      privileged `setuid`/`setgid`. The first process is root, because
+      something has to be — a machine whose first program cannot read its
+      own filesystem does not boot.
+      `setuid` changes **both** ids: setting only the effective one leaves a
+      real uid of 0, and a process with that can take privilege back, which
+      is the difference between dropping it and appearing to. Verified on
+      the board (`minikern.uid=1`): root, drop to 1000, both ids moved, and
+      `setuid(0)` refused.
+      The permission rule is pure and host-tested (`core/access.c`), and the
+      case it exists for is the **exclusivity**: a mode of 0077 denies its
+      own owner, which only happens if the owner's class is the whole
+      answer. A check that fell through from a denied owner to the group
+      bits would make that mode mean its opposite.
+      **XFS now parses ownership**, which it did not — `mode` was read and
+      `uid`/`gid` were not, which is precisely why permissions were "stored
+      and ignored". `xfsmount_stat` reports them.
+      **What is missing:** nothing *calls* the rule yet, because there is no
+      regular-file `openat` to call it from (§3). The check belongs where a
+      process exists rather than in the filesystem layer — putting it in
+      `xfsmount_read_file` was tried and reverted, since that would have the
+      hexagon reaching outward and the dependency would be circular. Also
+      missing: the unprivileged `setuid` that returns to a real uid one
+      already has, and `setresuid`/saved ids.
 - [ ] **Resource limits.** (S) `prlimit64` answers but enforces nothing.
 
 ---

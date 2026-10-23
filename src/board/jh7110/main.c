@@ -986,6 +986,7 @@ extern const char user_hostile_start[], user_hostile_end[];
 extern const char user_wait_start[], user_wait_end[];
 extern const char user_pgrp_start[], user_pgrp_end[];
 extern const char user_term_start[], user_term_end[];
+extern const char user_uid_start[], user_uid_end[];
 
 static void run_one_user_program(const char *name, const char *from, const char *to) {
     struct uproc *proc = uspace_alloc();
@@ -1193,6 +1194,11 @@ static void run_user_programs(void) {
      * stopped. */
     if (cmdline_has(boot_cmdline, "minikern.term")) {
         run_one_user_program("term", user_term_start, user_term_end);
+    }
+    /* Roadmap §1: the identity model. 0 means privilege dropped and stayed
+     * dropped; 131..134 name the step that failed. */
+    if (cmdline_has(boot_cmdline, "minikern.uid")) {
+        run_one_user_program("uid", user_uid_start, user_uid_end);
     }
     if (cmdline_has(boot_cmdline, "minikern.init")) {
         run_init_from_disk("/init");
