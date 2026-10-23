@@ -30,6 +30,12 @@
  * shared table would reset its parent's too. */
 struct signal_state {
     uint64_t delivered;
+    /* **Per signal, because an aggregate hides a storm.** A failing board
+     * run reported 306,450 signals delivered where a passing one reports
+     * about twenty, and that number says nothing about *which* signal was
+     * being delivered three hundred thousand times — which is the first
+     * thing worth knowing about a storm. */
+    uint64_t by_signal[SIG_COUNT];
 };
 
 static struct signal_state sig;
@@ -368,6 +374,10 @@ bool signal_deliver(struct trapframe *tf) {
     tf->x[1] = SIGNAL_TRAMPOLINE;        /* ra: where a returning handler lands */
     tf->sepc = a->sa_handler;
     sig.delivered++;
+    /* Bounded, not masked: `SIG_COUNT` is 65, so a mask would fold every
+     * real signal onto a wrong index — and the first version of this
+     * reported "signal 0" for all forty-four of them. */
+    sig.by_signal[signo < SIG_COUNT ? signo : 0u]++;
     return true;
 }
 
@@ -393,6 +403,18 @@ int signal_return(struct trapframe *tf) {
     }
     fp_restore(&frame->uc.uc_mcontext.sc_fpregs);
     return KERR_OK;
+}
+
+/* The busiest signal and how often it was delivered, for the report. A
+ * normal run's busiest is `SIGURG` a dozen or two times — a runtime
+ * preempting its own goroutines. */
+void signal_busiest(uint32_t *signo, uint64_t *count) {
+    uint32_t best = 0;
+    for (uint32_t i = 1; i < SIG_COUNT; i++) {
+        best = sig.by_signal[i] > sig.by_signal[best] ? i : best;
+    }
+    *signo = best;
+    *count = sig.by_signal[best];
 }
 
 uint64_t signal_delivered(void) {

@@ -133,7 +133,8 @@ grep -qE '^go: still running after the fault, 76127 primes below 1000$' "$log" |
 # anything but signals. A second signal arriving inside a handler used to
 # restart its frame at the top of the alternate stack, on top of the outer
 # handler's.
-grep -qE '^signal: [0-9]+ delivered, 0 frames overwritten$' "$log" ||
+grep -qE '^signal: [0-9]+ delivered \(most often [0-9]+, [0-9]+ times\), 0 frames overwritten$' \
+    "$log" ||
     fail "a signal frame was overwritten while its handler ran: $(grep -m1 'frames overwritten' "$log")"
 
 # No goroutine leaked, and it reached its own last line.

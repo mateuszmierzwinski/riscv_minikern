@@ -88,6 +88,9 @@ struct thread {
     phys_t kstack;
     uint64_t tid;
     enum thread_state state;
+    /* The hart that last ran it, for the pinning diagnostic above.
+     * `SMP_MAX_HARTS` means "never run anywhere yet". */
+    uint32_t last_hart;
     virt_t futex_addr;
     const void *wait_chan;  /* a kernel object being waited on; see sched.h */
     uint64_t futex_deadline;
@@ -190,7 +193,25 @@ static uint64_t placeable(const struct thread *t) {
     return want & ~isolated;
 }
 
+/* Whether a thread may be pinned to wherever it last ran.
+ *
+ * A diagnostic, not a policy: with it on, a thread stays on one hart for
+ * its whole life while the other harts keep running other threads. That
+ * separates "four harts executing user code at once" from "one thread's
+ * state passing between harts" — and the second is where a context switch,
+ * a trap frame, a saved `tp` and a hart's `satp` all live. §0's race needs
+ * at least two harts; this says which of the two reasons it needs them
+ * for. */
+static bool pin_threads_where_they_ran;
+
+void sched_pin_threads(bool on) {
+    pin_threads_where_they_ran = on;
+}
+
 static bool may_run_here(const struct thread *t, uint32_t hart) {
+    if (pin_threads_where_they_ran && t->last_hart != SMP_MAX_HARTS && t->last_hart != hart) {
+        return false;
+    }
     return (placeable(t) & (1ull << hart)) != 0;
 }
 
@@ -374,6 +395,7 @@ static int spawn(struct uproc *proc, const struct trapframe *frame, uint64_t sp,
                                     .tid = next_tid++,
                                     .state = THREAD_RUNNABLE,
                                     .owns_stack = true,
+                                    .last_hart = SMP_MAX_HARTS,
                                     .proc = proc};
     /* A new thread **inherits its creator's signal mask**, as the ABI
      * requires, and nothing else: not its pending signals, and not its
@@ -1092,6 +1114,66 @@ static uint64_t earliest_deadline(void) {
  * say so, because everything after it is a consequence. */
 static uint32_t stack_overflows;
 
+/* Threads refused the processor because their saved stack pointer was not
+ * in their own kernel stack. Always a bug, and never the thread's. */
+static uint32_t bad_resumes;
+
+uint32_t sched_bad_resumes(void) {
+    return bad_resumes;
+}
+
+/* **Is this thread's saved stack pointer its own?** Asked on the way *in*,
+ * which is the side nobody was checking.
+ *
+ * `slot_is_still_ours` asks the same question of the thread on its way out,
+ * and that is where the slot-alias bug was caught. The other direction had
+ * no check at all — and resuming a thread whose `ksp` points somewhere else
+ * restores a register set from whatever is at that address. If that is a
+ * kernel stack, the registers restored are a *kernel* context, and the
+ * `sret` that follows puts a kernel program counter and a kernel stack
+ * pointer into user mode. That is exactly the frame
+ * `uspace_impossible_frames` caught once on the board: `sepc` inside the
+ * kernel's own text, `sp` in its identity map, reported as a fault in user
+ * code long after the switch that caused it.
+ *
+ * A thread that fails this is **not run**. The alternative is to run it and
+ * watch the machine misbehave somewhere else, which is what has been
+ * happening. */
+static bool resume_is_sane(uint32_t t) {
+    uint64_t base = threads[t].kstack;
+    uint64_t sp = threads[t].ksp;
+    /* **Is anybody else already running it?**
+     *
+     * Two harts in one thread is the shape of every symptom this race has:
+     * both restore the same register set, both run the same code, and their
+     * writes to the thread's own memory interleave — which from outside is a
+     * computation that produced a number nobody computed. The claim is made
+     * under the kernel lock and should make this impossible, which is
+     * exactly why it is worth asserting rather than assuming. */
+    for (uint32_t h = 0; h < SMP_MAX_HARTS; h++) {
+        if (h == smp_hart_index() || harts[h].current != t) {
+            continue;
+        }
+        bad_resumes++;
+        kprintf("\nsched: **tid %llu is already running on hart %u** (this is hart %u)\n",
+                (unsigned long long)threads[t].tid, h, smp_hart_index());
+        return false;
+    }
+    if (base == 0) {
+        return true; /* the canary has already reported this one */
+    }
+    if (sp > base && sp <= base + KSTACK_PAGES * PAGE_SIZE) {
+        return true;
+    }
+    bad_resumes++;
+    kprintf("\nsched: **tid %llu cannot be resumed**: ksp %016llx is not in its stack"
+            " [%016llx, %016llx) — state %u\n",
+            (unsigned long long)threads[t].tid, (unsigned long long)sp,
+            (unsigned long long)base, (unsigned long long)(base + KSTACK_PAGES * PAGE_SIZE),
+            (unsigned)threads[t].state);
+    return false;
+}
+
 static void check_kernel_stack(uint32_t t) {
     if (threads[t].kstack == 0 ||
         *(volatile uint64_t *)(uintptr_t)threads[t].kstack == KSTACK_CANARY) {
@@ -1227,7 +1309,15 @@ void sched_run(void) {
             h->idle = false;
             continue;
         }
+        if (!resume_is_sane(t)) {
+            /* Left alone rather than run: its slot is not released either,
+             * because something still believes it owns that memory and
+             * handing it out again would spread the damage. */
+            threads[t].state = THREAD_BLOCKED;
+            continue;
+        }
         h->current = t;
+        threads[t].last_hart = smp_hart_index();
         h->slice_started = timer_ns();
         /* **This hart's address space must be the thread's.** With one
          * process it never changed, so nothing noticed it was not being

@@ -33,6 +33,22 @@ static uint32_t total_pages;
 
 /* The heap asks for pages through a port, so it has no idea what is under
  * it — which is what let it be host-tested before any of this existed. */
+/* Pages the kernel heap has taken from the frame allocator and given back.
+ *
+ * **The frames the heap gives back go to user pages**, which makes the heap
+ * a second owner of the same pool: a page freed while something still holds
+ * a pointer into it comes back as somebody's fresh anonymous memory, full
+ * of whatever the kernel last wrote there. The user-side counter
+ * (`uspace_freed_frames`) says "no frames freed" and means only "no
+ * *mappings* went away", which is how this side stayed invisible. */
+static uint64_t heap_pages_taken;
+static uint64_t heap_pages_given_back;
+
+void mem_heap_traffic(uint64_t *taken, uint64_t *given_back) {
+    *taken = heap_pages_taken;
+    *given_back = heap_pages_given_back;
+}
+
 static int heap_alloc_page(void *self, uint32_t npages, void **virt) {
     phys_t phys = 0;
     int rc;
@@ -41,6 +57,7 @@ static int heap_alloc_page(void *self, uint32_t npages, void **virt) {
     if (rc != KERR_OK) {
         return rc;
     }
+    heap_pages_taken += npages;
     /* The kernel's map is an identity map, so a frame's physical address is
      * also its address. When the kernel moves to the top half this becomes
      * an addition, and it is the only line that has to change. */
@@ -48,8 +65,23 @@ static int heap_alloc_page(void *self, uint32_t npages, void **virt) {
     return KERR_OK;
 }
 
+static bool heap_keeps_its_pages;
+
+void mem_heap_keep_pages(bool on) {
+    heap_keeps_its_pages = on;
+}
+
 static void heap_free_page(void *self, void *virt, uint32_t npages) {
     (void)self;
+    heap_pages_given_back += npages;
+    if (heap_keeps_its_pages) {
+        /* Leaked on purpose: a page the heap never gives back cannot be
+         * handed to a user mapping, so if the corruption stops when this is
+         * on, what reaches user memory is a write through a pointer into
+         * freed *kernel* memory. 1.5 MiB on a 2 GiB machine is a cheap
+         * answer to that question. */
+        return;
+    }
     (void)pmm_free(&frames, (phys_t)(uintptr_t)virt, npages);
 }
 
@@ -122,12 +154,53 @@ int mem_init(const struct bootinfo *info, phys_t arena_base, uint64_t arena_byte
     return KERR_OK;
 }
 
+const struct pmm *mem_frames(void) {
+    return &frames;
+}
+
+/* **Is anybody else in here?**
+ *
+ * The frame allocator's bitmap is a read-modify-write on a shared word, and
+ * what makes that safe is the kernel lock: one hart inside the kernel at a
+ * time. Every theory about the four-hart race that ends "but the lock
+ * prevents that" rests on it, and nothing had ever checked it — so this
+ * does, at the one place where a lost update means a frame with two owners.
+ *
+ * A flag rather than a count, and set with an exchange rather than a store:
+ * the question is only ever "was it already taken?". */
+static uint32_t inside_the_allocator;
+static uint32_t allocator_collisions;
+
+uint32_t mem_allocator_collisions(void) {
+    return allocator_collisions;
+}
+
+static bool enter_the_allocator(void) {
+    if (__atomic_exchange_n(&inside_the_allocator, 1u, __ATOMIC_ACQ_REL) == 0u) {
+        return true;
+    }
+    allocator_collisions++;
+    return false;
+}
+
+static void leave_the_allocator(bool mine) {
+    if (mine) {
+        __atomic_store_n(&inside_the_allocator, 0u, __ATOMIC_RELEASE);
+    }
+}
+
 int mem_alloc_pages(uint32_t npages, uint32_t align_pages, phys_t *phys) {
-    return pmm_alloc(&frames, npages, align_pages, phys);
+    bool mine = enter_the_allocator();
+    int rc = pmm_alloc(&frames, npages, align_pages, phys);
+    leave_the_allocator(mine);
+    return rc;
 }
 
 int mem_free_pages(phys_t phys, uint32_t npages) {
-    return pmm_free(&frames, phys, npages);
+    bool mine = enter_the_allocator();
+    int rc = pmm_free(&frames, phys, npages);
+    leave_the_allocator(mine);
+    return rc;
 }
 
 int mem_share_page(phys_t phys) {

@@ -89,6 +89,30 @@ void pgtable_destroy(struct pgtable *pt) {
     }
 }
 
+/* One entry, tested against a frame: reports its virtual address when the
+ * entry is a leaf that covers the frame. Returns 1 when it reported. */
+static uint32_t report_if_covers(uint64_t pte, virt_t va, uint64_t span, phys_t phys, virt_t *out,
+                                 uint32_t max, uint32_t found) {
+    if (!pte_is_leaf(pte) || pte_phys(pte) > phys || pte_phys(pte) + span <= phys) {
+        return 0;
+    }
+    if (found < max) {
+        out[found] = va;
+    }
+    return 1;
+}
+
+/* Makes every store this hart has already made visible to the others before
+ * the next one.
+ *
+ * It is `__atomic_thread_fence` and not inline assembly because this file is
+ * host-tested: the arithmetic of a page table is pure, and it is tested on
+ * the machine that compiles it. The builtin is the same `fence` instruction
+ * on RISC-V and the right thing on the host. */
+static void publish_barrier(void) {
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+}
+
 /* Walks to the table that holds `va`'s entry at `level`, creating the
  * tables above it when `create` is set. NULL when a table is missing and
  * none may be made, or when a large mapping already covers the address —
@@ -106,6 +130,17 @@ static uint64_t *walk_to(struct pgtable *pt, virt_t va, uint32_t level, bool cre
             if (!create || pt->mem.alloc(pt->mem.self, &next, &phys) != KERR_OK) {
                 return NULL;
             }
+            /* **The table's contents before the pointer to it.**
+             *
+             * Four harts walk these tables at once, in hardware, while one
+             * of them edits under the kernel lock — and the lock means
+             * nothing to an MMU. The allocator has just zeroed this page,
+             * and on a weakly ordered machine another hart may observe the
+             * store that publishes it *before* those zeroes: its walk then
+             * descends into a table full of whatever the page held last
+             * time, and a page-table walk that reads stale entries does not
+             * fault. It translates to the wrong page. */
+            publish_barrier();
             *entry = pte_make(phys, PTE_V);
         } else {
             next = pt->mem.to_virt(pt->mem.self, pte_phys(*entry));
@@ -135,6 +170,12 @@ int pgtable_map(struct pgtable *pt, virt_t va, phys_t pa, uint64_t size, uint64_
     /* A and D are set here rather than left to hardware: this kernel does
      * not use them for paging decisions, and an implementation that faults
      * to set them would fault on every first access. */
+    /* **The page's contents before the entry that reaches it**, for the
+     * same reason as the table above: the caller has just zeroed this frame
+     * or filled it from a file, and another hart's MMU may see the entry
+     * first and read what the frame held when it belonged to something
+     * else. */
+    publish_barrier();
     table[index_at(va, level)] = pte_make(pa, prot | PTE_V | PTE_A | PTE_D);
     return KERR_OK;
 }
@@ -210,6 +251,51 @@ uint64_t pgtable_unmap(struct pgtable *pt, virt_t va) {
         table = pt->mem.to_virt(pt->mem.self, pte_phys(*entry));
     }
     return 0;
+}
+
+/* Every virtual address in this table that maps `phys`.
+ *
+ * The question a corrupted "fresh" page asks: a frame the allocator has
+ * just handed out, already holding somebody's data, is reachable from
+ * somewhere — and the table is the only place that can say where. One
+ * mapping is the expected answer. **Two is the bug**, and knowing the
+ * second address says what it is: a heap page, a stack, a page table.
+ *
+ * Walks all three levels and reports leaves at any of them, so a 2 MiB or
+ * 1 GiB mapping that covers the frame counts too. Linear in the tables that
+ * exist, which is why nothing calls it on a hot path. */
+uint32_t pgtable_find_mappings(const struct pgtable *pt, phys_t phys, virt_t *out, uint32_t max) {
+    uint32_t found = 0;
+    for (uint32_t i2 = 0; i2 < PT_ENTRIES; i2++) {
+        uint64_t e2 = pt->root[i2];
+        const uint64_t *t1;
+        if (pte_is_leaf(e2)) {
+            found += report_if_covers(e2, (virt_t)i2 << 30, GIGAPAGE_SIZE, phys, out, max, found);
+            continue;
+        }
+        if (!pte_is_table(e2)) {
+            continue;
+        }
+        t1 = pt->mem.to_virt(pt->mem.self, pte_phys(e2));
+        for (uint32_t i1 = 0; i1 < PT_ENTRIES; i1++) {
+            uint64_t e1 = t1[i1];
+            const uint64_t *t0;
+            virt_t base1 = ((virt_t)i2 << 30) | ((virt_t)i1 << 21);
+            if (pte_is_leaf(e1)) {
+                found += report_if_covers(e1, base1, MEGAPAGE_SIZE, phys, out, max, found);
+                continue;
+            }
+            if (!pte_is_table(e1)) {
+                continue;
+            }
+            t0 = pt->mem.to_virt(pt->mem.self, pte_phys(e1));
+            for (uint32_t i0 = 0; i0 < PT_ENTRIES; i0++) {
+                found += report_if_covers(t0[i0], base1 | ((virt_t)i0 << 12), PAGE_SIZE, phys, out,
+                                          max, found);
+            }
+        }
+    }
+    return found;
 }
 
 uint64_t pgtable_satp(const struct pgtable *pt, uint16_t asid) {

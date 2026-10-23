@@ -362,6 +362,18 @@ uint32_t sched_lost_deadlines(void);
  * happen, so without this they are a hang with no output at all. */
 uint32_t sched_overdue_wakes(void);
 
+/* Threads that could not be resumed because their saved stack pointer was
+ * not inside their own kernel stack. A thread cannot do this to itself:
+ * any value but zero is the kernel having lost track of whose stack is
+ * whose, and it is the one way a *kernel* register set becomes a user
+ * frame. */
+uint32_t sched_bad_resumes(void);
+
+/* Keeps every thread on the hart it first ran on. A diagnostic for §0's
+ * race: it leaves four harts running user code while no thread's state ever
+ * passes between them. */
+void sched_pin_threads(bool on);
+
 /* The running thread's nice value, and setting it. Setting clamps to the
  * permitted range rather than refusing, as POSIX requires, and recomputes
  * the weight the scheduler divides by — so it takes effect at the next

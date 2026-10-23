@@ -51,6 +51,62 @@ Ordering inside a section is roughly by what unblocks the most.
       measurement* is worth more than one that was never suspected, and
       because the first small sample (1 in 8 against 0 in 16) pointed the
       other way: it took 40 more runs to stop believing it.
+      **A reproducer that fails in a second.** `src/userland/racestress`
+      does nothing but the operations that have been seen to fail — a
+      buffered channel, interface values through `fmt`, a mutex and an
+      atomic under contention, and the prime sieve on every hart at once —
+      in a loop, checking every result. It reproduces the corruption in
+      **under a second**, where `go_qemu_test` needed about thirty boots:
+      one failure in thirty is enough to know something is wrong and far too
+      rare to *compare* anything, which is why every knob in this entry used
+      to be an argument rather than a measurement.
+      The thing that made it reproduce was **allocating**. The first version
+      ran four hundred rounds of channels and counters and never failed; the
+      failing program's garbage collector is the heaviest user of this
+      kernel there is, and adding a prime sieve per round — a fresh 60,000
+      element slice, on eight goroutines at once — took it from never to
+      twenty times in twenty.
+      **Ruled out, each with a rate rather than an argument.** Every row is
+      a configuration of the same binary, and the knob that makes it
+      possible to ask stays in the tree:
+
+      | Configuration | Reproduced |
+      |---|---|
+      | baseline | 20 of 20 |
+      | `minikern.tlbsafe` — broadcast TLB *additions* too | 19 of 20 |
+      | `GODEBUG=asyncpreemptoff=1` — Go stops preempting | 19 of 20 |
+      | `minikern.nopreempt` — the kernel drops `tgkill` | 18 of 20 |
+      | `minikern.eager` — every mapping backed at `mmap` | 4 of 10 |
+      | `minikern.heapkeep` — the heap never returns a frame | 3 of 10 |
+      | `minikern.nomigrate` — a thread stays on one hart | **9 of 10** |
+      | `minikern.smp=off` — one hart | **0 of 20** |
+
+      So it needs **more than one hart** and nothing else on that list. The
+      last two rows are the informative pair: pinning each thread to a hart
+      makes it *more* likely rather than less, so it is not a thread's state
+      passing between harts — four harts running user code at once is
+      enough. (`nomigrate` is also the configuration to hunt in.)
+      Also ruled out by instrument rather than by knob: a thread resumed on
+      a stack that is not its own, a thread claimed by two harts at once, a
+      frame handed out twice by the allocator, **two harts inside the frame
+      allocator at once** — which is the assumption the whole big-lock design
+      rests on and had never been checked — and the kernel heap handing a
+      page it had finished with to a user mapping.
+      **Caught in the act, once.** With `minikern.paranoid` the kernel reads
+      back every page it zeroes, and one page, zeroed and mapped
+      microseconds earlier, already held `0x000000000000ea60` — **60000**,
+      which is the length of the very slice the program was about to
+      allocate. So the frame has a second writer, and the allocator says it
+      was not handed out twice. `pgtable_find_mappings` was added to ask the
+      obvious next question — which other address maps that frame — and has
+      not yet fired at the same time as the dirty page.
+      **What the corruption looks like**, measured rather than inferred: a
+      worker's own sieve, compared against a reference, has about 8,600 of
+      its 60,000 marks wrong, scattered from the first index to the last,
+      with marks both missing and extra. The arithmetic is not wrong; the
+      memory the arithmetic read was. A fresh `make([]bool, n)` must be
+      zero, and a Go runtime does not zero a span it believes came straight
+      from the kernel.
       **A sharper signature than before**, from the one board failure:
       `store access fault at sepc 0x4020f3fe, stval 0x40000000` with
       `sp 0x407b7e30`, reported as a fault *in user code*, after 306,450
@@ -129,6 +185,38 @@ Ordering inside a section is roughly by what unblocks the most.
       child has not finished although its own work was far shorter than the
       wait. The exit status alone could not tell "stopped" from "ran
       through", so the old test was not checking what it claimed.
+- [x] **A kernel register set entering user mode.** (S) **Fixed**, and it
+      was the one failure in this family whose mechanism is exact.
+      `uspace_enter_frame` arms `sscratch` — the trap path's one source of
+      truth for "this trap came from user mode" — and then spends five
+      instructions in the kernel with interrupts on. A trap in that window
+      took the *user* path, switched `sp` to the thread's kernel stack top,
+      and wrote the kernel's own register set **over the frame that function
+      was in the middle of loading**: the frame lives at exactly that
+      address. On the way out the handler correctly saw `sstatus.SPP` say
+      supervisor and returned, and the `sret` then entered user mode with a
+      kernel program counter and a kernel stack pointer.
+      It was named by its own address: an endless instruction page fault at
+      `sepc 0x80204be8`, which `nm` places five instructions into
+      `uspace_enter_frame`. The board had shown the same thing as
+      `sepc 0x4020f3fe` with `sp 0x407b7e30` and called it a fault in user
+      code. Interrupts are now off across the window — `sret` restores them
+      from `SPIE` — and the window is **closed rather than narrowed**, since
+      no instruction both arms `sscratch` and returns.
+      `trap_mismatched_entries` is the invariant for the class: the entry
+      code records which path it took in the frame's spare word, and C
+      compares it against what the hardware says. The two disagreeing is
+      precisely `sscratch` armed while the kernel is still running.
+- [x] **Every detector was reported before the program ran.** (S) The whole
+      block — unrecorded regions, replaced pages, slot aliases, stack
+      overflows, spawn failures, hart misses, and everything added while
+      hunting the race — sat at the end of *hart startup*, so it printed
+      zeros in every run and could not have printed anything else. This file
+      said those detectors "all read zero in the failing runs"; they did,
+      because they were read before the run. **A detector reported at the
+      wrong moment is worse than no detector**, because it is evidence of
+      the wrong thing. They are printed after a program finishes now, which
+      is how the dirty-frame report above was finally seen.
 - [x] **An idle hart was never told the process had ended.** (S) **Found by
       the test above**, and it is the reason that test hung in silence
       rather than failing. The scheduling loop reads "is the process over?"

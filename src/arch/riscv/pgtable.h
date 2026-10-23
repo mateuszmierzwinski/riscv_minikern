@@ -129,6 +129,12 @@ uint64_t pgtable_unmap(struct pgtable *pt, virt_t va);
 
 /* The value `satp` wants for this address space, with Sv39 selected and an
  * address-space id. */
+/* Every virtual address in this table that maps `phys`, up to `max` of
+ * them, with the count returned (which may exceed `max`). One is normal;
+ * **two is a frame with two owners**, and the second address says what it
+ * is. Walks the tables, so it is not for a hot path. */
+uint32_t pgtable_find_mappings(const struct pgtable *pt, phys_t phys, virt_t *out, uint32_t max);
+
 uint64_t pgtable_satp(const struct pgtable *pt, uint16_t asid);
 
 /* The physical address an entry points at — the next table, or the page.

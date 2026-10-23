@@ -468,6 +468,16 @@ uint32_t uspace_stale_records(void);
  * here and never in the demand count. */
 uint64_t uspace_populated_pages(void);
 
+/* Backs every mapping at `mmap` rather than on first touch — the behaviour
+ * before demand paging, kept as a knob because it bisects the fault path
+ * out of a hunt in one line. */
+void uspace_back_eagerly(bool on);
+
+/* Turns on the checks that are too expensive to leave running: reading back
+ * every page the kernel zeroes, and walking the tables for a second mapping
+ * of a frame that turns out dirty. For a hunt, not for a boot. */
+void uspace_set_paranoid(bool on);
+
 /* Raises a signal on a process, doing **what that signal means**.
  *
  * Four of them do not reach a handler at all by default: `SIGSTOP` always
@@ -495,6 +505,15 @@ uint32_t uspace_impossible_frames(void);
  * file-backed mapping is otherwise indistinguishable from an anonymous one
  * that a program happened to write the same bytes into. */
 uint64_t uspace_file_pages(void);
+
+/* Frames that were not zero immediately after being zeroed for a fresh
+ * mapping. A fresh anonymous page must read as zero — a Go runtime does not
+ * zero a span it believes came from the kernel — so any value but zero here
+ * is memory handed to two owners at once. */
+uint32_t uspace_dirty_frames(void);
+
+/* Frames handed back to the allocator because a mapping went away. */
+uint64_t uspace_freed_frames(void);
 
 /* How many 2 MiB pages have been handed to user space. It is the only way
  * to tell a huge mapping from an ordinary one from outside: the program

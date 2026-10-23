@@ -30,6 +30,16 @@
  * 38 words rather than 37 to keep the frame 16-byte aligned, which the ABI
  * requires of any stack pointer. */
 #define FRAME_KTP (36 * 8)
+
+/* **Which path the entry code took**, so that C can check it against what
+ * the hardware says. 1 means it took the user path, because `sscratch` was
+ * non-zero; 0 means the kernel path. `sstatus.SPP` is the other answer to
+ * the same question, and the two must agree: a trap that entered by the
+ * user path while the hardware says it came from the kernel is `sscratch`
+ * armed while the kernel was still running — the bug that put a kernel
+ * register set into user mode. The word was the frame's alignment padding,
+ * which is why the frame does not grow. */
+#define FRAME_ENTRY (37 * 8)
 #define FRAME_SIZE (38 * 8)
 
 #endif

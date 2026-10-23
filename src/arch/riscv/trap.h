@@ -30,7 +30,11 @@ struct trapframe {
     uint64_t scause;
     uint64_t stval;
     uint64_t kernel_tp;  /* the hart id to restore on a trap from user mode */
-    uint64_t padding;    /* keeps the frame 16-byte aligned */
+    /* Non-zero when the entry code took its **user** path, which it decides
+     * by `sscratch` being armed. `sstatus.SPP` is the hardware's answer to
+     * the same question, and `trap_mismatched_entries` counts the times
+     * they disagree — see `frame.h`. It was the frame's alignment padding. */
+    uint64_t entry;
 };
 
 /* Exception causes this kernel names. The rest are printed by number. */
@@ -98,6 +102,18 @@ void trap_set_lock(bool (*enter)(void), void (*exit)(bool));
  * finished, so a thread switch from there resumes the other thread with the
  * interrupt still pending. NULL to remove it. */
 void trap_set_user_return_hook(void (*hook)(struct trapframe *tf));
+
+/* Traps that entered by the user path while the hardware said they came
+ * from the kernel — `sscratch` armed with the kernel still running. Any
+ * value but zero means a trap frame was written over a stack that was in
+ * use, which is how a kernel register set reaches user mode. */
+uint64_t trap_mismatched_entries(void);
+
+/* The most harts that have been inside the kernel at the same time. One, by
+ * construction — the kernel lock is what makes four harts safe without
+ * auditing every structure here — and every argument that ends "but the lock
+ * prevents that" rests on it. */
+uint32_t trap_most_harts_inside(void);
 
 /* How many software interrupts (cross-hart pokes) this machine has actually
  * taken as traps, which is not the same as how many were sent. */

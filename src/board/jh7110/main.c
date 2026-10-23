@@ -79,11 +79,18 @@ static void banner(uint64_t hart) {
  * power the machine off, and one that takes HSM for granted brings up no
  * other cores and says nothing about why. */
 static void report_firmware(void) {
-    kprintf("sbi: timer %s, hart-state %s, reset %s, debug-console %s\n",
+    kprintf("sbi: timer %s, hart-state %s, reset %s, debug-console %s, remote-fence %s\n",
             sbi_probe_extension(SBI_EXT_TIME) ? "yes" : "no",
             sbi_probe_extension(SBI_EXT_HSM) ? "yes" : "no",
             sbi_probe_extension(SBI_EXT_SRST) ? "yes" : "no",
-            sbi_probe_extension(SBI_EXT_DBCN) ? "yes" : "no");
+            sbi_probe_extension(SBI_EXT_DBCN) ? "yes" : "no",
+            /* **The one whose absence is silent.** Without RFENCE a
+             * mapping removed on one hart stays in another hart's TLB, and
+             * a stale translation does not fault — it reads the wrong page.
+             * Every other extension here announces itself by failing
+             * loudly; this one announces itself by corrupting memory, so it
+             * is worth a word in the boot log. */
+            mmu_can_flush_remotely() ? "yes" : "**NO**");
 }
 
 /* Reads the machine's own description. Everything after this point knows
@@ -555,6 +562,38 @@ static void bring_up_other_harts(uint64_t dtb, uint64_t boot_hart) {
     }
     kprintf("smp: %u of %u started harts reached the kernel, %u running in total\n",
             harts_arrived, want, smp_running_count());
+}
+
+/* Everything the kernel noticed that it should not have.
+ *
+ * **Called after a program has run, which it was not.** This block used to
+ * sit at the end of hart startup — before any program existed — so every
+ * counter in it was printed as zero in every run, including the ones added
+ * while hunting the four-hart race. `ROADMAP.md` §0 said those detectors
+ * "all read zero in the failing runs", and they did: they were read before
+ * the run. A detector reported at the wrong moment is worse than no
+ * detector, because it is evidence of the wrong thing.
+ *
+ * `trap:` is printed unconditionally, because "one hart inside the kernel"
+ * is the assumption every other argument in this kernel rests on and a
+ * number nobody has ever seen is not a measurement. */
+static void report_detectors(void) {
+    /* `trap:` counts traps in flight rather than harts holding the lock —
+     * a trap that yields is still counted until it is resumed, so more than
+     * four is ordinary on a four-hart machine and the number is here for
+     * scale rather than as an assertion. The allocator's collision count is
+     * the real test: it is taken at the one place a lost update costs a
+     * frame with two owners. */
+    kprintf("trap: %u traps in flight at most, %u frames handed out twice,"
+            " %u allocator collisions\n",
+            trap_most_harts_inside(), pmm_double_allocations(mem_frames()),
+            mem_allocator_collisions());
+    {
+        uint64_t taken = 0, given = 0;
+        mem_heap_traffic(&taken, &given);
+        kprintf("mem: the kernel heap took %llu pages and gave back %llu\n",
+                (unsigned long long)taken, (unsigned long long)given);
+    }
     if (uspace_unrecorded_regions() != 0) {
         kprintf("uspace: **%u mappings the address-space record could not hold**\n",
                 uspace_unrecorded_regions());
@@ -563,6 +602,10 @@ static void bring_up_other_harts(uint64_t dtb, uint64_t boot_hart) {
         kprintf("uspace: **%u live pages replaced by an unfixed mapping**\n",
                 uspace_replaced_pages());
     }
+    if (uspace_dirty_frames() != 0) {
+        kprintf("uspace: **%u frames were not zero after being zeroed**\n",
+                uspace_dirty_frames());
+    }
     if (uspace_impossible_frames() != 0) {
         kprintf("uspace: **%u frames returned to user mode with a kernel pc or sp**\n",
                 uspace_impossible_frames());
@@ -570,6 +613,14 @@ static void bring_up_other_harts(uint64_t dtb, uint64_t boot_hart) {
     if (uspace_stale_records() != 0) {
         kprintf("uspace: **%u pages mapped at an address the record called free**\n",
                 uspace_stale_records());
+    }
+    if (trap_mismatched_entries() != 0) {
+        kprintf("trap: **%llu traps entered by the wrong path** (sscratch armed in the kernel)\n",
+                (unsigned long long)trap_mismatched_entries());
+    }
+    if (sched_bad_resumes() != 0) {
+        kprintf("sched: **%u threads could not be resumed on their own stack**\n",
+                sched_bad_resumes());
     }
     if (sched_spawn_failures() != 0 || sched_stack_overflows() != 0 ||
         sched_slot_aliases() != 0) {
@@ -1008,6 +1059,7 @@ extern const char user_tstp_start[], user_tstp_end[];
  * are what turn "demand paging works" and "nothing is copied" into
  * measurements rather than claims, so they are printed together. */
 static void report_mapping_counters(void) {
+    kprintf("mem: %llu frames freed by unmapping\n", (unsigned long long)uspace_freed_frames());
     kprintf("mem: %llu pages backed on demand, %llu populated up front, %llu moved by mremap,"
             " %llu huge, %llu from a file\n",
             (unsigned long long)uspace_demand_pages(), (unsigned long long)uspace_populated_pages(),
@@ -1066,13 +1118,22 @@ static void run_one_user_program(const char *name, const char *from, const char 
  * and on the architecture this migrated from, the equivalent check was
  * satisfiable by a core that had never left its idle loop, which is why
  * this counts switches rather than asking whether a hart is up. */
+static void report_detectors(void);
+
 static void report_hart_usage(void) {
+    report_detectors();
     {
         uint64_t sleeps = 0, average = 0, worst = 0;
         sched_sleep_report(&sleeps, &average, &worst);
-        kprintf("signal: %llu delivered, %llu frames overwritten\n",
-                (unsigned long long)signal_delivered(),
-                (unsigned long long)signal_clobbered_frames());
+        {
+            uint32_t busiest = 0;
+            uint64_t times = 0;
+            signal_busiest(&busiest, &times);
+            kprintf("signal: %llu delivered (most often %u, %llu times), %llu frames"
+                    " overwritten\n",
+                    (unsigned long long)signal_delivered(), busiest, (unsigned long long)times,
+                    (unsigned long long)signal_clobbered_frames());
+        }
         kprintf("sched: %llu sleeps, woken %llu us late on average, %llu us at worst\n",
                 (unsigned long long)sleeps, (unsigned long long)average,
                 (unsigned long long)worst);
@@ -1179,6 +1240,15 @@ static void run_user_programs(void) {
     syscall_allow_tgkill(!cmdline_has(boot_cmdline, "minikern.nopreempt"));
     /* Puts `gettid`'s old wrong answer back, for measuring what it cost. */
     syscall_one_tid(cmdline_has(boot_cmdline, "minikern.onetid"));
+    /* Keeps the kernel heap's pages out of the frame pool — a diagnostic for
+     * §0's race, which leaks about 1.5 MiB. */
+    mem_heap_keep_pages(cmdline_has(boot_cmdline, "minikern.heapkeep"));
+    /* Every mapping backed at `mmap`, as it was before demand paging. */
+    uspace_back_eagerly(cmdline_has(boot_cmdline, "minikern.eager"));
+    /* Every thread stays on the hart it first ran on. */
+    sched_pin_threads(cmdline_has(boot_cmdline, "minikern.nomigrate"));
+    /* The checks that are too expensive to leave on. */
+    uspace_set_paranoid(cmdline_has(boot_cmdline, "minikern.paranoid"));
     /* The controlling terminal, before anything can read it. */
     {
         static const struct console_input_port port = {.read = console_input_read,

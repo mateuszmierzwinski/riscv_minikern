@@ -41,6 +41,11 @@ struct pmm {
      * this kernel will leak rather than free early, which is the right way
      * round. NULL means no sharing is possible and every free is a free. */
     uint8_t *refs;
+
+    /* Times a frame was handed out while the bitmap already said it was
+     * used. The bitmap is what makes that impossible, so this is the
+     * allocator asked to confirm its own answer rather than believed. */
+    uint32_t double_allocations;
 };
 
 /* Gives the allocator somewhere to count shares. `refs` is npages bytes and
@@ -78,6 +83,10 @@ void pmm_reserve(struct pmm *p, phys_t phys, uint64_t len);
  * is a multiple of align_pages (0 or 1: any). Returns KERR_OK with *phys
  * set, or KERR_NOMEM. */
 int pmm_alloc(struct pmm *p, uint32_t npages, uint32_t align_pages, phys_t *phys);
+
+/* Times `pmm_alloc` found the frame it was about to hand out already
+ * marked used. Any value but zero is one page with two owners. */
+uint32_t pmm_double_allocations(const struct pmm *p);
 
 /* Frees npages frames from phys. Returns KERR_OK, or KERR_INVAL when any of
  * them is outside the pmm, misaligned or already free (a double free). */

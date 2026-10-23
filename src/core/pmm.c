@@ -138,10 +138,24 @@ int pmm_alloc(struct pmm *p, uint32_t npages, uint32_t align_pages, phys_t *phys
         return rc;
     }
     for (uint32_t k = 0; k < npages; k++) {
+        /* **A frame handed out twice** is two owners of one page, which is
+         * the shape of the corruption `ROADMAP.md` §0 is chasing: a fresh
+         * allocation arrives already full of somebody else's data. The
+         * bitmap is what prevents it, so this is the bitmap being asked to
+         * confirm its own answer — cheap, and the alternative is to keep
+         * believing it. */
+        if (page_used(p, index + k)) {
+            p->double_allocations++;
+            return KERR_INVAL;
+        }
         set_page(p, index + k, true);
     }
     *phys = p->base + (index << PMM_PAGE_SHIFT);
     return KERR_OK;
+}
+
+uint32_t pmm_double_allocations(const struct pmm *p) {
+    return p->double_allocations;
 }
 
 int pmm_free(struct pmm *p, phys_t phys, uint32_t npages) {

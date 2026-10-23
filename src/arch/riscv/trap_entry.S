@@ -30,7 +30,17 @@ trap_entry:
     csrrw   sp, sscratch, sp
     bnez    sp, 1f
     csrr    sp, sscratch            /* came from the kernel: that was our sp */
+    addi    sp, sp, -FRAME_SIZE
+    /* Which path this was, for the C side to check against `sstatus.SPP`.
+     * Written with `zero` and with `sp` — a register that is already this
+     * frame's address and is therefore both non-zero and free. **No scratch
+     * register**: nothing has been saved yet at this point, so borrowing
+     * one would destroy the interrupted program's copy of it. */
+    sd      zero, FRAME_ENTRY(sp)   /* the kernel path */
+    j       2f
 1:  addi    sp, sp, -FRAME_SIZE
+    sd      sp, FRAME_ENTRY(sp)     /* the user path: `sscratch` was armed */
+2:
 
     sd      x1, FRAME_X(1)(sp)
     sd      x3, FRAME_X(3)(sp)

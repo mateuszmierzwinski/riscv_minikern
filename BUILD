@@ -1170,6 +1170,26 @@ sh_test(
     tags = ["manual"],
 )
 
+# §0's reproducer: the four-hart race, hammered until it shows.
+#
+# Not a gate — the thing it looks for is known to be there — but the
+# instrument that makes a question about it answerable in minutes rather than
+# a day. See `test/race_qemu_test.sh`.
+sh_test(
+    name = "race_qemu_test",
+    size = "large",
+    srcs = ["test/race_qemu_test.sh"],
+    args = [
+        "$(rootpath :minikern)",
+        "$(rootpath //src/userland/racestress:racestress)",
+    ],
+    data = [
+        ":minikern",
+        "//src/userland/racestress:racestress",
+    ],
+    tags = ["manual"],
+)
+
 # P3: four harts, and a Go program using all of them.
 sh_test(
     name = "smp_qemu_test",

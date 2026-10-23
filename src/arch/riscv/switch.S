@@ -84,8 +84,34 @@ context_switch:
 
     .globl uspace_enter_frame
 uspace_enter_frame:
+    /* **Interrupts off first, and this is not a tidiness measure.**
+     *
+     * `sscratch` is the trap path's one source of truth for "this trap came
+     * from user mode": non-zero means user, and the entry code switches to
+     * the stack it names. Arming it here therefore makes the next *handful
+     * of instructions* lie — they run in the kernel, with interrupts on,
+     * with `sscratch` saying user.
+     *
+     * An interrupt in that window was the four-hart race. The entry took
+     * the user path, switched `sp` to this thread's kernel stack top, and
+     * wrote the kernel's own register set **over the frame this function is
+     * in the middle of loading** — the frame is at exactly that address. On
+     * the way out the handler saw `sstatus.SPP` say supervisor, correctly
+     * returned to this code, and the `sret` below then entered user mode
+     * with a kernel program counter and a kernel stack pointer. That is the
+     * fault the board reported as `sepc 0x4020f3fe` and the emulator as an
+     * endless instruction page fault five instructions into *this function*
+     * — which is what named it.
+     *
+     * `sret` restores `SIE` from `SPIE`, which is set below, so the thread
+     * still gets interrupts the moment it is in user mode. The window is
+     * closed rather than narrowed: there is no instruction that sets
+     * `sscratch` and returns in one step, so making it small would have
+     * left exactly this bug, more rarely. */
+    csrci   sstatus, 2              /* SIE: no interrupts until sret */
+
     /* The stack a trap from this thread will land on: just above the frame,
-     * which is at the base of this thread's kernel stack. Exactly what the
+     * which is at the top of this thread's kernel stack. Exactly what the
      * trap path records on its way back out. */
     addi    t0, a0, FRAME_SIZE
     csrw    sscratch, t0

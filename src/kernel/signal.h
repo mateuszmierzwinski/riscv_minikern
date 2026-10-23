@@ -163,6 +163,11 @@ const uint8_t *signal_trampoline_code(uint32_t *bytes);
 /* How many signals have been delivered, for a report. */
 uint64_t signal_delivered(void);
 
+/* Which signal was delivered most often, and how often. An aggregate count
+ * cannot tell a busy program from a kernel re-delivering one signal for
+ * ever, and the failing runs this is for are the second kind. */
+void signal_busiest(uint32_t *signo, uint64_t *count);
+
 /* How many times a handler's frame was found overwritten on its way back —
  * which means something else wrote over the stack the frame was on. It
  * should be zero; anything else is a frame placed where it could be

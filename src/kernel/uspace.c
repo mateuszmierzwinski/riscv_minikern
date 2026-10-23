@@ -1543,6 +1543,92 @@ static bool page_count(uint64_t bytes, uint64_t *pages) {
  * pointer to a next-level table, not a page, so "mapped but inaccessible"
  * is not something the format can express at a leaf. Leaving it absent
  * gives the same behaviour — a touch faults — without the page tables. */
+/* Frames handed back to the allocator because a mapping went away. It is
+ * the denominator for every theory about a write arriving through a stale
+ * translation *after* the frame was reused: no frees, no such writes. */
+static uint64_t freed_frames;
+
+uint64_t uspace_freed_frames(void) {
+    return freed_frames;
+}
+
+/* Frames that were not still zero after being zeroed. */
+static uint32_t dirty_frames;
+
+uint32_t uspace_dirty_frames(void) {
+    return dirty_frames;
+}
+
+/* **Was the frame still zero after we zeroed it?**
+ *
+ * A fresh anonymous mapping must read as zero — a Go runtime relies on
+ * exactly that and does not zero a span it believes came straight from the
+ * kernel. The four-hart race's reproducer says it does not always hold: a
+ * worker's freshly made 60,000-element slice came back with 8,648 elements
+ * set, scattered from the first index to the last, which is dirty memory
+ * handed out as clean.
+ *
+ * So the question is asked where it can still be attributed: right after
+ * this page was zeroed and mapped. A frame that is already dirty here is a
+ * frame somebody else is writing — one the allocator handed out twice. */
+/* Whether the costly checks run. Off by default: reading back every page
+ * the kernel zeroes is 4 KiB per fault, which is both a real cost and —
+ * measured — enough of a change in timing to hide the race it is looking
+ * for. `minikern.paranoid` turns it on for a hunt. */
+static bool paranoid;
+
+void uspace_set_paranoid(bool on) {
+    paranoid = on;
+}
+
+static void check_the_frame_is_clean(phys_t page, virt_t va) {
+    const volatile uint64_t *words = (const volatile uint64_t *)(uintptr_t)page;
+    if (!paranoid) {
+        return;
+    }
+    /* **And that the mapping leads to this frame.**
+     *
+     * The frame is verified zero through the *identity* map — the physical
+     * address — and the program reads it through its own virtual one. Those
+     * are the same memory only if the entry that was just written says so,
+     * and the corruption being chased is a program reading something other
+     * than the page it was given. Walking the table back is the one way to
+     * ask whether the two addresses agree. */
+    {
+        struct uproc *me = uspace_current();
+        phys_t got = 0;
+        uint64_t flags = 0, span = 0;
+        if (me != NULL && (!pgtable_lookup(&me->pt, va, &got, &flags, &span) ||
+                           (got & ~(phys_t)(PAGE_SIZE - 1u)) != page)) {
+            if (dirty_frames++ == 0) {
+                kprintf("\nuspace: **%016llx does not lead to the frame it was given**:"
+                        " mapped %016llx, found %016llx\n",
+                        (unsigned long long)va, (unsigned long long)page,
+                        (unsigned long long)got);
+            }
+            return;
+        }
+    }
+    for (uint32_t i = 0; i < PAGE_SIZE / 8u; i++) {
+        if (words[i] == 0) {
+            continue;
+        }
+        if (dirty_frames++ == 0) {
+            virt_t where[4] = {0};
+            struct uproc *me = uspace_current();
+            uint32_t n = me == NULL ? 0u : pgtable_find_mappings(&me->pt, page, where, 4u);
+            kprintf("\nuspace: **the frame just zeroed for %016llx is not zero**:"
+                    " word %u of %016llx is %016llx\n",
+                    (unsigned long long)va, i, (unsigned long long)page,
+                    (unsigned long long)words[i]);
+            kprintf("uspace:   %u addresses map that frame: %016llx %016llx %016llx %016llx\n", n,
+                    (unsigned long long)where[0], (unsigned long long)where[1],
+                    (unsigned long long)where[2], (unsigned long long)where[3]);
+        }
+        return;
+    }
+}
+
 static int back_one_page(struct uproc *p, virt_t va, uint32_t prot) {
     phys_t page = 0;
     int rc;
@@ -1559,7 +1645,9 @@ static int back_one_page(struct uproc *p, virt_t va, uint32_t prot) {
     rc = pgtable_map(&p->pt, va, page, PAGE_SIZE, prot_bits(prot));
     if (rc != KERR_OK) {
         mem_free_pages(page, 1);
+        return rc;
     }
+    check_the_frame_is_clean(page, va);
     return rc;
 }
 
@@ -1961,6 +2049,19 @@ static int fixed_is_allowed(struct uproc *p, const struct uspace_mapping *m, uin
     return KERR_OK;
 }
 
+/* Whether every mapping is backed at `mmap` whatever the caller asked.
+ *
+ * The behaviour this kernel had before demand paging, as a knob: if §0's
+ * race survives with every page backed up front, the fault path is not
+ * where it lives — and that path is where `back_one_page`, the validator's
+ * `make_present`, the local-only TLB flush and the publish barrier all are.
+ * A large bisect for one line of configuration. */
+static bool back_everything_eagerly;
+
+void uspace_back_eagerly(bool on) {
+    back_everything_eagerly = on;
+}
+
 /* How many pages were backed at `mmap` because the caller asked for them to
  * be, rather than on first touch. */
 static uint64_t populated_pages;
@@ -2092,7 +2193,7 @@ int uspace_map(struct uproc *p, const struct uspace_mapping *m, virt_t *out) {
     if (rc != KERR_OK) {
         return rc;
     }
-    if (m->populate) {
+    if (m->populate || back_everything_eagerly) {
         populate(p, base, pages, m->prot);
     }
     *out = base;
@@ -2139,6 +2240,7 @@ static int drop_pages(struct uproc *p, virt_t at, uint64_t bytes) {
          * the loop and there is no second one after it: every removal is
          * already published before its frame is reusable. */
         published_removal();
+        freed_frames += span / PAGE_SIZE;
         mem_free_pages(phys, (uint32_t)(span / PAGE_SIZE));
         va = (va & ~(virt_t)(span - 1u)) + span;
     }

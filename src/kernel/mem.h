@@ -16,6 +16,7 @@
 #include <stdint.h>
 
 #include "core/bootinfo.h"
+#include "core/pmm.h"
 #include "core/ports.h"
 #include "core/types.h"
 
@@ -27,6 +28,25 @@ int mem_init(const struct bootinfo *info, phys_t arena_base, uint64_t arena_byte
 
 /* Frames. `align_pages` of 0 or 1 means any alignment. */
 int mem_alloc_pages(uint32_t npages, uint32_t align_pages, phys_t *phys);
+
+/* The frame allocator itself, for the counters it keeps about its own
+ * answers — see `pmm_double_allocations`. */
+const struct pmm *mem_frames(void);
+
+/* Times two harts were inside the frame allocator at once. The kernel lock
+ * is what makes that impossible; any value but zero means it does not. */
+uint32_t mem_allocator_collisions(void);
+
+/* Pages the kernel heap has taken from the frame allocator and given back.
+ * The heap and user mappings draw on one pool, so a page the heap gives
+ * back while something still points into it returns as somebody's fresh
+ * anonymous memory. */
+void mem_heap_traffic(uint64_t *taken, uint64_t *given_back);
+
+/* Stops the kernel heap returning pages to the frame allocator, so that a
+ * page it has finished with can never become a user page. It leaks, and it
+ * is a diagnostic: see `mem.c`. */
+void mem_heap_keep_pages(bool on);
 int mem_free_pages(phys_t phys, uint32_t npages);
 
 /* Says that one more address space is using this frame, so freeing it once

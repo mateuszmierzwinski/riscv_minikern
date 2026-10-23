@@ -15,6 +15,8 @@ _Static_assert(__builtin_offsetof(struct trapframe, sstatus) == FRAME_SSTATUS, "
 _Static_assert(__builtin_offsetof(struct trapframe, scause) == FRAME_SCAUSE, "scause offset");
 _Static_assert(__builtin_offsetof(struct trapframe, stval) == FRAME_STVAL, "stval offset");
 _Static_assert(__builtin_offsetof(struct trapframe, kernel_tp) == FRAME_KTP, "kernel_tp offset");
+_Static_assert(__builtin_offsetof(struct trapframe, entry) == FRAME_ENTRY, "entry offset");
+_Static_assert(__builtin_offsetof(struct trapframe, kernel_tp) == FRAME_KTP, "kernel_tp offset");
 _Static_assert(FRAME_SIZE % 16u == 0u, "a stack pointer must stay 16-byte aligned");
 
 void trap_entry(void);
@@ -143,6 +145,40 @@ static bool handle_interrupt(uint64_t code) {
     }
 }
 
+/* Traps whose two answers to "where did this come from?" disagreed. */
+static uint64_t mismatched_entries;
+
+uint64_t trap_mismatched_entries(void) {
+    return mismatched_entries;
+}
+
+/* **The two sources of truth, compared.**
+ *
+ * The entry code decides "this came from user mode" from `sscratch` being
+ * armed; the hardware records it in `sstatus.SPP`. They agree unless
+ * `sscratch` is armed while the kernel is still running — which is a window
+ * the kernel opens itself, and in that window a trap writes its frame onto
+ * a stack that is in use. The consequence was a thread entering user mode
+ * with a kernel program counter, found as an endless instruction page fault
+ * inside `uspace_enter_frame`.
+ *
+ * It is checked rather than reasoned about because the window was closed by
+ * argument once already: the comment in `trap_entry.S` said `sscratch` is
+ * "zero while the kernel runs", and it was not. */
+static void check_the_entry_agrees(const struct trapframe *tf) {
+    bool by_user_path = tf->entry != 0;
+    bool from_user = (tf->sstatus & (1ull << 8)) == 0;
+    if (by_user_path == from_user) {
+        return;
+    }
+    if (mismatched_entries++ == 0) {
+        kprintf("\ntrap: **this trap entered by the %s path but came from %s** —"
+                " sepc %016llx sp %016llx\n",
+                by_user_path ? "user" : "kernel", from_user ? "user mode" : "the kernel",
+                (unsigned long long)tf->sepc, (unsigned long long)tf->x[2]);
+    }
+}
+
 static void (*user_return_hook)(struct trapframe *tf);
 
 void trap_set_user_return_hook(void (*hook)(struct trapframe *tf)) {
@@ -189,8 +225,26 @@ void trap_set_lock(bool (*enter)(void), void (*exit)(bool)) {
     lock_exit = exit;
 }
 
+/* How many harts have been inside the kernel at the same time, and the most
+ * there has ever been.
+ *
+ * One, by construction: `klock_enter` on the way in and `klock_exit` on the
+ * way out are what make four harts safe without auditing every structure in
+ * this kernel. **Which is exactly why it is counted.** Every theory about
+ * the four-hart race that ends "but the lock prevents that" rests on this
+ * number being one, and nothing had ever checked it. */
+static uint32_t inside_the_kernel;
+static uint32_t most_inside;
+
+uint32_t trap_most_harts_inside(void) {
+    return most_inside;
+}
+
 void trap_handle(struct trapframe *tf) {
     bool took = lock_enter != NULL && lock_enter();
+    uint32_t now = __atomic_add_fetch(&inside_the_kernel, 1u, __ATOMIC_RELAXED);
+    most_inside = now > most_inside ? now : most_inside;
+    check_the_entry_agrees(tf);
     if ((tf->scause & SCAUSE_INTERRUPT) != 0 &&
         handle_interrupt(tf->scause & ~SCAUSE_INTERRUPT)) {
         on_the_way_back(tf);
@@ -201,6 +255,7 @@ void trap_handle(struct trapframe *tf) {
          * machine that is about to stop. */
         unexpected(tf);
     }
+    __atomic_sub_fetch(&inside_the_kernel, 1u, __ATOMIC_RELAXED);
     if (lock_exit != NULL) {
         lock_exit(took);
     }
