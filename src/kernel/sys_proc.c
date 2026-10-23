@@ -189,6 +189,22 @@ static int64_t sys_clone(struct trapframe *tf) {
     if ((flags & CLONE_THREAD) != 0) {
         return syscall_clone_thread(tf);
     }
+    /* **`RLIMIT_NPROC`, enforced before a slot is taken.**
+     *
+     * Counted by **uid**, not per process, because that is what the limit
+     * means: a fork bomb is one program making thousands, and a per-process
+     * count would let every child start again from zero and the limit would
+     * bound nothing. Root is exempt, like every other limit here.
+     *
+     * `EAGAIN` rather than `EPERM`: the caller is being told to try later,
+     * which is what the error means and what a runtime retries on. */
+    if (uspace_euid() != 0) {
+        struct uproc *me = uspace_current();
+        uint64_t limit = uspace_rlimit_nproc();
+        if (me != NULL && uspace_count_by_uid(me->uid) >= limit) {
+            return KERR_AGAIN;
+        }
+    }
     child = uspace_alloc();
     if (child == NULL) {
         return KERR_AGAIN;

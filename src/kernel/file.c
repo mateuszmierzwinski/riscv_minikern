@@ -1,5 +1,7 @@
 #include "kernel/file.h"
 
+#include "kernel/uspace.h"
+
 #include <stddef.h>
 
 #include "core/errno.h"
@@ -101,8 +103,15 @@ int fd_install(struct file *f) {
         return KERR_BADF;
     }
     /* The **lowest** free descriptor, which is what the ABI promises and
-     * what a program relies on when it dups onto 0, 1 or 2. */
-    for (uint32_t i = 0; i < FD_MAX; i++) {
+     * what a program relies on when it dups onto 0, 1 or 2.
+     *
+     * Bounded by `RLIMIT_NOFILE` as well as by the table, which is what
+     * makes that limit a limit: it read as a number and held nobody to it
+     * until this line. A descriptor at or above the soft limit is `EMFILE`,
+     * the same answer a full table gives, because to the caller they are
+     * the same situation. */
+    uint64_t limit = uspace_rlimit_nofile();
+    for (uint32_t i = 0; i < FD_MAX && i < limit; i++) {
         if (table[i] == NULL) {
             table[i] = f;
             return (int)i;

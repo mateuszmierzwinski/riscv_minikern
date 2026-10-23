@@ -100,6 +100,19 @@ struct uproc {
     uint32_t gid;
     uint32_t euid;
     uint32_t egid;
+    /* **Resource limits, soft and hard.**
+     *
+     * Only the ones this kernel can actually enforce are kept: descriptors,
+     * processes and the stack. A limit that is stored and never consulted is
+     * worse than an absent one, because a program reads it and plans
+     * around a number nothing will hold it to.
+     *
+     * Inherited at `fork` and across `execve`, which is what makes a shell
+     * able to limit a job by setting its own limits before starting it. */
+    uint64_t rlim_nofile_soft;
+    uint64_t rlim_nofile_hard;
+    uint64_t rlim_nproc_soft;
+    uint64_t rlim_nproc_hard;
     bool used;
     bool zombie;        /* finished, and keeping its status for its parent */
     int64_t status;     /* what `wait4` will report */
@@ -205,6 +218,18 @@ uint32_t uspace_pgid_of(const struct uproc *p);
 
 /* The caller's effective identity, for a permission check. */
 uint32_t uspace_euid(void);
+
+/* The calling process's soft limit on open descriptors, for the descriptor
+ * table to enforce. `RLIM_INFINITY` when there is no process — the kernel's
+ * own descriptors are not somebody's quota. */
+uint64_t uspace_rlimit_nofile(void);
+
+/* The soft limit on processes, and how many the caller's uid already has.
+ * Counting by uid rather than per process is what the limit means: a fork
+ * bomb is one program making thousands, and a per-process count would let
+ * each child start again from zero. */
+uint64_t uspace_rlimit_nproc(void);
+uint32_t uspace_count_by_uid(uint32_t uid);
 uint32_t uspace_egid(void);
 
 /* Whether the caller may open something with these owners and mode, for

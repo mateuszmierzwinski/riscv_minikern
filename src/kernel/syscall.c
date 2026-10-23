@@ -823,6 +823,8 @@ static int64_t sys_tgkill(struct trapframe *tf) {
  * given, and nothing here enforces a limit on anything, so every limit is
  * reported as unlimited except the stack, whose real value is known. */
 #define RLIMIT_STACK 3u
+#define RLIMIT_NPROC 6u
+#define RLIMIT_NOFILE 7u
 #define RLIM_INFINITY 0xFFFFFFFFFFFFFFFFull
 
 struct user_rlimit {
@@ -830,17 +832,107 @@ struct user_rlimit {
     uint64_t hard;
 };
 
-static int64_t sys_prlimit64(struct trapframe *tf) {
-    struct user_rlimit *out = (struct user_rlimit *)(uintptr_t)sysarg(tf, 3);
-    if (sysarg(tf, 2) != 0) {
-        return KERR_PERM; /* setting a limit is refused, not pretended */
+/* `prlimit64(pid, resource, new, old)`.
+ *
+ * This **answered and enforced nothing** until now: every limit read as
+ * infinite except the stack, and setting one was refused. A stored limit
+ * that nothing consults is worse than an absent one, because a program
+ * reads it and plans around a number nothing will hold it to — so the two
+ * that this kernel can actually enforce are enforced, and the rest still
+ * read as infinite because that is the truth about them.
+ *
+ * The privilege rule is POSIX's and is the whole point of a hard limit: a
+ * process may lower either, may raise its **soft** limit up to the hard
+ * one, and may raise the **hard** limit only as root. Without that, a limit
+ * is a suggestion a program can decline.
+ */
+static int64_t rlimit_get(struct uproc *me, uint64_t which, struct user_rlimit *out) {
+    switch (which) {
+    case RLIMIT_STACK:
+        out->soft = USER_STACK_PAGES * PAGE_SIZE;
+        out->hard = out->soft;
+        return 0;
+    case RLIMIT_NOFILE:
+        out->soft = me->rlim_nofile_soft == 0 ? FD_MAX : me->rlim_nofile_soft;
+        out->hard = me->rlim_nofile_hard == 0 ? FD_MAX : me->rlim_nofile_hard;
+        return 0;
+    case RLIMIT_NPROC:
+        out->soft = me->rlim_nproc_soft == 0 ? RLIM_INFINITY : me->rlim_nproc_soft;
+        out->hard = me->rlim_nproc_hard == 0 ? RLIM_INFINITY : me->rlim_nproc_hard;
+        return 0;
+    default:
+        out->soft = RLIM_INFINITY;
+        out->hard = RLIM_INFINITY;
+        return 0;
     }
-    if (!may_write(out, sizeof *out)) {
+}
+
+static int64_t rlimit_set(struct uproc *me, uint64_t which, const struct user_rlimit *in) {
+    uint64_t *soft, *hard;
+    uint64_t ceiling;
+    switch (which) {
+    case RLIMIT_NOFILE:
+        soft = &me->rlim_nofile_soft;
+        hard = &me->rlim_nofile_hard;
+        ceiling = FD_MAX;
+        break;
+    case RLIMIT_NPROC:
+        soft = &me->rlim_nproc_soft;
+        hard = &me->rlim_nproc_hard;
+        ceiling = PROC_MAX;
+        break;
+    default:
+        /* Not storable here, and **refused rather than accepted and
+         * dropped**: a caller that is told its limit was set and finds it
+         * was not has been lied to. */
+        return KERR_PERM;
+    }
+    if (in->soft > in->hard) {
+        return KERR_INVAL;
+    }
+    {
+        uint64_t current_hard = *hard == 0 ? ceiling : *hard;
+        /* Raising the hard limit is root's alone. Lowering is anybody's,
+         * and is one-way for the same reason dropping a uid is. */
+        if (in->hard > current_hard && uspace_euid() != 0) {
+            return KERR_PERM;
+        }
+    }
+    *soft = in->soft > ceiling ? ceiling : in->soft;
+    *hard = in->hard > ceiling ? ceiling : in->hard;
+    return 0;
+}
+
+static int64_t sys_prlimit64(struct trapframe *tf) {
+    uint64_t which = sysarg(tf, 1);
+    const struct user_rlimit *in = (const struct user_rlimit *)(uintptr_t)sysarg(tf, 2);
+    struct user_rlimit *out = (struct user_rlimit *)(uintptr_t)sysarg(tf, 3);
+    struct uproc *me = uspace_current();
+    struct user_rlimit want;
+    if (me == NULL) {
+        return KERR_SRCH;
+    }
+    if (sysarg(tf, 0) != 0) {
+        return KERR_PERM; /* another process's limits need a lookup this does not do */
+    }
+    /* **Read before write**, so a caller doing both in one call sees the
+     * old values rather than the ones it just set — which is what the
+     * interface promises and what makes the save-and-restore idiom work. */
+    if (out != NULL) {
+        struct user_rlimit old;
+        (void)rlimit_get(me, which, &old);
+        if (!may_write(out, sizeof *out) ||
+            uspace_copy_out((virt_t)(uintptr_t)out, &old, sizeof old) != KERR_OK) {
+            return KERR_FAULT;
+        }
+    }
+    if (in == NULL) {
+        return 0;
+    }
+    if (uspace_copy_in(&want, (virt_t)(uintptr_t)in, sizeof want) != KERR_OK) {
         return KERR_FAULT;
     }
-    out->soft = sysarg(tf, 1) == RLIMIT_STACK ? USER_STACK_PAGES * PAGE_SIZE : RLIM_INFINITY;
-    out->hard = out->soft;
-    return 0;
+    return rlimit_set(me, which, &want);
 }
 
 /* ── signals ───────────────────────────────────────────────────────────────

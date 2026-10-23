@@ -987,6 +987,7 @@ extern const char user_wait_start[], user_wait_end[];
 extern const char user_pgrp_start[], user_pgrp_end[];
 extern const char user_term_start[], user_term_end[];
 extern const char user_uid_start[], user_uid_end[];
+extern const char user_rlimit_start[], user_rlimit_end[];
 
 static void run_one_user_program(const char *name, const char *from, const char *to) {
     struct uproc *proc = uspace_alloc();
@@ -1199,6 +1200,12 @@ static void run_user_programs(void) {
      * dropped; 131..134 name the step that failed. */
     if (cmdline_has(boot_cmdline, "minikern.uid")) {
         run_one_user_program("uid", user_uid_start, user_uid_end);
+    }
+    /* Roadmap §1: a resource limit that bites. 0 means it was read
+     * honestly, lowered, enforced at the fifth descriptor, and could not be
+     * raised again after dropping privilege. */
+    if (cmdline_has(boot_cmdline, "minikern.rlimit")) {
+        run_one_user_program("rlimit", user_rlimit_start, user_rlimit_end);
     }
     if (cmdline_has(boot_cmdline, "minikern.init")) {
         run_init_from_disk("/init");

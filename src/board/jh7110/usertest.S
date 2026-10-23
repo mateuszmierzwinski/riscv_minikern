@@ -34,6 +34,8 @@
 #define SYS_GETUID 174
 #define SYS_GETEUID 175
 #define SYS_SETUID 146
+#define SYS_PRLIMIT64 261
+#define SYS_OPENAT 56
 
 user_program_start:
     /* write(1, message, length) — the address comes from the program
@@ -876,6 +878,136 @@ uid_regained:
     ecall
 5:  j       5b
 user_uid_end:
+
+/* A twelfth program: **a resource limit that actually bites.**
+ *
+ * Roadmap §1's last item. `prlimit64` answered every question with
+ * "infinite" and refused every attempt to set anything, so a program read a
+ * number nothing would hold it to.
+ *
+ *   1. Read `RLIMIT_NOFILE`. It must come back as the table's size, not as
+ *      infinity — the honest answer about a kernel with a fixed table.
+ *   2. Lower it to 5, which anybody may do.
+ *   3. Read it back and see 5. A limit that is accepted and dropped is
+ *      worse than one that is refused.
+ *   4. Open `/dev/null` until it fails. With 0, 1 and 2 already open, the
+ *      5th descriptor must be the last: the next `openat` is `EMFILE`.
+ *   5. Try to raise the hard limit back. Refused, because this program is
+ *      no longer root — the step that makes a hard limit mean anything.
+ *
+ * The fourth step is the one that was missing: before it, the limit was a
+ * number in a struct. 0 means every step held.
+ */
+    .globl user_rlimit_start
+    .globl user_rlimit_end
+user_rlimit_start:
+    /* prlimit64(0, RLIMIT_NOFILE, NULL, &old) */
+    addi    sp, sp, -32
+    li      a0, 0
+    li      a1, 7                /* RLIMIT_NOFILE */
+    li      a2, 0
+    mv      a3, sp
+    li      a7, SYS_PRLIMIT64
+    ecall
+    bnez    a0, rl_get_failed
+    ld      t0, 0(sp)            /* the soft limit */
+    li      t1, 64               /* FD_MAX: the honest answer */
+    bne     t0, t1, rl_not_table_size
+
+    /* Lower it to 5, soft and hard. */
+    li      t0, 5
+    sd      t0, 0(sp)
+    sd      t0, 8(sp)
+    li      a0, 0
+    li      a1, 7
+    mv      a2, sp
+    li      a3, 0
+    li      a7, SYS_PRLIMIT64
+    ecall
+    bnez    a0, rl_set_failed
+
+    /* Read it back. */
+    addi    sp, sp, -32
+    li      a0, 0
+    li      a1, 7
+    li      a2, 0
+    mv      a3, sp
+    li      a7, SYS_PRLIMIT64
+    ecall
+    bnez    a0, rl_get_failed
+    ld      t0, 0(sp)
+    li      t1, 5
+    bne     t0, t1, rl_not_lowered
+    addi    sp, sp, 32
+
+    /* Open /dev/null until it is refused. 0, 1 and 2 are already open, so
+     * exactly two more may be had. */
+    li      s2, 0                /* how many opened */
+rl_open_loop:
+    li      a0, -100             /* AT_FDCWD */
+    lla     a1, rl_devnull
+    li      a2, 0
+    li      a3, 0
+    li      a7, SYS_OPENAT
+    ecall
+    bltz    a0, rl_opens_done
+    addi    s2, s2, 1
+    li      t0, 8
+    blt     s2, t0, rl_open_loop
+    /* More than the limit allowed: the limit is not being enforced. */
+    j       rl_not_enforced
+rl_opens_done:
+    li      t0, 2
+    bne     s2, t0, rl_not_enforced
+
+    /* Drop privilege, then try to raise the hard limit back. */
+    li      a0, 1000
+    li      a7, SYS_SETUID
+    ecall
+    bnez    a0, rl_set_failed
+    li      t0, 64
+    sd      t0, 0(sp)
+    sd      t0, 8(sp)
+    li      a0, 0
+    li      a1, 7
+    mv      a2, sp
+    li      a3, 0
+    li      a7, SYS_PRLIMIT64
+    ecall
+    bgez    a0, rl_raised
+    li      a0, 0
+    li      a7, SYS_EXIT_GROUP
+    ecall
+
+rl_get_failed:
+    li      a0, 141
+    li      a7, SYS_EXIT_GROUP
+    ecall
+rl_not_table_size:
+    li      a0, 142
+    li      a7, SYS_EXIT_GROUP
+    ecall
+rl_set_failed:
+    li      a0, 143
+    li      a7, SYS_EXIT_GROUP
+    ecall
+rl_not_lowered:
+    li      a0, 144
+    li      a7, SYS_EXIT_GROUP
+    ecall
+rl_not_enforced:
+    li      a0, 145
+    li      a7, SYS_EXIT_GROUP
+    ecall
+rl_raised:
+    li      a0, 146
+    li      a7, SYS_EXIT_GROUP
+    ecall
+rl_devnull:
+    .asciz  "/dev/null"
+    .balign 4
+4:  j       4b
+user_rlimit_end:
 
 /* A second program, which faults on purpose: it reads an address that is
  * mapped for the kernel and not for user mode. */

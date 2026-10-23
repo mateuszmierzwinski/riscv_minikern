@@ -909,6 +909,10 @@ int uspace_fork_shared(struct uproc *child, struct uproc *parent) {
     child->gid = parent->gid;
     child->euid = parent->euid;
     child->egid = parent->egid;
+    child->rlim_nofile_soft = parent->rlim_nofile_soft;
+    child->rlim_nofile_hard = parent->rlim_nofile_hard;
+    child->rlim_nproc_soft = parent->rlim_nproc_soft;
+    child->rlim_nproc_hard = parent->rlim_nproc_hard;
     for (uint32_t i = 0; i < SIG_COUNT; i++) {
         child->actions[i] = parent->actions[i];
     }
@@ -921,6 +925,24 @@ uint32_t uspace_pid_of(const struct uproc *p) {
 
 uint32_t uspace_pgid_of(const struct uproc *p) {
     return p == NULL ? 0u : p->pgid;
+}
+
+uint64_t uspace_rlimit_nofile(void) {
+    const struct uproc *p = uspace_current();
+    return p == NULL || p->rlim_nofile_soft == 0 ? ~0ull : p->rlim_nofile_soft;
+}
+
+uint64_t uspace_rlimit_nproc(void) {
+    const struct uproc *p = uspace_current();
+    return p == NULL || p->rlim_nproc_soft == 0 ? ~0ull : p->rlim_nproc_soft;
+}
+
+uint32_t uspace_count_by_uid(uint32_t uid) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < PROC_MAX; i++) {
+        n += procs[i].used && !procs[i].zombie && procs[i].uid == uid ? 1u : 0u;
+    }
+    return n;
 }
 
 uint32_t uspace_euid(void) {
@@ -1034,6 +1056,10 @@ int uspace_exec(struct uproc *p, const uint8_t *image, uint32_t bytes, const cha
                             .gid = p->gid,
                             .euid = p->euid,
                             .egid = p->egid,
+                            .rlim_nofile_soft = p->rlim_nofile_soft,
+                            .rlim_nofile_hard = p->rlim_nofile_hard,
+                            .rlim_nproc_soft = p->rlim_nproc_soft,
+                            .rlim_nproc_hard = p->rlim_nproc_hard,
                             .used = true};
     rc = uspace_build_elf_args(fresh, image, bytes, path, argv, argc);
     if (rc != KERR_OK) {
@@ -1426,6 +1452,10 @@ int uspace_fork(struct uproc *child, struct uproc *parent) {
     child->gid = parent->gid;
     child->euid = parent->euid;
     child->egid = parent->egid;
+    child->rlim_nofile_soft = parent->rlim_nofile_soft;
+    child->rlim_nofile_hard = parent->rlim_nofile_hard;
+    child->rlim_nproc_soft = parent->rlim_nproc_soft;
+    child->rlim_nproc_hard = parent->rlim_nproc_hard;
     for (uint32_t i = 0; i < SIG_COUNT; i++) {
         child->actions[i] = parent->actions[i];
     }

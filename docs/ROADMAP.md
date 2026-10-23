@@ -136,7 +136,26 @@ Ordering inside a section is roughly by what unblocks the most.
       hexagon reaching outward and the dependency would be circular. Also
       missing: the unprivileged `setuid` that returns to a real uid one
       already has, and `setresuid`/saved ids.
-- [ ] **Resource limits.** (S) `prlimit64` answers but enforces nothing.
+- [x] **Resource limits.** (S) **Done for the two this kernel can enforce,
+      and honest about the rest.** `prlimit64` answered every question with
+      "infinite" and refused every attempt to set anything, so a program
+      read a number nothing would hold it to.
+      It now gets and sets, with POSIX's privilege rule — lower either,
+      raise the **soft** limit up to the hard one, raise the **hard** limit
+      only as root. Without that last part a limit is a suggestion a
+      program can decline.
+      **Enforced**, which is the half that was missing: `RLIMIT_NOFILE`
+      bounds `fd_install`, and `RLIMIT_NPROC` is checked before a process
+      slot is taken — counted **by uid**, because that is what the limit
+      means. A per-process count would let every child start again from
+      zero and bound nothing, which is exactly the shape a fork bomb has.
+      `RLIMIT_STACK` reads the real stack size; everything else still reads
+      as infinite, because that is the truth about it rather than a stored
+      number nothing consults.
+      Verified on the board (`minikern.rlimit=1`): read as 64 (the table's
+      size, not infinity), lowered to 5, the fifth descriptor refused with
+      `EMFILE` and the sixth never reached, and the hard limit unraisable
+      after dropping privilege.
 
 ---
 
