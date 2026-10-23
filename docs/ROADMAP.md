@@ -93,116 +93,55 @@ Ordering inside a section is roughly by what unblocks the most.
       that starts somewhere else is the oldest off-by-one there is, and the
       board found it the first time it ran.
 
-- [ ] **A corruption of user memory that the collector is involved in.** (M)
-      **Still open.** Renamed, because two of the three things its old title
-      said are now known to be wrong: it is not four-hart (one hart
-      reproduces it) and it is not a race in the kernel's own structures
-      (every one of those has been instrumented and reads clean).
+- [x] **The corruption of user memory — it was `MADV_DONTNEED`.** (M)
+      **Fixed, and proved on the board with a control.** The defect is the
+      entry above: `madvise(MADV_DONTNEED)` was accepted, answered 0 and
+      ignored, and a Go runtime relies on what that call promises about what
+      those addresses read as afterwards.
 
-      **The fix above did not close it.** The reproducer still failed four
-      times in four with `MADV_DONTNEED` honoured, so the stale-pages defect
-      was a real bug sitting next to this one rather than this one. Saying
-      so plainly matters: the evidence below was read as proof of a cause it
-      does not prove.
+      | On the VisionFive 2, 2,500 rounds a boot | Result |
+      |---|---|
+      | the fix, run 1 | **2,500 rounds, nothing went wrong** (678,480 syscalls) |
+      | the fix, run 2 | **2,500 rounds, nothing went wrong** (693,404 syscalls) |
+      | `minikern.keepadvice`, run 1 | **failed at round 7** |
+      | `minikern.keepadvice`, run 2 | **failed at round 9** |
 
-      **The sharpest evidence, and what it does and does not establish.** A
-      worker allocates its sieve, then a guard of the same size filled with
-      `0xA5`, checks that the two ranges do not overlap, fills the sieve,
-      and checks the guard. In a failing round the sieve sums **0** — every
-      position already reads `true`, so the outer loop skips everything and
-      writes nothing — and the guard comes back **pure**. The sieve is
-      reading `0xA5`. With `GODEBUG=clobberfree=1` it reads `0xdeadbeef`
-      instead, 15,000 bytes of each byte of it, which is what Go writes over
-      a span as it frees one.
+      Five thousand clean rounds against a control that fails inside ten.
+      `minikern.keepadvice` exists for exactly this: it puts the old kernel
+      back, so the gate was watched failing before it was trusted passing.
+      Both are standing cases in the board suite now.
 
-      So a fresh allocation is handed memory that still holds a previous
-      owner's bytes. What that does **not** explain is why Go did not zero
-      it: Go clears a reused span, which is why the first reading of this —
-      "the kernel lied about the memory being zero" — was too quick. Either
-      Go believed this span came straight from the kernel, or the bytes
-      arrived after it was cleared. Which of those it is, is the next thing
-      to establish, and the honest state is that it is not established.
+      **This entry said, in the commit before this one, that the fix had not
+      closed it.** That was measured under the emulator — four failures in
+      four with the guarantee honoured — and it was wrong. The board says
+      the opposite, unambiguously, with a control. Why the emulator
+      disagreed is not established; the likeliest explanation is the
+      staleness class of mistake that bit the board twice in the same
+      session, because the QEMU scripts take the kernel's path from
+      `bazel cquery`, which prints an output without building it, and they
+      have no check of their own. What is certain is that the retraction was
+      itself an emulator artefact, and that the operator's instruction to
+      stop using the emulator arrived while this was being got wrong.
 
-      **Everything the kernel's own bookkeeping could have done wrong has
-      been instrumented, and all of it reads clean — on the board**: no
-      frame reachable from two user addresses anywhere in the address space
-      (and the audit says so **among 2,570 user pages**, because an audit
-      that examined nothing gives the same clean answer and was read as
-      proof for most of this hunt), no page backed twice, no mapping placed on a range the record claims (a `PROT_NONE`
-      reservation included), no live page replaced by a fixed mapping, the
-      one kernel lock exclusive, and 28 user registers preserved across
-      hundreds of involuntary preemptions and fifty blocking sleeps. A
-      kernel can be internally consistent and still be the problem, but it
-      is not these. `minikern.mapchurn` adds the same question asked by a
-      raw program rather than a runtime — eight mappings kept and stamped
-      while a ninth is thrown away and replaced, four hundred times — and it
-      exits 0 on the board, so two separate mappings never become one piece
-      of memory and a store to a fresh mapping is never lost.
+      **What the runtime was relying on**, stated at the level it can be
+      defended: Go returns memory to the kernel with `madvise` and then
+      hands those addresses out again without clearing them, because the
+      call it made promised what they would read as. Keeping the pages is
+      therefore not declining optional advice — it is telling a program its
+      memory is zero while it still holds the last owner's bytes. The exact
+      bookkeeping inside the runtime that turns the broken promise into an
+      un-zeroed allocation is the runtime's business; the promise was the
+      kernel's, and it was not kept.
 
-      The **5 to 7 "stale-translation faults"** a board run reports are not
-      a lead either, which took two measurements to establish: broadcasting
-      TLB additions as well leaves the count where it was (5 against 7), so
-      they are not harts caching a mapping's absence. They are spurious page
-      faults, which the specification allows on a translation that is
-      perfectly valid, and the kernel handles them by noticing the tables
-      disagree with the hardware, fencing locally and retrying.
+      Everything the hunt excluded along the way stays excluded and stays
+      instrumented — no frame reachable from two user addresses (among
+      2,570 user pages on the board), no page backed twice, no mapping
+      placed on a claimed range, the kernel lock exclusive, 28 user
+      registers preserved across both kinds of context switch, and
+      `minikern.mapchurn` showing that two separate mappings never become
+      one piece of memory. None of them was the cause, and each is now the
+      standing answer to a question this hunt had to re-argue from scratch.
 
-      **The next step is a board one.** The fast reproducer is a Go binary
-      and runs only where there is a filesystem to load it from, which is
-      why it has been exercised under the emulator — and the emulator is no
-      longer the arbiter here.
-
-      **It is a board one now, and it needed nobody.** The reproducer runs
-      on the VisionFive 2, fetched over the network into DRAM, with the SD
-      card untouched — which matters because writing to the card is the
-      operator's to do and was not available.
-
-      The way in was already there: U-Boot has a network, since it is how
-      the kernel image itself arrives, so it can `wget` a second file just
-      as easily. And `uspace_build_elf` takes a **buffer** — reading a file
-      is only how the filesystem path obtains one. So
-      `minikern.loadat=<address>:<length>` names what the boot loader left
-      in memory, the range is **reserved before the frame allocator hands
-      anything out** (or the kernel would step on the program it is about to
-      run), and `minikern.runloaded` builds a process straight from it.
-      `test/hil/board.py -p <file>` is the other end: it serves the file
-      beside the kernel image, has U-Boot fetch it to 256 MiB into DRAM —
-      clear of the kernel and far below where U-Boot relocates itself — and
-      appends both knobs with the real size.
-
-      `minikern.run=<path>` stays for a program that *is* on the card, and
-      `STRESS_ROUNDS` lets a board boot buy more exposure than the default
-      300 rounds, because a boot costs ninety seconds of power-cycling and
-      what happens inside the capture window is the only part that measures
-      anything.
-
-      **The one piece of "caught in the act" evidence was an artefact of
-      the instrument, and withdrawing it matters.** With `minikern.paranoid`
-      the kernel read back every page it zeroed, and one page — zeroed and
-      mapped microseconds earlier — already held `0xea60`, which is 60000,
-      the length of the slice the program was about to allocate. That read
-      as a second writer reaching a frame nobody else could have, and it
-      steered the hunt for a long time.
-
-      It is explained, and not by a defect. The check runs *after*
-      `pgtable_map`, and the kernel holds the big lock — but another thread
-      of the same process, in **user mode on another hart**, can touch that
-      address the instant it becomes mapped, because a TLB miss is resolved
-      by the hardware walking the tables and needs no kernel at all. So the
-      frame had an entirely legitimate second writer: the program itself.
-      The check is only meaningful on one hart, which is now said where it
-      is defined. An instrument whose own race is indistinguishable from the
-      bug it hunts is worse than none.
-
-      The instruments built during the hunt all stay: an alias audit over
-      the whole address space, counts of pages backed twice, of mappings
-      placed on a range already taken, of live pages a fixed mapping
-      replaced, of the kernel lock failing to be exclusive, and
-      `minikern.regs` for user registers across both kinds of context
-      switch. Every one of them reads zero, which is the point — they are
-      now the standing answer to a whole class of suspicion that this
-      session had to re-argue from scratch. `CLAUDE.md` §5 records what each
-      one cost to learn.
 - [x] **An embedded program's stack was not in its own address-space
       record.** (S) **Found and fixed** by §2's `mremap` test, which is the
       first embedded program to both use its stack and call `mmap`. The raw

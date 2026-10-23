@@ -35,6 +35,11 @@ PROJECT = os.path.dirname(os.path.dirname(HERE))
 BOARD_TARGET = "//:minikern_board"
 SERVED = os.path.expanduser(os.environ.get("MINIKERN_SERVED", "~/vf2/minikern.bin"))
 
+# The reproducer, named as a Bazel target because the suite must run the one
+# that was just built rather than whatever is lying about.
+RACESTRESS = "//src/userland/racestress:racestress"
+
+
 # A case is (name, bootargs, [lines that must appear], capture seconds).
 #
 # **An exit status here is not a boolean, and getting that wrong cried wolf
@@ -84,6 +89,26 @@ CASES = [
      "minikern.disk=sd minikern.init=1",
      ["go: done", "init: /init exited with 0"],
      150),
+    # **§0's reproducer, and the control that proves the gate is one.**
+    #
+    # This is the case that found the corruption and the case that now
+    # guards it. It is a Go binary, so it is fetched into DRAM by the boot
+    # loader rather than read off the card — see `board.py -p`. Two and a
+    # half thousand rounds because a boot costs ninety seconds and the
+    # capture window is the only part that measures anything.
+    #
+    # The control matters as much as the case: `minikern.keepadvice` puts
+    # back the kernel that ignored `MADV_DONTNEED`, and with it the
+    # reproducer fails inside ten rounds. A gate that cannot fail is not a
+    # gate, and this one was watched failing before it was trusted passing.
+    ("§0: the memory corruption, on the board",
+     "minikern.disk=sd minikern.env=STRESS_ROUNDS=2500",
+     ["stress: 2500 rounds, nothing went wrong"],
+     260, RACESTRESS),
+    ("§0 control — the corruption must come back without the fix",
+     "minikern.disk=sd minikern.env=STRESS_ROUNDS=2500 minikern.keepadvice",
+     ["stress: FAILED"],
+     260, RACESTRESS),
 ]
 
 
@@ -93,11 +118,26 @@ CASES = [
 # grown a check of its own.
 
 
-def run_case(name, bootargs, wanted, seconds, out_dir):
-    log_path = os.path.join(out_dir, name.split(" ")[0].replace("/", "_") + ".log")
-    subprocess.run([sys.executable, os.path.join(HERE, "board.py"), bootargs,
-                    "-t", str(seconds), "-o", log_path, "-q",
-                    "-w", "900"], check=False)
+def built(target):
+    """The path of a target's output, built first — `cquery` alone does not
+    build, which is the mistake this file's staleness check exists for."""
+    subprocess.run(["bazel", "build", target], cwd=PROJECT, check=True,
+                   capture_output=True)
+    rel = subprocess.run(["bazel", "cquery", "--output=files", target], cwd=PROJECT,
+                         check=True, capture_output=True, text=True).stdout.split()[0]
+    workspace = subprocess.run(["bazel", "info", "workspace"], cwd=PROJECT, check=True,
+                               capture_output=True, text=True).stdout.strip()
+    return os.path.join(workspace, rel)
+
+
+def run_case(name, bootargs, wanted, seconds, out_dir, program=None):
+    log_path = os.path.join(out_dir, name.split(" ")[0].replace("/", "_").replace("§", "s")
+                            + ".log")
+    command = [sys.executable, os.path.join(HERE, "board.py"), bootargs,
+               "-t", str(seconds), "-o", log_path, "-q", "-w", "900"]
+    if program is not None:
+        command += ["-p", built(program)]
+    subprocess.run(command, check=False)
     text = open(log_path, "rb").read().decode("utf-8", "replace") if os.path.exists(log_path) else ""
     missing = [line for line in wanted if line not in text]
     return missing, log_path
@@ -112,10 +152,12 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     print(f"hil: image md5 {image.stage(PROJECT)}")
     failures = 0
-    for name, bootargs, wanted, seconds in CASES:
+    for case in CASES:
+        name, bootargs, wanted, seconds = case[:4]
+        program = case[4] if len(case) > 4 else None
         if args.only and args.only not in name:
             continue
-        missing, log_path = run_case(name, bootargs, wanted, seconds, args.out)
+        missing, log_path = run_case(name, bootargs, wanted, seconds, args.out, program)
         if missing:
             failures += 1
             print(f"FAIL  {name}")
