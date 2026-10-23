@@ -726,7 +726,22 @@ int64_t uspace_run(struct uproc *p) {
     /* Now wait for them to leave, before anything they might still be
      * standing on is freed — a kernel stack, or the page tables their own
      * `satp` still points at. */
-    while (sched_joined_harts() > 0) {
+    {
+        /* Unbounded, because there is nothing better to do than wait — but
+         * **not silent**. A hart that never leaves used to stop the machine
+         * with no output of any kind, which is indistinguishable from a
+         * board that has died; the report names it instead. The threshold is
+         * in loop iterations rather than time because the clock is one of
+         * the things that may have stopped. */
+        uint64_t spins = 0;
+        bool said = false;
+        while (sched_joined_harts() > 0) {
+            if (++spins > 200000000ull && !said) {
+                said = true;
+                kprintf("\nuspace: **harts have not left the scheduler**\n");
+                sched_report_joined();
+            }
+        }
     }
     uspace_release_address_space();
     trap_set_expected(NULL);
@@ -1367,6 +1382,7 @@ struct uproc *uspace_current(void) {
 void uspace_exit(int64_t status) {
     struct uproc *me = uspace_current();
     bool is_root = me == NULL || me == running;
+    uint32_t left = 0;
     if (is_root) {
         /* The program the kernel started. Its status is what `uspace_run`
          * returns, and its ending stops the harts' loops. */
@@ -1379,7 +1395,21 @@ void uspace_exit(int64_t status) {
          * space goes now, unless it was borrowing its parent's. */
         me->status = status;
         me->zombie = true;
-        if (!me->shares_pt) {
+        /* **Its other threads first, and off their harts**, before the
+         * address space goes. `exit_group` ends the process rather than the
+         * caller, so unlike the last-thread path there may be siblings
+         * still executing — and one of those on another hart would be
+         * running against page tables being freed underneath it.
+         *
+         * If one will not leave, the address space is **leaked rather than
+         * freed**: a process's worth of pages lost is a bounded cost, and
+         * freeing memory another hart is still writing through is not. */
+        (void)sched_end_siblings(me);
+        left = sched_await_siblings(me);
+        if (left != 0) {
+            kprintf("uspace: **%u thread(s) still on a hart; keeping the address space**\n", left);
+        }
+        if (!me->shares_pt && left == 0) {
             uspace_destroy(me);
         }
         me->shares_pt = false;

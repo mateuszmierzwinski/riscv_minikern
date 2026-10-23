@@ -42,11 +42,84 @@ Ordering inside a section is roughly by what unblocks the most.
       not. `uspace_stale_records` turns the next one into a report — it
       counts a page found mapped at an address the record called free, which
       only a move is in a position to notice.
-- [ ] **`sched_end_siblings` leaves threads running on other harts.** (S)
-      It marks them `THREAD_DYING` and the process is torn down; a thread
-      still executing on another hart runs until its next trap with its
-      address space being freed underneath it. It has not been seen to
-      fail, which is not the same as being right.
+- [x] **`sched_end_siblings` leaves threads running on other harts.** (S)
+      **Fixed, and it was two defects and a hole, not one.** It marked the
+      siblings and the caller carried straight on — and what a caller does
+      next is replace the address space (`execve`) or free it
+      (`exit_group`), so a sibling still executing user code on another hart
+      ran against page tables being taken apart underneath it. Nothing
+      faults: it reads and writes pages that by then belong to something
+      else.
+      **Marking is not stopping.** A thread is told to leave its hart by a
+      per-hart preemption flag, which the trap path reads on its way back to
+      user mode — so it only works if a trap happens. A thread spinning in
+      user mode makes no syscalls, and under dynamic ticks its hart may have
+      no deadline armed at all, so nothing was going to interrupt it. It now
+      gets an interrupt aimed at it: the opposite of `poke_idle_harts`'s
+      rule, which skips a busy hart because a busy hart finds work by
+      itself, and is why it is a separate function with the reasoning
+      written down.
+      **And `sched_yield_now` undid the marking**: it set `THREAD_RUNNABLE`
+      unconditionally, and the preemption path is exactly where a thread
+      that has been ended or stopped finds out — so a dying thread came back
+      as runnable and was re-claimed. Measured before the fix: the kernel
+      waited 6,179 µs for a thread to leave a hart it was never going to
+      leave, getting its answer only from the window between a yield and the
+      next claim. The same line meant a `SIGSTOP` could not stop a thread
+      running on another hart, which no test had tried.
+      Then the caller **waits**, blocked rather than spinning: this hart
+      holds the kernel lock, and the sibling cannot reach the kernel to
+      notice it has been ended until that lock is free, so spinning is a
+      deadlock and yielding hands the lock straight back. The departing
+      hart wakes the waiter, with the deadline as the backstop — waking on
+      *every* switch instead, which is where it started, kept the waiting
+      thread runnable so the hart never idled and the lock was never
+      released: a livelock rather than a slow wait.
+      `execve` refuses rather than risking it if a thread will not leave;
+      `exit_group` keeps the address space instead of freeing it, because a
+      process's worth of pages is a bounded loss and freeing memory another
+      hart is writing through is not.
+      Verified on the board (`minikern.endsib=1`): a child process with a
+      spinning thread that makes no syscalls, ended by `exit_group` from its
+      main thread. **5**, with `1 poke aimed, 1 woken by a departure, 1
+      look` and a **20 µs** wait where the broken mechanism took 6,179 µs —
+      four runs for four, after a rate of roughly one hang in two.
+      **The process-group test had to be rewritten**, and that is part of
+      the result rather than collateral. It sent `SIGSTOP` to *its own*
+      group, which includes the sender — so once `SIGSTOP` could actually
+      stop a running thread, the test stopped itself and deadlocked. It had
+      passed only because the stop did not work. It now does what a shell
+      does: puts the child in a group of its own with `setpgid`, stops that
+      group, and **proves the stop** with a `WNOHANG` probe showing the
+      child has not finished although its own work was far shorter than the
+      wait. The exit status alone could not tell "stopped" from "ran
+      through", so the old test was not checking what it claimed.
+- [x] **An idle hart was never told the process had ended.** (S) **Found by
+      the test above**, and it is the reason that test hung in silence
+      rather than failing. The scheduling loop reads "is the process over?"
+      only after a wake, so a hart asleep in `wfi` learns it when something
+      interrupts it — and with nothing else due, that was whatever tick
+      happened to come next, or nothing at all. The hart stayed in the
+      scheduler, and `uspace_run` waits for every hart to leave before
+      freeing what they are standing on, so the machine stopped with **no
+      output of any kind**: the least diagnosable state this kernel has, and
+      indistinguishable from a dead board. It is the rule the scheduler
+      already follows for work appearing, applied to work running out.
+      Two changes: the harts are poked when the process ends, and the wait
+      in `uspace_run` — which cannot be bounded, since there is nothing
+      better to do than wait — now **says who has not left and what they
+      are running** rather than hanging quietly. That report is what caught
+      it, after several runs whose only evidence was an empty log.
+- [x] **A poke to the boot hart was never delivered.** (S) **Found by the
+      above.** Software interrupts are enabled per hart, and only the
+      secondaries' path (`timer_init_cpu`) enabled them — the boot hart
+      enabled the timer alone. It cost nothing for as long as pokes only
+      ever went to *idle* harts, because a hart wakes from `wfi` on a poke
+      whether or not the interrupt is enabled; the moment one was aimed at a
+      busy hart to make it stop, the one aimed at the boot hart went
+      nowhere. `trap_software_interrupts` counts the pokes actually **taken**
+      as traps, as against sent, because that difference is invisible
+      otherwise.
 
 ---
 
@@ -171,6 +244,27 @@ Ordering inside a section is roughly by what unblocks the most.
       size, not infinity), lowered to 5, the fifth descriptor refused with
       `EMFILE` and the sixth never reached, and the hard limit unraisable
       after dropping privilege.
+
+- [x] **`getpid` returned the constant 1.** (S) **Done**, and it is worth
+      recording how it survived. It was written when there was one process
+      and never revisited, which made it the quietest kind of wrong answer:
+      every process believed it was pid 1, so anything comparing two pids
+      compared two 1s and agreed. It was found by running §1's own
+      process-group test as the **third** program in a boot rather than the
+      first — `getpgid(0)` gave the real group and `getpid()` gave 1, and a
+      test that had only ever passed because both numbers happened to be 1
+      failed honestly.
+      `gettid` was the same function, so every thread of a process reported
+      the same id — and a Go runtime records that as its thread's identity
+      and then preempts a goroutine with `tgkill(pid, that id, SIGURG)`.
+      Since `tgkill` resolves by thread id, **every preemption signal was
+      delivered to whichever thread was numbered 1**: the right signal, to
+      the wrong thread. It is now the calling thread's own id.
+      Verified on the board: the process-group test gives **7** as the third
+      program in a boot as well as the first, which is the thing that was
+      not true before — in a single boot that also runs the syscall-surface
+      suite (0), `wait4` (7), the identity model (0), resource limits (0),
+      `mremap` (63), the `mmap` flags (127) and the ending test (5).
 
 ---
 

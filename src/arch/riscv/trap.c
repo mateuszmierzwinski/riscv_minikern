@@ -101,6 +101,18 @@ void trap_set_expected(bool (*handler)(struct trapframe *tf)) {
 /* An interrupt, which is a normal event and not a fault: the timer ticks,
  * or a device wants attention. Unlike an exception, `sepc` is left alone —
  * the interrupted instruction has not run yet. */
+/* How many software interrupts have actually been **taken**, as against
+ * sent. The two are not the same thing and the difference is invisible
+ * without counting: a poke to an idle hart ends its `wfi` whether or not
+ * the interrupt is enabled, so the whole poking mechanism appears to work
+ * while no hart ever traps on one — and then a poke whose purpose is to
+ * interrupt a *busy* hart does nothing at all. */
+static uint64_t software_interrupts;
+
+uint64_t trap_software_interrupts(void) {
+    return software_interrupts;
+}
+
 static bool handle_interrupt(uint64_t code) {
     switch (code) {
     case IRQ_S_TIMER:
@@ -118,6 +130,7 @@ static bool handle_interrupt(uint64_t code) {
         return true;
     }
     case IRQ_S_SOFTWARE:
+        software_interrupts++;
         /* Clearing it is the whole handler. A hart is poked because the
          * answer to "what should I be running?" has changed — work has
          * appeared, or what it is running should stop — and that question

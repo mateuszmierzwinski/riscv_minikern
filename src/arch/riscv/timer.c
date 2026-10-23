@@ -126,8 +126,19 @@ int timer_init(const struct fdt *fdt, uint32_t hz) {
     per_hart[smp_hart_index()].next_deadline = timer_now() + timer.interval;
     arm_comparator(smp_hart_index());
     /* Enabling the source is separate from enabling interrupts at all: the
-     * caller decides when the kernel is ready to be interrupted. */
-    __asm__ volatile("csrs sie, %0" : : "r"(SIE_STIMER));
+     * caller decides when the kernel is ready to be interrupted.
+     *
+     * **Both sources, the same pair every other hart enables.** This
+     * enabled the timer alone, and the asymmetry was invisible because it
+     * only cost something in one direction: a hart that cannot take a
+     * software interrupt still wakes from `wfi` when one arrives, so the
+     * idle poke worked, and nothing else poked a *busy* hart. The moment
+     * one did — to make a thread leave a hart — the interrupt aimed at the
+     * boot hart went nowhere, and the thread stopped at the next periodic
+     * tick instead: measured, a 6,181 µs wait where the others took
+     * microseconds. A poke that is silently dropped by exactly one hart is
+     * the shape of defect this kernel has paid for repeatedly. */
+    __asm__ volatile("csrs sie, %0" : : "r"(SIE_STIMER | SIE_SSOFT));
     return KERR_OK;
 }
 

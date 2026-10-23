@@ -119,6 +119,11 @@ uint32_t sched_cpus(void);
  * on. */
 uint32_t sched_joined_harts(void);
 
+/* Prints which harts are still in the scheduling loop and what they are
+ * running — for the one wait in this kernel that cannot be bounded, where a
+ * hart that never leaves is otherwise total silence. */
+void sched_report_joined(void);
+
 /* Whether secondary harts should join the scheduler, and the switch the boot
  * hart sets. A hart parked before a process exists has nothing to claim. */
 bool sched_wants_harts(void);
@@ -157,6 +162,34 @@ int sched_spawn_in(struct uproc *proc, const struct trapframe *frame, uint64_t s
  * `execve` must do before it replaces the address space: the other threads
  * were running code that is about to disappear. Reports how many ended. */
 uint32_t sched_end_siblings(const struct uproc *proc);
+
+/* Waits until no other thread of `proc` is on a hart, and reports how many
+ * still are.
+ *
+ * The other half of `sched_end_siblings`, and without it that function was
+ * only half an answer: it marks the siblings and makes them leave, and the
+ * caller used to carry straight on. What a caller does next is **replace or
+ * destroy the address space** — `execve` rebuilds it, `exit_group` frees it
+ * — so a sibling still executing user code on another hart was running
+ * against page tables being taken apart underneath it. Nothing faults: it
+ * reads and writes pages that by then belong to something else.
+ *
+ * Bounded, and the count it returns is the caller's to act on. A thread
+ * that has been told to leave and has not is a kernel bug, and continuing
+ * into the teardown would be a worse answer than saying so. */
+uint32_t sched_await_siblings(const struct uproc *proc);
+
+/* How many threads had to be waited off a hart, and the longest such wait
+ * in microseconds. A non-zero count is the kernel reporting that it caught
+ * a thread mid-flight — which is what turns this race's closing into a
+ * measurement rather than an assertion. */
+void sched_await_report(uint32_t *threads_waited, uint64_t *worst_us);
+
+/* The three numbers behind that wait: pokes aimed at a hart to make it let
+ * a thread go, threads actually woken by a departure, and times the waiter
+ * looked again. Together they say which of the three mechanisms carried the
+ * wait — the poke, the departure's wake, or the deadline behind both. */
+void sched_await_detail(uint32_t *pokes, uint32_t *wakes, uint32_t *loops);
 
 /* Makes a thread that enters user mode at `frame`'s `sepc` with `frame`'s
  * registers, except `a0`, which is 0 — the child's half of `clone`'s
@@ -322,6 +355,12 @@ uint32_t sched_missed_pokes(void);
  * that did not happen yet**: nothing will interrupt any hart, so whoever was
  * waiting waits for ever. It must be zero. */
 uint32_t sched_lost_deadlines(void);
+
+/* Threads found still blocked a second or more past their own deadline — a
+ * wake-up that was armed and never arrived. The deadlock detector cannot
+ * see these, because a deadline is a reason to believe something will
+ * happen, so without this they are a hang with no output at all. */
+uint32_t sched_overdue_wakes(void);
 
 /* The running thread's nice value, and setting it. Setting clamps to the
  * permitted range rather than refusing, as POSIX requires, and recomputes

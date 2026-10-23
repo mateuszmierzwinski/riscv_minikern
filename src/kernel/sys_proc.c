@@ -122,6 +122,7 @@ static int64_t sys_execve(struct trapframe *tf) {
     struct uproc *me = uspace_current();
     uint8_t *image = NULL;
     uint32_t size = 0;
+    uint32_t left;
     int rc = copy_string_in(path, sizeof path, sysarg(tf, 0));
     if (rc != KERR_OK || me == NULL) {
         return rc != KERR_OK ? rc : KERR_SRCH;
@@ -143,7 +144,21 @@ static int64_t sys_execve(struct trapframe *tf) {
         }
         return rc;
     }
+    /* Every other thread of this process, and **off its hart** before the
+     * address space is replaced. `execve` keeps the process and throws away
+     * everything in it, so a sibling still executing the old program on
+     * another hart would be running against page tables being freed
+     * underneath it — which does not fault, it reads whatever owns those
+     * pages next. */
     (void)sched_end_siblings(me);
+    left = sched_await_siblings(me);
+    if (left != 0) {
+        /* Refused rather than risked: an `execve` that fails is something a
+         * program can be told about, and memory corruption is not. */
+        kprintf("exec: **%u thread(s) will not leave their hart; %s not started**\n", left, path);
+        kfree_image(image);
+        return KERR_AGAIN;
+    }
     rc = uspace_exec(me, image, size, path, argv, argc);
     kfree_image(image);
     if (rc != KERR_OK) {

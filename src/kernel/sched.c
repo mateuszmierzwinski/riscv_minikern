@@ -423,6 +423,86 @@ int sched_spawn_first(struct uproc *proc, const struct trapframe *frame, uint64_
     return spawn(proc, frame, sp, false, tid);
 }
 
+/* The channel a thread leaving a hart wakes: what `sched_await_siblings`
+ * blocks on, woken by the scheduling loop of whichever hart let the thread
+ * go. */
+static uint8_t sibling_channel;
+
+/* Whether any hart is running this slot, this moment.
+ *
+ * The **hart's** `current` is the authority, not the thread's state. Ending
+ * a thread sets its state to `THREAD_DYING` while it is still executing on
+ * a hart, so a test of the state would answer "no" about a thread that is
+ * very much running — which is the whole reason this question has to be
+ * asked separately. */
+static bool on_a_hart(uint32_t slot) {
+    for (uint32_t h = 0; h < SMP_MAX_HARTS; h++) {
+        if (harts[h].current == slot) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Sends one hart an interrupt although it is busy.
+ *
+ * `poke_idle_harts` deliberately skips a busy hart: an IPI costs 1499 ns and
+ * a hart that is already working finds new work by itself. **Here that
+ * reasoning is inverted**, which is why this is a separate function rather
+ * than a relaxed condition in that one. The point is not to make work
+ * visible but to make one named hart *stop*, and under dynamic ticks a hart
+ * running user code may have no deadline armed at all — so left alone it
+ * might not trap again until the idle backstop, a hundred milliseconds
+ * away, or until the thread chose to make a syscall. */
+static void poke_one_hart(uint32_t index) {
+    const struct smp_hart *h = smp_hart(index);
+    if (h == NULL || index == smp_hart_index()) {
+        return;
+    }
+    (void)sbi_send_ipi(1ull, (uint64_t)h->id);
+}
+
+/* Makes whichever hart is running `slot` leave it at the first opportunity.
+ *
+ * Two halves, and both are needed. The flag is what the trap path reads on
+ * its way back to user mode (`sched_take_preempt_request`); the interrupt is
+ * what makes a trap happen at all. Setting the flag alone is what this
+ * kernel used to do, and it made "it stops at its next return to user mode"
+ * true only of a thread that was going to return anyway. */
+static uint32_t leave_pokes;
+static uint32_t sibling_wakes;
+static uint32_t await_loops;
+
+static void make_it_leave(uint32_t slot) {
+    for (uint32_t h = 0; h < SMP_MAX_HARTS; h++) {
+        if (harts[h].current != slot) {
+            continue;
+        }
+        harts[h].preempt_pending = true;
+        poke_one_hart(h);
+        leave_pokes++;
+    }
+}
+
+/* Gives up a thread that is not on a hart.
+ *
+ * Its slot is free immediately, which is safe precisely because it is not
+ * running: nothing will resume it, and a thread here *is* its slot — there
+ * is no other reference by which it could be found again.
+ *
+ * **Its kernel stack is left to `sched_shutdown`**, which frees every one
+ * at the end of the run. Handing it back here would be correct by the same
+ * argument and would stop a process that exec's in a loop leaking four
+ * pages a time, but it is a separate change: freeing a page is not part of
+ * closing this race, and the two should not be proved together. */
+static void abandon(struct thread *t) {
+    phys_t stack = t->kstack;
+    bool owned = t->owns_stack;
+    *t = (struct thread){0}; /* THREAD_FREE, with no stale pointers left in it */
+    t->kstack = stack;
+    t->owns_stack = owned;
+}
+
 uint32_t sched_end_siblings(const struct uproc *proc) {
     uint32_t ended = 0;
     struct thread *me_thread = running_thread();
@@ -434,18 +514,105 @@ uint32_t sched_end_siblings(const struct uproc *proc) {
         if (threads[i].proc != proc) {
             continue;
         }
-        /* Marked free rather than switched to: a thread that is not running
-         * anywhere is simply forgotten, and one that *is* running on another
-         * hart stops at its next trap because its state is no longer
-         * runnable. Its kernel stack is reclaimed with the process's. */
-        /* **Dying, not free.** One of these may be running on another hart
-         * this moment, and a free slot is one `find_free_slot` may hand to a
-         * new thread while the old one is still on its stack. They are
-         * reclaimed wholesale by `sched_shutdown`. */
-        threads[i].state = THREAD_DYING;
+        if (on_a_hart(i)) {
+            /* **Dying, not free.** It is standing on its kernel stack this
+             * moment, and a free slot is one `find_free_slot` may hand to a
+             * new thread while the old one is still on it. The hart running
+             * it releases the slot itself, once the switch has actually left
+             * the stack — and `make_it_leave` is what makes that switch
+             * happen now rather than whenever the thread next traps. */
+            threads[i].state = THREAD_DYING;
+            make_it_leave(i);
+        } else {
+            abandon(&threads[i]);
+        }
         ended++;
     }
     return ended;
+}
+
+/* How long to wait before looking again. The timer rounds deadlines to
+ * 100 µs, so asking for less is asking for the same thing. */
+#define SIBLING_LOOK_AGAIN_NS 100000ull
+
+/* How long to wait in total. A thread that has been told to leave its hart
+ * and has not done so in 50 ms is not slow, it is a kernel bug — and 50 ms
+ * is long enough that no amount of ordinary lock contention reaches it. */
+#define SIBLING_WAIT_LIMIT_NS 50000000ull
+
+static uint32_t siblings_on_harts(const struct uproc *proc) {
+    uint32_t n = 0;
+    const struct thread *me_thread = running_thread();
+    for (uint32_t i = 0; i < SCHED_MAX_THREADS; i++) {
+        if (&threads[i] == me_thread || threads[i].proc != proc) {
+            continue;
+        }
+        n += on_a_hart(i) ? 1u : 0u;
+    }
+    return n;
+}
+
+/* How many threads have had to be waited off a hart, and the longest wait.
+ *
+ * These are what make the race's closing a measurement rather than an
+ * assertion. The window used to be open and nothing reported it, which is
+ * why the defect could be recorded as "has not been seen to fail" — a
+ * sentence that says nothing about whether it fails. A non-zero count is
+ * the kernel saying it caught a thread mid-flight. */
+static uint32_t awaited_threads;
+static uint64_t worst_await_ns;
+
+void sched_await_detail(uint32_t *pokes, uint32_t *wakes, uint32_t *loops) {
+    *pokes = leave_pokes;
+    *wakes = sibling_wakes;
+    *loops = await_loops;
+}
+
+void sched_await_report(uint32_t *threads_waited, uint64_t *worst_us) {
+    if (threads_waited != NULL) {
+        *threads_waited = awaited_threads;
+    }
+    if (worst_us != NULL) {
+        *worst_us = worst_await_ns / 1000u;
+    }
+}
+
+uint32_t sched_await_siblings(const struct uproc *proc) {
+    struct thread *me_thread = running_thread();
+    /* **What the caller was**, because the wait below will overwrite it.
+     * `sched_wait_on` sets `THREAD_BLOCKED`, and this is reached on the
+     * last-thread exit path by a caller that is already `THREAD_DYING` — a
+     * dying thread that came back as merely blocked would be woken, resumed
+     * and never have its slot released. The same lesson as
+     * `sched_yield_now`: a state another path set is not this one's to
+     * replace. */
+    enum thread_state was = me_thread != NULL ? me_thread->state : THREAD_FREE;
+    uint64_t started = timer_ns();
+    uint64_t until = started + SIBLING_WAIT_LIMIT_NS;
+    uint32_t left = siblings_on_harts(proc);
+    awaited_threads += left;
+    while (left != 0 && timer_ns() < until) {
+        /* **Blocked, not spun.** This hart holds the kernel lock, and a
+         * sibling cannot reach the kernel to notice it has been ended until
+         * that lock is free — so spinning here is a deadlock rather than a
+         * wait. Yielding is not enough either: a thread that yields is
+         * immediately the only runnable thread again, and the scheduling
+         * loop hands it straight back without the lock having been
+         * released. Blocking with a deadline is what makes the hart idle,
+         * and an idle hart releases the lock. That is the one path that
+         * lets the sibling in. */
+        (void)sched_wait_on(&sibling_channel, timer_ns() + SIBLING_LOOK_AGAIN_NS);
+        if (me_thread != NULL && was != THREAD_RUNNING) {
+            me_thread->state = was;
+        }
+        await_loops++;
+        left = siblings_on_harts(proc);
+    }
+    {
+        uint64_t took = timer_ns() - started;
+        worst_await_ns = took > worst_await_ns ? took : worst_await_ns;
+    }
+    return left;
 }
 
 /* A thread no hart is running, claimed for this one. The claim is the
@@ -733,10 +900,10 @@ uint32_t sched_stop_process(uint32_t pid) {
             continue;
         }
         if (threads[i].state == THREAD_RUNNING) {
-            /* On a hart now: marked, and it stops on its way out. */
-            for (uint32_t h = 0; h < SMP_MAX_HARTS; h++) {
-                harts[h].preempt_pending = harts[h].current == i ? true : harts[h].preempt_pending;
-            }
+            /* On a hart now: marked **and interrupted**, so it stops on its
+             * way out of a trap that happens because of this rather than
+             * whenever one happened to be due. */
+            make_it_leave(i);
         }
         threads[i].state = THREAD_STOPPED;
         moved++;
@@ -982,6 +1149,32 @@ static void yield_to_scheduler(void) {
     context_switch(&threads[was].ksp, h->idle_ksp);
 }
 
+/* This hart has stopped running a thread: releases the slot if the thread
+ * ended, and says so if anybody is waiting for it to.
+ *
+ * The slot is released **here and not where the thread ended**, which is
+ * the whole of `THREAD_DYING`: control has to have left the thread's kernel
+ * stack first, or another hart may hand the slot to a new thread while the
+ * old one is still standing on it.
+ *
+ * The wake is for `sched_await_siblings`, and it is **only for a thread
+ * that ended**. Waking on every switch instead — which is where this
+ * started — keeps the waiting thread runnable continuously, so the hart
+ * never idles, and an idle hart is the only thing that releases the kernel
+ * lock. The hart that needs that lock is the one with the thread to let go,
+ * so the result was not a slow wait but a livelock: measured, the wait
+ * never completed at all. */
+static void let_go_of(struct hartstate *h, uint32_t t) {
+    bool ended = threads[t].state == THREAD_DYING;
+    if (ended) {
+        threads[t].state = THREAD_FREE;
+    }
+    h->current = SCHED_NO_THREAD;
+    if (ended) {
+        sibling_wakes += sched_wake_on(&sibling_channel, SCHED_MAX_THREADS);
+    }
+}
+
 /* One hart's scheduling loop: claim a thread, run it, repeat until the
  * process is over.
  *
@@ -1058,10 +1251,7 @@ void sched_run(void) {
         /* Back on this hart's own stack, so the thread that just left is no
          * longer standing on anything: its slot can be reused now and not
          * before. */
-        if (threads[t].state == THREAD_DYING) {
-            threads[t].state = THREAD_FREE;
-        }
-        h->current = SCHED_NO_THREAD;
+        let_go_of(h, t);
         h->preempt_pending = false;
     }
     h->joined = false;
@@ -1073,7 +1263,22 @@ void sched_yield_now(void) {
     if (t == NULL) {
         return;
     }
-    t->state = THREAD_RUNNABLE;
+    /* **Only a thread that is still allowed to run becomes runnable
+     * again.** This set `THREAD_RUNNABLE` unconditionally, and the
+     * preemption path is exactly where a thread that has been ended or
+     * stopped finds out about it — so the assignment undid the thing being
+     * asked of it. A `THREAD_DYING` thread came back as runnable and was
+     * re-claimed, which is why a thread told to leave its hart appeared to
+     * leave for a moment and then carry on; and a `THREAD_STOPPED` one
+     * resumed in spite of its `SIGSTOP`, which had never been seen because
+     * no test had stopped a thread that was running on another hart.
+     *
+     * Measured before the fix: the kernel waited 6,179 µs for a thread to
+     * leave a hart it was never going to leave, and only got its answer
+     * from the window between a yield and the next claim. */
+    if (t->state == THREAD_RUNNING) {
+        t->state = THREAD_RUNNABLE;
+    }
     yield_to_scheduler();
 }
 
@@ -1297,15 +1502,45 @@ void sched_exit_proc(struct uproc *p, bool is_root) {
     /* Only the harts' loops stop, and only for the process they were
      * started for. A child ending must leave its parent running. */
     process_over = process_over || is_root;
+    /* **And every idle hart told to look.** The loop's exit condition is
+     * only read after a wake, so a hart asleep in `wfi` learns the process
+     * is over when something interrupts it — and with nothing else due, that
+     * was whatever tick happened to come next, or nothing at all. The hart
+     * then stayed in the scheduler, and `uspace_run` waits for every hart to
+     * leave before freeing what they stand on: the machine stopped with no
+     * output, which is how this was found. It is the same rule this
+     * scheduler already follows for work appearing, applied to work running
+     * out. */
+    if (process_over) {
+        poke_idle_harts();
+    }
     /* Every thread **of this process**, not every thread: one left RUNNABLE
      * would be claimed by a hart whose loop has not noticed yet, and one
-     * belonging to another process must not be touched at all. */
+     * belonging to another process must not be touched at all.
+     *
+     * **And not all of them freed.** This marked every slot `THREAD_FREE`,
+     * including one running on another hart — the slot-alias bug that
+     * `THREAD_DYING` exists for, in its third location: a free slot is one
+     * `find_free_slot` may hand to a new thread while the old one is still
+     * standing on its kernel stack, and the old thread then writes the stack
+     * pointer it is leaving into what is now somebody else's slot. The
+     * running ones are told to leave and release their own slots; the rest
+     * are given up here. */
     for (uint32_t i = 0; i < SCHED_MAX_THREADS; i++) {
-        if (threads[i].proc == p) {
-            threads[i].state = THREAD_FREE;
+        if (threads[i].proc != p || &threads[i] == t) {
+            continue;
+        }
+        if (on_a_hart(i)) {
+            threads[i].state = THREAD_DYING;
+            make_it_leave(i);
+        } else {
+            abandon(&threads[i]);
         }
     }
     if (t != NULL && t->proc == p) {
+        /* This thread is on this hart, so its slot is released by the
+         * scheduling loop once the switch has left its stack. */
+        t->state = THREAD_DYING;
         yield_to_scheduler();
     }
 }
@@ -1317,6 +1552,33 @@ void sched_exit_proc(struct uproc *p, bool is_root) {
 uint32_t sched_cpus(void) {
     uint32_t n = smp_running_count();
     return n == 0 ? 1u : (n > SMP_MAX_HARTS ? SMP_MAX_HARTS : n);
+}
+
+/* Says which harts are still in the scheduling loop and what each is
+ * running.
+ *
+ * `uspace_run` waits for every hart to leave before freeing anything they
+ * might be standing on, and that wait is unbounded by design — there is
+ * nothing better to do than wait. But a hart that never leaves makes the
+ * machine stop with **no output at all**, which is the least diagnosable
+ * state this kernel has: it looks exactly like a wedged board. One print of
+ * who is still there turns it into a report. */
+void sched_report_joined(void) {
+    uint32_t next = 0, serving = 0;
+    uint64_t owner = 0;
+    klock_state(&next, &serving, &owner);
+    kprintf("sched: over %u; klock next %u serving %u owner %llu\n", process_over ? 1u : 0u, next,
+            serving, (unsigned long long)owner);
+    for (uint32_t i = 0; i < SMP_MAX_HARTS; i++) {
+        uint32_t t = harts[i].current;
+        if (!harts[i].joined) {
+            continue;
+        }
+        kprintf("sched: hart %u joined, idle %u, armed %llu ns, tid %llu state %u\n", i,
+                harts[i].idle ? 1u : 0u, (unsigned long long)timer_armed_ns_of(i),
+                t == SCHED_NO_THREAD ? 0ull : (unsigned long long)threads[t].tid,
+                t == SCHED_NO_THREAD ? 0u : (unsigned)threads[t].state);
+    }
 }
 
 uint32_t sched_joined_harts(void) {
@@ -1358,6 +1620,50 @@ static bool something_can_progress(void) {
  * default and says which it was. Ten seconds, because a short threshold
  * would fire on a machine that is merely slow. */
 #define DEADLOCK_TICKS 1000u
+
+/* How long past its deadline a blocked thread has to be before it counts as
+ * a wake-up that was lost rather than one that is late. A second is three
+ * orders of magnitude past anything this kernel schedules. */
+#define OVERDUE_NS 1000000000ull
+
+static uint32_t overdue_wakes;
+
+uint32_t sched_overdue_wakes(void) {
+    return overdue_wakes;
+}
+
+/* Reports a thread whose deadline has long passed and which is still
+ * blocked.
+ *
+ * **The gap the deadlock detector leaves.** That one only fires when every
+ * thread is blocked with *no* deadline, because a deadline means something
+ * will happen — so a thread blocked on a deadline the clock went past is
+ * invisible to it, and the machine hangs in total silence with
+ * `something_can_progress` answering "yes" for ever. That is exactly the
+ * shape of a lost wake-up, and it is what a timed wait is for: finding it
+ * cost several board runs where the only evidence was no output at all.
+ *
+ * It complements `sched_lost_deadlines`, which asks whether a deadline is
+ * *armed* on some hart. This asks whether one that was armed ever
+ * **arrived**, which is a different failure and the one that hangs. */
+static void watch_for_overdue_wakes(uint64_t now) {
+    for (uint32_t i = 0; i < SCHED_MAX_THREADS; i++) {
+        uint64_t at = threads[i].futex_deadline;
+        if (threads[i].state != THREAD_BLOCKED || at == 0 || now < at + OVERDUE_NS) {
+            continue;
+        }
+        overdue_wakes++;
+        kprintf("\nsched: **tid %llu is %llu ms past its deadline and still blocked**"
+                " (waiting on %llx)\n",
+                (unsigned long long)threads[i].tid, (unsigned long long)((now - at) / 1000000u),
+                (unsigned long long)(uintptr_t)threads[i].wait_chan);
+        /* Woken, because the report is worth more than the hang and a
+         * spurious wake is something every caller of a timed wait already
+         * has to handle. */
+        place_on_runqueue(i);
+        threads[i].woken = false;
+    }
+}
 
 static void watch_for_deadlock(void) {
     if (something_can_progress()) {
@@ -1676,6 +1982,7 @@ void sched_tick(void) {
         missed_pokes++;
     }
     watch_for_deadlock();
+    watch_for_overdue_wakes(now);
     for (uint32_t i = 0; i < SCHED_MAX_THREADS; i++) {
         if (threads[i].state == THREAD_BLOCKED && threads[i].futex_deadline != 0 &&
             now >= threads[i].futex_deadline) {

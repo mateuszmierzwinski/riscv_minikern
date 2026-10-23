@@ -313,9 +313,32 @@ static int64_t sys_ok(struct trapframe *tf) {
 
 /* The one process. A real `getpid` needs a process table; until there is
  * one, 1 is both true and useful — it is what an init process is. */
+/* The calling process's own pid.
+ *
+ * **This returned the constant 1.** It was written when there was one
+ * process and never revisited, and it is the quietest kind of wrong answer:
+ * every process believed it was pid 1, so anything comparing pids compared
+ * two 1s and agreed. It was found by running the process-group test as the
+ * *third* program in a boot rather than the first — `getpgid(0)` gave the
+ * real group and `getpid()` gave 1, and the test that had passed only
+ * because both numbers happened to be 1 failed honestly. */
 static int64_t sys_getpid(struct trapframe *tf) {
+    struct uproc *me = uspace_current();
     (void)tf;
-    return 1;
+    return me != NULL ? (int64_t)uspace_pid_of(me) : 1;
+}
+
+/* The calling **thread's** id, which is a different number.
+ *
+ * It was aliased to `getpid` above, so every thread of a process reported
+ * the same id — and a Go runtime records this as its thread's identity and
+ * then preempts a goroutine with `tgkill(pid, that id, SIGURG)`. Since
+ * `tgkill` resolves by thread id, every preemption signal was delivered to
+ * whichever thread happened to be numbered 1: the right signal, to the
+ * wrong thread. */
+static int64_t sys_gettid(struct trapframe *tf) {
+    (void)tf;
+    return (int64_t)sched_current_tid();
 }
 
 /* Which CPUs this thread may run on.
@@ -1114,7 +1137,7 @@ static const struct syscall_entry table[] = {
     {SYS_CLOCK_GETTIME, "clock_gettime", sys_clock_gettime},
     {SYS_GETRANDOM, "getrandom", sys_getrandom},
     {SYS_GETPID, "getpid", sys_getpid},
-    {SYS_GETTID, "gettid", sys_getpid},
+    {SYS_GETTID, "gettid", sys_gettid},
     {SYS_SET_TID_ADDRESS, "set_tid_address", sys_getpid},
     {SYS_SET_ROBUST_LIST, "set_robust_list", sys_ok},
     {SYS_SIGALTSTACK, "sigaltstack", sys_sigaltstack},

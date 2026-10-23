@@ -28,6 +28,7 @@
 #define SYS_WAIT4 260
 #define SYS_KILL 129
 #define SYS_GETPGID 155
+#define SYS_SETPGID 154
 #define SYS_GETPID 172
 #define SYS_IOCTL 29
 #define SYS_READ 63
@@ -675,7 +676,11 @@ user_wait_end:
     .globl user_pgrp_start
     .globl user_pgrp_end
 user_pgrp_start:
-    /* getpgid(0) and getpid() must agree. */
+    /* A fresh process leads its own group: `getpgid(0)` and `getpid()` agree.
+     *
+     * This is also the check that caught `getpid` returning the constant 1 —
+     * it only ever ran as the first program in a boot, where the real pid
+     * *is* 1, so two wrong answers agreed. */
     li      a0, 0
     li      a7, SYS_GETPGID
     ecall
@@ -683,7 +688,6 @@ user_pgrp_start:
     li      a7, SYS_GETPID
     ecall
     bne     a0, s3, pgrp_bad_group
-    mv      s4, a0               /* our pid, which is also our pgid */
 
     /* fork */
     li      a0, 17               /* SIGCHLD: a child, not a thread */
@@ -695,16 +699,14 @@ user_pgrp_start:
     ecall
     bltz    a0, pgrp_clone_failed
     bnez    a0, pgrp_parent
+    mv      s4, a0
 
-    /* The child: confirm it inherited the group, then spin until it is
-     * continued. The spin is bounded so a failure ends rather than hangs —
-     * if it is never stopped it simply exits 7 early, and the ordering the
-     * parent checks is what catches that. */
-    li      a0, 0
-    li      a7, SYS_GETPGID
-    ecall
-    bne     a0, s4, pgrp_child_wrong_group
-    li      t0, 400000000
+    /* The child: spin briefly and exit 7. The spin is short — the parent
+     * waits far longer than it takes — so a child that was never stopped
+     * finishes during the parent's sleep, and the parent's `WNOHANG` probe
+     * sees it finished. That probe is the proof: it distinguishes "stopped"
+     * from "ran through", which the exit status alone cannot. */
+    li      t0, 20000000
 pgrp_child_spin:
     addi    t0, t0, -1
     bnez    t0, pgrp_child_spin
@@ -713,15 +715,28 @@ pgrp_child_spin:
     ecall
 
 pgrp_parent:
-    /* SIGSTOP to the whole group: kill(-pgid, SIGSTOP). */
+    mv      s4, a0               /* the child's pid */
+    /* **The child into a group of its own**, which is what a shell does to
+     * a job — and the reason this test has to: stopping *our* group would
+     * stop this process too, since it is in it. The old version did exactly
+     * that and passed only because `SIGSTOP` could not actually stop a
+     * thread that was running; once it could, the test deadlocked itself.
+     * The parent sets it rather than the child, so there is no window in
+     * which the signal could arrive before the move. */
+    mv      a0, s4
+    mv      a1, s4
+    li      a7, SYS_SETPGID
+    ecall
+    bltz    a0, pgrp_kill_failed
+
+    /* SIGSTOP to that group, by negative pid. */
     sub     a0, zero, s4
     li      a1, 19               /* SIGSTOP */
     li      a7, SYS_KILL
     ecall
     bltz    a0, pgrp_kill_failed
 
-    /* Long enough that a child which ignored the stop would have finished
-     * its spin and exited. */
+    /* Long enough that a child which ignored the stop would have finished. */
     addi    sp, sp, -16
     sd      zero, 0(sp)
     li      t0, 500000000
@@ -730,6 +745,17 @@ pgrp_parent:
     li      a1, 0
     li      a7, SYS_NANOSLEEP
     ecall
+
+    /* **The proof**: the child has not finished, because it is stopped. */
+    addi    sp, sp, -16
+    sw      zero, 0(sp)
+    mv      a0, s4
+    mv      a1, sp
+    li      a2, 1                /* WNOHANG */
+    li      a3, 0
+    li      a7, SYS_WAIT4
+    ecall
+    bnez    a0, pgrp_not_stopped
 
     /* SIGCONT to the group. */
     sub     a0, zero, s4
@@ -762,7 +788,7 @@ pgrp_clone_failed:
     li      a0, 112
     li      a7, SYS_EXIT_GROUP
     ecall
-pgrp_child_wrong_group:
+pgrp_not_stopped:
     li      a0, 113
     li      a7, SYS_EXIT_GROUP
     ecall
@@ -1374,3 +1400,112 @@ mf_done:
     ecall
 6:  j       6b
 user_mapflags_end:
+
+/* Roadmap §0: a thread that will not leave its hart on its own.
+ *
+ * The defect was that `sched_end_siblings` marked a process's other threads
+ * and the caller carried straight on to replace or free the address space —
+ * so a sibling still executing user code on another hart ran against page
+ * tables being taken apart underneath it. It "had not been seen to fail",
+ * which says nothing about whether it does.
+ *
+ * This program builds the case deliberately, which is the only way to see
+ * it: a child process with a **spinning thread that makes no syscalls**, so
+ * under dynamic ticks there is nothing scheduled to interrupt it, and then
+ * the child's main thread calls `exit_group`. The kernel has to get that
+ * thread off its hart before it frees the address space, and its own
+ * `waited for` line says whether it had to.
+ *
+ * The parent reaps the child and exits with its status: **5** means the
+ * whole sequence worked. A hang would be the wait never being satisfied,
+ * and the kernel's line would then name the threads that would not leave.
+ */
+    .globl user_endsib_start
+    .globl user_endsib_end
+user_endsib_start:
+    /* fork: a child with an address space of its own, which is what makes
+     * its exit free one rather than stop the machine. */
+    li      a0, 17               /* SIGCHLD */
+    li      a1, 0
+    li      a2, 0
+    li      a3, 0
+    li      a4, 0
+    li      a7, SYS_CLONE
+    ecall
+    bltz    a0, es_failed
+    bnez    a0, es_parent
+
+    /* The child. A stack for the thread it is about to make, out of mapped
+     * memory: an embedded program is one page. */
+    li      a0, 0
+    li      a1, 8192
+    li      a2, 3
+    li      a3, 0x22
+    li      a4, -1
+    li      a5, 0
+    li      a7, SYS_MMAP
+    ecall
+    bltz    a0, es_child_failed
+    li      t0, 8192
+    add     s5, a0, t0
+
+    /* clone(CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD) — a
+     * thread of the child, sharing its address space. */
+    li      a0, 0x00050f00
+    mv      a1, s5
+    li      a2, 0
+    li      a3, 0
+    li      a4, 0
+    li      a7, SYS_CLONE
+    ecall
+    bltz    a0, es_child_failed
+    bnez    a0, es_child_main
+
+    /* The thread: spin for ever, with **no syscall of any kind**. Nothing
+     * here will ever trap voluntarily, which is the whole point — only an
+     * interrupt aimed at this hart can stop it. */
+es_spin:
+    j       es_spin
+
+es_child_main:
+    /* Long enough that the thread is certainly on a hart of its own, and
+     * past any slice it might have been given. */
+    addi    sp, sp, -16
+    sd      zero, 0(sp)
+    li      t0, 50000000         /* 50 ms */
+    sd      t0, 8(sp)
+    mv      a0, sp
+    li      a1, 0
+    li      a7, SYS_NANOSLEEP
+    ecall
+    /* The whole process, while a thread of it is mid-instruction elsewhere. */
+    li      a0, 5
+    li      a7, SYS_EXIT_GROUP
+    ecall
+
+es_parent:
+    addi    sp, sp, -16
+    sw      zero, 0(sp)
+    li      a0, -1
+    mv      a1, sp
+    li      a2, 0
+    li      a3, 0
+    li      a7, SYS_WAIT4
+    ecall
+    bltz    a0, es_failed
+    lw      t0, 0(sp)
+    srli    t0, t0, 8
+    andi    a0, t0, 0xff
+    li      a7, SYS_EXIT_GROUP
+    ecall
+
+es_failed:
+    li      a0, 161
+    li      a7, SYS_EXIT_GROUP
+    ecall
+es_child_failed:
+    li      a0, 162
+    li      a7, SYS_EXIT_GROUP
+    ecall
+7:  j       7b
+user_endsib_end:

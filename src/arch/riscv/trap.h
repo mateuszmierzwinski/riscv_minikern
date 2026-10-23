@@ -99,4 +99,8 @@ void trap_set_lock(bool (*enter)(void), void (*exit)(bool));
  * interrupt still pending. NULL to remove it. */
 void trap_set_user_return_hook(void (*hook)(struct trapframe *tf));
 
+/* How many software interrupts (cross-hart pokes) this machine has actually
+ * taken as traps, which is not the same as how many were sent. */
+uint64_t trap_software_interrupts(void);
+
 #endif

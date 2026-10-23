@@ -994,6 +994,7 @@ extern const char user_uid_start[], user_uid_end[];
 extern const char user_rlimit_start[], user_rlimit_end[];
 extern const char user_mremap_start[], user_mremap_end[];
 extern const char user_mapflags_start[], user_mapflags_end[];
+extern const char user_endsib_start[], user_endsib_end[];
 
 /* The three numbers that tell how a mapping's pages were paid for: on first
  * touch, up front because the caller asked, and re-pointed by a move. They
@@ -1003,6 +1004,24 @@ static void report_mapping_counters(void) {
     kprintf("mem: %llu pages backed on demand, %llu populated up front, %llu moved by mremap\n",
             (unsigned long long)uspace_demand_pages(), (unsigned long long)uspace_populated_pages(),
             (unsigned long long)uspace_moved_pages());
+}
+
+/* Whether the kernel had to catch a thread mid-flight on another hart, and
+ * how long it took. Printed rather than asserted: a zero count means the
+ * race was not provoked, and that is as important to see as a non-zero one
+ * is — a test that cannot tell the two apart proves nothing. */
+static void report_await(void) {
+    uint32_t caught = 0;
+    uint64_t worst = 0;
+    sched_await_report(&caught, &worst);
+    {
+        uint32_t pokes = 0, wakes = 0, loops = 0;
+        sched_await_detail(&pokes, &wakes, &loops);
+        kprintf("sched: waited for %u thread(s) to leave a hart, worst %llu us\n", caught,
+                (unsigned long long)worst);
+        kprintf("sched:   %u pokes aimed, %u woken by a departure, %u looks, %llu pokes taken\n",
+                pokes, wakes, loops, (unsigned long long)trap_software_interrupts());
+    }
 }
 
 static void run_one_user_program(const char *name, const char *from, const char *to) {
@@ -1242,6 +1261,14 @@ static void run_user_programs(void) {
     if (cmdline_has(boot_cmdline, "minikern.mapflags")) {
         run_one_user_program("mapflags", user_mapflags_start, user_mapflags_end);
         report_mapping_counters();
+    }
+    /* Roadmap §0: a process ending while one of its threads is mid-flight
+     * on another hart. **5** means the whole sequence worked; the kernel's
+     * own "waited for" line says whether it had to catch anything, which is
+     * what makes the closing of the window a measurement. */
+    if (cmdline_has(boot_cmdline, "minikern.endsib")) {
+        run_one_user_program("endsib", user_endsib_start, user_endsib_end);
+        report_await();
     }
     if (cmdline_has(boot_cmdline, "minikern.init")) {
         run_init_from_disk("/init");
