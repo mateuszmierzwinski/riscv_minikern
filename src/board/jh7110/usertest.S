@@ -1833,3 +1833,169 @@ fm_magic:
     .balign 4
 9:  j       9b
 user_filemap_end:
+
+/* Roadmap §1: `^Z` from the keyboard to a job, which is the last thing in
+ * that section.
+ *
+ * Everything on this path existed and nothing had ever walked it: the
+ * terminal raises `SIGTSTP` on the **foreground group**, `TIOCSPGRP` sets
+ * which group that is, and `SIGSTOP`/`SIGCONT` act on a process rather than
+ * a handler. What was missing was a program willing to be the shell for
+ * long enough to prove it.
+ *
+ * So this one is: it puts a child in a group of its own, makes that group
+ * the terminal's foreground, prints a marker and waits. The harness types
+ * `^Z` when it sees the marker (`runtype.py`), and the kernel has to turn
+ * that keystroke into a signal that stops **the child and not this
+ * process** — which is why the parent stays in its own group, and why a
+ * kernel that raised the signal at the wrong group would hang here instead
+ * of passing.
+ *
+ * The proof is the same shape as the process-group test's: after a wait far
+ * longer than the child's own work, the child must **not** have finished.
+ * Then `SIGCONT`, and it does. **7 is a pass**; 171..175 name the step.
+ */
+    .globl user_tstp_start
+    .globl user_tstp_end
+user_tstp_start:
+    /* fork */
+    li      a0, 17               /* SIGCHLD */
+    li      a1, 0
+    li      a2, 0
+    li      a3, 0
+    li      a4, 0
+    li      a7, SYS_CLONE
+    ecall
+    bltz    a0, ts_clone_failed
+    bnez    a0, ts_parent
+
+    /* The child: its own group, then a little work, then 7. */
+    li      a0, 0
+    li      a1, 0
+    li      a7, SYS_SETPGID
+    ecall
+    /* **Long enough to still be running when the key is typed**, which the
+     * harness does about a second after the marker. The two constraints
+     * pull apart: the child must outlast the keystroke, and the parent must
+     * outwait the child. So the child works for roughly three seconds and
+     * the parent waits six — with a five-millisecond child, which is what
+     * this was first, the key arrived after it had finished and the test
+     * reported 174 for a reason that had nothing to do with the kernel. */
+    li      t0, 1500000000
+ts_child_spin:
+    addi    t0, t0, -1
+    bnez    t0, ts_child_spin
+    li      a0, 1
+    lla     a1, ts_child_msg
+    li      a2, ts_child_msg_end - ts_child_msg
+    li      a7, SYS_WRITE
+    ecall
+    li      a0, 7
+    li      a7, SYS_EXIT_GROUP
+    ecall
+
+ts_parent:
+    mv      s4, a0               /* the child's pid, and its group */
+    /* The parent sets the child's group too, so there is no window in
+     * which the keystroke could arrive before the move. */
+    mv      a0, s4
+    mv      a1, s4
+    li      a7, SYS_SETPGID
+    ecall
+    bltz    a0, ts_setpgid_failed
+
+    /* ioctl(0, TIOCSPGRP, &pgid): the child's group owns the keyboard. */
+    addi    sp, sp, -16
+    sw      s4, 0(sp)
+    li      a0, 0
+    li      a1, 0x5410           /* TIOCSPGRP */
+    mv      a2, sp
+    li      a7, SYS_IOCTL
+    ecall
+    bltz    a0, ts_ioctl_failed
+
+    /* The marker the harness waits for before typing. */
+    li      a0, 1
+    lla     a1, ts_ready
+    li      a2, ts_ready_end - ts_ready
+    li      a7, SYS_WRITE
+    ecall
+
+    /* Long enough that a child which was never stopped has finished. */
+    /* Two seconds, in `tv_sec`. **Not in `tv_nsec`**, which is where this
+     * first put it: a `timespec` with 2,000,000,000 nanoseconds is not a
+     * long sleep, it is an invalid argument — the kernel answers `EINVAL`
+     * and the call returns at once. The test then passed without ever
+     * waiting, in both the keystroke case and the control, which is how it
+     * was caught. */
+    addi    sp, sp, -16
+    li      t0, 6
+    sd      t0, 0(sp)
+    sd      zero, 8(sp)
+    mv      a0, sp
+    li      a1, 0
+    li      a7, SYS_NANOSLEEP
+    ecall
+    addi    sp, sp, 16
+
+    /* It must still be there: stopped, not finished. */
+    addi    sp, sp, -16
+    sw      zero, 0(sp)
+    mv      a0, s4
+    mv      a1, sp
+    li      a2, 1                /* WNOHANG */
+    li      a3, 0
+    li      a7, SYS_WAIT4
+    ecall
+    bnez    a0, ts_not_stopped
+
+    /* SIGCONT to the group, then reap it. */
+    sub     a0, zero, s4
+    li      a1, 18               /* SIGCONT */
+    li      a7, SYS_KILL
+    ecall
+    bltz    a0, ts_setpgid_failed
+    addi    sp, sp, -16
+    sw      zero, 0(sp)
+    li      a0, -1
+    mv      a1, sp
+    li      a2, 0
+    li      a3, 0
+    li      a7, SYS_WAIT4
+    ecall
+    bltz    a0, ts_wait_failed
+    lw      t0, 0(sp)
+    srli    t0, t0, 8
+    andi    a0, t0, 0xff
+    li      a7, SYS_EXIT_GROUP
+    ecall
+
+ts_clone_failed:
+    li      a0, 171
+    li      a7, SYS_EXIT_GROUP
+    ecall
+ts_setpgid_failed:
+    li      a0, 172
+    li      a7, SYS_EXIT_GROUP
+    ecall
+ts_ioctl_failed:
+    li      a0, 173
+    li      a7, SYS_EXIT_GROUP
+    ecall
+ts_not_stopped:
+    li      a0, 174
+    li      a7, SYS_EXIT_GROUP
+    ecall
+ts_wait_failed:
+    li      a0, 175
+    li      a7, SYS_EXIT_GROUP
+    ecall
+ts_ready:
+    .ascii  "tstp: the keyboard is the child's\n"
+ts_ready_end:
+ts_child_msg:
+    .ascii  "tstp: the child finished its work\n"
+ts_child_msg_end:
+    .balign 4
+10: j       10b
+user_tstp_end:

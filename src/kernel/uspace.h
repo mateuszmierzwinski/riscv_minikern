@@ -468,6 +468,23 @@ uint32_t uspace_stale_records(void);
  * here and never in the demand count. */
 uint64_t uspace_populated_pages(void);
 
+/* Raises a signal on a process, doing **what that signal means**.
+ *
+ * Four of them do not reach a handler at all by default: `SIGSTOP` always
+ * stops the process, and `SIGTSTP`, `SIGTTIN` and `SIGTTOU` stop it unless
+ * it has claimed them — a shell catches `SIGTSTP` so that it can record the
+ * job before stopping. `SIGCONT` continues it. Everything else is raised
+ * for delivery in the ordinary way.
+ *
+ * **One place, because it had two and both had half of it.** `kill` and the
+ * terminal each carried their own copy handling `SIGSTOP` and `SIGCONT`, so
+ * `^Z` — which is `SIGTSTP` — fell through to ordinary delivery, where a
+ * signal nothing handles is fatal: the keystroke **killed** the foreground
+ * job instead of stopping it. The same hole made a background `read` kill
+ * the reader rather than stopping it. A rule about what a signal means
+ * belongs with the signal, not with each of its senders. */
+void uspace_deliver_signal(struct uproc *p, uint32_t signo);
+
 /* Frames about to be returned through to user mode whose `sepc` or stack
  * pointer was a kernel address. A program cannot cause one: any value but
  * zero means this kernel restored the wrong registers, and the fault that

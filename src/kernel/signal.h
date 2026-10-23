@@ -40,11 +40,19 @@
 #define SIGBUS 7
 #define SIGFPE 8
 #define SIGKILL 9
-/* The two that act on the process rather than on a handler: neither can be
- * caught, blocked or ignored, which is why they are the scheduler's and not
- * the signal frame's. */
+/* The signals that act on the **process** rather than on a handler.
+ *
+ * `SIGSTOP` and `SIGCONT` cannot be caught, blocked or ignored, which is why
+ * they are the scheduler's business and not the signal frame's. The other
+ * three stop a process *by default* and can be caught — a shell catches
+ * `SIGTSTP` so that it can put the job in its own list before stopping it —
+ * so "what does this signal do?" is a question about the signal **and** the
+ * process, and `uspace_deliver_signal` is the one place that asks it. */
 #define SIGSTOP 19
 #define SIGCONT 18
+#define SIGTSTP 20
+#define SIGTTIN 21
+#define SIGTTOU 22
 #define SIGSEGV 11
 #define SIGPIPE 13
 #define SIGALRM 14

@@ -409,20 +409,8 @@ static int64_t sys_setsid(struct trapframe *tf) {
  * pending set, so "the process" means the thread that will notice first,
  * which is right for the signals a shell sends and would not be for a
  * multi-threaded program catching them. Stated rather than hidden. */
-static void deliver_to_one(struct uproc *p, uint32_t signo) {
-    if (signo == SIGSTOP) {
-        (void)sched_stop_process(uspace_pid_of(p));
-        return;
-    }
-    if (signo == SIGCONT) {
-        (void)sched_continue_process(uspace_pid_of(p));
-        return;
-    }
-    sched_raise_on_process(uspace_pid_of(p), signo);
-}
-
 static void deliver_in_group(struct uproc *p, uint32_t signo) {
-    deliver_to_one(p, signo);
+    uspace_deliver_signal(p, signo);
 }
 
 static int64_t sys_kill(struct trapframe *tf) {
@@ -438,7 +426,7 @@ static int64_t sys_kill(struct trapframe *tf) {
             return KERR_SRCH;
         }
         if (signo != 0) {
-            deliver_to_one(target, signo);
+            uspace_deliver_signal(target, signo);
         }
         return 0;
     }

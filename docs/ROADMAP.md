@@ -229,10 +229,34 @@ Ordering inside a section is roughly by what unblocks the most.
       size, blocks on `read`, and a line typed over the serial line arrives
       through the discipline and comes back out. That needed a harness that
       sends as well as captures.
-- [ ] **`SIGTSTP` from the keyboard to a shell's job.** (S) The terminal
-      raises it on the foreground group already; what is missing is
-      anything that sets a foreground group, which is a shell's job and
-      waits for one to exist.
+- [x] **`SIGTSTP` from the keyboard to a shell's job.** (S) **Done, and
+      walking the path found two defects** — which is the argument for
+      walking a path that every piece of is already built.
+      **`SIGTSTP` killed the job instead of stopping it.** What a signal
+      *does* to a process by default had two copies, one in `kill` and one
+      in the terminal's group-signal path, and both had only half of it:
+      `SIGSTOP` and `SIGCONT` were handled, and `SIGTSTP`, `SIGTTIN` and
+      `SIGTTOU` fell through to ordinary delivery — where a signal nothing
+      handles is fatal. So `^Z` ended the foreground job, and a background
+      `read` killed the reader rather than stopping it. There is now one
+      `uspace_deliver_signal`, and the three catchable stop signals stop a
+      process only when it has not claimed them, because a shell catches
+      `SIGTSTP` to record the job before it stops.
+      **`nanosleep` clamped every sleep to one second**, with no reason
+      written down. That is not a cautious approximation: the call returned
+      early and reported success, which to a program is indistinguishable
+      from time having passed, so `time.Sleep(5s)` came back after one.
+      Verified on the board with the harness typing the key
+      (`runtype.py … "tstp: the keyboard is the child" '\x1a'`): the program
+      puts a child in a group of its own, makes that group the terminal's
+      foreground with `TIOCSPGRP`, prints a marker and waits six seconds.
+      **7** with the keystroke — the child was stopped and continued — and
+      **174** without it, which is the control that makes the 7 mean
+      something. Three versions of this test passed while proving nothing:
+      the first slept 2,000,000,000 **nanoseconds**, which is not a long
+      sleep but an invalid argument; the second had a child whose work was
+      over before the key arrived; only the third has both margins the right
+      way round.
 - [x] **Users and groups.** (M) **Mostly done, and the gap is named.**
       Real and effective uid/gid on every process, inherited at `fork` and
       surviving `execve`, with `getuid`/`geteuid`/`getgid`/`getegid` and the
@@ -252,12 +276,15 @@ Ordering inside a section is roughly by what unblocks the most.
       **XFS now parses ownership**, which it did not — `mode` was read and
       `uid`/`gid` were not, which is precisely why permissions were "stored
       and ignored". `xfsmount_stat` reports them.
-      **What is missing:** nothing *calls* the rule yet, because there is no
-      regular-file `openat` to call it from (§3). The check belongs where a
-      process exists rather than in the filesystem layer — putting it in
+      **The rule has a caller now.** This entry used to end "nothing *calls*
+      the rule yet, because there is no regular-file `openat` to call it
+      from" — §2's file-backed mappings needed that `openat`, and it checks
+      the mode from the filesystem's own inode against the caller's identity
+      before handing out a descriptor. The check sits where a process
+      exists, not in the filesystem layer: putting it in
       `xfsmount_read_file` was tried and reverted, since that would have the
-      hexagon reaching outward and the dependency would be circular. Also
-      missing: the unprivileged `setuid` that returns to a real uid one
+      hexagon reaching outward and the dependency would be circular.
+      Still missing: the unprivileged `setuid` that returns to a real uid one
       already has, and `setresuid`/saved ids.
 - [x] **Resource limits.** (S) **Done for the two this kernel can enforce,
       and honest about the rest.** `prlimit64` answered every question with
@@ -329,8 +356,12 @@ Ordering inside a section is roughly by what unblocks the most.
       about to write through the pointer, and a kernel fault is a panic
       where a program's would be ordinary.
 - [x] **Copy-on-write.** (L) **Done** for anonymous memory, with `fork`
-      above. Not done for `MAP_PRIVATE` file mappings, which need
-      file-backed mappings first.
+      above. The note that followed — "not done for `MAP_PRIVATE` file
+      mappings, which need file-backed mappings first" — is **withdrawn
+      rather than completed**: a private file mapping here fills each page
+      from the file into a page of its own, so there is nothing shared
+      between two processes for copy-on-write to postpone. A *shared* file
+      mapping would need it, and `MAP_SHARED` is refused.
 - [x] **File-backed mappings.** (M) **Done** for `MAP_PRIVATE`, read-only,
       which is what "maps a file to read it" needs. A region records the
       file and the offset it starts at, and each page is filled from the

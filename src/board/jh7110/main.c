@@ -1001,6 +1001,7 @@ extern const char user_mapflags_start[], user_mapflags_end[];
 extern const char user_endsib_start[], user_endsib_end[];
 extern const char user_huge_start[], user_huge_end[];
 extern const char user_filemap_start[], user_filemap_end[];
+extern const char user_tstp_start[], user_tstp_end[];
 
 /* The three numbers that tell how a mapping's pages were paid for: on first
  * touch, up front because the caller asked, and re-pointed by a move. They
@@ -1290,6 +1291,14 @@ static void run_user_programs(void) {
     if (cmdline_has(boot_cmdline, "minikern.filemap")) {
         run_one_user_program("filemap", user_filemap_start, user_filemap_end);
         report_mapping_counters();
+    }
+    /* Roadmap §1: `^Z` from the keyboard to a job. **7** is a pass, and it
+     * needs the harness to type `^Z` when the program says it is ready —
+     * `runtype.py` does that; a plain boot leaves this program waiting and
+     * then reporting 174, which is the honest answer to a keystroke that
+     * never came. */
+    if (cmdline_has(boot_cmdline, "minikern.tstp")) {
+        run_one_user_program("tstp", user_tstp_start, user_tstp_end);
     }
     if (cmdline_has(boot_cmdline, "minikern.endsib")) {
         run_one_user_program("endsib", user_endsib_start, user_endsib_end);

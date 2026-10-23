@@ -7,13 +7,13 @@
 #include "arch/riscv/timer.h"
 #include "core/tty.h"
 #include "kernel/sched.h"
+#include "kernel/signal.h"
 #include "kernel/uspace.h"
 
-/* The signals a terminal raises. `SIGINT` and `SIGTSTP` on the keys, and
- * `SIGTTIN` at a reader that is not in the foreground. */
+/* `SIGINT` is the only one this file names that is not already in
+ * `signal.h`: the stop signals are there, because what they *mean* is the
+ * same wherever they come from. */
 #define SIGINT 2
-#define SIGTSTP 20
-#define SIGTTIN 21
 
 /* How long a blocked reader waits before looking again. Short enough that a
  * lost wake costs a keystroke's delay rather than a hang, long enough to be
@@ -145,7 +145,10 @@ static bool may_read_keyboard(void) {
     if (uspace_pgid_of(me) == term.foreground) {
         return true;
     }
-    sched_raise_on_process(uspace_pid_of(me), SIGTTIN);
+    /* **Through the signal's own meaning**, not straight at the thread: a
+     * background reader is *stopped* by `SIGTTIN` unless it has claimed it,
+     * and raising it as an ordinary signal killed the reader instead. */
+    uspace_deliver_signal(me, SIGTTIN);
     return false;
 }
 

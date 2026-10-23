@@ -868,7 +868,14 @@ static int64_t sys_nanosleep(struct trapframe *tf) {
     }
     want = (uint64_t)req->sec * 1000000000ull + (uint64_t)req->nsec;
     trace_sleep("nanosleep", want);
-    want = want > 1000000000ull ? 1000000000ull : want;
+    /* **A sleep sleeps for as long as it was asked.** This clamped it to one
+     * second, with no reason written down, and that is not a cautious
+     * approximation — it is the call returning early and reporting success,
+     * which to the program is indistinguishable from time having passed.
+     * `time.Sleep(5s)` came back after one. It was found by a test that
+     * needed a two-second wait to mean anything: the wait did not happen,
+     * so the thing it was waiting for had not happened either, and the test
+     * passed for a reason that had nothing to do with what it checked. */
     deadline = timer_ns() + want;
     if (!sched_sleep_until(deadline)) {
         /* No thread to block — before the scheduler is running. Then the

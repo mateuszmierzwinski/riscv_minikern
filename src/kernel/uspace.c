@@ -1119,16 +1119,31 @@ bool uspace_may_access(uint32_t file_uid, uint32_t file_gid, uint32_t mode, uint
     return access_permitted(uspace_euid(), uspace_egid(), file_uid, file_gid, mode, want);
 }
 
-static void raise_one(struct uproc *p, uint32_t signo) {
-    if (signo == SIGSTOP) {
-        (void)sched_stop_process(p->pid);
-        return;
-    }
+/* Whether this process has claimed this signal for itself. */
+static bool handler_installed(const struct uproc *p, uint32_t signo) {
+    uint64_t h = p->actions[signo].sa_handler;
+    return h != SIG_DFL && h != SIG_IGN;
+}
+
+/* Whether a signal **stops** a process when nothing has claimed it. */
+static bool stops_by_default(uint32_t signo) {
+    return signo == SIGTSTP || signo == SIGTTIN || signo == SIGTTOU;
+}
+
+void uspace_deliver_signal(struct uproc *p, uint32_t signo) {
     if (signo == SIGCONT) {
         (void)sched_continue_process(p->pid);
         return;
     }
+    if (signo == SIGSTOP || (stops_by_default(signo) && !handler_installed(p, signo))) {
+        (void)sched_stop_process(p->pid);
+        return;
+    }
     (void)sched_raise_on_process(p->pid, signo);
+}
+
+static void raise_one(struct uproc *p, uint32_t signo) {
+    uspace_deliver_signal(p, signo);
 }
 
 uint32_t uspace_signal_group(uint32_t pgid, uint32_t signo) {
