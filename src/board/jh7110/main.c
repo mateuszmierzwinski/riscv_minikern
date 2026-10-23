@@ -1075,6 +1075,7 @@ extern const char user_tstp_start[], user_tstp_end[];
 extern const char user_swap_start[], user_swap_end[];
 extern const char user_regs_start[], user_regs_end[];
 extern const char user_dontneed_start[], user_dontneed_end[];
+extern const char user_mapchurn_start[], user_mapchurn_end[];
 
 /* The three numbers that tell how a mapping's pages were paid for: on first
  * touch, up front because the caller asked, and re-pointed by a move. They
@@ -1428,6 +1429,11 @@ static void run_user_programs(void) {
      * preempted in favour of anything interesting. */
     /* Roadmap §0: the guarantee the corruption came from breaking.
      * **0** is a pass; 190..194 name the step. */
+    /* Roadmap §0: two mappings must never be the same memory. **0** is a
+     * pass; 100 + the slot names the region whose stamp went wrong. */
+    if (cmdline_has(boot_cmdline, "minikern.mapchurn")) {
+        run_one_user_program("mapchurn", user_mapchurn_start, user_mapchurn_end);
+    }
     if (cmdline_has(boot_cmdline, "minikern.dontneed")) {
         run_one_user_program("dontneed", user_dontneed_start, user_dontneed_end);
     }

@@ -53,10 +53,11 @@ SERVED = os.path.expanduser(os.environ.get("MINIKERN_SERVED", "~/vf2/minikern.bi
 CASES = [
     ("memory self-tests",
      "minikern.dontneed minikern.regs minikern.mremap minikern.mapflags "
-     "minikern.huge",
+     "minikern.huge minikern.mapchurn",
      ["dontneed exited with 0", "regs exited with 0", "mremap exited with 63",
-      "mapflags exited with 127", "huge exited with 127"],
-     100),
+      "mapflags exited with 127", "huge exited with 127",
+      "mapchurn exited with 0"],
+     140),
     ("MADV_DONTNEED control — the guarantee must fail when it is broken",
      "minikern.dontneed minikern.keepadvice",
      ["dontneed exited with 200"],

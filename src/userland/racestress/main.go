@@ -273,6 +273,21 @@ func inParallel(workers, n int) ([]int, [][]bool) {
 				guard[i] = 0xA5
 			}
 			sum := fillSieve(sieve)
+			/* **The decisive question, asked of the kernel directly.**
+			 *
+			 * A failing round has the sieve reading the guard's `0xA5`
+			 * while the two ranges provably do not overlap, so either two
+			 * distinct virtual ranges share physical memory or the bytes
+			 * arrived after the runtime cleared the sieve. Those have
+			 * different culprits and the program cannot tell them apart —
+			 * but the kernel can say which frame backs each address, and
+			 * the only moment that answer is still true is now. Two lines
+			 * of output: the same frame twice is aliasing, two frames is
+			 * not, and either way the guessing stops. */
+			if sum != wantedSum {
+				askTheKernelAbout(unsafe.Pointer(&sieve[0]))
+				askTheKernelAbout(unsafe.Pointer(&guard[0]))
+			}
 			for i, b := range guard {
 				if b != 0xA5 {
 					fmt.Printf("stress: **the guard beside worker %d's sieve holds %#02x at %d**\n",

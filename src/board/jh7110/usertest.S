@@ -2522,3 +2522,148 @@ dn_exit:
     li      a7, SYS_EXIT_GROUP
     ecall
 user_dontneed_end:
+
+/* Roadmap §0: can two separate mappings ever be the same memory?
+ *
+ * **The §0 question, asked without Go and without the card.** The fast
+ * reproducer is a Go binary, so it needs a filesystem to be loaded from and
+ * has only ever run under the emulator — and the emulator is not the
+ * arbiter here. What it reports is that a fresh allocation holds a previous
+ * one's bytes while the two ranges provably do not overlap, which is either
+ * two virtual ranges over one frame or bytes arriving after a range was
+ * cleared. A program that does nothing but map, stamp and check can ask
+ * that on real silicon, in the kernel's own image, with no runtime in the
+ * way to be suspected.
+ *
+ * Eight regions of 64 KiB are kept at once, each stamped with a word made
+ * of its own slot number so that a byte from the wrong region names the
+ * region it came from. Every iteration throws one away, maps a new one in
+ * its place, stamps it, and then **re-checks all eight** — so a frame
+ * handed out while still mapped elsewhere is caught on the next pass rather
+ * than whenever something happens to read it. Four hundred iterations is
+ * four hundred `mmap`s and nearly as many `munmap`s, which is the churn
+ * that makes an allocator or a stale translation show itself.
+ *
+ * One word per page is checked rather than every byte: `mmap` hands out
+ * whole pages, so an overlap is page-granular and the first word of a page
+ * is as good a witness as all 4,096 — and it keeps four hundred passes over
+ * half a megabyte quick enough to run on every board boot.
+ *
+ * **0 is a pass.** 170 is out of memory, 171 a mapping refused, and
+ * 100 + slot names the region whose stamp came back wrong.
+ */
+#define MC_REGION 65536
+#define MC_SLOTS 8
+#define MC_ROUNDS 400
+
+    .globl user_mapchurn_start
+    .globl user_mapchurn_end
+user_mapchurn_start:
+    /* A page to hold the eight bases, because a slot is an index and
+     * registers cannot be indexed. */
+    li      a0, 0
+    li      a1, 4096
+    li      a2, 3
+    li      a3, 0x22
+    li      a4, -1
+    li      a5, 0
+    li      a7, SYS_MMAP
+    ecall
+    bltz    a0, mc_no_memory
+    mv      s3, a0
+    li      s2, 0                   /* the iteration */
+
+mc_loop:
+    andi    t0, s2, (MC_SLOTS - 1)  /* the slot this round replaces */
+    slli    t1, t0, 3
+    add     s4, s3, t1              /* &base[slot], kept across the calls */
+
+    /* Throw the old one away, if there is one. */
+    ld      t2, 0(s4)
+    beqz    t2, mc_fresh
+    mv      a0, t2
+    li      a1, MC_REGION
+    li      a7, SYS_MUNMAP
+    ecall
+
+mc_fresh:
+    li      a0, 0
+    li      a1, MC_REGION
+    li      a2, 3
+    li      a3, 0x22
+    li      a4, -1
+    li      a5, 0
+    li      a7, SYS_MMAP
+    ecall
+    bltz    a0, mc_refused
+    sd      a0, 0(s4)
+
+    /* Stamp it: the slot's number in every byte of every page's first word,
+     * so a word read from the wrong region says which region it was. */
+    andi    t0, s2, (MC_SLOTS - 1)
+    addi    t3, t0, 1
+    li      t4, 0x0101
+    slli    t5, t4, 16
+    or      t4, t4, t5
+    slli    t5, t4, 32
+    or      t4, t4, t5              /* 0x0101010101010101 */
+    mul     t3, t3, t4              /* the slot's stamp word */
+    mv      t1, a0
+    li      t5, MC_REGION
+    add     t5, t1, t5              /* the end */
+    li      t6, 4096
+mc_stamp:
+    sd      t3, 0(t1)
+    add     t1, t1, t6
+    blt     t1, t5, mc_stamp
+
+    /* Now every slot must still hold its own stamp. */
+    li      t0, 0
+mc_check_slot:
+    slli    t1, t0, 3
+    add     t1, s3, t1
+    ld      t2, 0(t1)               /* this slot's base */
+    beqz    t2, mc_next_slot
+    addi    t3, t0, 1
+    li      t4, 0x0101
+    slli    t5, t4, 16
+    or      t4, t4, t5
+    slli    t5, t4, 32
+    or      t4, t4, t5
+    mul     t3, t3, t4              /* what it should hold */
+    li      t6, MC_REGION
+    add     t6, t2, t6
+    li      a1, 4096
+mc_check_page:
+    ld      a2, 0(t2)
+    bne     a2, t3, mc_wrong
+    add     t2, t2, a1
+    blt     t2, t6, mc_check_page
+mc_next_slot:
+    addi    t0, t0, 1
+    li      t1, MC_SLOTS
+    blt     t0, t1, mc_check_slot
+
+    addi    s2, s2, 1
+    li      t0, MC_ROUNDS
+    blt     s2, t0, mc_loop
+
+    li      a0, 0
+    j       mc_exit
+mc_no_memory:
+    li      a0, 170
+    j       mc_exit
+mc_refused:
+    li      a0, 171
+    j       mc_exit
+mc_wrong:
+    /* 100 + the slot whose stamp was wrong. The value that was there is in
+     * `a2` and the kernel prints the exit status only, so the slot is what
+     * there is room to say — and it is the half that matters: it names the
+     * region whose memory went somewhere else. */
+    li      a0, 100
+    add     a0, a0, t0
+mc_exit:
+    li      a7, SYS_EXIT_GROUP
+    ecall
+user_mapchurn_end:
