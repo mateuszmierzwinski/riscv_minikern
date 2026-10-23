@@ -298,6 +298,44 @@ uint32_t pgtable_find_mappings(const struct pgtable *pt, phys_t phys, virt_t *ou
     return found;
 }
 
+/* The entry for `va` at the leaf level, or NULL when no table reaches it.
+ *
+ * Unlike `walk_to`, it does not create tables: a page that is being swapped
+ * out is mapped, so its tables exist, and a page whose tables do not exist
+ * was never swapped. */
+static uint64_t *leaf_entry(const struct pgtable *pt, virt_t va) {
+    const uint64_t *table = pt->root;
+    if (!pgtable_va_is_canonical(va)) {
+        return NULL;
+    }
+    for (uint32_t l = PT_LEVELS; l-- > 1u;) {
+        uint64_t pte = table[index_at(va, l)];
+        if (!pte_is_table(pte)) {
+            return NULL;
+        }
+        table = pt->mem.to_virt(pt->mem.self, pte_phys(pte));
+    }
+    return (uint64_t *)&table[index_at(va, 0)];
+}
+
+int pgtable_set_swapped(struct pgtable *pt, virt_t va, uint32_t slot) {
+    uint64_t *entry = leaf_entry(pt, va);
+    if (entry == NULL || !pte_is_leaf(*entry)) {
+        return KERR_NOENT;
+    }
+    *entry = ((uint64_t)slot << PTE_SWAP_SHIFT) | PTE_SWAPPED;
+    return KERR_OK;
+}
+
+bool pgtable_swapped_slot(const struct pgtable *pt, virt_t va, uint32_t *slot) {
+    const uint64_t *entry = leaf_entry(pt, va);
+    if (entry == NULL || (*entry & PTE_V) != 0 || (*entry & PTE_SWAPPED) == 0) {
+        return false;
+    }
+    *slot = (uint32_t)(*entry >> PTE_SWAP_SHIFT);
+    return true;
+}
+
 uint64_t pgtable_satp(const struct pgtable *pt, uint16_t asid) {
     return SATP_MODE_SV39 | ((uint64_t)asid << 44) | (pt->root_phys >> 12);
 }

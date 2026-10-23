@@ -773,6 +773,7 @@ cc_library(
         ":exec",
         ":fair",
         ":kernel_mem",
+        ":kernel_swap",
         ":kernel_net",
         ":kernel_xfs",
         ":kernel_random",

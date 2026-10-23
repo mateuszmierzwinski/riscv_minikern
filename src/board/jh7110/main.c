@@ -487,6 +487,7 @@ static void secondary_hart_loop(void);
 static void report_hart_usage(void);
 static void start_swap_if_asked(void);
 static void swap_selftest(void);
+static void report_swap(void);
 
 void smp_secondary_main(uint64_t hart, uint64_t satp) {
     smp_set_this_hart(hart);
@@ -1056,6 +1057,7 @@ extern const char user_endsib_start[], user_endsib_end[];
 extern const char user_huge_start[], user_huge_end[];
 extern const char user_filemap_start[], user_filemap_end[];
 extern const char user_tstp_start[], user_tstp_end[];
+extern const char user_swap_start[], user_swap_end[];
 
 /* The three numbers that tell how a mapping's pages were paid for: on first
  * touch, up front because the caller asked, and re-pointed by a move. They
@@ -1381,6 +1383,13 @@ static void run_user_programs(void) {
     if (cmdline_has(boot_cmdline, "minikern.swaptest")) {
         swap_selftest();
     }
+    /* Roadmap §2: a program's pages out to swap and back, through a fault.
+     * **0** is a pass, and the swap counters below are what prove the pages
+     * went anywhere — the program cannot tell, which is the promise. */
+    if (cmdline_has(boot_cmdline, "minikern.swapout")) {
+        run_one_user_program("swap", user_swap_start, user_swap_end);
+        report_swap();
+    }
     if (cmdline_has(boot_cmdline, "minikern.init")) {
         run_init_from_disk("/init");
     }
@@ -1470,6 +1479,20 @@ static void swap_selftest(void) {
     kprintf("swap: a page went out to slot %u and came back byte for byte\n", slot);
     mem_free_pages(out, 1);
     mem_free_pages(back, 1);
+}
+
+/* What swap has actually done. Printed after a program that used it,
+ * because the program cannot see any of this and that is the point: the
+ * only evidence that a page went out and came back is the kernel's. */
+static void report_swap(void) {
+    uint32_t slots = 0, used = 0;
+    uint64_t written = 0, read_back = 0, in = 0, out = 0;
+    swap_report(&slots, &used, &written, &read_back);
+    uspace_swap_report(&in, &out);
+    kprintf("swap: %u of %u slots in use; %llu pages written, %llu read back\n", used, slots,
+            (unsigned long long)written, (unsigned long long)read_back);
+    kprintf("swap: %llu pages sent out by a process, %llu faulted back in\n",
+            (unsigned long long)out, (unsigned long long)in);
 }
 
 /* True when the operator asked the machine to switch itself off at the end,

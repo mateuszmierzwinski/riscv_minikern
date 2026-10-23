@@ -24,7 +24,9 @@
 #include "core/console.h"
 #include "core/errno.h"
 #include "kernel/file.h"
+#include "core/access.h"
 #include "kernel/sched.h"
+#include "kernel/swap.h"
 #include "kernel/signal.h"
 #include "kernel/syscall.h"
 #include "kernel/uspace.h"
@@ -447,6 +449,54 @@ static int64_t sys_kill(struct trapframe *tf) {
  * — the exit code in bits 8..15, which is the detail that makes a correct
  * kernel look wrong if it is missed, because the caller then reads a status
  * 256 times too small. */
+/* `swapon(path, flags)` and `swapoff(path)` — **root's only**.
+ *
+ * Who may turn swap on is not a detail: it decides where a machine's memory
+ * goes and how slow it gets, and the file it names is read and written by
+ * the kernel at addresses of its choosing. So it is `EPERM` for anybody but
+ * root — a real check, because this kernel has had real identities since
+ * §1 and `uspace_euid` is the same function every other privileged call
+ * asks.
+ *
+ * **The flags carry the swappiness**, in the low seven bits, which is where
+ * Linux puts a swap device's priority. Reusing the field keeps the call's
+ * shape ABI-compatible and avoids inventing a syscall for one number; 0
+ * means "leave it alone", so `swapon(path, 0)` is the ordinary call and
+ * gets the default.
+ *
+ * Its size is the file's, which is the whole point of a page *file*: the
+ * operator chooses it with `dd` and the kernel uses what is there. There is
+ * nothing for a syscall to set. */
+static int64_t sys_swapon(struct trapframe *tf) {
+    char path[EXEC_MAX_PATH];
+    uint32_t flags = (uint32_t)sysarg(tf, 1);
+    uint32_t swappiness = flags & 0x7fu;
+    int rc = copy_string_in(path, sizeof path, sysarg(tf, 0));
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    if (uspace_euid() != ACCESS_ROOT) {
+        return KERR_PERM;
+    }
+    return swap_enable(path, swappiness == 0u ? 60u : swappiness);
+}
+
+static int64_t sys_swapoff(struct trapframe *tf) {
+    char path[EXEC_MAX_PATH];
+    int rc = copy_string_in(path, sizeof path, sysarg(tf, 0));
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    if (uspace_euid() != ACCESS_ROOT) {
+        return KERR_PERM;
+    }
+    /* The path is checked for readability and then ignored: this kernel has
+     * one swap file at a time, so "turn off the one that is on" is the only
+     * thing `swapoff` can mean here. Taking the argument anyway keeps the
+     * call the shape a program expects. */
+    return swap_disable();
+}
+
 static int64_t sys_wait4(struct trapframe *tf) {
     int64_t want = (int64_t)sysarg(tf, 0);
     virt_t status_at = sysarg(tf, 1);
@@ -513,6 +563,8 @@ const struct syscall_entry sys_proc_table[] = {
     {220, "clone", sys_clone},
     {221, "execve", sys_execve},
     {260, "wait4", sys_wait4},
+    {SYS_SWAPON, "swapon", sys_swapon},
+    {SYS_SWAPOFF, "swapoff", sys_swapoff},
     {129, "kill", sys_kill},
     {154, "setpgid", sys_setpgid},
     {155, "getpgid", sys_getpgid},

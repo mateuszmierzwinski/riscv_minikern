@@ -204,8 +204,39 @@ static void test_exhaustion_is_reported(void) {
     pgtable_destroy(&pt);
 }
 
+/* A page that has gone out to swap: the entry remembers where, and every
+ * other reader has to see "not mapped" — which is the whole reason the
+ * valid bit is clear. The case that matters is the third one: an address
+ * that was never mapped must not look swapped, or a fault on a wild
+ * pointer would try to read slot 0 out of the swap file. */
+static void test_a_swapped_page_is_remembered_but_not_mapped(void) {
+    struct pgtable pt;
+    phys_t pa = 0;
+    uint64_t flags = 0, size = 0;
+    uint32_t slot = 0;
+    KTEST_CHECK(pgtable_create(&pt, &arena_mem) == KERR_OK);
+    KTEST_CHECK(pgtable_map(&pt, 0x4000u, 0x90000u, PAGE_SIZE, PT_PROT_RW | PT_PROT_USER) ==
+                KERR_OK);
+    KTEST_CHECK(pgtable_set_swapped(&pt, 0x4000u, 1234u) == KERR_OK);
+    /* Not mapped, to everybody who asks the ordinary way. */
+    KTEST_CHECK(!pgtable_lookup(&pt, 0x4000u, &pa, &flags, &size));
+    /* And remembered, to whoever asks the one question that matters. */
+    KTEST_CHECK(pgtable_swapped_slot(&pt, 0x4000u, &slot) && slot == 1234u);
+    /* An address that was never mapped is absent, not swapped. */
+    KTEST_CHECK(!pgtable_swapped_slot(&pt, 0x8000u, &slot));
+    /* Nor is a page that is mapped. */
+    KTEST_CHECK(pgtable_map(&pt, 0x5000u, 0x91000u, PAGE_SIZE, PT_PROT_RW | PT_PROT_USER) ==
+                KERR_OK);
+    KTEST_CHECK(!pgtable_swapped_slot(&pt, 0x5000u, &slot));
+    /* Swapping out a page that is not there is refused rather than
+     * inventing an entry for it. */
+    KTEST_CHECK(pgtable_set_swapped(&pt, 0x9000u, 7u) == KERR_NOENT);
+    pgtable_destroy(&pt);
+}
+
 int main(void) {
     KTEST_RUN(test_canonical_addresses);
+    KTEST_RUN(test_a_swapped_page_is_remembered_but_not_mapped);
     KTEST_RUN(test_maps_and_reads_back_a_page);
     KTEST_RUN(test_large_pages);
     KTEST_RUN(test_misaligned_large_mappings_are_refused);

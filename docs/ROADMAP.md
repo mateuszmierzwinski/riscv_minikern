@@ -541,16 +541,50 @@ Ordering inside a section is roughly by what unblocks the most.
       time (`xfsmount_map_file`) and read and written as blocks after that —
       which is how Linux's `swapon` works, and for the same reason. A sparse
       file is refused: a hole has nowhere to put a page.
-      **Done so far**: the file layer. The slot map and its bitmap, a page
-      written out and read back through the block cache, `swappiness` 0..100
-      carried from `minikern.swap=<path>[:<swappiness>]`, and the counters.
-      `minikern.swaptest=1` proves a page survives the round trip — into one
-      frame, back into a *different* one, because reading it back into the
-      frame it came from would pass even if the read did nothing.
-      **Still owed**: the page table's swap entry and the fault that reads a
-      page back, choosing a victim, the watermark that decides *when* to
-      swap, and the root-only `swapon`/`swapoff`. Verifying on the board
-      needs a swap file on the card, which only the operator can create.
+      **Pages go out and come back.** A page that is out leaves its slot
+      number in the page table entry it used to be in, with the valid bit
+      clear — so the hardware ignores it, every existing reader is told "not
+      mapped", and `pte_is_leaf`/`pte_is_table` cannot see it because both
+      require that bit. The marker is what separates it from an entry that
+      is simply **absent**: without one, a fault on a swapped page would be
+      backed with a fresh zero page and the page's contents would be gone
+      silently, which is the worst way to lose memory. For the same reason
+      the fault handler asks about swap **before** demand paging.
+      A page comes back with its *region's* rights rather than the ones its
+      entry had, because the region is the authority on what a process may
+      do with an address and a page that went out read-only and came back
+      writable would be a permission appearing from nowhere.
+      **Giving the slots back** matters as much as taking them: a page that
+      is out still costs a slot, so `munmap` releases the slots in its range
+      — the loop that frees pages cannot see them, since a swap entry is not
+      a mapping — and a process that ends releases every slot its regions
+      still hold. Without those, a program that pages memory out and then
+      frees it fills the file with pages nobody will ask for.
+      **Root's to turn on**: `swapon(path, flags)` and `swapoff(path)`, both
+      `EPERM` for anybody else — a real check, because this kernel has had
+      real identities since §1. The flags carry the swappiness in the low
+      seven bits, which is where Linux puts a swap device's priority: it
+      keeps the call's shape and avoids inventing a syscall for one number.
+      The *size* is the file's, which is the point of a page file — the
+      operator chooses it with `dd` and the kernel uses what is there.
+      **`madvise(MADV_PAGEOUT)` now does something**, and it is what makes
+      swap testable at all: on a machine with 8 GiB the pressure that would
+      cause paging is unreachable, and Linux has exactly this advice for
+      exactly this purpose, so a program asking for it is asking an ordinary
+      question. The rest of the advice is still accepted and ignored, which
+      is honest — advice is advice, and the only thing a kernel may not do
+      is *claim* to have taken it.
+      Verified **on the board**, with a 64 MiB `/swapfile` the operator
+      created on the card: 16,384 slots resolved from the file's extents, a
+      page out to slot 0 and back byte for byte, and a program that wrote a
+      marker into each of sixteen pages, asked for them to be paged out, and
+      read all sixteen back — **exit 0**, with the kernel reporting `16
+      pages sent out by a process, 16 faulted back in` and no slot left
+      taken. The Go program runs unchanged with swap enabled.
+      **Still owed**: the watermark that decides when to swap without being
+      asked, which is what `swappiness` will scale, and a victim choice
+      better than "the first page of the first region" — both of which need
+      a machine under memory pressure to mean anything.
 - [x] **Huge pages for user space.** (M) **Done**, for 2 MiB pages, and only
       when a program asks: `MAP_HUGETLB` was in the refused list until there
       were huge pages to give, which is the right place for a flag to wait.

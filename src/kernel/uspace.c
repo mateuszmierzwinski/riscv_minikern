@@ -16,6 +16,7 @@
 #include "kernel/file.h"
 #include "kernel/klock.h"
 #include "kernel/sched.h"
+#include "kernel/swap.h"
 #include "arch/riscv/sigframe.h"
 #include "kernel/signal.h"
 #include "kernel/syscall.h"
@@ -286,10 +287,31 @@ static void unshare_kernel_mappings(struct pgtable *pt) {
     }
 }
 
+/* Gives back every swap slot this address space still holds.
+ *
+ * A process that ends with pages out leaks them otherwise: the slots stay
+ * taken and the file fills with pages whose owner is gone. The regions are
+ * the only record of where to look, which is the same reason `fork` and
+ * placement read them. */
+static void release_every_slot(struct uproc *p) {
+    uint32_t given = 0;
+    for (uint32_t i = 0; i < p->vmas.n; i++) {
+        for (virt_t va = p->vmas.v[i].start; va < p->vmas.v[i].end; va += PAGE_SIZE) {
+            uint32_t slot = 0;
+            if (pgtable_swapped_slot(&p->pt, va, &slot)) {
+                swap_release(slot);
+                given++;
+            }
+        }
+    }
+    (void)given;
+}
+
 void uspace_destroy(struct uproc *p) {
     if (!p->built) {
         return;
     }
+    release_every_slot(p);
     drop_every_file(p);
     unshare_kernel_mappings(&p->pt);
     pgtable_destroy(&p->pt);
@@ -493,6 +515,66 @@ static bool resolve_copy_on_write(struct trapframe *tf) {
  * first touch, which is why `MAP_POPULATE` exists for callers that would
  * rather pay up front.
  */
+/* Pages brought back from swap, and pages sent out to it. */
+static uint64_t pages_in_from_swap;
+static uint64_t pages_out_to_swap;
+
+void uspace_swap_report(uint64_t *in, uint64_t *out) {
+    *in = pages_in_from_swap;
+    *out = pages_out_to_swap;
+}
+
+/* **A page that is out in swap**, brought back where it was.
+ *
+ * This runs before `back_on_demand` and the order is the whole point: both
+ * are faults on an address the page tables call absent, and the difference
+ * between them is an entry that remembers a slot. Backing a swapped page
+ * with a fresh zero page instead would lose its contents and report
+ * nothing, which is the worst way to lose memory.
+ *
+ * The page comes back with the region's rights rather than the ones it had,
+ * for the same reason demand paging uses them: the region is the authority
+ * on what a process may do with an address, and a page that went out
+ * read-only and came back writable would be a permission appearing out of
+ * nowhere. */
+static bool page_in_from_swap(struct trapframe *tf) {
+    uint64_t code = tf->scause & ~SCAUSE_INTERRUPT;
+    struct uproc *me = uspace_current();
+    const struct vma *region;
+    virt_t page;
+    uint32_t slot = 0;
+    phys_t frame = 0;
+    if (code != EXC_INSN_PAGE_FAULT && code != EXC_LOAD_PAGE_FAULT &&
+        code != EXC_STORE_PAGE_FAULT) {
+        return false;
+    }
+    if (me == NULL) {
+        return false;
+    }
+    page = tf->stval & ~(virt_t)(PAGE_SIZE - 1u);
+    if (!pgtable_swapped_slot(&me->pt, page, &slot)) {
+        return false;
+    }
+    region = vma_find(&me->vmas, page);
+    if (region == NULL || region->prot == 0) {
+        return false; /* the record and the entry disagree: not ours to fix */
+    }
+    if (mem_alloc_pages(1, 1, &frame) != KERR_OK) {
+        return false;
+    }
+    if (swap_in(slot, frame) != KERR_OK) {
+        mem_free_pages(frame, 1);
+        return false;
+    }
+    if (pgtable_map(&me->pt, page, frame, PAGE_SIZE, prot_bits(region->prot)) != KERR_OK) {
+        mem_free_pages(frame, 1);
+        return false;
+    }
+    pages_in_from_swap++;
+    published_addition();
+    return true;
+}
+
 static bool back_on_demand(struct trapframe *tf) {
     uint64_t code = tf->scause & ~SCAUSE_INTERRUPT;
     struct uproc *me = uspace_current();
@@ -650,6 +732,14 @@ static bool on_user_trap(struct trapframe *tf) {
     if (resolve_copy_on_write(tf)) {
         handled_faults++;
         trace_handled_fault(tf, "copy-on-write");
+        return true;
+    }
+    /* **Before demand paging**, because both are faults on an address the
+     * tables call absent and only the entry says which this is. The other
+     * order would back a swapped page with a fresh zero page and lose it. */
+    if (page_in_from_swap(tf)) {
+        handled_faults++;
+        trace_handled_fault(tf, "back from swap");
         return true;
     }
     if (back_on_demand(tf)) {
@@ -2220,6 +2310,16 @@ static int drop_pages(struct uproc *p, virt_t at, uint64_t bytes) {
         uint64_t flags = 0, size = 0;
         uint64_t span;
         if (!pgtable_lookup(&p->pt, va, &phys, &flags, &size)) {
+            /* **A page that is out in swap still costs a slot.** Unmapping
+             * it has to give that slot back, or a program that pages memory
+             * out and then frees it fills the swap file with pages nobody
+             * will ever ask for. The entry is not a mapping, so the loop
+             * above cannot see it — which is exactly why this is here. */
+            uint32_t slot = 0;
+            if (pgtable_swapped_slot(&p->pt, va, &slot)) {
+                swap_release(slot);
+                (void)pgtable_unmap(&p->pt, va);
+            }
             va += PAGE_SIZE;
             continue;
         }
@@ -2300,6 +2400,88 @@ int uspace_unmap(struct uproc *p, virt_t at, uint64_t bytes) {
         return KERR_NOMEM;
     }
     return drop_pages(p, at, bytes);
+}
+
+/* Sends one of a process's pages out to swap, if it finds one it may.
+ *
+ * **What it may not take** is the interesting half. A page that is part of
+ * a huge mapping is one entry over 2 MiB and cannot be paged piecemeal; a
+ * file-backed page should be dropped and re-read rather than written to
+ * swap, which is cheaper and is not built yet; a `PROT_NONE` region has no
+ * pages; and the trampoline the signal handlers return through must be
+ * there at the moment a signal is delivered, which is exactly when the
+ * kernel cannot wait for a disk. Everything else — anonymous memory, which
+ * is nearly all of a program's — is fair.
+ *
+ * The frame is freed only after the removal has reached every hart, because
+ * a hart still holding the old translation would write into a frame that
+ * now belongs to something else. That is the same rule as `munmap`'s, and
+ * the reason the order here is write, record, publish, free.
+ *
+ * Reports how many pages it managed, which is not always what was asked:
+ * running out of slots is ordinary and is not an error. */
+/* Whether a region's pages may be sent out at all. */
+static bool may_page_out(const struct vma *r) {
+    return r->prot != 0 && r->file == NULL && (r->flags & VMA_HUGE) == 0 &&
+           r->start != SIGNAL_TRAMPOLINE;
+}
+
+/* One page out, reporting whether it went. */
+static bool page_out_one(struct uproc *p, virt_t va) {
+    phys_t phys = 0;
+    uint64_t flags = 0, span = 0;
+    uint32_t slot = 0;
+    if (!pgtable_lookup(&p->pt, va, &phys, &flags, &span) || span != PAGE_SIZE) {
+        return false;
+    }
+    phys &= ~(phys_t)(PAGE_SIZE - 1u);
+    if (swap_out(phys, &slot) != KERR_OK) {
+        return false;
+    }
+    if (pgtable_set_swapped(&p->pt, va, slot) != KERR_OK) {
+        swap_release(slot);
+        return false;
+    }
+    /* **Published before the frame is freed**, because a hart still holding
+     * the old translation would write into a frame that now belongs to
+     * something else. The same rule as `munmap`'s, and the reason the order
+     * is write, record, publish, free. */
+    published_removal();
+    mem_free_pages(phys, 1);
+    pages_out_to_swap++;
+    return true;
+}
+
+uint32_t uspace_reclaim_range(struct uproc *p, virt_t at, uint64_t pages) {
+    uint32_t done = 0;
+    if (p == NULL || !swap_enabled()) {
+        return 0;
+    }
+    for (uint64_t i = 0; i < pages; i++) {
+        virt_t va = at + i * PAGE_SIZE;
+        const struct vma *r = vma_find(&p->vmas, va);
+        if (r != NULL && may_page_out(r) && page_out_one(p, va)) {
+            done++;
+        }
+    }
+    return done;
+}
+
+uint32_t uspace_reclaim_pages(struct uproc *p, uint32_t want) {
+    uint32_t done = 0;
+    if (p == NULL || !swap_enabled()) {
+        return 0;
+    }
+    for (uint32_t i = 0; i < p->vmas.n && done < want; i++) {
+        const struct vma *r = &p->vmas.v[i];
+        if (!may_page_out(r)) {
+            continue;
+        }
+        for (virt_t va = r->start; va < r->end && done < want; va += PAGE_SIZE) {
+            done += page_out_one(p, va) ? 1u : 0u;
+        }
+    }
+    return done;
 }
 
 /* ── mremap ────────────────────────────────────────────────────────────── */

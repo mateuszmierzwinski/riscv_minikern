@@ -18,6 +18,7 @@
 #include "kernel/fdobjects.h"
 #include "kernel/file.h"
 #include "kernel/sched.h"
+#include "kernel/swap.h"
 #include "kernel/signal.h"
 #include "arch/riscv/timer.h"
 #include "kernel/uspace.h"
@@ -163,6 +164,9 @@ static const struct refused_map_flag refused_map_flags[] = {
 /* The flags `mremap` is called with. `MREMAP_FIXED` is the only one that
  * reads the fifth argument, which is why the argument is not read without
  * it: the register holds whatever the caller left there. */
+/* `madvise`'s advice, of which this kernel acts on one. */
+#define MADV_PAGEOUT 21u
+
 #define MREMAP_MAYMOVE 0x01u
 #define MREMAP_FIXED 0x02u
 #define MREMAP_DONTUNMAP 0x04u
@@ -305,6 +309,38 @@ static int64_t sys_munmap(struct trapframe *tf) {
  * program can watch it being touched again. Treating it as an ordinary move
  * would leave such a program faulting on addresses it was promised, and a
  * flag honoured in name only is worse than one that is not there. */
+/* `madvise`, of which one piece of advice now does something.
+ *
+ * **`MADV_PAGEOUT` is the program saying "I will not need these soon".**
+ * Linux has exactly this advice for exactly this purpose, so a program
+ * asking for it is asking an ordinary question — and it is the only way to
+ * exercise swap on a machine with 8 GiB of memory, where the pressure that
+ * would otherwise cause paging is unreachable.
+ *
+ * Everything else is still accepted and ignored, which for the rest of the
+ * advice is honest: `MADV_DONTNEED` and `MADV_FREE` permit the kernel to
+ * discard pages and this one keeps them, which is allowed and is what a
+ * runtime copes with. Advice is advice; the only thing a kernel may not do
+ * is *claim* to have taken it. */
+static int64_t sys_madvise(struct trapframe *tf) {
+    uint64_t at = sysarg(tf, 0);
+    uint64_t bytes = sysarg(tf, 1);
+    uint32_t advice = (uint32_t)sysarg(tf, 2);
+    uint64_t pages = (bytes + PAGE_SIZE - 1u) / PAGE_SIZE;
+    if (advice != MADV_PAGEOUT) {
+        return 0;
+    }
+    if ((at & (PAGE_SIZE - 1u)) != 0 || pages == 0 || pages > SWAP_MAX_SLOTS) {
+        return KERR_INVAL;
+    }
+    /* The count of pages that actually went is not reported: `madvise`
+     * answers 0 for success, and a program that could see how much was
+     * paged out would be reading the kernel's memory pressure through a
+     * call that promises nothing. The kernel's own counters say. */
+    (void)uspace_reclaim_range(uspace_current(), at, pages);
+    return 0;
+}
+
 static int64_t sys_mremap(struct trapframe *tf) {
     uint64_t flags = sysarg(tf, 3);
     virt_t to = (flags & MREMAP_FIXED) != 0 ? sysarg(tf, 4) : 0;
@@ -1205,7 +1241,7 @@ static const struct syscall_entry table[] = {
     {SYS_MUNMAP, "munmap", sys_munmap},
     {SYS_MREMAP, "mremap", sys_mremap},
     {SYS_MPROTECT, "mprotect", sys_mprotect},
-    {SYS_MADVISE, "madvise", sys_ok},
+    {SYS_MADVISE, "madvise", sys_madvise},
     {SYS_CLOCK_GETTIME, "clock_gettime", sys_clock_gettime},
     {SYS_GETRANDOM, "getrandom", sys_getrandom},
     {SYS_GETPID, "getpid", sys_getpid},

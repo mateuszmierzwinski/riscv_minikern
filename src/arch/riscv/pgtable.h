@@ -34,6 +34,23 @@
 
 #include "core/types.h"
 
+/* **A page that is out in swap**, recorded in the entry it used to live in.
+ *
+ * `V` is clear, so the hardware ignores the entry and a walk reports "not
+ * mapped" — which is what a fault handler needs to hear, and what every
+ * existing caller already copes with. Both `pte_is_leaf` and `pte_is_table`
+ * require `V`, so a swapped entry is invisible to them by construction
+ * rather than by everyone remembering.
+ *
+ * The marker is what distinguishes it from an entry that is simply **absent**
+ * (all zero). Without one, a fault on a swapped page would be backed with a
+ * fresh zero page and the page's contents would be gone — silently, which
+ * is the worst way to lose memory. The slot sits above the flag bits, where
+ * a physical page number would be; nothing reads it as one, because nothing
+ * reads an invalid entry at all. */
+#define PTE_SWAPPED (1ull << 1) /* `R`, which means nothing while `V` is clear */
+#define PTE_SWAP_SHIFT 10u
+
 #define PT_LEVELS 3u
 #define PT_ENTRIES 512u            /* per level: 4096 bytes / 8 */
 #define PT_BYTES 4096u
@@ -134,6 +151,16 @@ uint64_t pgtable_unmap(struct pgtable *pt, virt_t va);
  * **two is a frame with two owners**, and the second address says what it
  * is. Walks the tables, so it is not for a hot path. */
 uint32_t pgtable_find_mappings(const struct pgtable *pt, phys_t phys, virt_t *out, uint32_t max);
+
+/* Records that `va`'s page has gone out to `slot`, replacing its mapping
+ * with an invalid entry that remembers where. The page must be mapped now;
+ * KERR_NOENT when it is not. */
+int pgtable_set_swapped(struct pgtable *pt, virt_t va, uint32_t slot);
+
+/* Whether `va`'s entry says its page is out in swap, and which slot. False
+ * for a mapped page and for one that was never there — the three cases a
+ * fault has to tell apart. */
+bool pgtable_swapped_slot(const struct pgtable *pt, virt_t va, uint32_t *slot);
 
 uint64_t pgtable_satp(const struct pgtable *pt, uint16_t asid);
 

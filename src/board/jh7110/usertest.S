@@ -40,6 +40,7 @@
 #define SYS_OPENAT 56
 #define SYS_MUNMAP 215
 #define SYS_MREMAP 216
+#define SYS_MADVISE 233
 
 user_program_start:
     /* write(1, message, length) — the address comes from the program
@@ -1999,3 +2000,85 @@ ts_child_msg_end:
     .balign 4
 10: j       10b
 user_tstp_end:
+
+/* Roadmap §2: a page that goes out to swap and comes back.
+ *
+ * The program cannot see swap and must not be able to: that is the whole
+ * promise. So it writes a pattern across several pages, asks the kernel —
+ * through a syscall it is allowed to make — to take them away, and reads
+ * the pattern back. If the bytes are right, the pages went somewhere and
+ * came back; the kernel's own counters say where.
+ *
+ * `madvise(addr, len, MADV_PAGEOUT)` is the request. Linux has exactly this
+ * advice for exactly this purpose, so the program is asking an ordinary
+ * question rather than using a private interface — and a kernel that
+ * ignores it (as this one did until now) simply answers 0 and the pattern
+ * is still right, which is why the kernel's counters are what prove it.
+ *
+ * **0 is a pass**; 181..183 name the step.
+ */
+    .globl user_swap_start
+    .globl user_swap_end
+user_swap_start:
+    /* mmap(NULL, 64 KiB, RW, PRIVATE|ANON) */
+    li      a0, 0
+    li      a1, 65536
+    li      a2, 3
+    li      a3, 0x22
+    li      a4, -1
+    li      a5, 0
+    li      a7, SYS_MMAP
+    ecall
+    bltz    a0, sw_no_memory
+    mv      s3, a0
+
+    /* A word per page, each the page's own index plus one — so a page that
+     * comes back as zeroes, or as another page, is caught. */
+    li      t3, 4096
+    mv      t1, s3
+    li      t2, 1
+    li      t4, 17
+sw_fill:
+    sd      t2, 0(t1)
+    add     t1, t1, t3
+    addi    t2, t2, 1
+    blt     t2, t4, sw_fill
+
+    /* madvise(addr, 64 KiB, MADV_PAGEOUT=21) */
+    mv      a0, s3
+    li      a1, 65536
+    li      a2, 21
+    li      a7, SYS_MADVISE
+    ecall
+    bltz    a0, sw_advice_refused
+
+    /* And read every one of them back. */
+    li      t3, 4096
+    mv      t1, s3
+    li      t2, 1
+    li      t4, 17
+sw_check:
+    ld      t5, 0(t1)
+    bne     t5, t2, sw_came_back_wrong
+    add     t1, t1, t3
+    addi    t2, t2, 1
+    blt     t2, t4, sw_check
+
+    li      a0, 0
+    li      a7, SYS_EXIT_GROUP
+    ecall
+
+sw_no_memory:
+    li      a0, 181
+    li      a7, SYS_EXIT_GROUP
+    ecall
+sw_advice_refused:
+    li      a0, 182
+    li      a7, SYS_EXIT_GROUP
+    ecall
+sw_came_back_wrong:
+    li      a0, 183
+    li      a7, SYS_EXIT_GROUP
+    ecall
+11: j       11b
+user_swap_end:

@@ -478,6 +478,21 @@ void uspace_back_eagerly(bool on);
  * of a frame that turns out dirty. For a hunt, not for a boot. */
 void uspace_set_paranoid(bool on);
 
+/* Sends up to `want` of a process's pages out to swap, reporting how many
+ * went. Anonymous pages only: a huge mapping is one entry over 2 MiB, a
+ * file-backed page is better dropped and re-read, and the signal
+ * trampoline has to be there at the moment a signal is delivered — which
+ * is precisely when the kernel cannot wait for a disk. */
+uint32_t uspace_reclaim_pages(struct uproc *p, uint32_t want);
+
+/* The same for one range, which is what `madvise(MADV_PAGEOUT)` asks for:
+ * the program naming the memory it will not need soon. */
+uint32_t uspace_reclaim_range(struct uproc *p, virt_t at, uint64_t pages);
+
+/* Pages brought back from swap, and pages sent out to it. The second
+ * without the first is a program that has not missed them yet. */
+void uspace_swap_report(uint64_t *in, uint64_t *out);
+
 /* Raises a signal on a process, doing **what that signal means**.
  *
  * Four of them do not reach a handler at all by default: `SIGSTOP` always
