@@ -502,8 +502,22 @@ static void damage_agblklog(void) {
     seal(block(0), 512u, XFS_SB_CRC);
 }
 
-static void damage_dirblklog(void) {
+/* A directory block of two filesystem blocks: a geometry, not damage.
+ *
+ * `mkfs.xfs -n size=8192` makes one, and it used to be refused at mount.
+ * Only the mount is checked here — the synthetic filesystem's root
+ * directory is a single block, so *listing* it under this geometry would be
+ * asking the reader to gather a directory block the fixture does not have.
+ * The board suite carries the real one. */
+static void two_block_directory_blocks(void) {
     block(0)[XFS_SB_DIRBLKLOG] = 1u;
+    seal(block(0), 512u, XFS_SB_CRC);
+}
+
+/* One larger than the buffer that gathers it, which is the largest the
+ * format allows — so this is a corrupt superblock rather than a geometry. */
+static void damage_dirblklog(void) {
+    block(0)[XFS_SB_DIRBLKLOG] = 6u; /* 64 blocks: 256 KiB */
     seal(block(0), 512u, XFS_SB_CRC);
 }
 
@@ -557,6 +571,7 @@ static void test_a_superblock_that_cannot_be_trusted(void) {
     KTEST_CHECK(mount_with(damage_agcount) == KERR_INVAL);
     KTEST_CHECK(mount_with(damage_agblklog) == KERR_INVAL);
     KTEST_CHECK(mount_with(damage_dirblklog) == KERR_NOTSUP);
+    KTEST_CHECK(mount_with(two_block_directory_blocks) == KERR_OK);
     KTEST_CHECK(reads_outside == 0);
 }
 

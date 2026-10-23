@@ -326,8 +326,8 @@ static bool sf_has_name(const uint8_t *sf, uint32_t count, const char *name, uin
  * in it, and the three fields of the inode that must then agree with it —
  * and splitting it would hand half-written bytes inside a live inode to a
  * second function (Rule 11, Single derivation). */
-static int sf_add(struct xfs *fs, const struct xfs_inode *dir, const char *name, uint32_t namelen,
-                  uint64_t ino, uint8_t ftype, uint64_t now_s) {
+int xfs_dir_sf_add(struct xfs *fs, const struct xfs_inode *dir, const char *name, uint32_t namelen,
+                   uint64_t ino, uint8_t ftype, uint64_t now_s) {
     uint64_t block;
     uint32_t boffset, count, used, room;
     struct bbuf *b;
@@ -442,7 +442,7 @@ int xfs_create(struct xfs *fs, const struct xfs_inode *dir, const char *name, ui
         rc = write_new_inode(fs, ino, mode, now_s);
     }
     if (rc == KERR_OK) {
-        rc = sf_add(fs, dir, name, namelen, ino, XFS_DIR3_FT_REG, now_s);
+        rc = xfs_dir_sf_add(fs, dir, name, namelen, ino, XFS_DIR3_FT_REG, now_s);
     }
     if (rc == KERR_OK) {
         rc = log_create(fs, ino, dir->ino);

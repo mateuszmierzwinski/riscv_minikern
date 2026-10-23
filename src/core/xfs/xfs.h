@@ -59,6 +59,17 @@
 #define XFS_INODE_MAX  512u
 #define XFS_FORK_MAX   (XFS_INODE_MAX - 176u)
 
+/* The largest directory block this reader will mount.
+ *
+ * A directory block is `1 << sb_dirblklog` filesystem blocks, and the format
+ * allows it up to 64 KiB — `mkfs.xfs -n size=` picks it, and a filesystem
+ * built for large directories uses more than one block. Entries do not
+ * straddle a directory block, but they **do** straddle the filesystem blocks
+ * inside one, and the checksum covers the whole thing, so reading such a
+ * directory means having all of it contiguous. Hence a buffer, sized for the
+ * largest the format permits rather than for the largest seen so far. */
+#define XFS_DIRBLK_MAX 65536u
+
 /* The deepest path this will walk, and the longest name it will match. */
 #define XFS_PATH_DEPTH 16u
 #define XFS_NAME_MAX   255u
@@ -77,7 +88,8 @@ struct xfs {
     uint32_t agblocks;
     uint32_t agcount;
     uint32_t logblocks;
-    uint32_t dirblocks;   /* blocks per directory block (1 << sb_dirblklog) */
+    uint32_t dirblocks;    /* blocks per directory block (1 << sb_dirblklog) */
+    uint32_t dirblocksize; /* and that in bytes, which is what parsing uses */
     uint8_t blocklog;
     uint8_t inopblog;
     uint8_t agblklog;
@@ -94,6 +106,20 @@ struct xfs {
      * (`XFS_DI_BIG_NEXTENTS`). From the superblock, because it is a property
      * of the filesystem and not of an inode. */
     bool big_extent_counts;
+    /* **How each lookup was answered**, because the two paths are
+     * indistinguishable from their results. A name found through the hash
+     * index and a name found by walking every entry return the same inode,
+     * so a test of the index that does not look at these numbers passes
+     * just as happily when the index is never used — which is how it was
+     * nearly shipped unexercised. */
+    uint64_t hash_lookups;
+    uint64_t walked_lookups;
+    /* Where a directory block that spans several filesystem blocks is
+     * gathered. Per filesystem rather than a module static, so that nothing
+     * about reading a directory depends on there being one mount or one
+     * thread — and unused when a directory block is a single filesystem
+     * block, which is the default geometry. */
+    uint8_t dirblock[XFS_DIRBLK_MAX];
 };
 
 /* One inode, parsed, with its inline fork copied out so no cached block
@@ -206,6 +232,18 @@ int xfs_create(struct xfs *fs, const struct xfs_inode *dir, const char *name, ui
  * that owns blocks (they would be leaked), a directory, a hard link, a
  * parent that has outgrown its inode, and a chunk the free-inode tree does
  * not describe (core/xfs/xfs_free.c). */
+/* A second name for an existing file, in a directory that still fits in its
+ * inode. KERR_PERM for a directory — a second name for one makes a cycle —
+ * and KERR_EXIST when the name is taken. */
+int xfs_link(struct xfs *fs, const struct xfs_inode *dir, const char *name, uint32_t namelen,
+             uint64_t ino, uint64_t now_s);
+
+/* Moves a name, replacing whatever is at the destination. A directory may
+ * be renamed within its own parent but not moved to another, because its
+ * `..` and both parents' link counts would then be wrong (KERR_NOTSUP). */
+int xfs_rename(struct xfs *fs, const struct xfs_inode *olddir, const char *from, uint32_t fromlen,
+               const struct xfs_inode *newdir, const char *to, uint32_t tolen, uint64_t now_s);
+
 int xfs_unlink(struct xfs *fs, const struct xfs_inode *dir, const char *name, uint32_t namelen,
                uint64_t now_s);
 

@@ -72,6 +72,7 @@ static void take_geometry(struct xfs *fs, const uint8_t *sb) {
     fs->inopblog = sb[XFS_SB_INOPBLOG];
     fs->agblklog = sb[XFS_SB_AGBLKLOG];
     fs->dirblocks = 1u << sb[XFS_SB_DIRBLKLOG];
+    fs->dirblocksize = fs->dirblocks * fs->blocksize;
     fs->dir_leaf_block = XFS_DIR2_LEAF_SPACE_BYTES >> fs->blocklog;
 }
 
@@ -98,8 +99,13 @@ static int check_geometry(const struct xfs *fs) {
         kprintf("xfs: a %u-byte sector does not fit this device's blocks\n", fs->sectsize);
         return KERR_NOTSUP;
     }
-    if (fs->dirblocks != 1u) {
-        kprintf("xfs: multi-block directory blocks are not supported\n");
+    /* A directory block of several filesystem blocks is read by gathering
+     * it (`xfs_dir.c`); what cannot be read is one larger than the buffer,
+     * and the buffer is the largest the format allows. A shift that
+     * overflows it is a corrupt superblock rather than an exotic geometry. */
+    if (fs->dirblocksize > XFS_DIRBLK_MAX || fs->dirblocksize < fs->blocksize) {
+        kprintf("xfs: a %u-byte directory block is not a geometry this reads\n",
+                fs->dirblocksize);
         return KERR_NOTSUP;
     }
     return KERR_OK;

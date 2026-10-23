@@ -127,8 +127,36 @@ CASES = [
      f"minikern.cat=/p{FIXTURE_ENTRIES - 1}",
      [f"mounted read-only, {FIXTURE_ENTRIES + 2} entries in /",
       f"cat: /p{FIXTURE_ENTRIES - 1} is {fixtures.PAYLOAD_BYTES} bytes, "
-      f"checksum {fixtures.PAYLOAD_CHECKSUM}"],
+      f"checksum {fixtures.PAYLOAD_CHECKSUM}",
+      # **And answered by the index, not by walking.** The two paths return
+      # the same inode, so without this the case passes just as happily
+      # when the hash index is never reached.
+      " hashed, 0 walked)"],
      150, None, True),
+    # **§3: a directory block of two filesystem blocks** (`-n size=8192`),
+    # which was refused at mount. Entries do not straddle a directory block
+    # but they do straddle the filesystem blocks inside one, and the
+    # checksum covers the whole of it — so this is the case that proves the
+    # gathering, and the payload checksum proves it gathered them in order.
+    ("§3: 8 KiB directory blocks",
+     f"minikern.cat=/p{FIXTURE_ENTRIES - 1}",
+     [f"mounted read-only, {FIXTURE_ENTRIES + 2} entries in /",
+      f"cat: /p{FIXTURE_ENTRIES - 1} is {fixtures.PAYLOAD_BYTES} bytes, "
+      f"checksum {fixtures.PAYLOAD_CHECKSUM}",
+      " hashed, 0 walked)"],
+     150, None, 8192),
+    # **§3: the write path, which had never run.** `xfs_create` had no
+    # caller at all, so create, write and unlink were code that compiled.
+    # The filesystem is a RAM disk the boot loader fetched, discarded at the
+    # next power cycle — so a test that corrupts it costs nothing and the
+    # operator's card is never touched. Each step checks what the previous
+    # one claimed rather than its return value, and the last pair is the
+    # reason a link count exists: removing one name leaves the file
+    # readable under the other.
+    ("§3: create, write, link, rename and unlink",
+     "minikern.fswrite",
+     ["fswrite: every step passed"],
+     120, None, "small"),
 ]
 
 
@@ -158,8 +186,14 @@ def run_case(name, bootargs, wanted, seconds, out_dir, program=None, needs_image
     if program is not None:
         command += ["-p", built(program)]
     if needs_image:
-        command += ["-i", fixtures.big_directory(os.path.join(out_dir, "fx"),
-                                                 FIXTURE_ENTRIES)]
+        # True for the default geometry, or a directory-block size in bytes.
+        at = os.path.join(out_dir, "fx")
+        if needs_image == "small":
+            img = fixtures.small_directory(at)
+        else:
+            size = None if needs_image is True else needs_image
+            img = fixtures.big_directory(at, FIXTURE_ENTRIES, size)
+        command += ["-i", img]
     subprocess.run(command, check=False)
     text = open(log_path, "rb").read().decode("utf-8", "replace") if os.path.exists(log_path) else ""
     missing = [line for line in wanted if line not in text]

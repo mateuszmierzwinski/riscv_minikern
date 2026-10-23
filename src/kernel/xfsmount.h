@@ -73,4 +73,35 @@ int xfsmount_read_file(const char *path, uint32_t limit, uint8_t **out, uint32_t
  * first-block read never exercises. */
 int xfsmount_hash_file(const char *path, uint8_t digest[32], uint64_t *size);
 
+/* How the last mount's lookups were answered: through the directory's hash
+ * index, or by walking every entry. Reported rather than asserted — a zero
+ * in the first is the difference between an index that works and one that
+ * is never reached. */
+void xfsmount_lookup_counts(uint64_t *hashed, uint64_t *walked);
+
+/* ── writing ───────────────────────────────────────────────────────────── */
+
+/* Whether this filesystem may be written: it is mounted, the device is not
+ * read-only, and it carries no feature that places obligations on a writer
+ * this kernel does not meet. */
+bool xfsmount_writable(void);
+
+/* The write operations, on names **in the root directory**.
+ *
+ * Root-relative because that is what the write path can reach: adding and
+ * removing entries is implemented for a directory that still fits in its
+ * inode, and resolving a parent would promise more than the layer below
+ * delivers. Enough to exercise every operation, which is what they had
+ * never been — `xfs_create` had no caller at all before this.
+ */
+int xfsmount_create(const char *name, uint16_t mode);
+int xfsmount_write(const char *name, uint64_t off, const void *buf, uint32_t len);
+int xfsmount_link(const char *existing, const char *newname);
+int xfsmount_rename(const char *from, const char *to);
+int xfsmount_unlink(const char *name);
+
+/* A name's inode and its link count, which is how a test of `link` and
+ * `unlink` checks what they did rather than that they returned 0. */
+int xfsmount_inode_of(const char *name, uint64_t *ino, uint32_t *nlink);
+
 #endif

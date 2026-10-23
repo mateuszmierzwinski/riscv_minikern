@@ -789,20 +789,47 @@ sparse inodes, `nrext64`, exchange-range, parent pointers, `bigtime`,
       computes, which is a standing case in the board suite. A 40,000-entry
       directory lists all 40,002 entries.
 
-- [ ] **The directory hash index.** (M) **Not what the old entry said.** It
-      claimed a directory past `leaf` format "cannot be listed", and that
-      was wrong: listing and lookup both walk the **data blocks by file
-      offset** through `xfs_bmap`, so every directory format reads correctly
-      once its extent map does — 40,002 entries on the board say so.
+- [x] **The directory hash index.** (M) **Done, and proved to be in use.**
+      The entry this replaces claimed a directory past `leaf` format "cannot
+      be listed", which was wrong — listing and lookup both walk the data
+      blocks by offset, so they worked once the extent map did. What was
+      missing is what leaf and node format exist *for*: the index, so a
+      lookup does not read every entry.
 
-      What leaf and node format actually add is the **hash index**, and that
-      is what is unused: `xfs_dir_lookup` is a linear scan of every entry,
-      so finding one name in a large directory costs reading all of them.
-      Correct, and O(n) where the format offers O(log n). A real gap, but a
-      performance one — which is a different entry from the one that was
-      here, and worth more than the one it replaces.
-- [ ] **Multi-block directory blocks** (`-n size=` greater than the block
-      size). (S) Refused at mount.
+      `xfs_dirhash.c` computes the format's name hash — an on-disk interface
+      fact, and a reader that computes it differently finds nothing, which
+      looks exactly like an empty directory — then binary-searches the leaf,
+      or descends the node blocks first when there is more than one leaf.
+
+      Two details are the difference between correct and nearly correct.
+      **Hashes collide**, so finding one is the start of a scan: every entry
+      with that hash is resolved and its name compared, and a run of equal
+      hashes can continue into the next leaf, which is why `forw` is
+      followed. And an **address is a byte offset divided by eight**, so it
+      resolves to a block *and an offset within it*.
+
+      The fallback stays for shortform and block-format directories, which
+      have no index block to search and a handful of entries to walk — the
+      walk is the right path for those, not a lesser one. `KERR_NOTSUP`
+      distinguishes "this directory has no index" from "the name is not
+      here", and confusing the two would make every lookup in a small
+      directory fail.
+
+      **The bug worth recording** is that a directory's data blocks and its
+      index blocks do not agree about where anything is: a data block has a
+      32-bit magic at offset 0 with its checksum at 4, while a leaf or node
+      block is an `xfs_da3_blkinfo` with a **16-bit magic at offset 8** and
+      its checksum at 12. Verifying one as the other reads part of a block
+      number as a magic and rejects every block, which is what it did — so
+      the getter is two functions, and one magic parameter cannot express
+      the difference.
+
+      **And it is measured, not assumed.** The two paths return the same
+      inode, so a test of the index passes just as happily when the index is
+      never reached — `xfs` counts `hash_lookups` against `walked_lookups`
+      and the board case requires `0 walked`. On hardware, both geometries:
+      `2 hashed, 0 walked`, with the payload checksum exact.
+
 - [ ] **Log replay.** (M) A dirty log is refused rather than replayed, so an
       unclean shutdown needs `xfs_repair` on another machine. Deliberate for
       now — guessing at a log is how data is lost — but it is a gap.
@@ -810,9 +837,51 @@ sparse inodes, `nrext64`, exchange-range, parent pointers, `bigtime`,
       pointers are accepted but unusable.
 - [ ] **External logs, quotas, the realtime subvolume, v4 filesystems,
       inode sizes other than 256 and 512.** (M each) Refused.
-- [ ] **Writing beyond the simple cases.** (M) Create, unlink and write
-      exist; rename, hard links, directory growth into leaf format, and
-      allocation under fragmentation do not.
+- [x] **Hard links and rename, and the write path running at all.** (M)
+      **Done for the shortform case, and verified on the board — where it
+      turned out the rest of the write path had never run either.**
+
+      `xfs_create` **had no caller**. Create, unlink and write were written,
+      compiled and reachable from nothing, so "writing works for the simple
+      cases" was a claim about code existing rather than about behaviour.
+      They are reachable now (`xfsmount_create`, `_write`, `_link`,
+      `_rename`, `_unlink`, on names in the root, which is as far as a write
+      path limited to shortform directories can honestly reach) and
+      exercised by `minikern.fswrite`.
+
+      `link` and `rename` are arrangements of the two operations create and
+      unlink already had, plus the thing that makes them safe: the **link
+      count**. `unlink` had been refusing any file whose count was above one
+      — reasonable while nothing could produce one, and a bug the moment
+      `link` existed, because removing one name from a file with two would
+      have freed the inode under the other. It now removes the name and
+      decrements, and frees only at the last one.
+
+      `rename` adds before it removes, because a crash between them leaves
+      the file reachable under **both** names where the other order leaves
+      it reachable under neither — and with no log replay, neither can be
+      undone. A directory may be renamed within its parent but not moved to
+      another: its `..` and both parents' counts would be wrong.
+
+      **On the board**, every step, each checking what the previous one
+      claimed: create, write, read back, link, both names resolving to one
+      inode with a count of two, rename, the old name gone, unlink one name
+      with the other still reading the same bytes, and unlink the last. A
+      standing case, on a RAM-disk image that is discarded at the next power
+      cycle — so a test that corrupts a filesystem costs nothing and the
+      operator's card is never touched.
+
+- [ ] **Directory growth out of the inode.** (M) The write path adds and
+      removes entries in a **shortform** directory, so a directory stops
+      accepting new names once it no longer fits in its inode — `KERR_NOTSUP`,
+      which is honest and is what the fixture for the write test had to be
+      built around. Growing one into block and then leaf format, and the
+      free-space accounting that goes with it, is the remaining half of
+      writing. Reading all of those formats already works.
+- [ ] **Allocation under fragmentation.** (M) The allocator takes the first
+      run it finds that is big enough. A filesystem with no such run has
+      nothing it can do, where a real one would take several smaller
+      extents.
 
 ---
 

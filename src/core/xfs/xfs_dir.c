@@ -64,15 +64,21 @@ static int list_shortform(struct xfs *fs, const struct xfs_inode *dir, xfs_diren
  * must not be parsed as entries; a data block of a larger directory has
  * nothing after them. */
 static uint32_t data_end(const struct xfs *fs, const uint8_t *block) {
+    uint32_t size = fs->dirblocksize;
     uint32_t count;
+    /* **The directory block's size, not the filesystem's.** They are the
+     * same in the default geometry, which is why saying `blocksize` here
+     * worked for as long as `-n size=` was refused at mount: a tail read at
+     * the wrong offset is a count of leaf entries taken from the middle of
+     * somebody's filename. */
     if (xfs_be32(block + XFS_DIR3_HDR_MAGIC) != XFS_DIR3_BLOCK_MAGIC) {
-        return fs->blocksize;
+        return size;
     }
-    count = xfs_be32(block + fs->blocksize - XFS_DIR2_BLOCK_TAIL_SIZE);
-    if (count > (fs->blocksize - XFS_DIR3_DATA_HDR_SIZE) / XFS_DIR2_LEAF_ENTRY_SIZE) {
+    count = xfs_be32(block + size - XFS_DIR2_BLOCK_TAIL_SIZE);
+    if (count > (size - XFS_DIR3_DATA_HDR_SIZE) / XFS_DIR2_LEAF_ENTRY_SIZE) {
         return XFS_DIR3_DATA_HDR_SIZE; /* a tail that cannot be true: read nothing */
     }
-    return fs->blocksize - XFS_DIR2_BLOCK_TAIL_SIZE - count * XFS_DIR2_LEAF_ENTRY_SIZE;
+    return size - XFS_DIR2_BLOCK_TAIL_SIZE - count * XFS_DIR2_LEAF_ENTRY_SIZE;
 }
 
 /* Walks the entries of one directory block. */
@@ -110,9 +116,122 @@ static int list_block(struct xfs *fs, const uint8_t *block, xfs_dirent_fn fn, vo
 
 /* A directory block must also say it belongs to this directory: a block
  * that names another owner is a block we were sent to by mistake. */
-static int block_owner_ok(const struct xfs *fs, const uint8_t *block, uint64_t ino) {
-    (void)fs;
-    return xfs_be64(block + XFS_DIR3_HDR_OWNER) == ino ? KERR_OK : KERR_IO;
+/* One directory block's bytes, however many filesystem blocks it took.
+ *
+ * `held` is the cache buffer to give back, and it is `NULL` when the block
+ * was gathered into the filesystem's buffer instead — which is the whole
+ * reason this is a struct rather than a pointer. The single-block case, the
+ * default geometry, hands back the cached block directly and copies
+ * nothing.
+ */
+void xfs_dir_block_put(struct xfs *fs, struct xfs_dirblock *b) {
+    if (b->held != NULL) {
+        bcache_put(fs->cache, b->held);
+        b->held = NULL;
+    }
+}
+
+/* Reads the filesystem blocks of one directory block into `fs->dirblock`.
+ *
+ * Each is found through `xfs_bmap`, so a directory whose extent map is a
+ * b-tree gathers exactly like one whose extents are in the inode. A hole
+ * part way through a directory block is corruption rather than a sparse
+ * directory: the block's own checksum covers all of it. */
+static int gather(struct xfs *fs, const struct xfs_inode *dir, uint64_t first) {
+    for (uint32_t i = 0; i < fs->dirblocks; i++) {
+        struct xfs_extent e;
+        struct bbuf *b;
+        uint64_t at = first + i;
+        int rc = xfs_bmap(fs, dir, at, &e);
+        if (rc != KERR_OK) {
+            return rc == KERR_NOENT ? KERR_IO : rc;
+        }
+        rc = bcache_get(fs->cache, xfs_fsb_to_block(fs, e.startblock + (at - e.startoff)), &b);
+        if (rc != KERR_OK) {
+            return rc;
+        }
+        xfs_copy_bytes(fs->dirblock + (uint64_t)i * fs->blocksize, b->data, fs->blocksize);
+        bcache_put(fs->cache, b);
+    }
+    return KERR_OK;
+}
+
+/* The bytes of one directory block, gathered if it spans several, and **not
+ * verified** — its caller knows which kind of block it asked for and
+ * therefore where the magic, the checksum, the UUID and the owner are. */
+static int raw_dir_block(struct xfs *fs, const struct xfs_inode *dir, uint64_t first,
+                         struct xfs_dirblock *out) {
+    struct xfs_extent e;
+    int rc;
+    out->at = NULL;
+    out->held = NULL;
+    if (fs->dirblocks > 1u) {
+        rc = gather(fs, dir, first);
+        out->at = rc == KERR_OK ? fs->dirblock : NULL;
+        return rc;
+    }
+    rc = xfs_bmap(fs, dir, first, &e);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    rc = bcache_get(fs->cache, xfs_fsb_to_block(fs, e.startblock + (first - e.startoff)),
+                    &out->held);
+    out->at = rc == KERR_OK ? out->held->data : NULL;
+    return rc;
+}
+
+/* The three checks every metadata block gets, at the offsets of its kind.
+ *
+ * **A directory's data blocks and its index blocks do not agree about where
+ * any of this lives**, and that is the mistake this function exists to stop
+ * repeating: a data block carries a 32-bit magic at offset 0 with its
+ * checksum at 4, while a leaf or node block is an `xfs_da3_blkinfo` whose
+ * magic is **16 bits at offset 8** with its checksum at 12. Verifying one as
+ * the other reads two bytes of a block number as a magic and rejects every
+ * block — which is exactly what it did. */
+static int verified(const struct xfs *fs, const uint8_t *at, uint64_t ino, uint32_t crc_off,
+                    uint32_t uuid_off, uint32_t owner_off) {
+    if (!xfs_crc_ok(at, fs->dirblocksize, crc_off) || !xfs_uuid_ok(fs, at + uuid_off)) {
+        return KERR_IO;
+    }
+    return xfs_be64(at + owner_off) == ino ? KERR_OK : KERR_IO;
+}
+
+int xfs_dir_data_get(struct xfs *fs, const struct xfs_inode *dir, uint64_t first,
+                     struct xfs_dirblock *out) {
+    uint32_t magic;
+    int rc = raw_dir_block(fs, dir, first, out);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    magic = xfs_be32(out->at + XFS_DIR3_HDR_MAGIC);
+    rc = magic == XFS_DIR3_BLOCK_MAGIC || magic == XFS_DIR3_DATA_MAGIC
+             ? verified(fs, out->at, dir->ino, XFS_DIR3_HDR_CRC, XFS_DIR3_HDR_UUID,
+                        XFS_DIR3_HDR_OWNER)
+             : KERR_IO;
+    if (rc != KERR_OK) {
+        xfs_dir_block_put(fs, out);
+    }
+    return rc;
+}
+
+int xfs_dir_index_get(struct xfs *fs, const struct xfs_inode *dir, uint64_t first,
+                      struct xfs_dirblock *out) {
+    uint32_t magic;
+    int rc = raw_dir_block(fs, dir, first, out);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    magic = xfs_be16(out->at + XFS_DA3_MAGIC_OFF);
+    rc = magic == XFS_DIR3_LEAF1_MAGIC || magic == XFS_DIR3_LEAFN_MAGIC ||
+                 magic == XFS_DA3_NODE_MAGIC
+             ? verified(fs, out->at, dir->ino, XFS_DA3_CRC_OFF, XFS_DA3_UUID_OFF,
+                        XFS_DA3_OWNER_OFF)
+             : KERR_IO;
+    if (rc != KERR_OK) {
+        xfs_dir_block_put(fs, out);
+    }
+    return rc;
 }
 
 /* Walks every data block of a directory held in extents. */
@@ -127,13 +246,16 @@ static int list_data_blocks(struct xfs *fs, const struct xfs_inode *dir, xfs_dir
                             void *self) {
     uint64_t blocks = (dir->size + fs->blocksize - 1u) / fs->blocksize;
     int rc = KERR_OK;
-    for (uint64_t i = 0; i < blocks && rc == KERR_OK; i++) {
-        struct xfs_extent e;
-        struct bbuf *b;
+    /* **Stepping by directory blocks, not filesystem blocks.** A directory
+     * block is the unit with a header, a tail and a checksum; the
+     * filesystem blocks inside one are continuation, and entries straddle
+     * them freely. */
+    for (uint64_t i = 0; i < blocks && rc == KERR_OK; i += fs->dirblocks) {
+        struct xfs_dirblock b;
         if (i >= fs->dir_leaf_block) {
             break; /* the hash structures live above this: never data */
         }
-        rc = xfs_bmap(fs, dir, i, &e);
+        rc = xfs_dir_data_get(fs, dir, i, &b);
         if (rc == KERR_NOENT) {
             rc = KERR_OK; /* a hole in a directory: nothing to list */
             continue;
@@ -141,16 +263,8 @@ static int list_data_blocks(struct xfs *fs, const struct xfs_inode *dir, xfs_dir
         if (rc != KERR_OK) {
             return rc;
         }
-        rc = xfs_meta_block(fs, e.startblock + (i - e.startoff), XFS_DIR3_BLOCK_MAGIC, XFS_DIR3_DATA_MAGIC,
-                            XFS_DIR3_HDR_CRC, XFS_DIR3_HDR_UUID, &b);
-        if (rc != KERR_OK) {
-            return rc;
-        }
-        rc = block_owner_ok(fs, b->data, dir->ino);
-        if (rc == KERR_OK) {
-            rc = list_block(fs, b->data, fn, self);
-        }
-        bcache_put(fs->cache, b);
+        rc = list_block(fs, b.at, fn, self);
+        xfs_dir_block_put(fs, &b);
     }
     return rc;
 }
@@ -205,6 +319,20 @@ int xfs_dir_lookup(struct xfs *fs, const struct xfs_inode *dir, const char *name
     if (len == 0 || len > XFS_NAME_MAX) {
         return KERR_INVAL;
     }
+    /* **The index first, the walk when there is no index.**
+     *
+     * A shortform or block-format directory has no leaf block to search and
+     * a handful of entries to walk, so the fallback is not a lesser path —
+     * it is the right one for those. `KERR_NOTSUP` is how the hash lookup
+     * says "this directory has no index", which is different from "the name
+     * is not here" and must not be confused with it: treating the first as
+     * the second would make every lookup in a small directory fail. */
+    rc = xfs_dir_hash_lookup(fs, dir, name, len, ino);
+    if (rc != KERR_NOTSUP) {
+        fs->hash_lookups++;
+        return rc;
+    }
+    fs->walked_lookups++;
     rc = xfs_dir_list(fs, dir, lookup_visit, &l);
     if (rc == KERR_EXIST) {
         *ino = l.ino;

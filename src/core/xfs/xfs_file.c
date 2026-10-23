@@ -18,12 +18,6 @@ static void zero_fill(uint8_t *at, uint32_t n) {
     }
 }
 
-static void copy_bytes(uint8_t *dst, const uint8_t *src, uint32_t n) {
-    for (uint32_t i = 0; i < n; i++) {
-        dst[i] = src[i];
-    }
-}
-
 /* A file held inside its own inode: a symbolic link's target, or a
  * directory's shortform content. */
 static int read_local(const struct xfs_inode *ip, uint64_t off, uint8_t *buf, uint32_t len,
@@ -33,7 +27,7 @@ static int read_local(const struct xfs_inode *ip, uint64_t off, uint8_t *buf, ui
         return KERR_OK;
     }
     *got = have - (uint32_t)off < len ? have - (uint32_t)off : len;
-    copy_bytes(buf, ip->fork + off, *got);
+    xfs_copy_bytes(buf, ip->fork + off, *got);
     return KERR_OK;
 }
 
@@ -56,7 +50,7 @@ static int read_chunk(struct xfs *fs, const struct xfs_inode *ip, uint64_t at, u
     if (rc != KERR_OK) {
         return rc;
     }
-    copy_bytes(out, b->data + within, chunk);
+    xfs_copy_bytes(out, b->data + within, chunk);
     bcache_put(fs->cache, b);
     return KERR_OK;
 }
@@ -143,7 +137,7 @@ static int write_chunk(struct xfs *fs, const struct xfs_inode *ip, uint64_t at, 
     if (rc != KERR_OK) {
         return rc;
     }
-    copy_bytes(b->data + within, in, chunk);
+    xfs_copy_bytes(b->data + within, in, chunk);
     bcache_dirty(b);
     bcache_put(fs->cache, b);
     return KERR_OK;

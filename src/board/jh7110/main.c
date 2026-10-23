@@ -1246,6 +1246,98 @@ static void report_hart_usage(void) {
  * expects. This is the path a Go binary will take. */
 #define INIT_MAX_BYTES (4u * 1024u * 1024u)
 
+/* Exercises the write path, which had never been run at all.
+ *
+ * **`xfs_create` had no caller.** Create, unlink and write were written,
+ * compiled and reachable from nothing — so "writing works for the simple
+ * cases" was a statement about the code existing. This is the test that
+ * turns it into a statement about behaviour, and it is a board test because
+ * the filesystem it writes to is a RAM disk the boot loader fetched
+ * (`minikern.disk=ram`): the image is discarded at the next power cycle, so
+ * a test that corrupts it costs nothing and the operator's card is never
+ * touched.
+ *
+ * The sequence is chosen so that each step checks what the previous one
+ * claimed, rather than only its return value: a file is created and read
+ * back, linked and found under both names with a count of two, renamed and
+ * found under neither the old name nor the replaced one, and unlinked once
+ * — after which the *other* name must still read the same bytes, which is
+ * the whole point of a link count and the case `unlink` used to refuse.
+ *
+ * Each step prints its own line, because "the write test failed" is not
+ * something anybody can act on.
+ */
+static bool wrote_and_checked(const char *what, int rc) {
+    kprintf("fswrite: %-28s %s (rc %d)\n", what, rc == KERR_OK ? "ok" : "FAILED", rc);
+    return rc == KERR_OK;
+}
+
+static int read_back(const char *name, const char *want, uint32_t len) {
+    uint8_t *bytes = NULL;
+    uint32_t size = 0;
+    char path[64];
+    uint32_t n = 0;
+    int rc;
+    path[n++] = '/';
+    while (name[n - 1u] != '\0' && n + 1u < sizeof path) {
+        path[n] = name[n - 1u];
+        n++;
+    }
+    path[n] = '\0';
+    rc = xfsmount_read_file(path, INIT_MAX_BYTES, &bytes, &size);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    if (size != len) {
+        kfree(bytes);
+        return KERR_IO;
+    }
+    for (uint32_t i = 0; i < len; i++) {
+        if (bytes[i] != (uint8_t)want[i]) {
+            kfree(bytes);
+            return KERR_IO;
+        }
+    }
+    kfree(bytes);
+    return KERR_OK;
+}
+
+static void run_write_selftest(void) {
+    static const char text[] = "a file this kernel wrote";
+    const uint32_t len = (uint32_t)(sizeof text - 1u);
+    uint64_t one = 0, two = 0;
+    uint32_t links = 0;
+    bool ok = true;
+    if (!xfsmount_writable()) {
+        kprintf("fswrite: this filesystem may not be written\n");
+        return;
+    }
+    ok = ok && wrote_and_checked("create /w1", xfsmount_create("w1", 0100644u));
+    ok = ok && wrote_and_checked("write /w1", xfsmount_write("w1", 0, text, len));
+    ok = ok && wrote_and_checked("read /w1 back", read_back("w1", text, len));
+    ok = ok && wrote_and_checked("link /w1 -> /w2", xfsmount_link("w1", "w2"));
+    ok = ok && wrote_and_checked("read /w2 back", read_back("w2", text, len));
+    if (ok && xfsmount_inode_of("w2", &two, &links) == KERR_OK) {
+        ok = wrote_and_checked("two names, one inode", links == 2u ? KERR_OK : KERR_IO);
+        (void)xfsmount_inode_of("w1", &one, &links);
+        ok = ok && wrote_and_checked("the same inode", one == two ? KERR_OK : KERR_IO);
+    }
+    ok = ok && wrote_and_checked("rename /w2 -> /w3", xfsmount_rename("w2", "w3"));
+    ok = ok && wrote_and_checked("read /w3 back", read_back("w3", text, len));
+    ok = ok && wrote_and_checked("/w2 is gone",
+                                 xfsmount_inode_of("w2", &two, &links) == KERR_OK ? KERR_IO
+                                                                                  : KERR_OK);
+    /* The link count's reason for existing: removing one name must leave
+     * the file reachable under the other, with its contents intact. */
+    ok = ok && wrote_and_checked("unlink /w1", xfsmount_unlink("w1"));
+    ok = ok && wrote_and_checked("/w3 survives it", read_back("w3", text, len));
+    ok = ok && wrote_and_checked("unlink /w3", xfsmount_unlink("w3"));
+    ok = ok && wrote_and_checked("/w3 is gone",
+                                 xfsmount_inode_of("w3", &two, &links) == KERR_OK ? KERR_IO
+                                                                                  : KERR_OK);
+    kprintf("fswrite: %s\n", ok ? "every step passed" : "a step FAILED");
+}
+
 /* Reads a named file and says what it found: `minikern.cat=<path>`.
  *
  * **The instrument the filesystem work needs.** Listing a directory walks
@@ -1272,7 +1364,13 @@ static void cat_a_file(const char *path) {
     for (uint32_t i = 0; i < size; i++) {
         sum += bytes[i];
     }
-    kprintf("cat: %s is %u bytes, checksum %llu\n", path, size, (unsigned long long)sum);
+    {
+        uint64_t hashed = 0, walked = 0;
+        xfsmount_lookup_counts(&hashed, &walked);
+        kprintf("cat: %s is %u bytes, checksum %llu (%llu hashed, %llu walked)\n", path, size,
+                (unsigned long long)sum, (unsigned long long)hashed,
+                (unsigned long long)walked);
+    }
     kfree(bytes);
 }
 
@@ -1574,6 +1672,10 @@ static void run_user_programs(void) {
     }
     if (cmdline_has(boot_cmdline, "minikern.init")) {
         run_init_from_disk("/init");
+    }
+    /* Roadmap §3: the write path, on a filesystem in memory. */
+    if (cmdline_has(boot_cmdline, "minikern.fswrite")) {
+        run_write_selftest();
     }
     /* `minikern.cat=<path>` — lookup and extent reading, in one answer. */
     {

@@ -8,6 +8,7 @@
 #include "core/errno.h"
 #include "core/xfs/xfs.h"
 #include "core/xfs/xfs_internal.h"
+#include "arch/riscv/timer.h"
 #include "kernel/disk.h"
 #include "kernel/mem.h"
 
@@ -252,4 +253,119 @@ int xfsmount_read_file(const char *path, uint32_t limit, uint8_t **out, uint32_t
     *out = buf;
     *size = (uint32_t)ip.size;
     return KERR_OK;
+}
+
+void xfsmount_lookup_counts(uint64_t *hashed, uint64_t *walked) {
+    *hashed = fs.hash_lookups;
+    *walked = fs.walked_lookups;
+}
+
+/* ── writing ───────────────────────────────────────────────────────────── */
+
+/* What goes in a timestamp, given that this board has no clock.
+ *
+ * **Seconds since boot, and files will look dated 1970.** There is no RTC
+ * (`ROADMAP.md` §4), so there is no epoch to count from; the alternative is
+ * writing zero, which claims the same wrong thing less informatively. A
+ * timestamp that at least orders two writes correctly is worth more than
+ * one that does not, and when a clock arrives this is the one line that
+ * changes. */
+static uint64_t now_seconds(void) {
+    return timer_ns() / 1000000000ull;
+}
+
+/* The root directory, which is what the write operations act in.
+ *
+ * Read fresh each time rather than kept: every operation that adds or
+ * removes an entry changes the directory's inode, and a cached copy would
+ * be the shape it had before. */
+static int root_inode(struct xfs_inode *out) {
+    if (!mounted) {
+        return KERR_NODEV;
+    }
+    return xfs_path_lookup(&fs, "/", out);
+}
+
+bool xfsmount_writable(void) {
+    return mounted && xfs_writable(&fs);
+}
+
+static uint32_t name_length(const char *name) {
+    uint32_t n = 0;
+    while (name[n] != '\0') {
+        n++;
+    }
+    return n;
+}
+
+int xfsmount_create(const char *name, uint16_t mode) {
+    struct xfs_inode root;
+    uint64_t ino = 0;
+    int rc = root_inode(&root);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    rc = xfs_create(&fs, &root, name, name_length(name), mode, now_seconds(), &ino);
+    return rc != KERR_OK ? rc : xfs_flush(&fs);
+}
+
+int xfsmount_write(const char *name, uint64_t off, const void *buf, uint32_t len) {
+    struct xfs_inode root, ip;
+    uint64_t ino = 0;
+    uint32_t put = 0;
+    int rc = root_inode(&root);
+    rc = rc != KERR_OK ? rc : xfs_dir_lookup(&fs, &root, name, name_length(name), &ino);
+    rc = rc != KERR_OK ? rc : xfs_inode_read(&fs, ino, &ip);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    rc = xfs_file_write(&fs, &ip, off, buf, len, &put);
+    if (rc == KERR_OK && put != len) {
+        return KERR_IO; /* a short write with no reason is not a success */
+    }
+    return rc != KERR_OK ? rc : xfs_flush(&fs);
+}
+
+int xfsmount_link(const char *existing, const char *newname) {
+    struct xfs_inode root;
+    uint64_t ino = 0;
+    int rc = root_inode(&root);
+    rc = rc != KERR_OK ? rc : xfs_dir_lookup(&fs, &root, existing, name_length(existing), &ino);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    rc = xfs_link(&fs, &root, newname, name_length(newname), ino, now_seconds());
+    return rc != KERR_OK ? rc : xfs_flush(&fs);
+}
+
+int xfsmount_rename(const char *from, const char *to) {
+    struct xfs_inode root;
+    int rc = root_inode(&root);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    rc = xfs_rename(&fs, &root, from, name_length(from), &root, to, name_length(to),
+                    now_seconds());
+    return rc != KERR_OK ? rc : xfs_flush(&fs);
+}
+
+int xfsmount_unlink(const char *name) {
+    struct xfs_inode root;
+    int rc = root_inode(&root);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    rc = xfs_unlink(&fs, &root, name, name_length(name), now_seconds());
+    return rc != KERR_OK ? rc : xfs_flush(&fs);
+}
+
+int xfsmount_inode_of(const char *name, uint64_t *ino, uint32_t *nlink) {
+    struct xfs_inode root, ip;
+    int rc = root_inode(&root);
+    rc = rc != KERR_OK ? rc : xfs_dir_lookup(&fs, &root, name, name_length(name), ino);
+    rc = rc != KERR_OK ? rc : xfs_inode_read(&fs, *ino, &ip);
+    if (rc == KERR_OK) {
+        *nlink = ip.nlink;
+    }
+    return rc;
 }

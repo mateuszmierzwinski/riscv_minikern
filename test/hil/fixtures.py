@@ -24,11 +24,12 @@ PAYLOAD_BYTES = 65536
 # 256 repetitions of 0..255, whose sum is 255*256/2 = 32640.
 PAYLOAD_CHECKSUM = (PAYLOAD_BYTES // 256) * 32640
 
+# The naming option is added per image, because a fixture may want a
+# different directory block size.
 MKFS = [
     "mkfs.xfs", "-q", "-f",
     "-m", "crc=1,finobt=1,reflink=0,rmapbt=0,bigtime=0,inobtcount=0",
     "-i", "sparse=0,size=512,nrext64=0",
-    "-n", "ftype=1",
     "-b", "size=4096",
 ]
 
@@ -41,7 +42,7 @@ def payload(at):
     return path
 
 
-def big_directory(at, entries):
+def big_directory(at, entries, dirblksize=None):
     """An image whose root directory has `entries` files in it.
 
     Past a few hundred entries the directory's own extent map moves into a
@@ -57,17 +58,42 @@ def big_directory(at, entries):
         for i in range(1, entries + 1):
             f.write(f"p{i} ---644 0 0 {data}\n")
         f.write("$\n")
-    img = os.path.join(at, f"dir{entries}.img")
+    tag = f"{entries}" if dirblksize is None else f"{entries}n{dirblksize}"
+    img = os.path.join(at, f"dir{tag}.img")
     with open(img, "wb") as f:
         f.truncate(320 * 1024 * 1024)
-    subprocess.run(MKFS + ["-p", proto, img], check=True)
+    naming = ["-n", "ftype=1" if dirblksize is None else f"ftype=1,size={dirblksize}"]
+    subprocess.run(MKFS + naming + ["-p", proto, img], check=True)
+    return img
+
+
+def small_directory(at):
+    """An image whose root directory still fits inside its inode.
+
+    The write path adds and removes entries in a **shortform** directory —
+    one small enough to live in the inode's literal area — so a fixture for
+    it has to be nearly empty. The big-directory images refuse every write
+    with `KERR_NOTSUP`, which is the honest answer: growing a directory out
+    of its inode is a separate gap (`ROADMAP.md` §3) and until it is closed,
+    writing is for small directories.
+    """
+    os.makedirs(at, exist_ok=True)
+    data = payload(at)
+    proto = os.path.join(at, "protosmall")
+    with open(proto, "w") as f:
+        f.write(f"dummy\n0 0\nd--755 0 0\nseed ---644 0 0 {data}\n$\n")
+    img = os.path.join(at, "small.img")
+    with open(img, "wb") as f:
+        f.truncate(320 * 1024 * 1024)
+    subprocess.run(MKFS + ["-n", "ftype=1", "-p", proto, img], check=True)
     return img
 
 
 def main():
     at = sys.argv[1] if len(sys.argv) > 1 else "/tmp/minikern-fixtures"
     entries = int(sys.argv[2]) if len(sys.argv) > 2 else 3000
-    img = big_directory(at, entries)
+    dirblksize = int(sys.argv[3]) if len(sys.argv) > 3 else None
+    img = small_directory(at) if entries == 0 else big_directory(at, entries, dirblksize)
     print(img)
     print(f"payload: {PAYLOAD_BYTES} bytes, checksum {PAYLOAD_CHECKSUM}", file=sys.stderr)
     return 0

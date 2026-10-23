@@ -64,7 +64,7 @@ static uint32_t sf_used(const uint8_t *sf, uint32_t count) {
  * down over it, which is all a shortform directory is — a list with no
  * gaps. The entries that remain keep their offsets, which stay in order
  * because removing one cannot reorder the others. */
-static int sf_remove(struct xfs *fs, const struct xfs_inode *dir, const char *name, uint32_t namelen,
+int xfs_dir_sf_remove(struct xfs *fs, const struct xfs_inode *dir, const char *name, uint32_t namelen,
                      uint64_t now_s, uint64_t *ino) {
     uint64_t block;
     uint32_t boffset, count, used, gap;
@@ -272,11 +272,18 @@ int xfs_unlink(struct xfs *fs, const struct xfs_inode *dir, const char *name, ui
     if (ip.format != XFS_DINODE_FMT_EXTENTS && ip.nblocks != 0) {
         return KERR_NOTSUP; /* a fork shape whose blocks this cannot find */
     }
-    if (ip.nlink != 1) {
-        return KERR_NOTSUP; /* a link count this does not keep */
+    /* **A name, not a file.** `unlink` removes one link; the file goes
+     * when the last one does. This refused anything with a count above one
+     * because nothing could make such a file — hard links did not exist —
+     * and now that they do, removing one name from a file with two would
+     * have freed the inode under the other name. */
+    if (ip.nlink > 1u) {
+        rc = xfs_dir_sf_remove(fs, dir, name, namelen, now_s, &ino);
+        rc = rc != KERR_OK ? rc : xfs_inode_adjust_nlink(fs, ino, -1);
+        return rc != KERR_OK ? rc : log_unlink(fs, dir->ino);
     }
     rc = free_file_blocks(fs, &ip);
-    rc = rc != KERR_OK ? rc : sf_remove(fs, dir, name, namelen, now_s, &ino);
+    rc = rc != KERR_OK ? rc : xfs_dir_sf_remove(fs, dir, name, namelen, now_s, &ino);
     rc = rc != KERR_OK ? rc : release_inode(fs, xfs_fsb_ag(fs, ino >> fs->inopblog), ino);
     rc = rc != KERR_OK ? rc : xfs_count_inodes_free(fs, 1);
     rc = rc != KERR_OK ? rc : clear_inode(fs, ino);

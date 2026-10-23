@@ -201,6 +201,38 @@
 #define XFS_DIR2_BLOCK_TAIL_SIZE 8u
 #define XFS_DIR2_LEAF_ENTRY_SIZE 8u
 
+/* The hash index: leaf blocks of sorted hashes, and node blocks above them.
+ *
+ * A directory that outgrows a single block gains a **leaf** block holding
+ * `{hash, address}` pairs sorted by hash; one that outgrows a single leaf
+ * gains **node** blocks above them, holding `{hash, block}` pairs. Both sit
+ * above 32 GiB of logical offset, which is how they stay out of the data.
+ *
+ * An `address` is a byte offset into the directory's data space divided by
+ * eight — the format's `xfs_dir2_dataptr_t` — so resolving one is a
+ * multiply, then a division into a block and an offset within it.
+ *
+ * The v5 header these blocks share (`xfs_da3_blkinfo`) is 56 bytes, and
+ * both kinds put a count where it ends. */
+#define XFS_DIR3_LEAF1_MAGIC 0x3df1u /* the one leaf of a leaf-format directory */
+#define XFS_DIR3_LEAFN_MAGIC 0x3dffu /* a leaf under node blocks */
+#define XFS_DA3_NODE_MAGIC   0x3ebeu /* an interior block of the hash tree */
+
+#define XFS_DA3_MAGIC_OFF  8u  /* u16, inside the 56-byte blkinfo */
+#define XFS_DA3_FORW_OFF   0u  /* u32: the next block at this level */
+#define XFS_DA3_CRC_OFF    12u /* u32, little-endian */
+#define XFS_DA3_UUID_OFF   32u /* 16 bytes */
+#define XFS_DA3_OWNER_OFF  48u /* u64 */
+#define XFS_DA3_HDR_SIZE   64u /* blkinfo, then count and one more u16, padded */
+#define XFS_DA3_COUNT_OFF  56u /* u16: entries in a leaf, or children in a node */
+#define XFS_DA3_LEVEL_OFF  58u /* u16, node blocks only: 0 is the leaf level */
+#define XFS_DA3_ENTRY_SIZE 8u  /* {hash, address} or {hash, block} */
+
+/* How many levels of node blocks this will descend before refusing. The
+ * format's limit is five; the cap exists so a tree that points at itself is
+ * an error rather than a loop. */
+#define XFS_DA3_MAX_LEVELS 8u
+
 /* Directory data lives below 32 GiB of logical offset; the hash structures
  * live above it. A listing only has to read what is below. */
 #define XFS_DIR2_LEAF_SPACE_BYTES 0x800000000ull /* 32 GiB */

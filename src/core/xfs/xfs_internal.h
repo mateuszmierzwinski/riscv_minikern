@@ -36,6 +36,15 @@ static inline uint32_t xfs_fsb_ag(const struct xfs *fs, uint64_t fsb) {
     return (uint32_t)(fsb >> fs->agblklog);
 }
 
+/* Copies `n` bytes. Shared rather than written twice: reading a file and
+ * gathering a directory block both do it, and `memcpy` is not available to
+ * a freestanding core that deliberately links no libc. */
+static inline void xfs_copy_bytes(uint8_t *dst, const uint8_t *src, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++) {
+        dst[i] = src[i];
+    }
+}
+
 /* True when fsb names a block inside the filesystem. */
 bool xfs_fsb_valid(const struct xfs *fs, uint64_t fsb, uint64_t count);
 
@@ -133,6 +142,56 @@ void xfs_extent_unpack(const uint8_t *p, struct xfs_extent *out);
 
 /* Packs one back, which is the exact inverse (there is a round-trip test). */
 void xfs_extent_pack(uint8_t *p, const struct xfs_extent *e);
+
+/* Adds or removes one entry of a shortform directory, and touches its
+ * times. Shared because `create`, `unlink`, `link` and `rename` are four
+ * arrangements of the same two operations. */
+int xfs_dir_sf_add(struct xfs *fs, const struct xfs_inode *dir, const char *name, uint32_t namelen,
+                   uint64_t ino, uint8_t ftype, uint64_t now_s);
+int xfs_dir_sf_remove(struct xfs *fs, const struct xfs_inode *dir, const char *name,
+                      uint32_t namelen, uint64_t now_s, uint64_t *ino);
+
+/* Moves an inode's link count by `delta`, resealing it. The count is what
+ * says whether a file still exists when a name is removed. */
+int xfs_inode_adjust_nlink(struct xfs *fs, uint64_t ino, int32_t delta);
+
+/* One directory block's bytes, however many filesystem blocks it took.
+ *
+ * `held` is the cache buffer to give back, and `NULL` when the block was
+ * gathered into the filesystem's buffer instead. Shared because the hash
+ * index's leaf and node blocks are directory blocks too: they are the same
+ * size, gathered the same way and verified the same way, and the only thing
+ * that differs is what the bytes mean. */
+struct xfs_dirblock {
+    const uint8_t *at;
+    struct bbuf *held;
+};
+
+/* The directory block at logical filesystem block `first`, verified.
+ *
+ * **Two functions because the two kinds of block disagree about where their
+ * header is.** A *data* block carries a 32-bit magic at offset 0 with its
+ * checksum at 4; an *index* block — leaf or node — is an `xfs_da3_blkinfo`
+ * whose magic is 16 bits at offset 8 with its checksum at 12. One function
+ * taking a magic cannot express that, and taking the data block's offsets
+ * for an index block rejects every one of them. */
+int xfs_dir_data_get(struct xfs *fs, const struct xfs_inode *dir, uint64_t first,
+                     struct xfs_dirblock *out);
+int xfs_dir_index_get(struct xfs *fs, const struct xfs_inode *dir, uint64_t first,
+                      struct xfs_dirblock *out);
+void xfs_dir_block_put(struct xfs *fs, struct xfs_dirblock *b);
+
+/* The name hash the directory's index is sorted by.
+ *
+ * An on-disk interface fact: the index is a sorted array of these, so a
+ * reader that computes them differently finds nothing. Four bytes at a time
+ * with a seven-bit rotation, which is the format's definition. */
+uint32_t xfs_dir_hashname(const char *name, uint32_t len);
+
+/* The inode a name maps to, through the hash index. KERR_NOENT when the
+ * name is not there, KERR_NOTSUP when this directory has no index to use. */
+int xfs_dir_hash_lookup(struct xfs *fs, const struct xfs_inode *dir, const char *name,
+                        uint32_t len, uint64_t *ino);
 
 /* The extent covering logical block off, or KERR_NOENT when off is in a
  * hole. Walks the inode's inline extent list. */
