@@ -210,7 +210,18 @@ static int take_inode(struct xfs *fs, uint32_t agno, uint64_t *ino) {
     bcache_put(fs->cache, finob);
     bcache_put(fs->cache, inob);
     bcache_put(fs->cache, agib);
-    *ino = ((uint64_t)agno << (fs->agblklog + fs->inopblog)) | (startino & 0xffffffffu) | bit;
+    /* **`+ bit`, not `| bit`.** The chunk's first inode number is not
+     * aligned to the chunk's size — the first one in a group commonly
+     * starts at 96 — so an offset shares bits with it and an `or` silently
+     * returns an inode that is already in use. With a start of 96, offset
+     * 32 produced 96 again: the **root directory**, whose inode was then
+     * overwritten with the new file's, after which the filesystem had no
+     * root. Twenty-eight creates worked first, because the offsets below 32
+     * happen to have no bits in common with 96.
+     *
+     * It had never run: `xfs_create` had no caller until the write path was
+     * wired up, so this was waiting in code that compiled. */
+    *ino = ((uint64_t)agno << (fs->agblklog + fs->inopblog)) + (startino & 0xffffffffu) + bit;
     return KERR_OK;
 }
 
@@ -428,8 +439,8 @@ int xfs_create(struct xfs *fs, const struct xfs_inode *dir, const char *name, ui
     if (!xfs_is_dir(dir)) {
         return KERR_NOTDIR;
     }
-    if (dir->format != XFS_DINODE_FMT_LOCAL) {
-        return KERR_NOTSUP; /* a directory that has outgrown its inode */
+    if (dir->format != XFS_DINODE_FMT_LOCAL && dir->format != XFS_DINODE_FMT_EXTENTS) {
+        return KERR_NOTSUP; /* a fork shape the write path cannot place into */
     }
     if (!name_is_allowed(name, namelen)) {
         return KERR_INVAL;
@@ -442,11 +453,35 @@ int xfs_create(struct xfs *fs, const struct xfs_inode *dir, const char *name, ui
         rc = write_new_inode(fs, ino, mode, now_s);
     }
     if (rc == KERR_OK) {
-        rc = xfs_dir_sf_add(fs, dir, name, namelen, ino, XFS_DIR3_FT_REG, now_s);
+        rc = xfs_dir_add(fs, dir, name, namelen, ino, XFS_DIR3_FT_REG, now_s);
     }
     if (rc == KERR_OK) {
         rc = log_create(fs, ino, dir->ino);
     }
     *ino_out = ino;
     return rc;
+}
+
+/* Adds an entry, growing the directory if it has to.
+ *
+ * **The one place that knows a directory can change shape.** Every caller —
+ * create, link, rename — wants the same thing, "this name now points at
+ * this inode", and none of them should have to know whether the directory
+ * still fits in its inode. `KERR_NOSPC` from the shortform path is not a
+ * failure but the signal that it is time to grow, which is why that path
+ * returns it rather than attempting the conversion itself: the conversion
+ * needs the new entry, and building the block from the old entries *and*
+ * the new one together is what keeps the directory from briefly holding
+ * neither answer. */
+int xfs_dir_add(struct xfs *fs, const struct xfs_inode *dir, const char *name, uint32_t namelen,
+                uint64_t ino, uint8_t ftype, uint64_t now_s) {
+    int rc;
+    if (dir->format == XFS_DINODE_FMT_LOCAL) {
+        rc = xfs_dir_sf_add(fs, dir, name, namelen, ino, ftype, now_s);
+        if (rc != KERR_NOSPC) {
+            return rc;
+        }
+        return xfs_dir_to_block(fs, dir, name, namelen, ino, ftype, now_s);
+    }
+    return xfs_dir_block_add(fs, dir, name, namelen, ino, ftype, now_s);
 }

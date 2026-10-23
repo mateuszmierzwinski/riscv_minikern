@@ -1302,6 +1302,64 @@ static int read_back(const char *name, const char *want, uint32_t len) {
     return KERR_OK;
 }
 
+/* Fills a directory until it must change shape, then empties it.
+ *
+ * **The step that proves the conversion.** A shortform directory lives in
+ * its inode and holds about ten names; past that it has to become a block
+ * directory, and this kernel used to answer `KERR_NOSPC` and stop. Forty
+ * names is comfortably past the boundary, so the conversion happens in the
+ * middle of the loop without the test having to know where — and then every
+ * name is read back *after* all of them are added, because a conversion
+ * that loses the entries it was converting would otherwise pass.
+ *
+ * Removing them again matters as much: a block directory's entries leave
+ * free spans behind, and the next addition has to reuse one. The second
+ * pass of adds is what tests that.
+ */
+/* How many names to add. Past shortform's dozen, and inside the budget of
+ * free inodes a fresh filesystem's first inode chunk holds: allocating a
+ * *second* chunk is its own gap (`ROADMAP.md` §3), so a test that asked for
+ * sixty names would be measuring that instead and failing with
+ * `KERR_NOSPC`. */
+#define NAMES 20u
+
+static int grow_a_directory(void) {
+    char name[8] = "g00";
+    uint64_t ino = 0;
+    uint32_t links = 0;
+    for (uint32_t pass = 0; pass < 2u; pass++) {
+        for (uint32_t i = 0; i < NAMES; i++) {
+            name[1] = (char)('0' + i / 10u);
+            name[2] = (char)('0' + i % 10u);
+            int rc = xfsmount_create(name, 0100644u);
+            if (rc != KERR_OK) {
+                kprintf("fswrite:   pass %u: create %s failed (rc %d)\n", pass, name, rc);
+                xfsmount_root_shape();
+                return rc;
+            }
+        }
+        for (uint32_t i = 0; i < NAMES; i++) {
+            name[1] = (char)('0' + i / 10u);
+            name[2] = (char)('0' + i % 10u);
+            int rc = xfsmount_inode_of(name, &ino, &links);
+            if (rc != KERR_OK) {
+                kprintf("fswrite:   pass %u: %s is not there (rc %d)\n", pass, name, rc);
+                return rc;
+            }
+        }
+        for (uint32_t i = 0; i < NAMES; i++) {
+            name[1] = (char)('0' + i / 10u);
+            name[2] = (char)('0' + i % 10u);
+            int rc = xfsmount_unlink(name);
+            if (rc != KERR_OK) {
+                kprintf("fswrite:   pass %u: unlink %s failed (rc %d)\n", pass, name, rc);
+                return rc;
+            }
+        }
+    }
+    return KERR_OK;
+}
+
 static void run_write_selftest(void) {
     static const char text[] = "a file this kernel wrote";
     const uint32_t len = (uint32_t)(sizeof text - 1u);
@@ -1335,6 +1393,7 @@ static void run_write_selftest(void) {
     ok = ok && wrote_and_checked("/w3 is gone",
                                  xfsmount_inode_of("w3", &two, &links) == KERR_OK ? KERR_IO
                                                                                   : KERR_OK);
+    ok = ok && wrote_and_checked("grow past shortform", grow_a_directory());
     kprintf("fswrite: %s\n", ok ? "every step passed" : "a step FAILED");
 }
 

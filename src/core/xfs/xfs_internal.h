@@ -143,6 +143,38 @@ void xfs_extent_unpack(const uint8_t *p, struct xfs_extent *out);
 /* Packs one back, which is the exact inverse (there is a round-trip test). */
 void xfs_extent_pack(uint8_t *p, const struct xfs_extent *e);
 
+/* Adds an entry to a directory of whatever shape, growing it when the
+ * shape it has cannot hold one more. What `create`, `link` and `rename` all
+ * want, so that none of them has to know about formats. */
+int xfs_dir_add(struct xfs *fs, const struct xfs_inode *dir, const char *name, uint32_t namelen,
+                uint64_t ino, uint8_t ftype, uint64_t now_s);
+
+/* Removes an entry from a directory of whatever shape. */
+int xfs_dir_remove(struct xfs *fs, const struct xfs_inode *dir, const char *name,
+                   uint32_t namelen, uint64_t now_s, uint64_t *ino);
+
+/* Adds an entry to a block-format directory: into the free space, with its
+ * hash inserted into the sorted array and the tail's count raised.
+ * KERR_NOSPC when the block is full, which is where leaf format begins. */
+int xfs_dir_block_add(struct xfs *fs, const struct xfs_inode *dir, const char *name,
+                      uint32_t namelen, uint64_t ino, uint8_t ftype, uint64_t now_s);
+
+/* Removes one from a block-format directory, leaving the space free and the
+ * hash array one shorter. */
+int xfs_dir_block_remove(struct xfs *fs, const struct xfs_inode *dir, const char *name,
+                         uint32_t namelen, uint64_t now_s, uint64_t *ino);
+
+/* Turns a shortform directory into a block-format one, adding `name` as
+ * part of the same step.
+ *
+ * It takes the new entry because the conversion exists *because* of it: the
+ * block is built once, from the old entries and the new one together, and
+ * converting first and adding afterwards would write the block twice and
+ * leave a directory briefly holding neither answer. KERR_NOSPC when even
+ * one block would not hold them all, which is where leaf format begins. */
+int xfs_dir_to_block(struct xfs *fs, const struct xfs_inode *dir, const char *name,
+                     uint32_t namelen, uint64_t ino, uint8_t ftype, uint64_t now_s);
+
 /* Adds or removes one entry of a shortform directory, and touches its
  * times. Shared because `create`, `unlink`, `link` and `rename` are four
  * arrangements of the same two operations. */

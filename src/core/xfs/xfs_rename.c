@@ -65,7 +65,9 @@ static int may_write_into(const struct xfs *fs, const struct xfs_inode *dir) {
     if (!xfs_is_dir(dir)) {
         return KERR_NOTDIR;
     }
-    return dir->format == XFS_DINODE_FMT_LOCAL ? KERR_OK : KERR_NOTSUP;
+    return dir->format == XFS_DINODE_FMT_LOCAL || dir->format == XFS_DINODE_FMT_EXTENTS
+               ? KERR_OK
+               : KERR_NOTSUP;
 }
 
 int xfs_link(struct xfs *fs, const struct xfs_inode *dir, const char *name, uint32_t namelen,
@@ -88,7 +90,7 @@ int xfs_link(struct xfs *fs, const struct xfs_inode *dir, const char *name, uint
     if (xfs_dir_lookup(fs, dir, name, namelen, &existing) == KERR_OK) {
         return KERR_EXIST;
     }
-    rc = xfs_dir_sf_add(fs, dir, name, namelen, ino, ftype_of(&ip), now_s);
+    rc = xfs_dir_add(fs, dir, name, namelen, ino, ftype_of(&ip), now_s);
     return rc != KERR_OK ? rc : xfs_inode_adjust_nlink(fs, ino, 1);
 }
 
@@ -140,6 +142,6 @@ int xfs_rename(struct xfs *fs, const struct xfs_inode *olddir, const char *from,
     rc = replace_target(fs, newdir, to, tolen, now_s);
     /* Add before remove: a crash in between leaves the file reachable under
      * both names rather than under neither. */
-    rc = rc != KERR_OK ? rc : xfs_dir_sf_add(fs, newdir, to, tolen, ino, ftype_of(&ip), now_s);
-    return rc != KERR_OK ? rc : xfs_dir_sf_remove(fs, olddir, from, fromlen, now_s, &removed);
+    rc = rc != KERR_OK ? rc : xfs_dir_add(fs, newdir, to, tolen, ino, ftype_of(&ip), now_s);
+    return rc != KERR_OK ? rc : xfs_dir_remove(fs, olddir, from, fromlen, now_s, &removed);
 }

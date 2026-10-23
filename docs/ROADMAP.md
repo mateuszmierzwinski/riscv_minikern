@@ -871,13 +871,58 @@ sparse inodes, `nrext64`, exchange-range, parent pointers, `bigtime`,
       cycle — so a test that corrupts a filesystem costs nothing and the
       operator's card is never touched.
 
-- [ ] **Directory growth out of the inode.** (M) The write path adds and
-      removes entries in a **shortform** directory, so a directory stops
-      accepting new names once it no longer fits in its inode — `KERR_NOTSUP`,
-      which is honest and is what the fixture for the write test had to be
-      built around. Growing one into block and then leaf format, and the
-      free-space accounting that goes with it, is the remaining half of
-      writing. Reading all of those formats already works.
+- [x] **Directory growth: shortform into block format.** (M) **Done, and
+      verified on the board.** A directory stopped accepting names at about
+      a dozen — `KERR_NOSPC`, with a comment saying it would have to become
+      a block directory. It becomes one now, which takes it to roughly a
+      hundred and twenty.
+
+      The conversion builds the block once from the old entries **and the
+      new one together**, which is why it takes the new entry as an
+      argument: converting first and adding after would write the block
+      twice and leave a directory briefly holding neither answer. It also
+      has to create what shortform does not store — `.` and `..` are
+      synthesized by a reader there and are real entries here — and compute
+      every entry's hash, because the block carries the sorted array a
+      larger directory's lookup will search.
+
+      Adding and removing afterwards are done **in place**: an entry goes
+      into a free span, its hash is inserted into the sorted array, and the
+      tail's count rises; removal leaves a free span and takes the pair out.
+      No compaction, because free spans are what the format expects — and
+      compacting would need a second buffer, which there is not.
+
+      `xfs_dir_add` and `xfs_dir_remove` are where the shape is decided, so
+      create, link, rename and unlink do not know about formats. A block
+      directory is not shrunk back when it empties, which is what Linux does
+      and what stops a directory that is repeatedly filled and emptied
+      converting twice per entry.
+
+      **Two bugs it found, both in code that had never run.** The hash array
+      grows *downwards* as entries are added, so a free span reaching it
+      stops being entirely free — the first version left the span's recorded
+      length alone and eventually wrote an entry over the hashes. And
+      `take_inode` composed an inode number as `start | offset` where the
+      format means `start + offset`: a group's first chunk commonly starts
+      at inode 96, so offset 32 produced 96 again — **the root directory** —
+      whose inode was then overwritten with the new file's. Twenty-eight
+      creates worked first, because every offset below 32 happens to share
+      no bits with 96.
+
+      **On the board**: twenty names added, all twenty found, all twenty
+      removed, twice over — the second pass being what proves a removed
+      entry's space is reused.
+
+- [ ] **Directory growth: block format into leaf.** (M) Past about a
+      hundred and twenty names a block directory is full and the entries
+      have to move into their own blocks with the hashes in a leaf block of
+      their own (`KERR_NOSPC`). Reading both formats already works, as does
+      growing into the first of them.
+- [ ] **A second inode chunk.** (S–M) `take_inode` allocates from the inode
+      b-tree records that exist; when every chunk in a group is full it
+      answers `KERR_NOSPC` rather than allocating a new chunk, so a fresh
+      filesystem accepts about sixty new files and then stops. Found by the
+      write test asking for sixty.
 - [ ] **Allocation under fragmentation.** (M) The allocator takes the first
       run it finds that is big enough. A filesystem with no such run has
       nothing it can do, where a real one would take several smaller

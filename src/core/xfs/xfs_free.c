@@ -255,8 +255,11 @@ int xfs_unlink(struct xfs *fs, const struct xfs_inode *dir, const char *name, ui
     if (!xfs_writable(fs)) {
         return KERR_ROFS;
     }
-    if (!xfs_is_dir(dir) || dir->format != XFS_DINODE_FMT_LOCAL) {
-        return xfs_is_dir(dir) ? KERR_NOTSUP : KERR_NOTDIR;
+    if (!xfs_is_dir(dir)) {
+        return KERR_NOTDIR;
+    }
+    if (dir->format != XFS_DINODE_FMT_LOCAL && dir->format != XFS_DINODE_FMT_EXTENTS) {
+        return KERR_NOTSUP; /* a fork shape the write path cannot edit */
     }
     rc = xfs_dir_lookup(fs, dir, name, namelen, &ino);
     if (rc != KERR_OK) {
@@ -283,9 +286,26 @@ int xfs_unlink(struct xfs *fs, const struct xfs_inode *dir, const char *name, ui
         return rc != KERR_OK ? rc : log_unlink(fs, dir->ino);
     }
     rc = free_file_blocks(fs, &ip);
-    rc = rc != KERR_OK ? rc : xfs_dir_sf_remove(fs, dir, name, namelen, now_s, &ino);
+    rc = rc != KERR_OK ? rc : xfs_dir_remove(fs, dir, name, namelen, now_s, &ino);
     rc = rc != KERR_OK ? rc : release_inode(fs, xfs_fsb_ag(fs, ino >> fs->inopblog), ino);
     rc = rc != KERR_OK ? rc : xfs_count_inodes_free(fs, 1);
     rc = rc != KERR_OK ? rc : clear_inode(fs, ino);
     return rc != KERR_OK ? rc : log_unlink(fs, dir->ino);
+}
+
+/* Removes an entry from a directory of whatever shape.
+ *
+ * The counterpart of `xfs_dir_add`, and for the same reason: unlink and
+ * rename want a name gone and should not have to know whether the
+ * directory still lives in its inode. A block directory is **not** shrunk
+ * back into its inode when it empties — the space stays allocated and the
+ * format stays as it is, which is what Linux does too, and what keeps a
+ * directory that is repeatedly filled and emptied from converting twice per
+ * entry. */
+int xfs_dir_remove(struct xfs *fs, const struct xfs_inode *dir, const char *name,
+                   uint32_t namelen, uint64_t now_s, uint64_t *ino) {
+    if (dir->format == XFS_DINODE_FMT_LOCAL) {
+        return xfs_dir_sf_remove(fs, dir, name, namelen, now_s, ino);
+    }
+    return xfs_dir_block_remove(fs, dir, name, namelen, now_s, ino);
 }

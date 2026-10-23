@@ -369,3 +369,15 @@ int xfsmount_inode_of(const char *name, uint64_t *ino, uint32_t *nlink) {
     }
     return rc;
 }
+
+void xfsmount_root_shape(void) {
+    struct xfs_inode root;
+    int rc = root_inode(&root);
+    if (rc != KERR_OK) {
+        kprintf("xfs: the root will not read (rc %d)\n", rc);
+        return;
+    }
+    kprintf("xfs: root mode %u format %u size %llu nextents %u nblocks %llu\n", root.mode,
+            root.format, (unsigned long long)root.size, root.nextents,
+            (unsigned long long)root.nblocks);
+}

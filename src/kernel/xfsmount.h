@@ -104,4 +104,8 @@ int xfsmount_unlink(const char *name);
  * `unlink` checks what they did rather than that they returned 0. */
 int xfsmount_inode_of(const char *name, uint64_t *ino, uint32_t *nlink);
 
+/* Prints the root directory's shape. For a failure in the write path,
+ * where "it stopped being a directory" needs to say which field says so. */
+void xfsmount_root_shape(void);
+
 #endif
