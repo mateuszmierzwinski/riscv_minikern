@@ -235,6 +235,82 @@ static void test_finds_the_nth_match(void) {
     }
 }
 
+/* A tree whose interesting part is a **list**: a parent with children whose
+ * names nothing predicts. This is the shape an operating-point table has,
+ * and the reason a reader needs to walk children at all. */
+static uint32_t fdtb_board_with_a_list(struct fdtb *b) {
+    memset(b, 0, sizeof *b);
+    fdtb_begin(b, "");
+    fdtb_prop_u32(b, "#address-cells", 2);
+    fdtb_prop_u32(b, "#size-cells", 2);
+    fdtb_begin(b, "opp-table");
+    fdtb_prop_str(b, "compatible", "operating-points-v2");
+    fdtb_begin(b, "opp-375000000");
+    fdtb_prop_cells2(b, "opp-hz", 0u, 375000000u);
+    fdtb_prop_u32(b, "opp-microvolt", 800000u);
+    fdtb_end(b);
+    fdtb_begin(b, "opp-1500000000");
+    fdtb_prop_cells2(b, "opp-hz", 0u, 1500000000u);
+    fdtb_prop_u32(b, "opp-microvolt", 1040000u);
+    fdtb_end(b);
+    fdtb_end(b);
+    fdtb_begin(b, "soc");
+    fdtb_begin(b, "serial@10000000");
+    fdtb_prop_str(b, "compatible", "ns16550a");
+    fdtb_end(b);
+    fdtb_end(b);
+    fdtb_end(b);
+    return fdtb_finish(b);
+}
+
+static void test_walks_a_node_s_children(void) {
+    static struct fdtb b;
+    struct fdt f;
+    char path[96];
+    struct fdt_prop hz;
+    uint64_t rate = 0;
+    uint32_t len = fdtb_board_with_a_list(&b);
+    KTEST_CHECK(fdt_open(&f, b.blob, len) == KERR_OK);
+    KTEST_CHECK(fdt_nth_child(&f, "/opp-table", 0, path, sizeof path) == KERR_OK);
+    KTEST_CHECK_STR(path, "/opp-table/opp-375000000");
+    KTEST_CHECK(fdt_nth_child(&f, "/opp-table", 1, path, sizeof path) == KERR_OK);
+    KTEST_CHECK_STR(path, "/opp-table/opp-1500000000");
+    /* Past the last one ends a loop rather than repeating it. */
+    KTEST_CHECK(fdt_nth_child(&f, "/opp-table", 2, path, sizeof path) == KERR_NOENT);
+    /* And a child found this way is a path like any other. */
+    KTEST_CHECK(fdt_nth_child(&f, "/opp-table", 1, path, sizeof path) == KERR_OK);
+    KTEST_CHECK(fdt_get_prop(&f, path, "opp-hz", &hz) == KERR_OK);
+    KTEST_CHECK(fdt_prop_cells(&hz, 0, 2, &rate) == KERR_OK);
+    KTEST_CHECK(rate == 1500000000ull);
+}
+
+/* **Only direct children count.** A grandchild is in the subtree and is not
+ * in the list, and a walker that counted it would hand a caller an entry
+ * that is not an operating point at all. */
+static void test_a_grandchild_is_not_a_child(void) {
+    static struct fdtb b;
+    struct fdt f;
+    char path[96];
+    uint32_t len = fdtb_board_with_a_list(&b);
+    KTEST_CHECK(fdt_open(&f, b.blob, len) == KERR_OK);
+    /* The root has two children: the table and the soc. */
+    KTEST_CHECK(fdt_nth_child(&f, "/", 0, path, sizeof path) == KERR_OK);
+    KTEST_CHECK_STR(path, "/opp-table");
+    KTEST_CHECK(fdt_nth_child(&f, "/", 1, path, sizeof path) == KERR_OK);
+    KTEST_CHECK_STR(path, "/soc");
+    KTEST_CHECK(fdt_nth_child(&f, "/", 2, path, sizeof path) == KERR_NOENT);
+}
+
+static void test_a_node_with_no_children(void) {
+    static struct fdtb b;
+    struct fdt f;
+    char path[96];
+    uint32_t len = fdtb_board_with_a_list(&b);
+    KTEST_CHECK(fdt_open(&f, b.blob, len) == KERR_OK);
+    KTEST_CHECK(fdt_nth_child(&f, "/soc/serial@10000000", 0, path, sizeof path) == KERR_NOENT);
+    KTEST_CHECK(fdt_nth_child(&f, "/not-there", 0, path, sizeof path) == KERR_NOENT);
+}
+
 int main(void) {
     KTEST_RUN(test_opens_and_finds);
     KTEST_RUN(test_absent_is_noent);
@@ -250,5 +326,8 @@ int main(void) {
     KTEST_RUN(test_a_path_too_long_is_refused);
     KTEST_RUN(test_a_device_above_four_gibibytes);
     KTEST_RUN(test_finds_the_nth_match);
+    KTEST_RUN(test_walks_a_node_s_children);
+    KTEST_RUN(test_a_grandchild_is_not_a_child);
+    KTEST_RUN(test_a_node_with_no_children);
     return ktest_failures();
 }

@@ -103,7 +103,20 @@ int ustack_build(uint8_t *buf, uint32_t len, virt_t top, const struct ustack_arg
     words = 1u + a->argc + 1u + a->envc + 1u + (a->nauxv + 2u + (execfn_addr != 0 ? 1u : 0u)) * 2u;
     /* The stack pointer must be 16-byte aligned when a program starts: the
      * ABI requires it, and a runtime that spills a 128-bit value relative to
-     * it will fault if it is not. */
+     * it will fault if it is not.
+     *
+     * **Both ends have to be aligned, and only one was.** The block is taken
+     * from the top downwards, so aligning where it *ends* leaves the stack
+     * pointer — which is where it *begins* — aligned only when the block is
+     * a whole number of 16-byte units. The word count depends on how many
+     * arguments and environment variables there are, so the alignment
+     * depended on their **parity**: two environment variables worked and
+     * three did not, and the failure was the builder refusing with
+     * `KERR_INVAL` at its own final check.
+     *
+     * Nothing noticed for as long as the only caller passed a fixed two.
+     * The padding word goes above `AT_NULL`, where nothing reads it. */
+    words = (words + 1u) & ~1u;
     b.at = (b.at + 15u) & ~15u;
     block = take(&b, words * WORD);
     if (block == NULL) {

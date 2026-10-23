@@ -77,6 +77,12 @@ int fdt_find_compatible_nth(const struct fdt *fdt, const char *compat, uint32_t 
  * device tree refers to another — an interrupt controller, a clock, a
  * regulator. Resolving them is what makes a tree a graph rather than a list.
  * KERR_NOENT when no node claims it. */
+/* The nth direct child of a node, as a path. KERR_NOENT past the last one,
+ * which ends a loop. Needed for anything the tree expresses as a list — an
+ * operating-point table above all. */
+int fdt_nth_child(const struct fdt *fdt, const char *parent, uint32_t n, char *path,
+                  uint32_t cap);
+
 int fdt_find_phandle(const struct fdt *fdt, uint32_t phandle, char *path, uint32_t cap);
 
 /* Cuts the last component off a path in place: "/cpus/cpu@1/x" becomes

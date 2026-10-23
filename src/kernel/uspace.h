@@ -29,6 +29,7 @@
 #include "arch/riscv/pgtable.h"
 #include "arch/riscv/trap.h"
 #include "core/types.h"
+#include "core/vma.h"
 #include "kernel/file.h"
 #include "kernel/signal.h"
 
@@ -101,6 +102,21 @@ struct uproc {
     virt_t brk;        /* the program break, past the last segment */
     virt_t brk_floor;  /* where it started, which it may not go below */
     virt_t mmap_next;  /* the cursor anonymous mappings are placed at */
+
+    /* **What is mapped where**, including the ranges that have no pages.
+     *
+     * Placement used to consult the page tables, which cannot answer the
+     * question: a `PROT_NONE` reservation is deliberately left unmapped —
+     * Sv39 has no way to say "mapped but inaccessible" at a leaf — so a
+     * reserved range looks free, and a mapping placed inside one is mapped
+     * over the moment the runtime commits its reservation with `MAP_FIXED`.
+     * Two unrelated allocations then share pages.
+     *
+     * This set is the address space's own record, so a reservation is as
+     * visible as anything else. It was in the tree all along, carried from
+     * the ARM kernel and never built, because its addresses were 32 bits
+     * wide and user space here is 256 GiB. */
+    struct vma_set vmas;
     struct pgtable pt;
     virt_t entry;
     virt_t stack_top;
@@ -281,5 +297,46 @@ uint64_t uspace_syscalls(void);
  * broadcasting a fence on every mapping, and worth being able to see: if it
  * ever grew large, the trade would be the wrong way round. */
 uint64_t uspace_stale_faults(void);
+
+/* Makes a *new* mapping reach every hart, not just this one.
+ *
+ * The default is local-only, because a stale "absent" entry is harmless — a
+ * hart that trips over one fences and retries — and broadcasting on every
+ * map cost more than SMP gained. This exists to test that reasoning against
+ * a machine rather than to be believed. */
+void uspace_broadcast_additions(bool on);
+
+/* One extra variable in the environment every process starts with, on top of
+ * `HOME` and `PATH`.
+ *
+ * A kernel that can pass nothing to the program it starts cannot ask it to
+ * behave differently, and some of the most useful questions are exactly
+ * that: a Go runtime's `GODEBUG` can switch its asynchronous preemption off,
+ * which separates "the program is wrong" from "signal delivery is wrong"
+ * without changing either. Empty or NULL passes nothing. */
+void uspace_set_extra_env(const char *text, uint32_t len);
+
+/* How many live pages were destroyed by a mapping the caller did not insist
+ * on. Any value but zero means a program's memory was replaced with zeroes
+ * underneath it. */
+uint32_t uspace_replaced_pages(void);
+
+/* Mappings the address-space record could not hold, so placement may reuse
+ * an address that is live. */
+uint32_t uspace_unrecorded_regions(void);
+
+/* A child with an address space of its own, made of the parent's pages
+ * copy-on-write. Unlike `uspace_fork_shared` (which is `vfork`), the two
+ * processes are isolated from the moment it returns. */
+int uspace_fork(struct uproc *child, struct uproc *parent);
+
+/* How many copy-on-write faults produced a private copy, and how many found
+ * themselves the last holder and simply took the page. */
+/* How many faults the kernel resolved and returned from. A number that
+ * climbs without the program progressing is a fault loop. */
+uint32_t uspace_handled_faults(void);
+
+uint32_t uspace_cow_copies(void);
+uint32_t uspace_cow_takeovers(void);
 
 #endif

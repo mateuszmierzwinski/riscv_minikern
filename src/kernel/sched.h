@@ -69,7 +69,18 @@ struct thread_signals {
 /* Go starts one thread per CPU it believes in, plus a few: a handful is
  * enough while `sched_getaffinity` reports one CPU, and running out is
  * reported as `EAGAIN` rather than ignored. */
-#define SCHED_MAX_THREADS 16u
+/* How many threads can exist at once.
+ *
+ * Sixteen was comfortable for a program with a handful of threads and is not
+ * comfortable for a Go runtime: it starts an M per busy P, plus the garbage
+ * collector's workers, plus `sysmon`, and it creates and retires them
+ * freely. A `clone` that fails is not a slowdown — the runtime treats it as
+ * fatal ("failed to create new OS thread") — so the table has to be sized
+ * for the runtime's appetite rather than the program's.
+ *
+ * Sixty-four costs 64 slots and, at four pages of kernel stack each, a
+ * megabyte of memory on a machine that has gigabytes. */
+#define SCHED_MAX_THREADS 64u
 
 /* Starts the scheduler and makes the process's first thread, which enters
  * user mode at `frame`'s `sepc` with `frame`'s registers and `sp`. Reports
@@ -247,5 +258,68 @@ bool sched_take_preempt_request(void);
 /* Frees every thread's kernel stack. Called when a process is torn down,
  * from a stack that is not one of them. */
 void sched_shutdown(void);
+
+/* How many threads have been found to have overflowed their kernel stack.
+ * Any value but zero means memory that belonged to something else was
+ * written, and nothing after it can be trusted. */
+uint32_t sched_stack_overflows(void);
+
+/* How many times a thread could not be created because the table was full.
+ * Any value but zero is a Go runtime about to abort. */
+uint32_t sched_spawn_failures(void);
+
+/* How many times a thread saving its stack pointer found the slot no longer
+ * its own — two harts with different ideas of what is running. */
+uint32_t sched_slot_aliases(void);
+
+/* How many ticks the scheduler has seen, and how many blocked threads it
+ * has woken because their deadline passed. A deadline that never wakes is a
+ * thread that waits for ever, and these two tell that apart from a tick
+ * that never arrives. */
+uint32_t sched_ticks_seen(void);
+
+/* ── when this hart next needs the timer ───────────────────────────────── */
+
+/* Works out what this hart is waiting for and arms — or **disarms** — its
+ * timer accordingly.
+ *
+ * Called after every scheduling decision, because every one of them can
+ * change the answer: a thread that blocks removes its slice, a thread that
+ * wakes may add one, and a hart left with a single runnable thread and
+ * nothing asleep needs no timer at all.
+ *
+ * Three things can want it:
+ *
+ *   - the running thread's **slice**, but only when something else is
+ *     runnable; one thread alone is not competing with anybody and a timer
+ *     that interrupts it would be pure overhead;
+ *   - the soonest **deadline** any blocked thread is waiting for;
+ *   - **housekeeping**, which only hart 1 does.
+ *
+ * `timer_arm_at` ignores a request for a deadline it already holds, so
+ * calling this often is cheap; what is not cheap is the firmware call it
+ * skips.
+ */
+/* Turns dynamic ticks on: the scheduler arms a one-shot timer for the next
+ * thing that is actually due, instead of a periodic clock. Off by default —
+ * see `sched_run` and docs/PREEMPTION_MODEL.md. */
+void sched_set_dynticks(bool on);
+
+void sched_arm_timer(void);
+
+/* Pokes every hart that is idle, so it looks for the work that has just
+ * appeared. With no periodic tick this is the only thing that ends an idle
+ * hart's `wfi`. */
+void sched_wake_idle_harts(void);
+
+/* How many times an idle hart's backstop timer found work that should have
+ * woken it. Any value but zero is a lost wakeup: the machine kept going
+ * because of a timeout rather than because the scheduler was right. */
+uint32_t sched_missed_pokes(void);
+
+/* How long a slice is, in nanoseconds. One value for now: the fair class
+ * in Phase 2 computes it per thread from the runnable count and weights. */
+#define SCHED_SLICE_NS 1500000ull
+uint32_t sched_deadline_wakes(void);
 
 #endif

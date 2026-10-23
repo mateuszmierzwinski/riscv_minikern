@@ -84,23 +84,26 @@ static int verify(struct xfs *fs, const uint8_t *di, uint64_t ino) {
     if (!xfs_crc_ok(di, fs->inodesize, XFS_DI_CRC) || !xfs_uuid_ok(fs, di + XFS_DI_UUID)) {
         return KERR_IO;
     }
-    if ((xfs_be64(di + XFS_DI_FLAGS2) & XFS_DIFLAG2_NREXT64) != 0) {
-        kprintf("xfs: inode %u uses 64-bit extent counts, which are not supported\n", (uint32_t)ino);
-        return KERR_NOTSUP;
-    }
     return KERR_OK;
 }
 
 /* Copies the core fields and the inline fork out of a verified inode. */
 static int take(struct xfs *fs, const uint8_t *di, uint64_t ino, struct xfs_inode *out) {
     uint32_t avail = fork_bytes(fs, di);
+    /* **The inode says, not the superblock.** The superblock's `NREXT64`
+     * permits the layout; each inode's `di_flags2` says whether it actually
+     * uses it, so a filesystem that gained the feature later still has
+     * inodes in the old shape and both must read correctly. */
+    bool big = (xfs_be64(di + XFS_DI_FLAGS2) & XFS_DIFLAG2_NREXT64) != 0;
     *out = (struct xfs_inode){
         .ino = ino,
         .size = xfs_be64(di + XFS_DI_SIZE),
         .nblocks = xfs_be64(di + XFS_DI_NBLOCKS),
         .mode = xfs_be16(di + XFS_DI_MODE),
         .nlink = xfs_be32(di + XFS_DI_NLINK),
-        .nextents = xfs_be32(di + XFS_DI_NEXTENTS),
+        .nextents = big ? (uint32_t)xfs_be64(di + XFS_DI_BIG_NEXTENTS)
+                        : xfs_be32(di + XFS_DI_NEXTENTS),
+        .big_extent_counts = big,
         .format = di[XFS_DI_FORMAT],
         .fork_len = avail < XFS_FORK_MAX ? avail : XFS_FORK_MAX,
     };

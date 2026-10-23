@@ -44,6 +44,7 @@
 #define CMD_USE_HOLD_REG 0x20000000u
 #define CMD_UPDATE_CLOCK_ONLY 0x00200000u
 #define CMD_SEND_INIT 0x00008000u
+#define CMD_STOP_ABORT 0x00004000u
 #define CMD_WAIT_PRVDATA 0x00002000u
 #define CMD_WRITE 0x00000400u
 #define CMD_DATA_EXPECTED 0x00000200u
@@ -178,8 +179,22 @@ static int dw_command(void *self, uint8_t index, uint32_t argument, uint32_t kin
     if (index == CMD_GO_IDLE) {
         flags |= CMD_SEND_INIT; /* the 80 clocks a card needs before it listens */
     }
-    if (index == CMD_READ_SINGLE || index == CMD_WRITE_SINGLE) {
-        flags |= CMD_DATA_EXPECTED | (index == CMD_WRITE_SINGLE ? CMD_WRITE : 0u);
+    /* **Which commands move data, all of them.** Listing only the
+     * single-block pair left `CMD18` without `DATA_EXPECTED`, so the
+     * controller sent the command and never started a transfer: the read
+     * waited for a FIFO that nothing was filling and timed out. A command
+     * that carries data has to say so, and the set is four, not two. */
+    if (index == CMD_READ_SINGLE || index == CMD_READ_MULTIPLE || index == CMD_WRITE_SINGLE ||
+        index == CMD_WRITE_MULTIPLE) {
+        bool writing = index == CMD_WRITE_SINGLE || index == CMD_WRITE_MULTIPLE;
+        flags |= CMD_DATA_EXPECTED | (writing ? CMD_WRITE : 0u);
+    }
+    /* A stop ends a transfer that is still running, which the controller has
+     * to be told: without it the command queues behind the data it is meant
+     * to interrupt. */
+    if (index == CMD_STOP_TRANSMISSION) {
+        flags |= CMD_STOP_ABORT;
+        flags &= ~CMD_WAIT_PRVDATA;
     }
     put(DW_RINTSTS, 0xffffffffu);
     put(DW_CMDARG, argument);
@@ -220,6 +235,10 @@ static int dw_command(void *self, uint8_t index, uint32_t argument, uint32_t kin
 
 /* Moves one block through the FIFO, a word at a time.
  *
+ * Used both for a single-block command and for each block of a multi-block
+ * stream, which is why it waits on the FIFO level rather than on the
+ * transfer-complete interrupt alone.
+ *
  * The FIFO's level is in the status register and the "ready" interrupt bits
  * are the controller's invitation to move a burst; this waits on the level
  * directly, which is simpler and correct whatever the watermark is set to. */
@@ -248,8 +267,21 @@ static int dw_move_block(void *self, bool reading, void *buf) {
             return KERR_TIMEDOUT;
         }
     }
-    /* The transfer is not over until the controller says so: the last words
-     * are still on their way to or from the card. */
+    /* The words are in the FIFO's hands now. `DATA_OVER` marks the end of
+     * the **whole** transfer, not of each block, so a multi-block read must
+     * not wait for it between blocks — the controller raises it once, after
+     * the last one. The block itself is complete when its words have moved,
+     * which is what the loop above waited for. */
+    return KERR_OK;
+}
+
+/* Waits for the controller to finish a transfer.
+ *
+ * `DATA_OVER` marks the end of the **whole** transfer and is raised once,
+ * however many blocks it carried — so it is waited for after the last block
+ * and not between them. Waiting between blocks of a multi-block read waits
+ * for something that will not happen until the read is over. */
+static int wait_for_data_over(void) {
     for (uint32_t spin = 0; spin < WAIT_SPINS; spin++) {
         uint32_t status = get(DW_RINTSTS);
         if ((status & INT_ERRORS) != 0) {
@@ -266,12 +298,19 @@ static int dw_move_block(void *self, bool reading, void *buf) {
 static int dw_run_faster(void *self) {
     (void)self;
     put(DW_CTYPE, 1u); /* one card, four-bit bus */
-    /* The identification clock is 400 kHz and the operating one is as fast
-     * as the divider allows from this controller's input clock. A divider of
-     * 2 is conservative: it is correct at any input clock the firmware may
-     * have left, and a card that cannot keep up is a card that fails its
-     * next read rather than one that corrupts data. */
-    return set_clock_divider(2u);
+    /* **25 MHz, which is every SD card's default speed.**
+     *
+     * The controller divides its input by `2 * CLKDIV`, and the tree says
+     * the input is 50 MHz, so 1 gives 25 MHz. That is the rate the standard
+     * guarantees without negotiating anything: going above it means
+     * high-speed mode, which has to be asked for with CMD6 and is not asked
+     * for here.
+     *
+     * It was 2 — 12.5 MHz — which was chosen to be safe at an unknown input
+     * clock and turned out to be the thing limiting reads: measured on a
+     * VisionFive 2, 5.0 MB/s at 12.5 MHz against a four-bit bus that should
+     * carry twice that. */
+    return set_clock_divider(1u);
 }
 
 static const struct sd_transport transport = {
@@ -288,19 +327,50 @@ static int one_block(bool reading, uint64_t lba, void *buf) {
     put(DW_BYTCNT, SD_BLOCK_BYTES);
     rc = dw_command(NULL, reading ? CMD_READ_SINGLE : CMD_WRITE_SINGLE, argument, SD_RESP_SHORT,
                     NULL);
-    return rc != KERR_OK ? rc : dw_move_block(NULL, reading, buf);
+    rc = rc != KERR_OK ? rc : dw_move_block(NULL, reading, buf);
+    return rc != KERR_OK ? rc : wait_for_data_over();
+}
+
+/* Reads several blocks with **one command**.
+ *
+ * A card streams blocks until it is told to stop, so `count` blocks cost one
+ * command, one stop and `count` FIFO drains — against `count` commands, each
+ * with its own round trip to the card and its own completion wait. The
+ * difference is most of the time for anything larger than a single block,
+ * which is every filesystem read of a file.
+ *
+ * The stop command is sent whatever happened, including after an error: a
+ * card left streaming answers the *next* command with data rather than a
+ * response, and the driver that sent it then reads a response out of a data
+ * block. One failed read would corrupt every read after it. */
+static int read_many(uint64_t lba, uint32_t count, uint8_t *to) {
+    uint32_t argument = mmc.card.high_capacity ? (uint32_t)lba : (uint32_t)(lba * SD_BLOCK_BYTES);
+    int rc;
+    put(DW_BLKSIZ, SD_BLOCK_BYTES);
+    put(DW_BYTCNT, count * SD_BLOCK_BYTES);
+    rc = dw_command(NULL, CMD_READ_MULTIPLE, argument, SD_RESP_SHORT, NULL);
+    for (uint32_t i = 0; rc == KERR_OK && i < count; i++) {
+        rc = dw_move_block(NULL, true, to + (size_t)i * SD_BLOCK_BYTES);
+    }
+    if (rc == KERR_OK) {
+        rc = wait_for_data_over();
+    }
+    {
+        int stop = dw_command(NULL, CMD_STOP_TRANSMISSION, 0, SD_RESP_BUSY, NULL);
+        rc = rc != KERR_OK ? rc : stop;
+    }
+    return rc;
 }
 
 static int dw_read(void *self, uint64_t lba, uint32_t count, void *buf) {
-    uint8_t *to = buf;
     (void)self;
-    for (uint32_t i = 0; i < count; i++) {
-        int rc = one_block(true, lba + i, to + (size_t)i * SD_BLOCK_BYTES);
-        if (rc != KERR_OK) {
-            return rc;
-        }
+    if (count == 0) {
+        return KERR_INVAL;
     }
-    return KERR_OK;
+    if (count == 1u) {
+        return one_block(true, lba, buf);
+    }
+    return read_many(lba, count, buf);
 }
 
 static int dw_write(void *self, uint64_t lba, uint32_t count, const void *buf) {

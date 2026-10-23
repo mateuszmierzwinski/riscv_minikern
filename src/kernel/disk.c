@@ -47,13 +47,38 @@ const char *disk_kind(void) {
  * because on a board with an M.2 drive that is the storage worth having, and
  * virtio second, which is the emulator's. A board with neither is the
  * ordinary case for a kernel that netboots. */
+/* The kind the operator asked for, empty for "whatever is there". */
+static char wanted[8];
+
+void disk_prefer(const char *kind, uint32_t len) {
+    uint32_t i = 0;
+    for (; kind != NULL && i < len && i + 1u < sizeof wanted; i++) {
+        wanted[i] = kind[i];
+    }
+    wanted[i] = '\0';
+}
+
+/* True when this kind may be attached: either nothing was asked for, or this
+ * is it. Compared on the prefix so "sd" matches "sd (designware)". */
+static bool allowed(const char *kind) {
+    if (wanted[0] == '\0') {
+        return true;
+    }
+    for (uint32_t i = 0; wanted[i] != '\0'; i++) {
+        if (kind[i] != wanted[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static int attach_any(const struct fdt *fdt) {
-    bool pci = pci_init(fdt) == KERR_OK;
+    bool pci = allowed("nvme") && pci_init(fdt) == KERR_OK;
     if (pci && nvme_init(&raw) == KERR_OK) {
         attached_kind = "nvme";
         return KERR_OK;
     }
-    if (sdhci_init(fdt, &raw) == KERR_OK) {
+    if (allowed("sd") && sdhci_init(fdt, &raw) == KERR_OK) {
         attached_kind = sdhci_kind();
         return KERR_OK;
     }
@@ -62,11 +87,11 @@ static int attach_any(const struct fdt *fdt) {
      * After SDHCI rather than before it only because an emulator models the
      * other one; on the board the SDHCI probe finds nothing and falls
      * through to here. */
-    if (dwmmc_init(fdt, &raw) == KERR_OK) {
+    if (allowed("sd") && dwmmc_init(fdt, &raw) == KERR_OK) {
         attached_kind = "sd (designware)";
         return KERR_OK;
     }
-    if (virtio_blk_init(fdt, &raw) == KERR_OK) {
+    if (allowed("virtio") && virtio_blk_init(fdt, &raw) == KERR_OK) {
         attached_kind = "virtio";
         return KERR_OK;
     }

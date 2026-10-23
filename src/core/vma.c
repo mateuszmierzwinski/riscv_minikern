@@ -4,12 +4,12 @@
 
 #include "core/errno.h"
 
-static bool aligned_range(uint32_t start, uint32_t end) {
+static bool aligned_range(virt_t start, virt_t end) {
     return start < end && (start % VMA_PAGE) == 0 && (end % VMA_PAGE) == 0;
 }
 
 /* Index of the first region ending after addr (n when none). */
-static uint32_t first_after(const struct vma_set *s, uint32_t addr) {
+static uint32_t first_after(const struct vma_set *s, virt_t addr) {
     uint32_t i = 0;
     while (i < s->n && s->v[i].end <= addr) {
         i++;
@@ -17,7 +17,7 @@ static uint32_t first_after(const struct vma_set *s, uint32_t addr) {
     return i;
 }
 
-const struct vma *vma_find(const struct vma_set *s, uint32_t addr) {
+const struct vma *vma_find(const struct vma_set *s, virt_t addr) {
     uint32_t i = first_after(s, addr);
     return (i < s->n && s->v[i].start <= addr) ? &s->v[i] : 0;
 }
@@ -52,7 +52,7 @@ static void merge_all(struct vma_set *s) {
     }
 }
 
-int vma_insert(struct vma_set *s, uint32_t start, uint32_t end, uint32_t prot, uint32_t flags) {
+int vma_insert(struct vma_set *s, virt_t start, virt_t end, uint32_t prot, uint32_t flags) {
     uint32_t i = first_after(s, start);
     if (!aligned_range(start, end) || (i < s->n && s->v[i].start < end)) {
         return KERR_INVAL;
@@ -69,14 +69,14 @@ int vma_insert(struct vma_set *s, uint32_t start, uint32_t end, uint32_t prot, u
 /* Region boundaries cut() must create: one per range end that falls
  * strictly inside a region. That many free slots are needed, at least
  * transiently, before anything is changed. */
-static uint32_t splits_needed(const struct vma_set *s, uint32_t start, uint32_t end) {
+static uint32_t splits_needed(const struct vma_set *s, virt_t start, virt_t end) {
     const struct vma *a = vma_find(s, start);
     const struct vma *b = vma_find(s, end);
     return (a != 0 && a->start < start ? 1u : 0u) + (b != 0 && b->start < end ? 1u : 0u);
 }
 
 /* Splits the region at index i at addr (strictly inside it). */
-static void split_at(struct vma_set *s, uint32_t i, uint32_t addr) {
+static void split_at(struct vma_set *s, uint32_t i, virt_t addr) {
     open_slot(s, i + 1);
     s->v[i + 1] = s->v[i];
     s->v[i].end = addr;
@@ -84,7 +84,7 @@ static void split_at(struct vma_set *s, uint32_t i, uint32_t addr) {
 }
 
 /* Splits regions so that start and end fall on region boundaries. */
-static void cut(struct vma_set *s, uint32_t start, uint32_t end) {
+static void cut(struct vma_set *s, virt_t start, virt_t end) {
     uint32_t i = first_after(s, start);
     if (i < s->n && s->v[i].start < start) {
         split_at(s, i, start);
@@ -95,8 +95,8 @@ static void cut(struct vma_set *s, uint32_t start, uint32_t end) {
     }
 }
 
-int vma_remove(struct vma_set *s, uint32_t start, uint32_t end,
-               void (*gone)(void *ctx, uint32_t lo, uint32_t hi), void *ctx) {
+int vma_remove(struct vma_set *s, virt_t start, virt_t end,
+               void (*gone)(void *ctx, virt_t lo, virt_t hi), void *ctx) {
     if (!aligned_range(start, end)) {
         return KERR_INVAL;
     }
@@ -105,15 +105,17 @@ int vma_remove(struct vma_set *s, uint32_t start, uint32_t end,
     }
     cut(s, start, end);
     for (uint32_t i = first_after(s, start); i < s->n && s->v[i].start < end;) {
-        gone(ctx, s->v[i].start, s->v[i].end);
+        if (gone != 0) {
+            gone(ctx, s->v[i].start, s->v[i].end);
+        }
         close_slot(s, i);
     }
     return KERR_OK;
 }
 
 /* True when every byte of [start, end) is inside some region. */
-static bool fully_mapped(const struct vma_set *s, uint32_t start, uint32_t end) {
-    uint32_t at = start;
+static bool fully_mapped(const struct vma_set *s, virt_t start, virt_t end) {
+    virt_t at = start;
     for (uint32_t i = first_after(s, start); i < s->n && at < end; i++) {
         if (s->v[i].start > at) {
             return false;
@@ -123,7 +125,7 @@ static bool fully_mapped(const struct vma_set *s, uint32_t start, uint32_t end) 
     return at >= end;
 }
 
-int vma_protect(struct vma_set *s, uint32_t start, uint32_t end, uint32_t prot) {
+int vma_protect(struct vma_set *s, virt_t start, virt_t end, uint32_t prot) {
     if (!aligned_range(start, end)) {
         return KERR_INVAL;
     }
@@ -138,15 +140,21 @@ int vma_protect(struct vma_set *s, uint32_t start, uint32_t end, uint32_t prot) 
     return KERR_OK;
 }
 
-static bool range_free(const struct vma_set *s, uint32_t start, uint32_t end) {
+static bool range_free(const struct vma_set *s, virt_t start, virt_t end) {
     uint32_t i = first_after(s, start);
     return i == s->n || s->v[i].start >= end;
 }
 
 /* The highest address a len-byte gap inside [lo, hi) can start at,
  * scanning regions from the top. KERR_NOMEM when none fits. */
-static int highest_gap(const struct vma_set *s, uint32_t len, uint32_t lo, uint32_t hi, uint32_t *addr) {
-    uint32_t top = hi;
+static int highest_gap(const struct vma_set *s, virt_t len, virt_t lo, virt_t hi, virt_t *addr) {
+    /* 64 bits, like everything else here. This held `hi` in a `uint32_t`,
+     * which on a 39-bit address space silently searched the bottom 4 GiB of
+     * a window that starts at 128 GiB — so every search failed and every
+     * `mmap` with it. The widening is the whole reason this file was never
+     * built on RISC-V, and a missed declaration reproduces the original
+     * defect exactly. */
+    virt_t top = hi;
     for (uint32_t i = s->n; i-- > 0;) {
         const struct vma *v = &s->v[i];
         if (v->start >= top) {
@@ -167,7 +175,7 @@ static int highest_gap(const struct vma_set *s, uint32_t len, uint32_t lo, uint3
     return KERR_OK;
 }
 
-int vma_find_free(const struct vma_set *s, uint32_t len, uint32_t hint, uint32_t lo, uint32_t hi, uint32_t *addr) {
+int vma_find_free(const struct vma_set *s, virt_t len, virt_t hint, virt_t lo, virt_t hi, virt_t *addr) {
     if (len == 0 || len % VMA_PAGE != 0 || hi <= lo || len > hi - lo) {
         return KERR_NOMEM;
     }

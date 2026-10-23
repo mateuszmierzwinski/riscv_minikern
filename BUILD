@@ -74,6 +74,18 @@ cc_library(
 # reports, in both of the layouts a card can use.
 # Partition tables: both formats, and the protective MBR that must not be
 # followed.
+# Where every mapping goes. Mostly about addresses above 4 GiB, which is
+# what had kept this file unused on a 64-bit machine.
+cc_test(
+    name = "vma_test",
+    size = "small",
+    srcs = ["test/vma_test.c"],
+    deps = [
+        ":ktest",
+        ":vma",
+    ],
+)
+
 cc_test(
     name = "partition_test",
     size = "small",
@@ -506,6 +518,17 @@ cc_library(
 # shared by the two transports that have nothing else in common.
 # One partition of a disk, as a disk: GPT and MBR, so a filesystem that does
 # not start at sector 0 is found.
+# The regions of one user address space: what is mapped where, and with what
+# rights. Pure and host-tested — and widened to 64-bit addresses, which is
+# what had kept it from being used on a machine with 256 GiB of user space.
+cc_library(
+    name = "vma",
+    srcs = ["src/core/vma.c"],
+    hdrs = ["src/core/vma.h"],
+    strip_include_prefix = "src",
+    deps = [":core_boot"],
+)
+
 cc_library(
     name = "partition",
     srcs = ["src/core/partition.c"],
@@ -589,6 +612,7 @@ cc_library(
     strip_include_prefix = "src",
     target_compatible_with = ["//platforms:riscv64"],
     deps = [
+        ":vma",
         ":arch_riscv",
         ":console",
         ":exec",
@@ -630,6 +654,21 @@ cc_library(
 )
 
 # The live block device and the cache over it.
+# What this machine actually is, measured: the numbers the scheduler's
+# design depends on (ROADMAP.md, and the scheduler plan's Phase 0).
+cc_library(
+    name = "kernel_probe",
+    srcs = ["src/kernel/probe.c"],
+    hdrs = ["src/kernel/probe.h"],
+    strip_include_prefix = "src",
+    target_compatible_with = ["//platforms:riscv64"],
+    deps = [
+        ":arch_riscv",
+        ":console",
+        ":core_boot",
+    ],
+)
+
 cc_library(
     name = "kernel_disk",
     srcs = ["src/kernel/disk.c"],
@@ -656,6 +695,7 @@ cc_library(
     target_compatible_with = ["//platforms:riscv64"],
     deps = [
         ":console",
+        ":crypto_hash",
         ":kernel_disk",
         ":kernel_mem",
         ":xfs",
@@ -736,6 +776,8 @@ cc_library(
     strip_include_prefix = "src",
     target_compatible_with = ["//platforms:riscv64"],
     deps = [
+        ":kernel_probe",
+        ":crypto_hash",
         ":arch_riscv",
         ":console",
         ":core_boot",
@@ -811,6 +853,41 @@ kernel_image(
 # started it in — argc, argv, the environment, the auxiliary vector — and
 # reports it, so the test checks the kernel's work from outside rather than
 # trusting the kernel's own account of it.
+
+# Four threads and a shared counter, with no runtime between the kernel and
+# the result: the reproducer for the four-hart race (CLAUDE.md, ROADMAP.md
+# §0). It **passes** — raw clone, atomics and a futex mutex are all correct
+# at this scale — which is what narrowed the remaining fault to something a
+# Go runtime does that this does not.
+user_binary(
+    name = "race",
+    srcs = [
+        "src/userland/race/clone.S",
+        "src/userland/race/main.c",
+        "src/userland/start.S",
+    ],
+)
+
+user_image(
+    name = "race.elf",
+    program = ":race",
+)
+
+# Does a real fork isolate the two processes? Written to be the proof rather
+# than a demonstration: both sides write the same addresses and each checks
+# it sees only its own.
+user_binary(
+    name = "forktest",
+    srcs = [
+        "src/userland/forktest/main.c",
+        "src/userland/start.S",
+    ],
+)
+
+user_image(
+    name = "forktest.elf",
+    program = ":forktest",
+)
 
 user_binary(
     name = "init",

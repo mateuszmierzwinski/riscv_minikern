@@ -271,22 +271,78 @@ static int create_io_queues(void) {
  * two pages from any offset, which is every request this kernel makes; a
  * longer one would need a PRP *list* in memory, and is refused rather than
  * silently truncated. */
+/* The page list a transfer of more than two pages needs.
+ *
+ * A command describes its buffer as at most two addresses: the first page
+ * (which may start part-way in) and a second. Anything longer puts the
+ * remaining pages' addresses in a list, and `prp2` points at the list
+ * instead. One 4 KiB page of list addresses 512 further pages, so 2 MiB in a
+ * single command — against the 8 KiB a two-address command can carry.
+ *
+ * Page-aligned by construction for the same reason the identify buffer is:
+ * the controller reads it through the same mechanism, and a list that
+ * straddles a page boundary is a list whose far half the controller cannot
+ * reach. One list is enough because one command is in flight at a time. */
+static uint64_t prp_list[PAGE_BYTES / sizeof(uint64_t)] __attribute__((aligned(4096)));
+
+/* Fills the list with the pages after the first, and returns what `prp2`
+ * should be: a page address when there are exactly two, and the list's own
+ * address when there are more. */
+static uint64_t describe_buffer(uint64_t at, uint64_t bytes) {
+    uint64_t first_page_has = PAGE_BYTES - (at & (PAGE_BYTES - 1u));
+    uint64_t next = (at & ~(uint64_t)(PAGE_BYTES - 1u)) + PAGE_BYTES;
+    uint64_t remaining, pages;
+    if (bytes <= first_page_has) {
+        return 0; /* it all fits in the first page */
+    }
+    remaining = bytes - first_page_has;
+    pages = (remaining + PAGE_BYTES - 1u) / PAGE_BYTES;
+    if (pages == 1u) {
+        return next;
+    }
+    for (uint64_t i = 0; i < pages && i < sizeof prp_list / sizeof prp_list[0]; i++) {
+        prp_list[i] = next + i * PAGE_BYTES;
+    }
+    return (uint64_t)(uintptr_t)prp_list;
+}
+
+/* The largest transfer this driver will issue in one command, in bytes: what
+ * one list page can describe, less the partial first page. */
+#define MAX_TRANSFER_BYTES ((PAGE_BYTES / sizeof(uint64_t)) * PAGE_BYTES)
+
 static int transfer(uint8_t opcode, uint64_t lba, uint32_t blocks, void *buf) {
     struct nvme_command cmd = {0};
     uint64_t at = (uint64_t)(uintptr_t)buf;
     uint64_t bytes = (uint64_t)blocks * nvme.block_size;
-    uint64_t first_page_has = PAGE_BYTES - (at & (PAGE_BYTES - 1u));
-    if (bytes > first_page_has + PAGE_BYTES) {
-        return KERR_INVAL; /* would need a PRP list, which this does not build */
+    if (bytes > MAX_TRANSFER_BYTES) {
+        return KERR_INVAL; /* the caller splits it: one list page is the limit */
     }
     cmd.opcode = opcode;
     cmd.namespace_id = 1;
     cmd.prp1 = at;
-    cmd.prp2 = bytes > first_page_has ? ((at & ~(uint64_t)(PAGE_BYTES - 1u)) + PAGE_BYTES) : 0;
+    cmd.prp2 = describe_buffer(at, bytes);
     cmd.cdw10 = (uint32_t)lba;
     cmd.cdw11 = (uint32_t)(lba >> 32);
     cmd.cdw12 = blocks - 1u; /* zero-based, as the specification has it */
     return submit(&nvme.io, &cmd, NULL);
+}
+
+/* Splits a request into transfers this driver can describe, so a caller
+ * never has to know the limit. */
+static int transfer_all(uint8_t opcode, uint64_t lba, uint32_t blocks, void *buf) {
+    uint32_t per = (uint32_t)(MAX_TRANSFER_BYTES / nvme.block_size);
+    uint8_t *to = buf;
+    while (blocks > 0) {
+        uint32_t n = blocks < per ? blocks : per;
+        int rc = transfer(opcode, lba, n, to);
+        if (rc != KERR_OK) {
+            return rc;
+        }
+        lba += n;
+        blocks -= n;
+        to += (size_t)n * nvme.block_size;
+    }
+    return KERR_OK;
 }
 
 static int nvme_read(void *self, uint64_t lba, uint32_t count, void *buf) {
@@ -294,7 +350,7 @@ static int nvme_read(void *self, uint64_t lba, uint32_t count, void *buf) {
     if (!nvme.up || count == 0 || lba + count > nvme.blocks) {
         return KERR_INVAL;
     }
-    return transfer(IO_READ, lba, count, buf);
+    return transfer_all(IO_READ, lba, count, buf);
 }
 
 static int nvme_write(void *self, uint64_t lba, uint32_t count, const void *buf) {
@@ -302,7 +358,7 @@ static int nvme_write(void *self, uint64_t lba, uint32_t count, const void *buf)
     if (!nvme.up || count == 0 || lba + count > nvme.blocks) {
         return KERR_INVAL;
     }
-    return transfer(IO_WRITE, lba, count, (void *)(uintptr_t)buf);
+    return transfer_all(IO_WRITE, lba, count, (void *)(uintptr_t)buf);
 }
 
 /* Nothing to flush: this driver writes through, with no volatile cache of

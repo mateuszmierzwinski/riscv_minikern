@@ -118,7 +118,11 @@ static bool handle_interrupt(uint64_t code) {
         return true;
     }
     case IRQ_S_SOFTWARE:
-        /* Nothing sends one yet; it is how one hart will wake another. */
+        /* Clearing it is the whole handler. A hart is poked because the
+         * answer to "what should I be running?" has changed — work has
+         * appeared, or what it is running should stop — and that question
+         * is asked on the way out of every trap anyway. The interrupt's job
+         * is only to end the `wfi`. */
         __asm__ volatile("csrc sip, %0" : : "r"(2ull));
         return true;
     default:

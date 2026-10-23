@@ -388,6 +388,91 @@ static int scan_for(const struct fdt *fdt, const struct matcher *m, uint32_t ski
     }
 }
 
+/* The nth child of a node, by path.
+ *
+ * Nodes that are a *list* are the reason this exists: an operating-point
+ * table is a parent whose children are the operating points, named
+ * `opp-1500000000` and such, and nothing about a name says how many there
+ * are or what the next one is called. A reader that can only find a node by
+ * its compatible string or its path cannot read a list at all.
+ *
+ * `KERR_NOENT` when the parent has no nth child, which is how a caller ends
+ * a loop. */
+int fdt_nth_child(const struct fdt *fdt, const char *parent, uint32_t n, char *path,
+                  uint32_t cap) {
+    const uint8_t *blk;
+    uint32_t at, depth = 0, seen = 0, parent_depth = 0;
+    bool inside = false;
+    struct open_node stack[FDT_MAX_DEPTH];
+    if (fdt == NULL || parent == NULL || path == NULL || cap == 0) {
+        return KERR_INVAL;
+    }
+    blk = fdt->base + fdt->struct_off;
+    at = 0;
+    for (;;) {
+        uint32_t token;
+        if (!fits(at, 4, fdt->struct_size)) {
+            return KERR_INVAL;
+        }
+        token = be32(blk + at);
+        at += 4;
+        if (token == FDT_END) {
+            return KERR_NOENT;
+        }
+        if (token == FDT_NOP) {
+            continue;
+        }
+        if (token == FDT_BEGIN_NODE) {
+            int32_t len = bounded_strlen(blk, at, fdt->struct_size);
+            if (len < 0 || depth == FDT_MAX_DEPTH) {
+                return KERR_INVAL;
+            }
+            stack[depth] = (struct open_node){.name = (const char *)blk + at, .len = (uint32_t)len};
+            depth++;
+            at = align4(at + (uint32_t)len + 1u);
+            if (!inside) {
+                char here[128];
+                if (depth >= 1u && build_path(&stack[1], depth - 1u, here, sizeof here) &&
+                    str_equal(here, parent)) {
+                    inside = true;
+                    parent_depth = depth;
+                }
+            } else if (depth == parent_depth + 1u) {
+                /* A direct child, which is the only kind that counts. */
+                if (seen == n) {
+                    return build_path(&stack[1], depth - 1u, path, cap) ? KERR_OK : KERR_NOMEM;
+                }
+                seen++;
+            }
+            continue;
+        }
+        if (token == FDT_END_NODE) {
+            if (depth == 0) {
+                return KERR_INVAL;
+            }
+            depth--;
+            if (inside && depth < parent_depth) {
+                return KERR_NOENT; /* out of the parent without finding it */
+            }
+            continue;
+        }
+        if (token != FDT_PROP) {
+            return KERR_INVAL;
+        }
+        {
+            uint32_t len;
+            if (depth == 0 || !fits(at, 8, fdt->struct_size)) {
+                return KERR_INVAL;
+            }
+            len = be32(blk + at);
+            if (!fits(at + 8, len, fdt->struct_size)) {
+                return KERR_INVAL;
+            }
+            at = align4(at + 8 + len);
+        }
+    }
+}
+
 int fdt_find_compatible(const struct fdt *fdt, const char *compat, char *path, uint32_t cap) {
     struct matcher m = {.prop = "compatible", .matches = matches_compatible, .want = compat};
     return compat == NULL ? KERR_INVAL : scan_for(fdt, &m, 0, path, cap);

@@ -1,5 +1,7 @@
 #include "kernel/xfsmount.h"
 
+#include "lib/sha256.h"
+
 #include <stddef.h>
 
 #include "core/console.h"
@@ -60,6 +62,49 @@ int32_t xfsmount_list_root(void) {
 
 /* Reads a file and prints its length and its first line, which is what
  * proves the extent map rather than just the directory. */
+/* How much of a file is read at a time. 64 KiB is large enough that the
+ * per-read cost disappears and small enough to sit in the heap beside
+ * everything else. */
+#define HASH_CHUNK 65536u
+
+int xfsmount_hash_file(const char *path, uint8_t digest[32], uint64_t *size) {
+    struct xfs_inode ip;
+    struct sha256 state;
+    uint8_t *buf;
+    uint64_t at = 0;
+    int rc;
+    if (!mounted) {
+        return KERR_NODEV;
+    }
+    rc = xfs_path_lookup(&fs, path, &ip);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    buf = kzalloc(HASH_CHUNK);
+    if (buf == NULL) {
+        return KERR_NOMEM;
+    }
+    sha256_init(&state);
+    while (at < ip.size) {
+        uint64_t left = ip.size - at;
+        uint32_t want = left < HASH_CHUNK ? (uint32_t)left : HASH_CHUNK;
+        uint32_t got = 0;
+        rc = xfs_file_read(&fs, &ip, at, buf, want, &got);
+        if (rc != KERR_OK || got == 0) {
+            rc = rc != KERR_OK ? rc : KERR_IO;
+            break;
+        }
+        sha256_update(&state, buf, got);
+        at += got;
+    }
+    if (rc == KERR_OK) {
+        sha256_final(&state, digest);
+        *size = ip.size;
+    }
+    kfree(buf);
+    return rc;
+}
+
 int xfsmount_show_file(const char *path) {
     struct xfs_inode ip;
     char *buf;

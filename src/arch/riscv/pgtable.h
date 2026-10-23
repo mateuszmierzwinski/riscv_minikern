@@ -51,6 +51,26 @@
 #define PTE_A (1ull << 6)   /* accessed */
 #define PTE_D (1ull << 7)   /* dirty */
 
+/* **Bits 8 and 9 belong to the software.** Sv39 reserves them for whatever
+ * the operating system wants to record about a page, and the hardware
+ * ignores them — so a fact the kernel needs on every fault can live in the
+ * entry itself rather than in a table beside it.
+ *
+ * `PTE_COW` marks a page that two address spaces share and that must be
+ * copied before either writes to it. The entry is left read-only, so a
+ * store faults; the handler sees this bit and knows the fault is a copy to
+ * perform rather than a program's mistake. Without it the two are
+ * indistinguishable, and a kernel that guessed would either kill a
+ * well-behaved program or silently let one process write into another's
+ * memory. */
+#define PTE_RSW0 (1ull << 8)
+#define PTE_RSW1 (1ull << 9)
+#define PTE_COW PTE_RSW0
+
+/* What the hardware actually looks at, so a `prot` value can be compared
+ * without the software's own bits getting in the way. */
+#define PTE_HARDWARE_BITS (PTE_V | PTE_R | PTE_W | PTE_X | PTE_U | PTE_G | PTE_A | PTE_D)
+
 /* What a caller asks for, which is the permission bits and nothing else:
  * V, A and D are the table's business. */
 #define PT_PROT_R (PTE_R)

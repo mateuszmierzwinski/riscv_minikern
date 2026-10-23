@@ -56,7 +56,10 @@ grep -qF "uspace: hello exited with 7 after 3 syscalls" "$log" ||
 grep -qF "about to touch the kernel's memory" "$log" || fail "the faulting program did not run"
 # The process is named in the message: once there can be more than one user
 # process, "a fault happened" is not enough to act on.
-grep -qE '^uspace: fault in user code \(pid [0-9]+\): load page fault at sepc [0-9a-f]+, stval 0000000080200000$' "$log" ||
+# The thread and its stack pointer are named too: with four harts running
+# four threads, "a fault happened in this program" is not actionable, and the
+# thread's own stack is the first thing to compare the address against.
+grep -qE '^uspace: fault in user code \(pid [0-9]+ tid [0-9]+, sp [0-9a-f]+\): load page fault at sepc [0-9a-f]+, stval 0000000080200000$' "$log" ||
     fail "the fault was not reported, or not as a load page fault at the kernel's text"
 grep -qF "uspace: faulter exited with -14 after 1 syscalls" "$log" ||
     fail "the faulting process did not end with a fault status"

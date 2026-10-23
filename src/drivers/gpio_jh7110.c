@@ -112,19 +112,41 @@ static int pin_ok(uint32_t controller, uint32_t pin) {
     return pin < controllers[controller].pins ? KERR_OK : KERR_INVAL;
 }
 
+/* Writes one pin's 8-bit field as a **32-bit read-modify-write**.
+ *
+ * The field is a byte and the register is a word, and those are not the same
+ * thing: this block takes 32-bit accesses, so a byte store to the right
+ * address is not a narrower version of the same write — it is a write the
+ * hardware need not honour at all. The driver did exactly that, and the
+ * result on a board was that one header pin of four could be driven and the
+ * other three could not, with no error anywhere: the stores were accepted
+ * and discarded.
+ *
+ * It is the same mistake this project already paid for on the JH7110's UART,
+ * whose `reg-io-width` is 4 — and the second time, it was not a register's
+ * *spacing* that was wrong but the *width of the access*. Four pins share a
+ * word, so the read-modify-write must also preserve its neighbours: writing
+ * the word wholesale would reconfigure three other pins, which on a board is
+ * three other wires. */
+static void write_pin_field(uint32_t controller, uint32_t byte_offset, uint8_t value) {
+    volatile uint32_t *word =
+        (volatile uint32_t *)(controllers[controller].regs + (byte_offset & ~3u));
+    uint32_t shift = 8u * (byte_offset & 3u);
+    uint32_t now = *word;
+    *word = (now & ~(0xffu << shift)) | ((uint32_t)value << shift);
+}
+
 int gpio_jh7110_set_output(uint32_t controller, uint32_t pin, bool high) {
     int rc = pin_ok(controller, pin);
-    volatile uint8_t *regs;
     if (rc != KERR_OK) {
         return rc;
     }
-    regs = controllers[controller].regs;
     /* The value before the enable: a pin switched to output while its value
      * byte still holds the last thing written drives that for as long as it
      * takes to get to the next instruction. On a board that glitch is on a
      * wire. */
-    regs[gpio_jh7110_dout_offset(pin)] = high ? DOUT_HIGH : DOUT_LOW;
-    regs[gpio_jh7110_doen_offset(pin)] = DOEN_OUTPUT;
+    write_pin_field(controller, gpio_jh7110_dout_offset(pin), high ? DOUT_HIGH : DOUT_LOW);
+    write_pin_field(controller, gpio_jh7110_doen_offset(pin), DOEN_OUTPUT);
     return KERR_OK;
 }
 
@@ -133,7 +155,34 @@ int gpio_jh7110_set_input(uint32_t controller, uint32_t pin) {
     if (rc != KERR_OK) {
         return rc;
     }
-    controllers[controller].regs[gpio_jh7110_doen_offset(pin)] = DOEN_INPUT;
+    write_pin_field(controller, gpio_jh7110_doen_offset(pin), DOEN_INPUT);
+    return KERR_OK;
+}
+
+int gpio_jh7110_peek(uint32_t controller, uint32_t byte_offset, uint32_t *word) {
+    if (controller >= CONTROLLERS || !controllers[controller].up || (byte_offset & 3u) != 0) {
+        return KERR_INVAL;
+    }
+    *word = *(volatile uint32_t *)(controllers[controller].regs + byte_offset);
+    return KERR_OK;
+}
+
+int gpio_jh7110_get_padcfg(uint32_t controller, uint32_t pin, uint32_t *value) {
+    int rc = pin_ok(controller, pin);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    *value = *(volatile uint32_t *)(controllers[controller].regs +
+                                    gpio_jh7110_padcfg_offset(pin));
+    return KERR_OK;
+}
+
+int gpio_jh7110_set_padcfg(uint32_t controller, uint32_t pin, uint32_t value) {
+    int rc = pin_ok(controller, pin);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    *(volatile uint32_t *)(controllers[controller].regs + gpio_jh7110_padcfg_offset(pin)) = value;
     return KERR_OK;
 }
 

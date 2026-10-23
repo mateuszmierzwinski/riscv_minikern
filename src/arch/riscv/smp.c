@@ -104,12 +104,32 @@ int smp_enumerate(const struct fdt *fdt, uint64_t boot_hart) {
     return count == 0 ? KERR_NOENT : KERR_OK;
 }
 
+/* How many times a hart failed to find itself. **Not nothing**: every
+ * per-hart structure in the kernel is indexed by this, so a hart that is not
+ * found and is handed index 0 shares another hart's scheduler state —
+ * including which thread it is running. Two harts running one thread is
+ * indistinguishable, from user space, from locks that do not work.
+ *
+ * Counted rather than assumed away, because the fallback used to be silent
+ * and a silent wrong answer here is the most expensive kind. */
+static uint32_t index_misses;
+
+uint32_t smp_hart_misses(void) {
+    return index_misses;
+}
+
 uint32_t smp_hart_index(void) {
     uint64_t me = smp_this_hart();
     for (uint32_t i = 0; i < count; i++) {
         if (harts[i].id == me) {
             return i;
         }
+    }
+    /* Before enumeration there is one hart and index 0 is right. After it,
+     * this is a hart whose id is not in the table — which must not quietly
+     * become hart 0. */
+    if (count != 0) {
+        __atomic_add_fetch(&index_misses, 1u, __ATOMIC_RELAXED);
     }
     return 0;
 }

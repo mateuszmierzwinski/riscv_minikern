@@ -50,7 +50,10 @@
 #include "kernel/signal.h"
 #include "kernel/syscall.h"
 #include "kernel/uspace.h"
+#include "kernel/probe.h"
 #include "kernel/xfsmount.h"
+#include "lib/sha256.h"
+#include "kernel/probe.h"
 #include "kernel/xfsmount.h"
 #include "core/ports.h"
 
@@ -272,7 +275,10 @@ static void wait_for_ticks(void) {
  * the last, because a filesystem lives at the beginning and a test that
  * scribbles on sector 0 destroys what the next test wants to read. */
 static void bring_up_storage(uint64_t dtb) {
+    size_t kindlen = 0;
+    const char *kind = cmdline_value(boot_cmdline, "minikern.disk", &kindlen);
     dwmmc_set_trace(cmdline_has(boot_cmdline, "minikern.mmctrace"));
+    disk_prefer(kind, (uint32_t)kindlen);
     struct fdt fdt;
     const struct blockdev *dev;
     if (fdt_open(&fdt, (const void *)(uintptr_t)dtb, FDT_MAX_BYTES) != KERR_OK) {
@@ -313,6 +319,59 @@ static void bring_up_storage(uint64_t dtb) {
  * log** rather than replaying it, and that refusal is the one most worth
  * naming: it means the filesystem was not unmounted cleanly and this kernel
  * will not guess at what was in flight (kernel/xfsmount.h). */
+static bool parse_pin(const char *spec, size_t len, uint32_t *at, uint32_t *first,
+                      uint32_t *second);
+static void checksum_a_file(void);
+
+/* Reads sequentially from the attached disk and reports what it managed.
+ *
+ * `minikern.diskbench=<mebibytes>:<blocks per read>` — the second number is
+ * the point. A driver that issues one command per block and one that issues
+ * one command per sixteen do the same work at the device and a very
+ * different amount of work around it, and the only way to know which
+ * dominates is to vary it on the hardware rather than reason about it.
+ *
+ * Reads only, and nothing is written: a benchmark that writes to the
+ * operator's disk to find out how fast it is has misunderstood the
+ * question. */
+static uint8_t bench_buffer[64u * 1024u] __attribute__((aligned(4096)));
+
+static void run_disk_benchmark(void) {
+    size_t len = 0;
+    const char *spec = cmdline_value(boot_cmdline, "minikern.diskbench", &len);
+    uint32_t at = 0, mebibytes = 0, per_read = 0;
+    const struct blockdev *dev = disk_device();
+    uint64_t started, elapsed_ms, blocks, done = 0;
+    if (spec == NULL || !disk_present() || dev == NULL) {
+        return;
+    }
+    if (!parse_pin(spec, len, &at, &mebibytes, &per_read) || mebibytes == 0) {
+        return;
+    }
+    per_read = per_read == 0 ? 1u : per_read;
+    if ((uint64_t)per_read * dev->block_size > sizeof bench_buffer) {
+        per_read = (uint32_t)(sizeof bench_buffer / dev->block_size);
+    }
+    blocks = ((uint64_t)mebibytes << 20) / dev->block_size;
+    blocks = blocks > dev->blocks ? dev->blocks : blocks;
+    started = timer_ns();
+    while (done < blocks) {
+        uint32_t n = (uint64_t)per_read > blocks - done ? (uint32_t)(blocks - done) : per_read;
+        if (dev->read(dev->self, done, n, bench_buffer) != KERR_OK) {
+            kprintf("bench: read of %u blocks at %llu failed\n", n, (unsigned long long)done);
+            return;
+        }
+        done += n;
+    }
+    elapsed_ms = (timer_ns() - started) / 1000000u;
+    elapsed_ms = elapsed_ms == 0 ? 1u : elapsed_ms;
+    kprintf("bench: %llu KiB in %llu ms, %llu KiB/s, %u blocks a read\n",
+            (unsigned long long)((done * dev->block_size) / 1024u),
+            (unsigned long long)elapsed_ms,
+            (unsigned long long)((done * dev->block_size) / 1024u * 1000u / elapsed_ms),
+            per_read);
+}
+
 static void bring_up_filesystem(void) {
     int rc = xfsmount_attach();
     int32_t entries;
@@ -336,11 +395,56 @@ static void bring_up_filesystem(void) {
     }
     kprintf("xfs: mounted read-only, %d entries in /\n", entries);
     (void)xfsmount_show_file("/hello.txt");
+    checksum_a_file();
+}
+
+/* Reads a whole file and prints its length and SHA-256.
+ *
+ * `minikern.sha=/path` — the point is the *whole* file. Listing a directory
+ * proves the inode and its name; reading one block proves the first extent.
+ * A file of a few megabytes is the first thing that needs the extent list
+ * walked to its end, and a hash of it is a statement the operator can check
+ * against the same file on another machine, which is a stronger claim than
+ * "no error was reported".
+ *
+ * **A `+` in the path means a space.** A kernel command line is separated by
+ * spaces, so a file whose name contains one cannot be written literally —
+ * the option ends at the space and the path is silently truncated, which is
+ * how `/2026-09-12 20-49-06.mp4` arrived here as `/2026-09-12`. The
+ * substitution is the same convention a query string uses, and it is needed
+ * precisely because a filename with a space in it is ordinary while a
+ * command line that can carry one is not. */
+static void checksum_a_file(void) {
+    size_t len = 0;
+    const char *path = cmdline_value(boot_cmdline, "minikern.sha", &len);
+    static char name[128];
+    uint8_t digest[32];
+    uint64_t size = 0;
+    int rc;
+    if (path == NULL || len == 0 || len >= sizeof name) {
+        return;
+    }
+    for (size_t i = 0; i < len; i++) {
+        name[i] = path[i] == '+' ? ' ' : path[i];
+    }
+    name[len] = '\0';
+    rc = xfsmount_hash_file(name, digest, &size);
+    if (rc != KERR_OK) {
+        kprintf("xfs: %s could not be read (rc %d)\n", name, rc);
+        return;
+    }
+    {
+        char hex[65];
+        sha256_format(digest, hex);
+        kprintf("xfs: %s is %llu bytes, sha256 %s\n", name, (unsigned long long)size, hex);
+    }
 }
 
 static void drive_a_pin(void);
 static void read_a_pin(void);
 static void loopback_pins(void);
+static void dump_pin_registers(void);
+static void set_a_padcfg(void);
 
 /* ── the other harts ───────────────────────────────────────────────────────── */
 
@@ -450,6 +554,23 @@ static void bring_up_other_harts(uint64_t dtb, uint64_t boot_hart) {
     }
     kprintf("smp: %u of %u started harts reached the kernel, %u running in total\n",
             harts_arrived, want, smp_running_count());
+    if (uspace_unrecorded_regions() != 0) {
+        kprintf("uspace: **%u mappings the address-space record could not hold**\n",
+                uspace_unrecorded_regions());
+    }
+    if (uspace_replaced_pages() != 0) {
+        kprintf("uspace: **%u live pages replaced by an unfixed mapping**\n",
+                uspace_replaced_pages());
+    }
+    if (sched_spawn_failures() != 0 || sched_stack_overflows() != 0 ||
+        sched_slot_aliases() != 0) {
+        kprintf("sched: %u threads refused, %u stacks overflowed, %u slots aliased\n",
+                sched_spawn_failures(), sched_stack_overflows(), sched_slot_aliases());
+    }
+    if (smp_hart_misses() != 0) {
+        kprintf("smp: **%u harts failed to identify themselves** and shared hart 0's state\n",
+                smp_hart_misses());
+    }
 }
 
 /* The network: the device, the stack, and a lease.
@@ -557,6 +678,8 @@ static void bring_up_gpio(uint64_t dtb) {
         }
     }
     read_a_pin();
+    dump_pin_registers();
+    set_a_padcfg();
     loopback_pins();
     drive_a_pin();
 }
@@ -703,33 +826,103 @@ static void loopback_pins(void) {
     }
 }
 
-static void drive_a_pin(void) {
-    uint32_t controller = 0, pin = 0;
-    bool high = false;
-    int rc;
-    if (!pin_from_cmdline("minikern.gpio", &controller, &pin)) {
+/* Drives each named pin and reads it back on itself.
+ *
+ * `minikern.gpio=<controller>:<pin>[,...]` — a list, so one boot can compare
+ * several pins side by side. That comparison is the point: a pin that drives
+ * and a pin that does not, in the same boot, localises a fault to the pad
+ * rather than to the driver.
+ *
+ * It is **opt-in and names the pins**, because driving one on a board whose
+ * schematic the kernel has not seen is how a kernel shorts something: a pin
+ * that is an input with a pull-up, or wired to a power-enable, does not
+ * forgive being driven low. So the operator says which pin, having looked.
+ *
+ * A self-readback is weaker evidence than a wire (`minikern.gpio.loop`): it
+ * cannot separate "the level reached the pad" from "the controller remembers
+ * what it was told". It is here for when there is no wire. */
+/* Dumps a window of a pin controller's registers.
+ *
+ * `minikern.gpio.dump=<controller>:<word index>` prints 16 words from there.
+ * It is **read-only**, and it exists because this driver drives a pin's
+ * output registers without selecting the pad's function: on the board one
+ * header pin could be driven and its neighbour could not. Which register
+ * holds that selection is a thing to *measure* — by comparing the words
+ * belonging to a pin that works against one that does not — rather than to
+ * guess from a datasheet this kernel cannot check. A guess written to a pin
+ * controller can drive a pad wired to something that does not forgive it. */
+/* Sets one named pin's pad configuration.
+ *
+ * `minikern.gpio.padcfg=<controller>:<pin>:<value>` — an experiment, not a
+ * feature. It exists because measuring showed a single pad-config bit
+ * separating the one header pin that could be driven from three that could
+ * not, and the only way to confirm which bit that is, is to set it and look.
+ * Scoped to a named pin so the write cannot land on an unrelated pad. */
+static void set_a_padcfg(void) {
+    size_t len = 0;
+    const char *spec = cmdline_value(boot_cmdline, "minikern.gpio.padcfg", &len);
+    uint32_t at = 0, controller = 0, pin = 0, value = 0;
+    if (spec == NULL || !parse_pin(spec, len, &at, &controller, &pin)) {
         return;
     }
-    kprintf("gpio: driving controller %u pin %u\n", controller, pin);
-    for (uint32_t step = 0; step < 2u; step++) {
-        bool want = step == 0;
-        rc = gpio_jh7110_set_output(controller, pin, want);
-        if (rc != KERR_OK) {
-            kprintf("gpio: could not drive it %s (rc %d)\n", want ? "high" : "low", rc);
-            return;
-        }
-        rc = gpio_jh7110_read(controller, pin, &high);
-        if (rc != KERR_OK) {
-            kprintf("gpio: could not read it back (rc %d)\n", rc);
-            return;
-        }
-        kprintf("gpio: drove %s, reads back %s%s\n", want ? "high" : "low", high ? "high" : "low",
-                high == want ? "" : " — which does not match, so the write did not reach the pin");
+    at += at < len && spec[at] == ':' ? 1u : 0u; /* the separator before the value */
+    while (at < len && spec[at] >= '0' && spec[at] <= '9') {
+        value = value * 10u + (uint32_t)(spec[at++] - '0');
     }
-    /* Left as an input afterwards: a pin this kernel was asked to poke at
-     * once should not stay driven for the rest of the machine's life. */
+    kprintf("gpio: setting %u:%u padcfg to %02x\n", controller, pin, value);
+    (void)gpio_jh7110_set_padcfg(controller, pin, value);
+}
+
+static void dump_pin_registers(void) {
+    uint32_t controller = 0, first = 0;
+    if (!pin_from_cmdline("minikern.gpio.dump", &controller, &first)) {
+        return;
+    }
+    for (uint32_t i = 0; i < 16u; i += 4u) {
+        uint32_t w[4] = {0, 0, 0, 0};
+        for (uint32_t j = 0; j < 4u; j++) {
+            (void)gpio_jh7110_peek(controller, (first + i + j) * 4u, &w[j]);
+        }
+        kprintf("gpio: +%04x  %08x %08x %08x %08x\n", (first + i) * 4u, w[0], w[1], w[2], w[3]);
+    }
+}
+
+static void drive_one_pin(uint32_t controller, uint32_t pin) {
+    uint32_t matched = 0;
+    uint32_t pad = 0;
+    if (gpio_jh7110_get_padcfg(controller, pin, &pad) == KERR_OK) {
+        kprintf("gpio: %u:%u padcfg %02x\n", controller, pin, pad);
+    }
+    for (uint32_t step = 0; step < 2u; step++) {
+        bool want = step == 0, got = false;
+        int rc = gpio_jh7110_set_output(controller, pin, want);
+        if (rc != KERR_OK) {
+            kprintf("gpio: could not drive %u:%u (rc %d)\n", controller, pin, rc);
+            return;
+        }
+        if (gpio_jh7110_read(controller, pin, &got) != KERR_OK) {
+            kprintf("gpio: could not read %u:%u back\n", controller, pin);
+            return;
+        }
+        kprintf("gpio: %u:%u drove %s, reads %s\n", controller, pin, want ? "high" : "low",
+                got ? "high" : "low");
+        matched += got == want ? 1u : 0u;
+    }
+    kprintf("gpio: %u:%u self-readback %s (%u of 2)\n", controller, pin,
+            matched == 2u ? "OK" : "FAILED", matched);
     (void)gpio_jh7110_set_input(controller, pin);
-    kprintf("gpio: left pin %u as an input\n", pin);
+}
+
+static void drive_a_pin(void) {
+    size_t len = 0;
+    const char *spec = cmdline_value(boot_cmdline, "minikern.gpio", &len);
+    uint32_t at = 0, controller = 0, pin = 0;
+    if (spec == NULL) {
+        return;
+    }
+    while (parse_pin(spec, len, &at, &controller, &pin)) {
+        drive_one_pin(controller, pin);
+    }
 }
 
 /* Runs the user-mode programs, if asked.
@@ -848,6 +1041,7 @@ static void run_user_programs(void) {
      * starts half way through is worse than none, because the first half
      * looks quiet. */
     sched_set_trace(cmdline_has(boot_cmdline, "minikern.trace"));
+    sched_set_dynticks(cmdline_has(boot_cmdline, "minikern.dynticks"));
     /* `minikern.calls=N` traces the first N calls. A fixed budget was
      * useless for anything that happens late — the budget was gone long
      * before a child process made its first call. */
@@ -855,6 +1049,12 @@ static void run_user_programs(void) {
     syscall_trace_sleeps(cmdline_has(boot_cmdline, "minikern.sleeps"));
     syscall_trace_errors(cmdline_has(boot_cmdline, "minikern.errors"));
     signal_set_delivery(!cmdline_has(boot_cmdline, "minikern.nosignals"));
+    uspace_broadcast_additions(cmdline_has(boot_cmdline, "minikern.tlbsafe"));
+    {
+        size_t envlen = 0;
+        const char *env = cmdline_value(boot_cmdline, "minikern.env", &envlen);
+        uspace_set_extra_env(env, (uint32_t)envlen);
+    }
     syscall_allow_tgkill(!cmdline_has(boot_cmdline, "minikern.nopreempt"));
     if (cmdline_has(boot_cmdline, "minikern.user")) {
         run_one_user_program("hello", user_program_start, user_program_end);
@@ -904,8 +1104,18 @@ void kmain(uint64_t hart, uint64_t dtb) {
     bring_up_clocks(dtb);
     bring_up_storage(dtb);
     bring_up_filesystem();
+    run_disk_benchmark();
     bring_up_gpio(dtb);
     bring_up_other_harts(dtb, hart);
+    /* **After the harts are up**, because half of what it measures is about
+     * them: how many are schedulable, and what an interrupt between two of
+     * them costs. */
+    if (cmdline_has(boot_cmdline, "minikern.probe")) {
+        struct fdt probe_tree;
+        if (fdt_open(&probe_tree, (const void *)(uintptr_t)dtb, FDT_MAX_BYTES) == KERR_OK) {
+            probe_report(&probe_tree);
+        }
+    }
     bring_up_network(dtb);
     wait_for_ticks();
     run_user_programs();

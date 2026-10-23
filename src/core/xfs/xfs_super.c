@@ -137,6 +137,7 @@ static int check_features(struct xfs *fs, const uint8_t *sb) {
                 ro & ~XFS_FEAT_RO_SUPPORTED);
         fs->write_refused = true;
     }
+    fs->big_extent_counts = (in & XFS_FEAT_IN_NREXT64) != 0;
     if ((in & ~XFS_FEAT_IN_SUPPORTED) != 0) {
         kprintf("xfs: unsupported features %08x (sparse inodes, nrext64 or needsrepair: refused)\n",
                 in & ~XFS_FEAT_IN_SUPPORTED);

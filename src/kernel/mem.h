@@ -29,6 +29,13 @@ int mem_init(const struct bootinfo *info, phys_t arena_base, uint64_t arena_byte
 int mem_alloc_pages(uint32_t npages, uint32_t align_pages, phys_t *phys);
 int mem_free_pages(phys_t phys, uint32_t npages);
 
+/* Says that one more address space is using this frame, so freeing it once
+ * does not take it away from the other. See `pmm_share`. */
+int mem_share_page(phys_t phys);
+
+/* How many address spaces hold a frame. 1 for an ordinary allocation. */
+uint32_t mem_page_shares(phys_t phys);
+
 /* Kernel objects, from the heap over those frames. */
 void *kmalloc(uint32_t bytes);
 void *kzalloc(uint32_t bytes);

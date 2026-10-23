@@ -272,6 +272,12 @@ static void on_user_return(struct trapframe *tf) {
         return;
     }
     (void)signal_deliver(tf);
+    /* **On the way back to user mode, say when to be interrupted next.**
+     * Every trap can change the answer — a syscall that blocked, a signal
+     * that woke something, a thread that ended — and this is the one place
+     * every one of them passes through. `timer_arm_at` skips the firmware
+     * call when the answer has not changed, which it usually has not. */
+    sched_arm_timer();
 }
 
 /* A fault on an address that **is** mapped, which means this hart's TLB had
@@ -285,6 +291,91 @@ static void on_user_return(struct trapframe *tf) {
  *
  * `sepc` is deliberately left alone: the faulting instruction runs again.
  */
+/* Resolves a store to a page two address spaces share.
+ *
+ * The page is read-only with `PTE_COW` set, so the store faulted. What
+ * happens next depends on how many holders the frame still has:
+ *
+ *   - **One.** Everyone else has gone, so there is nothing to copy: give the
+ *     write bit back and let the store proceed. A process that forks in a
+ *     loop would otherwise copy the same page every time.
+ *   - **More than one.** A private copy is made, the old frame loses this
+ *     holder, and the new one is mapped writable.
+ *
+ * The mapping is only ever made *more* permissive for this hart, so a local
+ * fence is enough: another hart that still has the read-only entry is
+ * correct to have it — the page really is read-only for the other process.
+ */
+static uint32_t cow_copies;
+static uint32_t cow_takeovers;
+
+uint32_t uspace_cow_copies(void) {
+    return cow_copies;
+}
+
+uint32_t uspace_cow_takeovers(void) {
+    return cow_takeovers;
+}
+
+static bool resolve_copy_on_write(struct trapframe *tf) {
+    virt_t va = tf->stval & ~(virt_t)(PAGE_SIZE - 1u);
+    /* **The faulting thread's process, not "the" process.**
+     *
+     * This used the single global that `uspace_run` sets to the first
+     * process and never changes, which was right while there was only ever
+     * one. With a real `fork` there are two, and the child's first store to
+     * a copy-on-write page was resolved against the *parent's* page tables:
+     * the parent's entry was made writable, the child's was not, and the
+     * child faulted on the same instruction for ever — silently, because a
+     * handled fault prints nothing. Isolation starts with knowing whose
+     * address space the fault is in. */
+    struct uproc *me = uspace_current();
+    phys_t phys = 0, fresh = 0;
+    uint64_t prot = 0, size = 0;
+    if ((tf->scause & ~SCAUSE_INTERRUPT) != EXC_STORE_PAGE_FAULT || me == NULL) {
+        return false;
+    }
+    if (!pgtable_lookup(&me->pt, va, &phys, &prot, &size) || (prot & PTE_COW) == 0) {
+        if (cow_copies + cow_takeovers < 6u && syscall_tracing_errors()) {
+            kprintf("cow: pid %u fault at %016llx: mapped %u prot %llx\n", me->pid,
+                    (unsigned long long)va,
+                    pgtable_lookup(&me->pt, va, &phys, &prot, &size) ? 1u : 0u,
+                    (unsigned long long)prot);
+        }
+        return false;
+    }
+    if (cow_copies + cow_takeovers < 6u && syscall_tracing_errors()) {
+        kprintf("cow: pid %u copying %016llx (%u holders)\n", me->pid, (unsigned long long)va,
+                mem_page_shares(phys & ~(phys_t)(PAGE_SIZE - 1u)));
+    }
+    phys &= ~(phys_t)(PAGE_SIZE - 1u);
+    if (mem_page_shares(phys) <= 1u) {
+        (void)pgtable_unmap(&me->pt, va);
+        if (pgtable_map(&me->pt, va, phys, PAGE_SIZE, (prot & ~PTE_COW) | PTE_W) !=
+            KERR_OK) {
+            return false;
+        }
+        cow_takeovers++;
+        mmu_flush_tlb_local();
+        return true;
+    }
+    if (mem_alloc_pages(1, 1, &fresh) != KERR_OK) {
+        return false;
+    }
+    for (uint32_t i = 0; i < PAGE_SIZE; i++) {
+        ((volatile uint8_t *)(uintptr_t)fresh)[i] = ((const volatile uint8_t *)(uintptr_t)phys)[i];
+    }
+    (void)pgtable_unmap(&me->pt, va);
+    if (pgtable_map(&me->pt, va, fresh, PAGE_SIZE, (prot & ~PTE_COW) | PTE_W) != KERR_OK) {
+        (void)mem_free_pages(fresh, 1);
+        return false;
+    }
+    (void)mem_free_pages(phys, 1); /* one holder fewer, not necessarily freed */
+    cow_copies++;
+    mmu_flush_tlb_local();
+    return true;
+}
+
 static bool retry_after_stale_translation(struct trapframe *tf) {
     uint64_t code = tf->scause & ~SCAUSE_INTERRUPT;
     uint64_t want;
@@ -299,8 +390,13 @@ static bool retry_after_stale_translation(struct trapframe *tf) {
     } else {
         return false;
     }
-    if (running == NULL || !pgtable_lookup(&running->pt, tf->stval, &phys, &flags, &size)) {
-        return false;
+    /* The faulting thread's process, for the same reason the copy-on-write
+     * handler needs it: a stale translation belongs to one address space. */
+    {
+        struct uproc *me = uspace_current();
+        if (me == NULL || !pgtable_lookup(&me->pt, tf->stval, &phys, &flags, &size)) {
+            return false;
+        }
     }
     /* Mapped, for user mode, with the right to do what was attempted — so
      * the tables and the hardware disagree, and the hardware is the one
@@ -354,6 +450,29 @@ static bool fault_becomes_a_signal(struct trapframe *tf) {
     return signal_deliver(tf);
 }
 
+/* Faults the kernel resolved and returned from.
+ *
+ * **A handled fault prints nothing**, which is right when there are a few of
+ * them and hides a disaster when there are millions: a handler that resolves
+ * a fault without actually changing anything leaves the instruction to fault
+ * again, for ever, in complete silence. Counting them is how that looks like
+ * something. */
+static uint32_t handled_faults;
+
+uint32_t uspace_handled_faults(void) {
+    return handled_faults;
+}
+
+static void trace_handled_fault(const struct trapframe *tf, const char *how) {
+    /* The first few only: a loop announces itself in ten lines, and ten
+     * thousand would be the same disaster with the evidence scrolled off. */
+    if (handled_faults > 12u || !syscall_tracing_errors()) {
+        return;
+    }
+    kprintf("fault: %s at sepc %016llx, stval %016llx (%s)\n", trap_cause_name(tf->scause),
+            (unsigned long long)tf->sepc, (unsigned long long)tf->stval, how);
+}
+
 static bool on_user_trap(struct trapframe *tf) {
     if ((tf->scause & SCAUSE_INTERRUPT) != 0) {
         return false; /* an interrupt: the trap layer deals with those */
@@ -370,7 +489,17 @@ static bool on_user_trap(struct trapframe *tf) {
         tf->sepc += step ? 4u : 0u;
         return true;
     }
+    /* **Before the stale-translation retry**, because a copy-on-write page
+     * is mapped and readable, so that check would see a mapping with the
+     * rights the access wanted and retry for ever. */
+    if (resolve_copy_on_write(tf)) {
+        handled_faults++;
+        trace_handled_fault(tf, "copy-on-write");
+        return true;
+    }
     if (retry_after_stale_translation(tf)) {
+        handled_faults++;
+        trace_handled_fault(tf, "stale translation");
         return true;
     }
     if (fault_becomes_a_signal(tf)) {
@@ -380,9 +509,17 @@ static bool on_user_trap(struct trapframe *tf) {
      * stops, and the kernel carries on. Reporting it this way — rather than
      * panicking — is the whole difference between a user fault and a kernel
      * one. */
-    kprintf("\nuspace: fault in user code (pid %u): %s at sepc %016llx, stval %016llx\n",
-            uspace_current() != NULL ? uspace_current()->pid : 0u, trap_cause_name(tf->scause),
-            (unsigned long long)tf->sepc, (unsigned long long)tf->stval);
+    /* **Which thread**, not just which process. With one thread the pid
+     * said everything; with four harts running four of them, "a fault
+     * happened somewhere in this program" is not something anyone can act
+     * on — and the thread's own stack is usually the first thing to compare
+     * the faulting address against. */
+    kprintf("\nuspace: fault in user code (pid %u tid %llu, sp %016llx): %s at sepc %016llx, "
+            "stval %016llx\n",
+            uspace_current() != NULL ? uspace_current()->pid : 0u,
+            (unsigned long long)sched_current_tid(), (unsigned long long)tf->x[2],
+            trap_cause_name(tf->scause), (unsigned long long)tf->sepc,
+            (unsigned long long)tf->stval);
     /* The registers, when asked for. A faulting address alone says where the
      * program stopped but not what it was holding, and the difference
      * between "a pointer was null" and "a pointer was wrong" is the whole
@@ -512,6 +649,13 @@ static uint64_t prot_bits(uint32_t prot) {
 static int load_segment(struct uproc *p, const struct elf_load *l, const uint8_t *image) {
     uint64_t start = l->vaddr & ~(PAGE_SIZE - 1u);
     uint64_t end = (l->vaddr + l->memsz + PAGE_SIZE - 1u) & ~(PAGE_SIZE - 1u);
+    /* The program's own segments belong in the address space's record like
+     * everything else. They are below the window `mmap` places into, so
+     * nothing would be put on top of them — but a record that is only
+     * *mostly* complete cannot be walked, and `fork` has to walk it to copy
+     * an address space. Overlap at a page shared by two segments is
+     * expected and is not an error here. */
+    (void)vma_insert(&p->vmas, start, end, l->prot, 0);
     for (uint64_t va = start; va < end; va += PAGE_SIZE) {
         phys_t page = 0;
         uint64_t have = 0, want = 0, size = 0;
@@ -595,14 +739,40 @@ static int map_signal_trampoline(struct uproc *p) {
     return pgtable_map(&p->pt, SIGNAL_TRAMPOLINE, page, PAGE_SIZE, PTE_R | PTE_X | PTE_U);
 }
 
+static void record_fixed_regions(struct uproc *p);
+
+/* Mappings the address-space record could not hold. Any value but zero means
+ * placement may hand out an address that is already in use. */
+static uint32_t unrecorded_regions;
+
+uint32_t uspace_unrecorded_regions(void) {
+    return unrecorded_regions;
+}
+
+/* The extra environment variable, copied because the command line it comes
+ * from is not kept. */
+static char extra_env[128];
+
+void uspace_set_extra_env(const char *text, uint32_t len) {
+    uint32_t i = 0;
+    for (; text != NULL && i < len && i + 1u < sizeof extra_env; i++) {
+        extra_env[i] = text[i];
+    }
+    extra_env[i] = '\0';
+}
+
 /* Builds the stack: the block is assembled in the page that will be the top
  * of the stack, then mapped. Assembling it in place would need the process's
  * address space to be loaded, which it is not yet. */
 static int build_start_state(struct uproc *p, const struct elf_image *img, const char *path,
                              const char *const *argv, uint32_t argc) {
     struct auxv_pair auxv[USTACK_MAX_AUXV];
-    const char *envp[2] = {"HOME=/", "PATH=/"};
-    struct ustack_args args = {.argv = argv, .argc = argc, .envp = envp, .envc = 2u, .auxv = auxv,
+    const char *envp[3] = {"HOME=/", "PATH=/", extra_env};
+    struct ustack_args args = {.argv = argv,
+                               .argc = argc,
+                               .envp = envp,
+                               .envc = extra_env[0] != '\0' ? 3u : 2u,
+                               .auxv = auxv,
                                .execfn = path};
     phys_t stack = 0;
     virt_t sp = 0;
@@ -619,6 +789,7 @@ static int build_start_state(struct uproc *p, const struct elf_image *img, const
     }
     /* The block lands at the very top of the stack, so it is built into the
      * last page's worth of the allocation. */
+    record_fixed_regions(p);
     rc = ustack_build((uint8_t *)(uintptr_t)stack, USER_STACK_PAGES * PAGE_SIZE, USER_STACK_TOP,
                       &args, &sp, &used);
     if (rc != KERR_OK) {
@@ -659,6 +830,10 @@ int uspace_build_elf_args(struct uproc *p, const uint8_t *image, uint32_t bytes,
     p->main_tid = 0;
     p->built = false;
     p->shares_pt = false;
+    /* A fresh address space has nothing in it. A process slot is reused, so
+     * the previous occupant's regions would otherwise still be recorded and
+     * placement would refuse addresses that are free. */
+    p->vmas.n = 0;
     rc = elf_parse(image, bytes, USER_TOP, &img);
     if (rc != KERR_OK) {
         return rc;
@@ -1029,23 +1204,156 @@ static int back_one_page(struct uproc *p, virt_t va, uint32_t prot) {
     return rc;
 }
 
-/* Where to put a mapping the caller did not insist on. The hint is honoured
- * when it is free and inside user space, because a runtime that places its
- * heap by hint gets a tidier address space when the hint works — and must
- * not fail when it does not. */
-static virt_t place_mapping(struct uproc *p, virt_t at, uint64_t pages) {
+/* Live pages destroyed by a mapping nobody insisted on. Always a bug. */
+static uint32_t replaced_pages;
+
+uint32_t uspace_replaced_pages(void) {
+    return replaced_pages;
+}
+
+/* Records the regions a process is given before it runs a single
+ * instruction: its stack and the page its signal handlers return through.
+ *
+ * **Neither is made by `mmap`, and both are in the window `mmap` places
+ * into.** The address-space record only knew about mappings the program
+ * asked for, so a gap search handed out the stack's own addresses — the
+ * first allocation a Go runtime made landed on the stack it was running on,
+ * and the program jumped to nothing. A record of the address space has to
+ * include everything in it, not everything the program requested. */
+static void record_fixed_regions(struct uproc *p) {
+    virt_t stack_low = USER_STACK_TOP - (virt_t)USER_STACK_PAGES * PAGE_SIZE;
+    (void)vma_insert(&p->vmas, stack_low, USER_STACK_TOP, PROT_READ | PROT_WRITE, VMA_GROWSDOWN);
+    (void)vma_insert(&p->vmas, SIGNAL_TRAMPOLINE, SIGNAL_TRAMPOLINE + PAGE_SIZE,
+                     PROT_READ | PROT_EXEC, 0);
+}
+
+/* ── fork ──────────────────────────────────────────────────────────────── */
+
+static void published_removal(void);
+
+/* One page of a parent's address space, given to a child **copy-on-write**.
+ *
+ * A writable page becomes read-only in *both*, with `PTE_COW` set so the
+ * fault handler knows the next store is a copy to make rather than a
+ * program's mistake. A read-only page is simply shared: neither can write
+ * it, so there is nothing to copy. Either way the frame gains a holder, so
+ * whichever process lets go first does not take it from the other.
+ *
+ * The parent's entry changes, which is a *removal* of rights, so it has to
+ * reach every hart before either process runs again — the caller does that
+ * once for the whole address space rather than once per page. */
+static int give_page_cow(struct uproc *child, struct uproc *parent, virt_t va) {
     phys_t phys = 0;
-    uint64_t flags = 0, size = 0;
-    virt_t chosen;
-    if (at != 0 && (at & (PAGE_SIZE - 1u)) == 0 && at + pages * PAGE_SIZE <= USER_STACK_TOP &&
-        !pgtable_lookup(&p->pt, at, &phys, &flags, &size)) {
-        return at;
+    uint64_t prot = 0, size = 0;
+    int rc;
+    if (!pgtable_lookup(&parent->pt, va, &phys, &prot, &size)) {
+        return KERR_OK; /* a hole: nothing to give */
     }
-    chosen = p->mmap_next;
-    if (chosen + pages * PAGE_SIZE > USER_STACK_TOP) {
+    if ((prot & PTE_U) == 0) {
+        return KERR_OK; /* the kernel's own mapping, shared another way */
+    }
+    if ((prot & PTE_W) != 0) {
+        uint64_t shared = (prot & ~PTE_W) | PTE_COW;
+        (void)pgtable_unmap(&parent->pt, va);
+        rc = pgtable_map(&parent->pt, va, phys, PAGE_SIZE, shared);
+        rc = rc != KERR_OK ? rc : pgtable_map(&child->pt, va, phys, PAGE_SIZE, shared);
+    } else {
+        rc = pgtable_map(&child->pt, va, phys, PAGE_SIZE, prot);
+    }
+    return rc != KERR_OK ? rc : mem_share_page(phys);
+}
+
+/* Gives a child every region the parent has, page by page. */
+static int give_address_space(struct uproc *child, struct uproc *parent) {
+    for (uint32_t i = 0; i < parent->vmas.n; i++) {
+        virt_t at = parent->vmas.v[i].start;
+        virt_t end = parent->vmas.v[i].end;
+        for (; at < end; at += PAGE_SIZE) {
+            int rc = give_page_cow(child, parent, at);
+            if (rc != KERR_OK) {
+                return rc;
+            }
+        }
+    }
+    /* The break is not an `mmap` region and is not recorded as one, so it
+     * is walked explicitly. */
+    for (virt_t at = parent->brk_floor; at < parent->brk; at += PAGE_SIZE) {
+        int rc = give_page_cow(child, parent, at);
+        if (rc != KERR_OK) {
+            return rc;
+        }
+    }
+    return KERR_OK;
+}
+
+/* A real `fork`: the child gets an address space **of its own**.
+ *
+ * Of its own, and initially made of the parent's pages: every writable page
+ * is marked read-only and copy-on-write in both, so the first store by
+ * either produces a private copy and nothing else is copied at all. A
+ * process that forks and immediately execs copies nothing but page tables.
+ *
+ * This is what `uspace_fork_shared` is not. That one hands the child the
+ * parent's tables and requires the parent to be suspended until the child
+ * execs — which is `vfork`, and which cannot support a parent that keeps
+ * running. Isolation is the point: after this, neither process can reach
+ * the other's memory, whatever either of them does.
+ *
+ * The parent's own entries lose their write bit here, so the change is a
+ * removal and must reach every hart before the parent runs again
+ * (`published_removal`). Doing it once for the whole address space rather
+ * than per page is the difference between one firmware call and thousands. */
+int uspace_fork(struct uproc *child, struct uproc *parent) {
+    struct pt_mem mem = {.alloc = proc_alloc, .free = proc_free, .to_virt = proc_to_virt};
+    uint32_t pid = child->pid;
+    int rc;
+    child->pt = (struct pgtable){0};
+    rc = pgtable_create(&child->pt, &mem);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    child->shares_pt = false;
+    child->vmas = parent->vmas;
+    child->entry = parent->entry;
+    child->stack_top = parent->stack_top;
+    child->brk = parent->brk;
+    child->brk_floor = parent->brk_floor;
+    child->mmap_next = parent->mmap_next;
+    child->pid = pid;
+    child->parent_pid = parent->pid;
+    for (uint32_t i = 0; i < SIG_COUNT; i++) {
+        child->actions[i] = parent->actions[i];
+    }
+    rc = give_address_space(child, parent);
+    rc = rc != KERR_OK ? rc : share_kernel_mappings(&child->pt);
+    if (rc != KERR_OK) {
+        pgtable_destroy(&child->pt);
+        return rc;
+    }
+    child->built = true;
+    published_removal();
+    return fd_copy_table(child, parent);
+}
+
+/* Where to put a mapping the caller did not insist on.
+ *
+ * **The address space answers this, not the page tables.** A hint is
+ * honoured when the whole range is free and inside user space, and
+ * otherwise a gap is found — and "free" has to include ranges that have no
+ * pages, which is what a `PROT_NONE` reservation is. Asking the page tables
+ * could not see one, so a mapping could be placed inside a runtime's
+ * reserved arena and then mapped over when the runtime committed it.
+ *
+ * `vma_find_free` takes the hint and the window and does both cases, which
+ * is why the bump cursor is gone: a cursor can only ever move forwards, so
+ * it could not step over a reservation without eventually walking off the
+ * end of user space. */
+static virt_t place_mapping(struct uproc *p, virt_t at, uint64_t pages) {
+    virt_t bytes = pages * PAGE_SIZE;
+    virt_t chosen = 0;
+    if (vma_find_free(&p->vmas, bytes, at, USER_MMAP_BASE, USER_STACK_TOP, &chosen) != KERR_OK) {
         return 0;
     }
-    p->mmap_next = chosen + pages * PAGE_SIZE;
     return chosen;
 }
 
@@ -1074,7 +1382,21 @@ static void published_removal(void) {
     mmu_flush_tlb_everywhere();
 }
 
+/* Whether an addition is broadcast too. Off by default — see above — and a
+ * knob rather than a constant because "is the cheap asymmetry sound?" is a
+ * question only a four-hart machine can answer, and answering it needs the
+ * expensive version to compare against. */
+static bool broadcast_additions;
+
+void uspace_broadcast_additions(bool on) {
+    broadcast_additions = on;
+}
+
 static void published_addition(void) {
+    if (broadcast_additions) {
+        mmu_flush_tlb_everywhere();
+        return;
+    }
     mmu_flush_tlb_local();
 }
 
@@ -1094,15 +1416,44 @@ int uspace_map_anon(struct uproc *p, virt_t at, uint64_t bytes, uint32_t prot, b
         return KERR_NOMEM;
     }
     /* A fixed mapping replaces whatever is there, which is how a runtime
-     * commits part of a reservation it already holds. */
+     * commits part of a reservation it already holds. A mapping the caller
+     * did *not* insist on must never replace anything — it was placed
+     * somewhere free — so when it does, that is a placement bug destroying
+     * live memory, and it is counted rather than left to be inferred from
+     * the program misbehaving later. */
     for (uint64_t i = 0; i < pages; i++) {
         virt_t va = base + i * PAGE_SIZE;
         int rc;
+        if (!fixed) {
+            phys_t was = 0;
+            uint64_t f = 0, sz = 0;
+            if (pgtable_lookup(&p->pt, va, &was, &f, &sz)) {
+                replaced_pages++;
+            }
+        }
         (void)uspace_unmap(p, va, PAGE_SIZE);
         rc = back_one_page(p, va, prot);
         if (rc != KERR_OK) {
             return rc;
         }
+    }
+    /* Recorded whatever its rights are: a reservation is a region of the
+     * address space that is spoken for, and the whole point of the set is
+     * that it says so. A fixed mapping replaces what was there, so the old
+     * regions go first.
+     *
+     * **A mapping that cannot be recorded is refused**, and the pages it
+     * had been given are handed back. An unrecorded region is worse than a
+     * failed `mmap`: the next gap search cannot see it, so it hands the same
+     * addresses out again and two allocations share pages. A program that
+     * is told `ENOMEM` can cope; one that is given memory somebody else is
+     * using cannot. The failure is silent and total — measured, a kernel
+     * that kept going here stopped producing any output at all. */
+    if (vma_remove(&p->vmas, base, base + pages * PAGE_SIZE, NULL, NULL) != KERR_OK ||
+        vma_insert(&p->vmas, base, base + pages * PAGE_SIZE, prot, 0) != KERR_OK) {
+        unrecorded_regions++;
+        (void)uspace_unmap(p, base, pages * PAGE_SIZE);
+        return KERR_NOMEM;
     }
     *out = base;
     published_addition();
@@ -1143,6 +1494,10 @@ int uspace_unmap(struct uproc *p, virt_t at, uint64_t bytes) {
 
 int uspace_protect(struct uproc *p, virt_t at, uint64_t bytes, uint32_t prot) {
     uint64_t pages = 0;
+    /* The record follows the rights, not only the ranges: a region whose
+     * permissions changed is still the same region, and a reader of the set
+     * that saw stale rights would answer a fault wrongly. */
+    (void)vma_protect(&p->vmas, at, at + bytes, prot);
     if ((at & (PAGE_SIZE - 1u)) != 0 || !page_count(bytes, &pages)) {
         return KERR_INVAL;
     }

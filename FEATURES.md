@@ -17,7 +17,8 @@ with every one of the mistakes they found.
 | **Four U74 cores running Go**, `NumCPU=4`, **3.3x** on 8 units of work | a lost-increment race in the hart-arrival counter: it was a plain `running++`, and that number reaches user space as `NumCPU`, so the board ran Go on two of its four cores with nothing looking wrong |
 | **An SD card**, through the controller the board actually has | the documentation said Cadence SDHCI; the board's tree says `starfive,jh7110-mmc`, a DesignWare MSHC. Two transports now share one copy of the card protocol |
 | **XFS mounted from that card, and a stock Go binary loaded off it and run** | `logstart` is an AG-encoded block number — this filesystem's *write* path converted it and its *read* path did not, so the two halves disagreed about where the log was |
-| **An NVMe drive in the M.2 slot**: `TS128GMTE110S`, 122 GB | the board's PCIe is `starfive,jh7110-pcie`, read through the link the firmware trained; and a command's data pointer must be page-aligned, which `kzalloc` is not |
+| **An NVMe drive in the M.2 slot**: `TS128GMTE110S`, 122 GB, at **334 MB/s** | the board's PCIe is `starfive,jh7110-pcie`, read through the link the firmware trained; a command's data pointer must be page-aligned, which `kzalloc` is not; and a page list raises a transfer's ceiling from 8 KiB to 2 MiB |
+| **The SD card at 8.2 MB/s**, against 2.5 when it first worked | one command per transfer rather than per block, and the card's standard 25 MHz rather than a cautious 12.5 — both measured with a benchmark built into the kernel |
 | **Its GPT read**, and the first partition presented as a disk | GPT and MBR, with a GPT disk's protective MBR recognised and skipped rather than followed |
 | **The kernel's own UART**, taking the console over from the firmware | a 16550's registers are not always one byte apart: this one has `reg-shift = 2` and `reg-io-width = 4`, and getting it wrong is *garbling*, not silence |
 | **A GPIO level crossing a physical wire**: driven on pin 60, read on pin 63 | the operator's jumper. It immediately showed what a loopback cannot: the other pin could not be driven at all, because this driver does not yet select a pad's function |
@@ -88,6 +89,15 @@ IPv4 with ARP, ICMP, UDP and TCP · DHCP · the MKNB netboot protocol with
 Ed25519-verified offers · XFS (mount, read, logged writes, create, remove,
 grow) · a network block device client · a buffer cache · the VMA tree · an
 ELF loader · a ustar reader.
+
+## What is missing
+
+`ROADMAP.md` is the list, with sizes and reasons — including the things this
+kernel deliberately does not do. The short version: no real `fork` (only
+`vfork`), no VFS or second filesystem, no `/proc`, no demand paging or
+copy-on-write, XFS cannot read b-tree-format forks or multi-block
+directories, the board has no Ethernet driver, and there is one privilege
+level.
 
 ## Planned
 

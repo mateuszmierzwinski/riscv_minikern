@@ -88,4 +88,28 @@ int gpio_jh7110_read(uint32_t controller, uint32_t pin, bool *high);
 phys_t gpio_jh7110_base(uint32_t controller);
 const char *gpio_jh7110_path(uint32_t controller);
 
+int gpio_jh7110_peek(uint32_t controller, uint32_t byte_offset, uint32_t *word);
+
+/* A pin's pad-configuration word: where the pad's own electrical behaviour
+ * lives, as distinct from which signal drives it.
+ *
+ * The block begins just past the two input-state words, one 32-bit word per
+ * pin, and this was **measured on a board rather than taken from a
+ * datasheet**: dumping it showed pin 60 reading `0x09` and pins 61, 63 and
+ * 36 reading `0x01`, and pin 60 was the only one of the four that could
+ * actually be driven. One bit separates a pin that works from a pin whose
+ * writes go nowhere.
+ *
+ * Writing it is scoped to one named pin for a reason: a pin controller is
+ * where a wrong write reaches a pad that is wired to something, so this
+ * takes a pin number and not an offset. */
+#define JH7110_PADCFG_BASE 0x120u
+
+static inline uint32_t gpio_jh7110_padcfg_offset(uint32_t pin) {
+    return JH7110_PADCFG_BASE + pin * 4u;
+}
+
+int gpio_jh7110_set_padcfg(uint32_t controller, uint32_t pin, uint32_t value);
+int gpio_jh7110_get_padcfg(uint32_t controller, uint32_t pin, uint32_t *value);
+
 #endif

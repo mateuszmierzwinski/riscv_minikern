@@ -44,4 +44,14 @@ int xfsmount_show_file(const char *path);
  * truncation, because half a program is not a program. */
 int xfsmount_read_file(const char *path, uint32_t limit, uint8_t **out, uint32_t *size);
 
+/* Hashes a file **without holding it in memory**, and reports its size.
+ *
+ * Reading a file whole is the obvious way to checksum one and it stops
+ * working at the first file worth checksumming: a five-megabyte video on a
+ * real drive is larger than this kernel's heap, so `xfsmount_read_file`
+ * answers `KERR_FBIG` and proves nothing. This walks it in chunks, which
+ * also means the extent list is followed to its end — the thing a single
+ * first-block read never exercises. */
+int xfsmount_hash_file(const char *path, uint8_t digest[32], uint64_t *size);
+
 #endif

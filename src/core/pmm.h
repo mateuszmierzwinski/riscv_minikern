@@ -26,7 +26,40 @@ struct pmm {
     uint32_t *bitmap;  /* npages bits, 1 = used */
     uint32_t free;     /* frames currently free */
     uint32_t hint;     /* word index where the next single-page search starts */
+
+    /* **How many address spaces are using each frame**, when the caller has
+     * given the allocator somewhere to keep it.
+     *
+     * A frame used once needs no count; the bitmap says everything. A frame
+     * that two processes share — because `fork` gave them the same page
+     * copy-on-write, or because they asked for shared memory — cannot be
+     * freed when one of them lets go. That is the whole of what this adds:
+     * a free is a decrement, and only the last one really frees.
+     *
+     * One byte per frame: 2 MiB for an 8 GiB machine, and a count that
+     * saturates rather than wrapping. A frame shared 255 times is a frame
+     * this kernel will leak rather than free early, which is the right way
+     * round. NULL means no sharing is possible and every free is a free. */
+    uint8_t *refs;
 };
+
+/* Gives the allocator somewhere to count shares. `refs` is npages bytes and
+ * must stay valid for the allocator's life; it is zeroed here. Without it
+ * the allocator behaves exactly as it did before. */
+void pmm_set_refcounts(struct pmm *p, uint8_t *refs);
+
+/* Says that one more address space is using this frame.
+ *
+ * KERR_INVAL when the frame is outside the allocator or is not allocated,
+ * KERR_NOTSUP when no refcount storage was given. A frame at the saturation
+ * point is left there and reports KERR_OK: it will leak, not be freed
+ * early. */
+int pmm_share(struct pmm *p, phys_t phys);
+
+/* How many address spaces are using a frame: 1 for an ordinary allocation,
+ * 0 for a free one. Without refcount storage every allocated frame reports
+ * 1, which is what the rest of the kernel should then assume. */
+uint32_t pmm_shares(const struct pmm *p, phys_t phys);
 
 /* Words of bitmap storage npages need. */
 #define PMM_BITMAP_WORDS(npages) (((npages) + 31u) / 32u)

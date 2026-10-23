@@ -90,6 +90,10 @@ struct xfs {
      * on. `xfs_writable` refuses on it, which is the enforcement of the
      * promise `check_features` makes when it allows the mount. */
     bool write_refused;
+    /* The inode's extent counts are 64-bit and live at different offsets
+     * (`XFS_DI_BIG_NEXTENTS`). From the superblock, because it is a property
+     * of the filesystem and not of an inode. */
+    bool big_extent_counts;
 };
 
 /* One inode, parsed, with its inline fork copied out so no cached block
@@ -101,6 +105,11 @@ struct xfs_inode {
     uint32_t mode;
     uint32_t nlink;
     uint32_t nextents;
+    /* This inode's extent counts are 64-bit and sit at different offsets.
+     * **Per inode, not per filesystem**: the superblock feature permits the
+     * layout and each inode's `di_flags2` says whether it uses it, so an
+     * inode written before the feature was enabled still reads correctly. */
+    bool big_extent_counts;
     uint8_t format;
     uint8_t fork[XFS_FORK_MAX];
     uint32_t fork_len;

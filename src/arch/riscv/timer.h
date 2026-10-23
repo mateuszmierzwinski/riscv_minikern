@@ -94,6 +94,57 @@ void timer_on_tick(void);
  * them all, for a kernel tearing something down. KERR_NOSPC when the list
  * is full. */
 int timer_add_tick_hook(void (*hook)(void));
+
+/* ── deadlines ─────────────────────────────────────────────────────────── */
+
+/* Arms this hart's timer for `ns`, or leaves it alone if that is already
+ * what it is armed for.
+ *
+ * **Not re-arming matters here more than on most machines.** This hardware
+ * has no `Sstc`, so there is no timer CSR a supervisor can write: every arm
+ * is a call into firmware, measured at **335 ns** on a VisionFive 2 — seven
+ * context switches. A scheduler that re-armed on every decision would spend
+ * more time arming than deciding.
+ *
+ * The deadline is rounded up to `TIMER_GRANULARITY_NS`, which is what makes
+ * "already armed for that" happen often enough to be worth testing for: two
+ * threads whose slices end 3 µs apart ask for the same deadline. */
+void timer_arm_at(uint64_t ns);
+
+/* Hands the timer over to whoever will arm it.
+ *
+ * Until this is called the timer is **periodic**, which is what the boot
+ * path needs: it proves the clock runs by counting ticks, and a clock that
+ * only ticks when asked cannot be proved that way. Once a scheduler exists
+ * there is something that knows when the next event is due, and ticking for
+ * its own sake becomes pure overhead — a hundred interrupts a second that
+ * find nothing to do.
+ *
+ * After this, a hart is interrupted only when something asked to be. */
+void timer_take_over(void);
+
+/* Takes this hart's timer away entirely: nothing is due, so nothing should
+ * interrupt.
+ *
+ * This is the point of the whole arrangement. One runnable thread on a hart
+ * and nothing sleeping means **no timer interrupts at all** — not a tick
+ * that finds nothing to do, which is what a periodic clock would deliver a
+ * hundred times a second for as long as the machine is busy. */
+void timer_disarm(void);
+
+/* What this hart is armed for, in nanoseconds, or 0 when it is disarmed. */
+uint64_t timer_armed_at(void);
+
+/* How many timer interrupts this hart has taken. The measure of whether
+ * dynticks is working: a hart running one thread with nothing asleep should
+ * hold this still. */
+uint64_t timer_interrupts_of(uint32_t hart_index);
+
+/* Deadlines are rounded up to this, so that near-identical requests become
+ * identical ones and the arm can be skipped. 100 µs is 400 ticks of this
+ * board's 4 MHz clock — coarse enough to coalesce, fine enough that a 1.5 ms
+ * slice is not visibly lengthened. */
+#define TIMER_GRANULARITY_NS 100000ull
 void timer_remove_tick_hook(void (*hook)(void));
 
 #endif

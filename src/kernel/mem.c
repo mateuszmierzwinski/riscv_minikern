@@ -21,6 +21,11 @@ extern char __kernel_end[];
 #define MAX_RAM_BYTES (8ull * 1024 * 1024 * 1024)
 #define MAX_FRAMES (MAX_RAM_BYTES / PMM_PAGE_SIZE)
 
+/* One share count per frame; see `pmm_set_refcounts`. At a byte each this
+ * is 2 MiB for the 8 GiB a board can carry, which is the price of being able
+ * to share a page at all. */
+static uint8_t frame_refs[MAX_FRAMES];
+
 static uint32_t frame_bits[PMM_BITMAP_WORDS(MAX_FRAMES)];
 static struct pmm frames;
 static struct kheap heap;
@@ -103,6 +108,14 @@ int mem_init(const struct bootinfo *info, phys_t arena_base, uint64_t arena_byte
     }
     total_pages = (uint32_t)pages;
     pmm_init(&frames, info->mem_base, total_pages, frame_bits);
+    /* **Somewhere to count shares**, before any frame is handed out.
+     *
+     * A frame that two address spaces hold — because `fork` gave them the
+     * same page to copy on write, or because they asked for shared memory —
+     * must not be freed when the first lets go. One byte per frame buys
+     * that, and it has to exist before the first allocation or the counts
+     * start out wrong. */
+    pmm_set_refcounts(&frames, frame_refs);
     pmm_release(&frames, info->mem_base, (uint64_t)total_pages * PMM_PAGE_SIZE);
     reserve_what_is_in_use(info, arena_base, arena_bytes);
     kheap_init(&heap, &(struct page_port){.alloc = heap_alloc_page, .free = heap_free_page});
@@ -115,6 +128,14 @@ int mem_alloc_pages(uint32_t npages, uint32_t align_pages, phys_t *phys) {
 
 int mem_free_pages(phys_t phys, uint32_t npages) {
     return pmm_free(&frames, phys, npages);
+}
+
+int mem_share_page(phys_t phys) {
+    return pmm_share(&frames, phys);
+}
+
+uint32_t mem_page_shares(phys_t phys) {
+    return pmm_shares(&frames, phys);
 }
 
 void *kmalloc(uint32_t bytes) {

@@ -1,5 +1,7 @@
 # minikern (RISC-V)
 
+![riscv_minikern logo](docs/riscv_minikern_logo_quokka.png)
+
 A from-scratch kernel for the **StarFive JH7110** — the SiFive VisionFive 2 —
 that copies no Linux code but implements Linux's syscall interface, so that
 ordinary `GOOS=linux GOARCH=riscv64` Go binaries run on it unchanged.
@@ -19,7 +21,8 @@ now reached on RISC-V.
 its SD card and an NVMe drive in its M.2 slot, reads the GPT on the drive,
 mounts XFS, loads that Go binary off the card and runs it on all four U74
 cores — 3.3x on eight units of work. `FEATURES.md` lists what the board
-proved and what each of those things cost, because an emulator had agreed
+proved and what each of those things cost, and `ROADMAP.md` lists what is
+missing, because an emulator had agreed
 with every mistake they found: a response with no CRC whose CRC was being
 checked, a configuration read to an unrouted bus that never returns, a
 filesystem whose reader and writer disagreed about where its log was, and a

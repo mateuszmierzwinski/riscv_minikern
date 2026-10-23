@@ -19,6 +19,50 @@ static void set_page(struct pmm *p, uint32_t i, bool used) {
     }
 }
 
+/* The index of a frame, or npages when it is not one of ours. */
+static uint32_t frame_index(const struct pmm *p, phys_t phys) {
+    uint64_t i;
+    if (phys < p->base || (phys & (PMM_PAGE_SIZE - 1u)) != 0) {
+        return p->npages;
+    }
+    i = ((uint64_t)phys - (uint64_t)p->base) >> PMM_PAGE_SHIFT;
+    return i < p->npages ? (uint32_t)i : p->npages;
+}
+
+void pmm_set_refcounts(struct pmm *p, uint8_t *refs) {
+    p->refs = refs;
+    for (uint32_t i = 0; refs != 0 && i < p->npages; i++) {
+        refs[i] = 0;
+    }
+}
+
+int pmm_share(struct pmm *p, phys_t phys) {
+    uint32_t i = frame_index(p, phys);
+    if (i == p->npages || !page_used(p, i)) {
+        return KERR_INVAL;
+    }
+    if (p->refs == 0) {
+        return KERR_NOTSUP;
+    }
+    /* Saturating, and once there it is **sticky**: the frame is leaked
+     * rather than ever freed again. A count that has stopped rising has
+     * stopped being true, and being too low is the direction that hands a
+     * live page back to the allocator. Leaking a page is much the better
+     * failure. */
+    if (p->refs[i] < 0xffu) {
+        p->refs[i] = (uint8_t)(p->refs[i] + 1u);
+    }
+    return KERR_OK;
+}
+
+uint32_t pmm_shares(const struct pmm *p, phys_t phys) {
+    uint32_t i = frame_index(p, phys);
+    if (i == p->npages || !page_used(p, i)) {
+        return 0;
+    }
+    return p->refs == 0 ? 1u : (uint32_t)p->refs[i] + 1u;
+}
+
 void pmm_init(struct pmm *p, phys_t base, uint32_t npages, uint32_t *bitmap) {
     *p = (struct pmm){.base = base, .npages = npages, .bitmap = bitmap};
     for (uint32_t w = 0; w < PMM_BITMAP_WORDS(npages); w++) {
@@ -112,6 +156,23 @@ int pmm_free(struct pmm *p, phys_t phys, uint32_t npages) {
         }
     }
     for (uint32_t k = 0; k < npages; k++) {
+        /* **A share is given up before a frame is freed.** A frame two
+         * address spaces hold is freed by neither of them until the second
+         * one lets go; freeing it on the first would hand a page that is
+         * still mapped somewhere back to the allocator, and the next
+         * allocation would be served live memory. */
+        if (p->refs != 0 && p->refs[index + k] == 0xffu) {
+            /* **Saturated, so it stays.** Once the count stops rising it has
+             * also stopped being true, and a count that is too low is the
+             * dangerous direction: decrementing from the ceiling would reach
+             * zero while holders remain and hand a live frame back. This
+             * leaks the frame instead, permanently and on purpose. */
+            continue;
+        }
+        if (p->refs != 0 && p->refs[index + k] != 0) {
+            p->refs[index + k] = (uint8_t)(p->refs[index + k] - 1u);
+            continue;
+        }
         set_page(p, index + k, false);
     }
     return KERR_OK;

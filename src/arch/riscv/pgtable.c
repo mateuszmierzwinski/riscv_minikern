@@ -176,7 +176,12 @@ bool pgtable_lookup(const struct pgtable *pt, virt_t va, phys_t *pa, uint64_t *p
         if (pte_is_leaf(pte)) {
             uint64_t span = span_at(l);
             *pa = pte_phys(pte) + (va & (span - 1u));
-            *prot = pte & (PTE_R | PTE_W | PTE_X | PTE_U | PTE_G);
+            /* The software's own bits come back too. A caller that asks
+             * what a page is needs to know whether it is shared
+             * copy-on-write as much as whether it is writable — and a fault
+             * handler that could not see `PTE_COW` could not tell a copy it
+             * must make from a program writing where it should not. */
+            *prot = pte & (PTE_R | PTE_W | PTE_X | PTE_U | PTE_G | PTE_RSW0 | PTE_RSW1);
             *size = span;
             return true;
         }

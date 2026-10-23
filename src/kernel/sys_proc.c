@@ -159,16 +159,22 @@ static int64_t sys_execve(struct trapframe *tf) {
     return 0;
 }
 
-/* `clone`, which here makes either a thread or a **vfork child**.
+/* `clone`: a thread, a **fork**, or a vfork child.
  *
  * A thread (`CLONE_THREAD`) shares everything and is what the scheduler's
- * `clone` already did. A vfork child is a new *process* that borrows its
- * parent's address space: the parent is suspended, so the borrowing is safe,
- * and the child's first `execve` gives it an address space of its own.
+ * `clone` already did.
  *
- * `fork` proper — a copied address space — is **refused** rather than
- * approximated. A caller that asked for a copy and got a shared one would
- * corrupt its parent's memory, and the failure would appear far from here.
+ * Without `CLONE_VM` it is a real `fork`: the child gets an address space of
+ * its own, made of the parent's pages copy-on-write, and the two are
+ * **isolated** from the moment the call returns. Neither can reach the
+ * other's memory whatever it does, and nothing is copied until one of them
+ * writes — so a process that forks and immediately execs copies page tables
+ * and nothing else.
+ *
+ * With `CLONE_VM` and `CLONE_VFORK` it is still a vfork child, which borrows
+ * its parent's address space while the parent is suspended. That remains
+ * because it is what a runtime asks for when it wants to exec something
+ * cheaply, and it is genuinely cheaper than a fork even now.
  */
 static int64_t sys_clone(struct trapframe *tf) {
     uint64_t flags = sysarg(tf, 0), stack = sysarg(tf, 1);
@@ -183,16 +189,14 @@ static int64_t sys_clone(struct trapframe *tf) {
     if ((flags & CLONE_THREAD) != 0) {
         return syscall_clone_thread(tf);
     }
-    if ((flags & CLONE_VM) == 0) {
-        /* A copied address space, which this kernel does not do. Refusing is
-         * the honest answer: a shared one would be silently wrong. */
-        return KERR_NOSYS;
-    }
     child = uspace_alloc();
     if (child == NULL) {
         return KERR_AGAIN;
     }
-    rc = uspace_fork_shared(child, parent);
+    /* The one decision that matters: a copied address space, or a borrowed
+     * one. */
+    rc = (flags & CLONE_VM) == 0 ? uspace_fork(child, parent)
+                                 : uspace_fork_shared(child, parent);
     if (rc != KERR_OK) {
         uspace_release(child);
         return rc;
@@ -202,6 +206,10 @@ static int64_t sys_clone(struct trapframe *tf) {
      * parent's if none was. */
     child_frame.sepc = tf->sepc + 4u;
     child_frame.x[10] = 0;
+    /* A forked child continues on **its own copy of the parent's stack**, at
+     * the same address — that is the whole point of copying the address
+     * space, and giving it a different stack pointer would put it somewhere
+     * its own copy does not have a frame. */
     rc = sched_spawn_in(child, &child_frame, stack != 0 ? stack : tf->x[2], &tid);
     if (rc != KERR_OK) {
         uspace_release(child);
@@ -232,6 +240,7 @@ static int64_t sys_wait4(struct trapframe *tf) {
     struct uproc *me = uspace_current();
     struct uproc *child;
     uint32_t pid;
+    uint32_t rounds = 0;
     int32_t encoded;
     if (me == NULL) {
         return KERR_SRCH;
@@ -253,9 +262,21 @@ static int64_t sys_wait4(struct trapframe *tf) {
         if (uspace_count_children(me->pid) == 0) {
             return KERR_CHILD;
         }
+        if (rounds < 4u && syscall_tracing_errors()) {
+            struct uproc *c = uspace_by_pid((uint32_t)(want > 0 ? want : 0));
+            kprintf("wait4: pid %u waiting; child %u used %u zombie %u parent %u; ticks %u "
+                    "deadline-wakes %u\n",
+                    me->pid, want > 0 ? (uint32_t)want : 0u, c != NULL && c->used ? 1u : 0u,
+                    c != NULL && c->zombie ? 1u : 0u, c != NULL ? c->parent_pid : 0u,
+                    sched_ticks_seen(), sched_deadline_wakes());
+        }
+        rounds++;
         uspace_wait_for_child(me);
     }
     pid = child->pid;
+    if (syscall_tracing_errors()) {
+        kprintf("wait4: pid %u reaping child %u after %u rounds\n", me->pid, pid, rounds);
+    }
     /* The exit code goes in bits 8..15, which is what `WEXITSTATUS` shifts
      * back out. A status written in the low byte reads as 0 for every
      * program that exits with anything under 256. */

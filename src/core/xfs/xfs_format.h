@@ -56,13 +56,34 @@
 #define XFS_FEAT_RO_SUPPORTED (XFS_FEAT_RO_FINOBT | XFS_FEAT_RO_INOBTCNT)
 
 #define XFS_FEAT_IN_FTYPE     0x00000001u /* directory entries carry a type byte */
-#define XFS_FEAT_IN_SPINODES  0x00000002u /* sparse inode chunks: refused */
+#define XFS_FEAT_IN_SPINODES  0x00000002u /* sparse inode chunks */
 #define XFS_FEAT_IN_META_UUID 0x00000004u /* metadata carries sb_meta_uuid */
 #define XFS_FEAT_IN_BIGTIME   0x00000008u /* wider timestamps, which we never read */
 #define XFS_FEAT_IN_NEEDSREPAIR 0x00000010u /* known broken: refused */
-#define XFS_FEAT_IN_NREXT64   0x00000020u /* 64-bit extent counts: a different inode layout */
-#define XFS_FEAT_IN_SUPPORTED \
-    (XFS_FEAT_IN_FTYPE | XFS_FEAT_IN_META_UUID | XFS_FEAT_IN_BIGTIME)
+#define XFS_FEAT_IN_NREXT64   0x00000020u /* 64-bit extent counts: the fields move */
+#define XFS_FEAT_IN_EXCHRANGE 0x00000040u /* exchange-range: log intents only */
+#define XFS_FEAT_IN_PARENT    0x00000080u /* parent pointers, kept as attributes */
+
+/* What this reader can read.
+ *
+ * Four of these were refused until a drive formatted by an ordinary
+ * `mkfs.xfs` arrived carrying all of them — `incompat 0xe2` — and each was
+ * then looked at on its merits rather than as a flag to clear:
+ *
+ *   - `SPINODES` changes how the inode **b-tree** records which inodes in a
+ *     chunk exist. A reader that finds an inode by arithmetic from its
+ *     number, as this one does, never consults those records.
+ *   - `NREXT64` moves two fields in the inode, which is handled where they
+ *     are read.
+ *   - `EXCHRANGE` adds a kind of log intent. A clean log contains none, and
+ *     this reader refuses a dirty log anyway.
+ *   - `PARENT` stores parent pointers as extended attributes, in a fork this
+ *     reader does not walk.
+ *
+ * `NEEDSREPAIR` stays refused: it is the filesystem saying so itself. */
+#define XFS_FEAT_IN_SUPPORTED                                                                \
+    (XFS_FEAT_IN_FTYPE | XFS_FEAT_IN_META_UUID | XFS_FEAT_IN_BIGTIME | XFS_FEAT_IN_SPINODES | \
+     XFS_FEAT_IN_NREXT64 | XFS_FEAT_IN_EXCHRANGE | XFS_FEAT_IN_PARENT)
 
 /* ── the inode ────────────────────────────────────────────────────────── */
 #define XFS_DINODE_MAGIC 0x494eu /* "IN" */
@@ -78,8 +99,24 @@
 #define XFS_DI_SIZE       56u  /* u64 */
 #define XFS_DI_NBLOCKS    64u  /* u64 */
 #define XFS_DI_EXTSIZE    72u  /* u32 */
-#define XFS_DI_NEXTENTS   76u  /* u32 */
-#define XFS_DI_ANEXTENTS  80u  /* u16 */
+#define XFS_DI_NEXTENTS   76u  /* u32, without NREXT64 */
+#define XFS_DI_ANEXTENTS  80u  /* u16, without NREXT64 */
+
+/* **With `NREXT64`, the data fork's extent count moves.**
+ *
+ * It does not widen in place: the 64-bit count takes over the eight bytes at
+ * offset 24 that a v3 inode otherwise leaves as padding, and the *attribute*
+ * fork's count takes over the four bytes at 76 where the data fork's used to
+ * be. Reading the old offset on a filesystem that has the feature therefore
+ * yields the attribute fork's extent count — a small number, usually zero —
+ * for the data fork, and a file reads as empty rather than failing.
+ *
+ * Taken from the on-disk format's own definition (`struct xfs_dinode`, where
+ * the union at offset 24 is `di_big_nextents` or `di_v3_pad`) rather than
+ * from memory, because "the field got wider" is exactly the plausible wrong
+ * answer. */
+#define XFS_DI_BIG_NEXTENTS  24u /* u64, with NREXT64 */
+#define XFS_DI_BIG_ANEXTENTS 76u /* u32, with NREXT64 */
 #define XFS_DI_FORKOFF    82u  /* u8: the attribute fork, in eight-byte units */
 #define XFS_DI_AFORMAT    83u  /* u8 */
 #define XFS_DI_FLAGS      90u  /* u16 */

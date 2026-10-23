@@ -73,6 +73,12 @@ long sbi_remote_sfence_vma(uint64_t hart_mask, uint64_t hart_mask_base, uint64_t
     return r.error;
 }
 
+long sbi_send_ipi(uint64_t hart_mask, uint64_t hart_mask_base) {
+    struct sbi_ret r = sbi_call(SBI_EXT_IPI, 0 /* send_ipi */, (long)hart_mask,
+                                (long)hart_mask_base, 0, 0);
+    return r.error;
+}
+
 bool sbi_has_rfence(void) {
     return sbi_probe_extension(SBI_EXT_RFENCE) > 0;
 }

@@ -56,7 +56,8 @@ status=0
 timeout 300 qemu-system-riscv64 -M virt -smp 4 -accel tcg,thread=multi -m 2G -nographic \
     -bios default -kernel "$image" \
     -drive "file=$tmp/fs.img,if=none,format=raw,id=nvm0" -device nvme,serial=mkgo,drive=nvm0 \
-    -append "console=sbi minikern.halt=poweroff minikern.init=1" > "$log" 2>&1 || status=$?
+    -append "console=sbi minikern.halt=poweroff minikern.init=1 ${MINIKERN_EXTRA:-}" \
+    > "$log" 2>&1 || status=$?
 tr -d '\r' < "$log" > "$log.clean" && mv "$log.clean" "$log"
 cat "$log"
 

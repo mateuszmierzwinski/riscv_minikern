@@ -539,8 +539,12 @@ static void test_a_superblock_that_cannot_be_trusted(void) {
      * that encodes an assumption protects the assumption, not the user. */
     KTEST_CHECK(mount_with(damage_reflink) == KERR_OK);
     KTEST_CHECK(mount_with(damage_rmapbt) == KERR_OK);
-    KTEST_CHECK(mount_with(damage_nrext64) == KERR_NOTSUP);
-    KTEST_CHECK(mount_with(damage_spinodes) == KERR_NOTSUP);
+    /* Both are readable now, each for its own reason: `NREXT64` moves two
+     * fields, which is handled where they are read, and `SPINODES` changes
+     * inode-b-tree records this reader never consults. See
+     * `XFS_FEAT_IN_SUPPORTED`. */
+    KTEST_CHECK(mount_with(damage_nrext64) == KERR_OK);
+    KTEST_CHECK(mount_with(damage_spinodes) == KERR_OK);
     KTEST_CHECK(mount_with(damage_needsrepair) == KERR_NOTSUP);
     KTEST_CHECK(mount_with(damage_log_incompat) == KERR_NOTSUP);
     KTEST_CHECK(mount_with(damage_unknown_feature) == KERR_NOTSUP);
@@ -658,12 +662,34 @@ static void test_inode_formats_we_refuse(void) {
     bcache_invalidate(&cache);
     KTEST_CHECK(xfs_inode_read(&fs, ROOT_INO, &ip) == KERR_NOTSUP);
 
+    /* **An inode with 64-bit extent counts reads, and reads them from the
+     * right place.** The count does not widen where it was: it moves to the
+     * eight bytes at offset 24 that a v3 inode otherwise pads, and the old
+     * four-byte slot becomes the *attribute* fork's. Reading the old offset
+     * on such an inode yields the attribute count — nearly always zero — so
+     * the file looks empty rather than failing, which is why this checks the
+     * value and not merely the absence of an error. */
     mount_fresh();
     di = inode_at(ROOT_INO);
     put64(di + XFS_DI_FLAGS2, XFS_DIFLAG2_NREXT64);
+    put64(di + XFS_DI_BIG_NEXTENTS, 3u);
+    put32(di + XFS_DI_NEXTENTS, 99u); /* the attribute fork's, once NREXT64 is set */
     seal(di, ISIZE, XFS_DI_CRC);
     bcache_invalidate(&cache);
-    KTEST_CHECK(xfs_inode_read(&fs, ROOT_INO, &ip) == KERR_NOTSUP);
+    KTEST_CHECK(xfs_inode_read(&fs, ROOT_INO, &ip) == KERR_OK);
+    KTEST_CHECK(ip.nextents == 3u);
+    KTEST_CHECK(ip.big_extent_counts);
+
+    /* And without the flag, the same inode's count comes from the old slot,
+     * so one layout is never read as the other. */
+    mount_fresh();
+    di = inode_at(ROOT_INO);
+    put32(di + XFS_DI_NEXTENTS, 7u);
+    seal(di, ISIZE, XFS_DI_CRC);
+    bcache_invalidate(&cache);
+    KTEST_CHECK(xfs_inode_read(&fs, ROOT_INO, &ip) == KERR_OK);
+    KTEST_CHECK(ip.nextents == 7u);
+    KTEST_CHECK(!ip.big_extent_counts);
 }
 
 /* An inode that claims more content, or more extents, than it has room

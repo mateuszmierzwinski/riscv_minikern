@@ -236,7 +236,16 @@ static int grow_file(struct xfs *fs, struct xfs_inode *ip, uint64_t end) {
     }
     if (rc == KERR_OK) {
         xfs_put_be64(di + XFS_DI_NBLOCKS, ip->nblocks);
-        xfs_put_be32(di + XFS_DI_NEXTENTS, ip->nextents);
+        /* The same field the reader takes from two places, written back to
+         * the one the filesystem actually uses. Writing the old offset on a
+         * `NREXT64` filesystem would set the *attribute* fork's extent count
+         * and leave the data fork's untouched — a corruption that reads back
+         * as an empty file. */
+        if (ip->big_extent_counts) {
+            xfs_put_be64(di + XFS_DI_BIG_NEXTENTS, ip->nextents);
+        } else {
+            xfs_put_be32(di + XFS_DI_NEXTENTS, ip->nextents);
+        }
         xfs_reseal(di, fs->inodesize, XFS_DI_CRC);
         bcache_dirty(b);
     }

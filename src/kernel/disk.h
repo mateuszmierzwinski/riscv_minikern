@@ -17,6 +17,15 @@
 /* Attaches the first storage device the machine offers and builds a cache
  * over it. KERR_NOENT when there is none, which is not an error: a kernel
  * that netboots has no disk and should say so once rather than fail. */
+/* Which kind of device to attach, when a board has more than one.
+ *
+ * `NULL` or an empty string keeps the default order — NVMe, then SD, then
+ * virtio — which is what a machine with one disk wants. A name restricts it
+ * to that kind, which a machine with two needs: this board has a drive in
+ * its M.2 slot *and* a card in its slot, and "the storage worth having" is
+ * not always the one the operator means to boot from. */
+void disk_prefer(const char *kind, uint32_t len);
+
 int disk_attach(const struct fdt *fdt);
 
 /* The cache, for a filesystem to read through. NULL when there is no disk. */

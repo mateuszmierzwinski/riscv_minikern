@@ -101,4 +101,13 @@ long sbi_remote_sfence_vma(uint64_t hart_mask, uint64_t hart_mask_base, uint64_t
  * running on luck. */
 bool sbi_has_rfence(void);
 
+/* Raises a software interrupt on the harts a mask names, the same way
+ * `sbi_remote_sfence_vma` names them: `hart_mask_base` of -1 means all.
+ *
+ * It is how one hart tells another that something has changed — a thread it
+ * could run, a mapping it must forget. A scheduler that only ever waits for
+ * the next tick answers at the tick's resolution; one that can poke a hart
+ * answers at this call's. */
+long sbi_send_ipi(uint64_t hart_mask, uint64_t hart_mask_base);
+
 #endif

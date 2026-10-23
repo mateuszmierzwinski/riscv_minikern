@@ -43,6 +43,11 @@ int smp_enumerate(const struct fdt *fdt, uint64_t boot_hart);
 
 /* How many harts there are, and one of them. */
 uint32_t smp_hart_count(void);
+
+/* How many times a hart could not find itself in the table and was given
+ * index 0 — which means it shared another hart's per-hart state. Any value
+ * but zero is a bug worth stopping for. */
+uint32_t smp_hart_misses(void);
 const struct smp_hart *smp_hart(uint32_t index);
 
 /* How many are running kernel code, the boot hart included. */
