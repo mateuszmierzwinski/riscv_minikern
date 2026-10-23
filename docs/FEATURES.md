@@ -65,6 +65,7 @@ scaling are not started.
 | **Futexes**: wait and wake, with timeouts | `go_qemu_test` |
 | **Memory syscalls**: `brk`, `mmap` with unbacked `PROT_NONE` reservations and honoured hints, `munmap` (which forgets the range, so a touch of returned memory faults), `mprotect` | `go_qemu_test` |
 | **Demand paging**: a mapping costs its pages when they are *touched*, with the rights coming from the region record — 1,545 pages on first touch in a Go run on the board | `init_qemu_test`, `minikern.init=1` on the board |
+| **The `mmap` flags, each honoured, vacuous or refused** — `MAP_POPULATE`/`MAP_LOCKED` back up front, `MAP_FIXED_NOREPLACE` refuses a collision instead of destroying it, and `MAP_SHARED`/`MAP_HUGETLB`/`MAP_GROWSDOWN` are refused rather than accepted and not delivered | `minikern.mapflags=1` on the board, exit status 127 |
 | **`mremap`**: grow in place, grow by moving (`MREMAP_MAYMOVE`), shrink, and a caller-chosen destination — **copying nothing**, since the frames that exist are re-pointed and the holes stay holes | `minikern.mremap=1` on the board, exit status 63 |
 | **A real program off the filesystem**: `/init` read from XFS on NVMe, ELF64-loaded, started with `argc`/`argv`/`envp`/`auxv`, run to completion | `init_qemu_test` |
 | **An ELF64 loader** that refuses what it cannot run — 32-bit, wrong architecture, dynamically linked, headers that contradict the file | `elf_test` |

@@ -245,10 +245,48 @@ Ordering inside a section is roughly by what unblocks the most.
 - [ ] **Swap.** (L) Not planned; listed so the absence is deliberate.
 - [ ] **Huge pages for user space.** (M) The kernel's own identity map uses
       1 GiB pages; user mappings are 4 KiB only.
-- [ ] **`MAP_FIXED_NOREPLACE`, `MAP_NORESERVE`, `MAP_POPULATE`.** (S) Flags
-      are largely ignored rather than honoured or refused. `MAP_POPULATE` is
-      now owed rather than merely missing: it is how a caller asks for the
-      eager backing demand paging took away.
+- [x] **`MAP_FIXED_NOREPLACE`, `MAP_NORESERVE`, `MAP_POPULATE`.** (S)
+      **Done**, and the item turned out to be about more than three flags.
+      What it said — "flags are largely ignored rather than honoured or
+      refused" — was the defect: the code had three constants and a comment
+      claiming the rest were advisory on Linux too, which was true of some
+      and a quiet lie about the others. Each flag now has one of **three**
+      answers, written down where it can be checked:
+      **Honoured.** `MAP_POPULATE` backs the whole mapping at `mmap`, which
+      is what a caller asks for when it would rather pay up front than take
+      a fault per page — the thing demand paging took away. `MAP_LOCKED`
+      populates too, because that is what locking does on Linux and a locked
+      mapping whose pages arrived later would not have been locked. Advisory
+      both there and here: running out part-way does not fail the mapping,
+      since the rest faults in as it would have anyway.
+      `MAP_FIXED_NOREPLACE` is `MAP_FIXED`'s insistence on an address with
+      the opposite answer to a collision — `EEXIST` rather than destruction
+      — and that is the whole reason it exists: without it a program's only
+      way to learn whether an address was free was to take it, and a wrong
+      guess cost whatever was there.
+      **Vacuous.** `MAP_NORESERVE` asks for memory not to be committed up
+      front, which since demand paging is what *every* mapping does; there
+      is no swap, so nothing can be evicted either. `MAP_STACK`,
+      `MAP_NONBLOCK`, `MAP_DENYWRITE` and `MAP_EXECUTABLE` ask for nothing
+      this kernel has. Recording that is not the same as ignoring them, and
+      writing it down is what stops the next reader "implementing" one.
+      **Refused**, which is the half that matters: a flag accepted and not
+      delivered leaves the caller's assumption standing. `MAP_SHARED`
+      without shared frames is a private mapping two processes each believe
+      the other can see, so their writes go nowhere; `MAP_HUGETLB` answered
+      with 4 KiB pages breaks the one assumption that is the reason to ask;
+      `MAP_GROWSDOWN` would promise a mapping that grows, and nothing here
+      grows one. Each is `EINVAL` with the name in the log, once, since
+      `EINVAL` alone tells a program nothing.
+      It also found a wrong bound in the fixed path: `at + bytes >
+      USER_STACK_TOP` **wraps**, so an address a few pages below 2^64
+      compared as being inside user space. It was not a hole — the page
+      tables refuse a non-canonical address — which is how a wrong check
+      survives.
+      Verified on the board (`minikern.mapflags=1`): **127**, all seven
+      checks. The populate half is the kernel's own counter, because a
+      program cannot see it: `4 populated up front` with the demand count
+      unmoved, so the write to the first page took no fault.
 
 ---
 

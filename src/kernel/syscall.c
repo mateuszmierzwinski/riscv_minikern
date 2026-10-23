@@ -109,12 +109,56 @@ static uint64_t refused;
  * whole generic table. */
 static uint64_t complained[8];
 
-/* The flags `mmap` is called with. Only the ones that change what this
- * kernel does; the rest are accepted and ignored, because a runtime passes
- * flags that are advisory on Linux too. */
-#define MAP_PRIVATE 0x02u
-#define MAP_FIXED 0x10u
-#define MAP_ANONYMOUS 0x20u
+/* The flags `mmap` is called with, and **what each one actually gets**.
+ *
+ * This used to be three constants and a sentence saying the rest were
+ * "accepted and ignored because they are advisory on Linux too", which was
+ * true of some of them and a quiet lie about the others. A flag this kernel
+ * accepts and does not deliver leaves the caller's assumption standing,
+ * which is the failure this project keeps paying for — so each one now has
+ * one of three answers, written down where it can be checked:
+ *
+ *   - **honoured**: it changes what happens here.
+ *   - **vacuous**: it asks for something that is already true. `MAP_NORESERVE`
+ *     asks for memory not to be committed up front, and since demand paging
+ *     that is what every mapping does; there is no swap, so `MAP_LOCKED`'s
+ *     pages cannot be evicted either. Saying so is not the same as ignoring
+ *     it, and writing it down is what stops someone "implementing" it.
+ *   - **refused**: it would otherwise be accepted and not delivered.
+ *     `MAP_SHARED` without shared frames is a private mapping that two
+ *     processes each believe the other can see — writes that silently go
+ *     nowhere. `MAP_HUGETLB` answered with 4 KiB pages breaks the one
+ *     assumption that is the reason to ask. `MAP_GROWSDOWN` would promise a
+ *     mapping that grows downwards, and nothing here grows one.
+ */
+#define MAP_SHARED 0x000001u
+#define MAP_PRIVATE 0x000002u
+#define MAP_FIXED 0x000010u
+#define MAP_ANONYMOUS 0x000020u
+#define MAP_GROWSDOWN 0x000100u
+#define MAP_DENYWRITE 0x000800u
+#define MAP_EXECUTABLE 0x001000u
+#define MAP_LOCKED 0x002000u
+#define MAP_NORESERVE 0x004000u
+#define MAP_POPULATE 0x008000u
+#define MAP_NONBLOCK 0x010000u
+#define MAP_STACK 0x020000u
+#define MAP_HUGETLB 0x040000u
+#define MAP_FIXED_NOREPLACE 0x100000u
+
+/* A flag the kernel will not deliver, and its name — because `EINVAL` tells
+ * a program nothing, and the kernel's log is the only place the reason can
+ * appear. */
+struct refused_map_flag {
+    uint64_t bit;
+    const char *name;
+};
+
+static const struct refused_map_flag refused_map_flags[] = {
+    {MAP_SHARED, "MAP_SHARED"},
+    {MAP_GROWSDOWN, "MAP_GROWSDOWN"},
+    {MAP_HUGETLB, "MAP_HUGETLB"},
+};
 
 /* The flags `mremap` is called with. `MREMAP_FIXED` is the only one that
  * reads the fifth argument, which is why the argument is not read without
@@ -152,15 +196,49 @@ static int64_t sys_brk(struct trapframe *tf) {
     return (int64_t)uspace_brk(uspace_current(), sysarg(tf, 0));
 }
 
+/* Which flags have already been complained about, so that a program looping
+ * on a refused mapping does not bury the log — the same reason the
+ * unimplemented syscalls have `complained` above. */
+static uint64_t complained_flags;
+
+/* The first flag in this request that the kernel will not deliver, or NULL. */
+static const struct refused_map_flag *refused_flag(uint64_t flags) {
+    for (uint32_t i = 0; i < sizeof refused_map_flags / sizeof refused_map_flags[0]; i++) {
+        if ((flags & refused_map_flags[i].bit) != 0) {
+            return &refused_map_flags[i];
+        }
+    }
+    return NULL;
+}
+
 static int64_t sys_mmap(struct trapframe *tf) {
     uint64_t flags = sysarg(tf, 3);
+    const struct refused_map_flag *no = refused_flag(flags);
+    struct uspace_mapping m;
     virt_t out = 0;
     int rc;
     if ((flags & MAP_ANONYMOUS) == 0) {
         return KERR_NODEV; /* nothing is mappable from a file yet */
     }
-    rc = uspace_map_anon(uspace_current(), sysarg(tf, 0), sysarg(tf, 1), (uint32_t)sysarg(tf, 2),
-                         (flags & MAP_FIXED) != 0, &out);
+    if (no != NULL) {
+        if ((complained_flags & no->bit) == 0) {
+            complained_flags |= no->bit;
+            kprintf("mmap: %s refused — it would be accepted and not delivered\n", no->name);
+        }
+        return KERR_INVAL;
+    }
+    m.at = sysarg(tf, 0);
+    m.bytes = sysarg(tf, 1);
+    m.prot = (uint32_t)sysarg(tf, 2);
+    /* `MAP_FIXED_NOREPLACE` is the same insistence on an address as
+     * `MAP_FIXED`, with the opposite answer to a collision — and it is its
+     * own bit, not an addition to `MAP_FIXED`. `MAP_LOCKED` populates
+     * because that is what locking does on Linux, and a locked mapping
+     * whose pages arrived later would not have been locked. */
+    m.fixed = (flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) != 0;
+    m.noreplace = (flags & MAP_FIXED_NOREPLACE) != 0;
+    m.populate = (flags & (MAP_POPULATE | MAP_LOCKED)) != 0;
+    rc = uspace_map_anon(uspace_current(), &m, &out);
     return rc == KERR_OK ? (int64_t)out : rc;
 }
 

@@ -993,6 +993,17 @@ extern const char user_term_start[], user_term_end[];
 extern const char user_uid_start[], user_uid_end[];
 extern const char user_rlimit_start[], user_rlimit_end[];
 extern const char user_mremap_start[], user_mremap_end[];
+extern const char user_mapflags_start[], user_mapflags_end[];
+
+/* The three numbers that tell how a mapping's pages were paid for: on first
+ * touch, up front because the caller asked, and re-pointed by a move. They
+ * are what turn "demand paging works" and "nothing is copied" into
+ * measurements rather than claims, so they are printed together. */
+static void report_mapping_counters(void) {
+    kprintf("mem: %llu pages backed on demand, %llu populated up front, %llu moved by mremap\n",
+            (unsigned long long)uspace_demand_pages(), (unsigned long long)uspace_populated_pages(),
+            (unsigned long long)uspace_moved_pages());
+}
 
 static void run_one_user_program(const char *name, const char *from, const char *to) {
     struct uproc *proc = uspace_alloc();
@@ -1097,9 +1108,7 @@ static void run_init_from_disk(const char *path) {
     /* Pages backed on first touch rather than at `mmap`. Zero would mean
      * demand paging is not happening whatever the code says — the one
      * number that tells "lazy" from "eager somewhere else". */
-    kprintf("mem: %llu pages backed on demand, %llu moved by mremap\n",
-            (unsigned long long)uspace_demand_pages(),
-            (unsigned long long)uspace_moved_pages());
+    report_mapping_counters();
     report_hart_usage();
     /* The stack's own counters after a program that used it. A reset or a
      * drop is the difference between "the program's logic is wrong" and
@@ -1224,9 +1233,15 @@ static void run_user_programs(void) {
      * many pages were re-pointed rather than copied. */
     if (cmdline_has(boot_cmdline, "minikern.mremap")) {
         run_one_user_program("mremap", user_mremap_start, user_mremap_end);
-        kprintf("mem: %llu pages backed on demand, %llu moved by mremap\n",
-                (unsigned long long)uspace_demand_pages(),
-                (unsigned long long)uspace_moved_pages());
+        report_mapping_counters();
+    }
+    /* Roadmap §2: the `mmap` flags. Seven checks in a bitmask, so **127** is
+     * a pass. The populated count below is the half the program cannot see:
+     * `MAP_POPULATE`'s pages are backed at `mmap` and so never appear in the
+     * demand count. */
+    if (cmdline_has(boot_cmdline, "minikern.mapflags")) {
+        run_one_user_program("mapflags", user_mapflags_start, user_mapflags_end);
+        report_mapping_counters();
     }
     if (cmdline_has(boot_cmdline, "minikern.init")) {
         run_init_from_disk("/init");

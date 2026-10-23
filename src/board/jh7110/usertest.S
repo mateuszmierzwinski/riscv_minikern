@@ -1247,3 +1247,130 @@ mr_refused:
     ecall
 5:  j       5b
 user_mremap_end:
+
+/* Roadmap §2: the `mmap` flags, each either honoured, vacuous or refused.
+ *
+ * Seven checks, one bit each; **127 is a pass.** The refusals are as much
+ * of the point as the honourings: a flag that is accepted and not delivered
+ * leaves the caller's assumption standing, and `MAP_SHARED` answered with
+ * private memory is two processes each believing the other can see their
+ * writes.
+ *
+ * What a program cannot see from here is whether `MAP_POPULATE` actually
+ * backed anything — the memory reads as zeroes either way. That half is the
+ * kernel's own counter, printed after this program runs: the pages it
+ * covers appear there and never in the demand-paging count.
+ */
+    .globl user_mapflags_start
+    .globl user_mapflags_end
+user_mapflags_start:
+    li      s2, 0
+
+    /* 1: MAP_SHARED is refused rather than quietly made private. */
+    li      a0, 0
+    li      a1, 4096
+    li      a2, 3
+    li      a3, 0x21             /* MAP_SHARED | MAP_ANONYMOUS */
+    li      a4, -1
+    li      a5, 0
+    li      a7, SYS_MMAP
+    ecall
+    bgez    a0, mf_huge
+    ori     s2, s2, 1
+
+    /* 2: MAP_HUGETLB, rather than 4 KiB pages pretending. */
+mf_huge:
+    li      a0, 0
+    li      a1, 4096
+    li      a2, 3
+    li      a3, 0x40022          /* MAP_HUGETLB | MAP_PRIVATE | MAP_ANONYMOUS */
+    li      a4, -1
+    li      a5, 0
+    li      a7, SYS_MMAP
+    ecall
+    bgez    a0, mf_grow
+    ori     s2, s2, 2
+
+    /* 3: MAP_GROWSDOWN, rather than a mapping that will not grow. */
+mf_grow:
+    li      a0, 0
+    li      a1, 4096
+    li      a2, 3
+    li      a3, 0x122            /* MAP_GROWSDOWN | MAP_PRIVATE | MAP_ANONYMOUS */
+    li      a4, -1
+    li      a5, 0
+    li      a7, SYS_MMAP
+    ecall
+    bgez    a0, mf_populate
+    ori     s2, s2, 4
+
+    /* 4: MAP_POPULATE is accepted and the memory works. */
+mf_populate:
+    li      a0, 0
+    li      a1, 4 * 4096
+    li      a2, 3
+    li      a3, 0x8022           /* MAP_POPULATE | MAP_PRIVATE | MAP_ANONYMOUS */
+    li      a4, -1
+    li      a5, 0
+    li      a7, SYS_MMAP
+    ecall
+    bltz    a0, mf_done
+    mv      s3, a0
+    li      t2, 0x1234
+    sd      t2, 0(s3)
+    ld      t5, 0(s3)
+    bne     t5, t2, mf_taken
+    ori     s2, s2, 8
+
+    /* 5: MAP_FIXED_NOREPLACE over something refuses instead of destroying
+     * it — which is the reason the flag exists. */
+mf_taken:
+    mv      a0, s3
+    li      a1, 4096
+    li      a2, 3
+    li      a3, 0x100022         /* MAP_FIXED_NOREPLACE | PRIVATE | ANONYMOUS */
+    li      a4, -1
+    li      a5, 0
+    li      a7, SYS_MMAP
+    ecall
+    bgez    a0, mf_free
+    ori     s2, s2, 16
+
+    /* 6: and takes the address once it is free, exactly. */
+mf_free:
+    mv      a0, s3
+    li      a1, 4 * 4096
+    li      a7, SYS_MUNMAP
+    ecall
+    bnez    a0, mf_vacuous
+    mv      a0, s3
+    li      a1, 4096
+    li      a2, 3
+    li      a3, 0x100022
+    li      a4, -1
+    li      a5, 0
+    li      a7, SYS_MMAP
+    ecall
+    bne     a0, s3, mf_vacuous
+    ori     s2, s2, 32
+
+    /* 7: the vacuous flags are accepted, because they ask for what is
+     * already true rather than for something missing. */
+mf_vacuous:
+    li      a0, 0
+    li      a1, 4096
+    li      a2, 3
+    li      a3, 0x24022          /* MAP_NORESERVE | MAP_STACK | PRIVATE | ANON */
+    li      a4, -1
+    li      a5, 0
+    li      a7, SYS_MMAP
+    ecall
+    bltz    a0, mf_done
+    ori     s2, s2, 64
+
+mf_done:
+    mv      a0, s2
+    li      a7, SYS_EXIT_GROUP
+    ecall
+6:  j       6b
+user_mapflags_end:

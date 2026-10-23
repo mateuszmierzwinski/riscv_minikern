@@ -310,24 +310,40 @@ struct uproc *uspace_current(void);
  * return: it unwinds to whoever called `uspace_run`. */
 void uspace_exit(int64_t status);
 
-/* Maps anonymous zeroed pages into the running process.
+/* What a mapping is being asked for.
+ *
+ * A struct rather than a row of positional arguments: `mmap` has six of its
+ * own, the flags that change what this kernel *does* keep being added to
+ * them, and the next thing to come — a file to map — belongs here rather
+ * than on the end of a signature nobody can read. The caller fills in what
+ * it means; everything it leaves alone is the ordinary case.
  *
  * `at` of 0 lets the kernel choose, and a non-zero `at` is **a request, not
  * a demand** unless `fixed` — which is what a runtime placing its heap by
- * hint expects: an address it cannot have comes back as a different one, not
- * as a failure.
+ * hint expects: an address it cannot have comes back as a different one,
+ * not as a failure.
  *
  * `prot` is PROT_* from `core/elf.h`. PROT_NONE is a **reservation**: an
  * address range is promised and nothing is backed, because a Go runtime
  * reserves its arenas before it uses any of them, and backing hundreds of
  * gigabytes of address space with page tables would exhaust memory for
  * nothing. The pages appear when the range is mapped again with real
- * permissions.
+ * permissions. */
+struct uspace_mapping {
+    virt_t at;
+    uint64_t bytes;
+    uint32_t prot;
+    bool fixed;     /* MAP_FIXED: this address, replacing what is there */
+    bool noreplace; /* MAP_FIXED_NOREPLACE: this address, and over nothing */
+    bool populate;  /* MAP_POPULATE: back the pages now, not on first touch */
+};
+
+/* Maps anonymous zeroed pages into the running process.
  *
  * Reports the address it chose. KERR_NOMEM when pages or address space run
- * out, KERR_INVAL for a length of zero or an unaligned fixed address. */
-int uspace_map_anon(struct uproc *p, virt_t at, uint64_t bytes, uint32_t prot, bool fixed,
-                    virt_t *out);
+ * out, KERR_INVAL for a length of zero or an unaligned fixed address, and
+ * KERR_EXIST for a `noreplace` mapping whose range is not free. */
+int uspace_map_anon(struct uproc *p, const struct uspace_mapping *m, virt_t *out);
 
 /* Unmaps a range and frees whatever was backing it. A range that was only
  * reserved unmaps successfully, having nothing to free — which is what a
@@ -438,6 +454,12 @@ uint64_t uspace_moved_pages(void);
  * zero means something mapped memory without recording it, which is this
  * kernel's most expensive class of defect. */
 uint32_t uspace_stale_records(void);
+
+/* How many pages were backed at `mmap` because the caller asked for them up
+ * front (`MAP_POPULATE`) rather than on first touch. It is how "the flag is
+ * honoured" is told from "the flag is accepted": the pages it covers appear
+ * here and never in the demand count. */
+uint64_t uspace_populated_pages(void);
 
 /* A child with an address space of its own, made of the parent's pages
  * copy-on-write. Unlike `uspace_fork_shared` (which is `vfork`), the two

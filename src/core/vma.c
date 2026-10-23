@@ -146,8 +146,12 @@ int vma_protect(struct vma_set *s, virt_t start, virt_t end, uint32_t prot) {
     return KERR_OK;
 }
 
-static bool range_free(const struct vma_set *s, virt_t start, virt_t end) {
-    uint32_t i = first_after(s, start);
+bool vma_range_free(const struct vma_set *s, virt_t start, virt_t end) {
+    uint32_t i;
+    if (s == NULL) {
+        return false;
+    }
+    i = first_after(s, start);
     return i == s->n || s->v[i].start >= end;
 }
 
@@ -185,7 +189,7 @@ int vma_find_free(const struct vma_set *s, virt_t len, virt_t hint, virt_t lo, v
     if (len == 0 || len % VMA_PAGE != 0 || hi <= lo || len > hi - lo) {
         return KERR_NOMEM;
     }
-    if (hint % VMA_PAGE == 0 && hint >= lo && hint <= hi - len && range_free(s, hint, hint + len)) {
+    if (hint % VMA_PAGE == 0 && hint >= lo && hint <= hi - len && vma_range_free(s, hint, hint + len)) {
         *addr = hint;
         return KERR_OK;
     }

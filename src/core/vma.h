@@ -9,6 +9,7 @@
 #ifndef MINIKERN_CORE_VMA_H
 #define MINIKERN_CORE_VMA_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #include "core/types.h"
@@ -63,6 +64,15 @@ int vma_remove(struct vma_set *s, virt_t start, virt_t end,
 /* Sets prot on [start, end). KERR_NOMEM (Linux's answer) when part of the
  * range is unmapped or a split needs a slot it lacks; nothing changes then. */
 int vma_protect(struct vma_set *s, virt_t start, virt_t end, uint32_t prot);
+
+/* Whether every byte of [start, end) is outside every region.
+ *
+ * The question `MAP_FIXED_NOREPLACE` asks, and the reason it exists: before
+ * it, the only way for a program to find out whether an address was free
+ * was to take it, and a wrong guess cost whatever was there. One region can
+ * answer, because the set is sorted and non-overlapping — the first region
+ * ending after `start` is the only one that could reach into the range. */
+bool vma_range_free(const struct vma_set *s, virt_t start, virt_t end);
 
 /* A free gap of len bytes inside [lo, hi): the highest one below hi, or
  * exactly hint when [hint, hint+len) is free and inside the window.

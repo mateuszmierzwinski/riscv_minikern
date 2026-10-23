@@ -197,6 +197,24 @@ static void test_a_removed_range_is_offered_again(void) {
     KTEST_CHECK(at == WINDOW_HI - 4u * PAGE);
 }
 
+/* `MAP_FIXED_NOREPLACE`'s question, which nothing could ask before: is this
+ * exact range free? One region answers it, because the set is sorted — and
+ * the case that matters is a range that *starts* free and runs into
+ * something, which a check of the first page alone would have called free.
+ * That mistake has been made in this file before, in the hinted placement
+ * path, and it cost live memory. */
+static void test_a_range_is_free_only_if_all_of_it_is(void) {
+    fresh();
+    KTEST_CHECK(vma_insert(&set, WINDOW_LO + 4u * PAGE, WINDOW_LO + 8u * PAGE, 3u, 0) == KERR_OK);
+    KTEST_CHECK(vma_range_free(&set, WINDOW_LO, WINDOW_LO + 4u * PAGE));
+    KTEST_CHECK(!vma_range_free(&set, WINDOW_LO, WINDOW_LO + 5u * PAGE));
+    KTEST_CHECK(!vma_range_free(&set, WINDOW_LO + 7u * PAGE, WINDOW_LO + 12u * PAGE));
+    KTEST_CHECK(!vma_range_free(&set, WINDOW_LO + 5u * PAGE, WINDOW_LO + 6u * PAGE));
+    /* Half-open at both ends: a range ending exactly where a region begins,
+     * and one beginning exactly where it ends, are both free. */
+    KTEST_CHECK(vma_range_free(&set, WINDOW_LO + 8u * PAGE, WINDOW_LO + 12u * PAGE));
+}
+
 int main(void) {
     KTEST_RUN(test_insert_and_find);
     KTEST_RUN(test_overlap_is_refused);
@@ -212,5 +230,6 @@ int main(void) {
     KTEST_RUN(test_growing_in_place_is_an_insert_that_merges);
     KTEST_RUN(test_an_occupied_tail_refuses_the_growth);
     KTEST_RUN(test_a_removed_range_is_offered_again);
+    KTEST_RUN(test_a_range_is_free_only_if_all_of_it_is);
     return ktest_failures();
 }

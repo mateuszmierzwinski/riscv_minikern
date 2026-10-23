@@ -1692,72 +1692,139 @@ static void published_addition(void) {
     mmu_flush_tlb_local();
 }
 
-int uspace_map_anon(struct uproc *p, virt_t at, uint64_t bytes, uint32_t prot, bool fixed,
-                    virt_t *out) {
+/* Whether a mapping may have the addresses it insists on.
+ *
+ * `MAP_FIXED` replaces whatever is there, which is how a runtime commits
+ * part of a reservation it already holds. `MAP_FIXED_NOREPLACE` is the same
+ * insistence with the opposite answer to a collision — `EEXIST` rather than
+ * destruction — and that is the whole reason it exists: without it a
+ * program's only way to find out whether an address was free was to take
+ * it, and a wrong guess cost whatever was there.
+ *
+ * The bound is written as a subtraction because the addition **wraps**. It
+ * used to read `at + pages * PAGE_SIZE > USER_STACK_TOP`, and an address a
+ * few pages below 2^64 wrapped past zero and compared as being inside user
+ * space. Nothing reached the page tables — they refuse a non-canonical
+ * address — so the check was wrong without being a hole, which is the kind
+ * that survives. */
+static int fixed_is_allowed(struct uproc *p, const struct uspace_mapping *m, uint64_t pages) {
+    uint64_t bytes = pages * PAGE_SIZE;
+    if ((m->at & (PAGE_SIZE - 1u)) != 0 || m->at == 0 || m->at >= USER_STACK_TOP ||
+        bytes > USER_STACK_TOP - m->at) {
+        return KERR_INVAL;
+    }
+    if (m->noreplace && !vma_range_free(&p->vmas, m->at, m->at + bytes)) {
+        return KERR_EXIST;
+    }
+    return KERR_OK;
+}
+
+/* How many pages were backed at `mmap` because the caller asked for them to
+ * be, rather than on first touch. */
+static uint64_t populated_pages;
+
+uint64_t uspace_populated_pages(void) {
+    return populated_pages;
+}
+
+/* Backs a whole mapping now, for a caller that would rather pay up front
+ * than take a fault per page (`MAP_POPULATE`, and `MAP_LOCKED`, which on
+ * Linux populates as part of locking).
+ *
+ * **Advisory, here as there**: running out of memory part-way does not fail
+ * the mapping, because the pages that did not get one will be faulted in
+ * exactly as they would have been without the flag. A reservation has
+ * nothing to populate — `PROT_NONE` means there is deliberately nothing
+ * there — so it is left alone rather than quietly given pages. */
+static void populate(struct uproc *p, virt_t base, uint64_t pages, uint32_t prot) {
+    if (prot == 0) {
+        return;
+    }
+    for (uint64_t i = 0; i < pages; i++) {
+        if (back_one_page(p, base + i * PAGE_SIZE, prot) != KERR_OK) {
+            return;
+        }
+        populated_pages++;
+    }
+}
+
+/* Takes the addresses a new mapping is about to occupy.
+ *
+ * A mapping the caller did *not* insist on must never replace anything — it
+ * was placed somewhere free — so when it does, that is a placement bug
+ * destroying live memory, and it is counted rather than left to be inferred
+ * from the program misbehaving later.
+ *
+ * **Unmapped, and not re-backed.** This used to back each page here, which
+ * is what made a large mapping cost all of its pages the moment it was
+ * asked for; the first touch of each page faults into `back_on_demand`
+ * instead. The pages still have to go: a fixed mapping replaces what was
+ * there, and leaving the old frame mapped under a new region's rights would
+ * be the previous contents showing through a fresh mapping, which a caller
+ * is entitled to assume is zero.
+ *
+ * `drop_pages` and not `uspace_unmap`, because the record is the caller's
+ * to rewrite — it removes and re-inserts the whole range. Going through
+ * `munmap`'s half would remove the record a page at a time, splitting a
+ * region once per page on the way. */
+static void clear_the_range(struct uproc *p, bool fixed, virt_t base, uint64_t pages) {
+    for (uint64_t i = 0; i < pages; i++) {
+        virt_t va = base + i * PAGE_SIZE;
+        phys_t was = 0;
+        uint64_t f = 0, sz = 0;
+        if (!fixed && pgtable_lookup(&p->pt, va, &was, &f, &sz)) {
+            replaced_pages++;
+        }
+        (void)drop_pages(p, va, PAGE_SIZE);
+    }
+}
+
+/* Writes the new region into the address-space record, whatever its rights
+ * are: a reservation is a range that is spoken for, and the whole point of
+ * the set is that it says so. A fixed mapping replaces what was there, so
+ * the old regions go first.
+ *
+ * **A mapping that cannot be recorded is refused**, and the pages it had
+ * been given are handed back. An unrecorded region is worse than a failed
+ * `mmap`: the next gap search cannot see it, so it hands the same addresses
+ * out again and two allocations share pages. A program that is told
+ * `ENOMEM` can cope; one that is given memory somebody else is using
+ * cannot. The failure is silent and total — measured, a kernel that kept
+ * going here stopped producing any output at all. */
+static int record_the_mapping(struct uproc *p, virt_t base, uint64_t pages, uint32_t prot) {
+    if (vma_remove(&p->vmas, base, base + pages * PAGE_SIZE, NULL, NULL) == KERR_OK &&
+        vma_insert(&p->vmas, base, base + pages * PAGE_SIZE, prot, 0) == KERR_OK) {
+        return KERR_OK;
+    }
+    unrecorded_regions++;
+    (void)drop_pages(p, base, pages * PAGE_SIZE);
+    return KERR_NOMEM;
+}
+
+int uspace_map_anon(struct uproc *p, const struct uspace_mapping *m, virt_t *out) {
     uint64_t pages = 0;
     virt_t base;
-    if (!page_count(bytes, &pages)) {
+    int rc;
+    if (p == NULL || m == NULL || out == NULL || !page_count(m->bytes, &pages)) {
         return KERR_INVAL;
     }
-    if (fixed && ((at & (PAGE_SIZE - 1u)) != 0 || at == 0 ||
-                  at + pages * PAGE_SIZE > USER_STACK_TOP)) {
-        return KERR_INVAL;
+    if (m->fixed) {
+        rc = fixed_is_allowed(p, m, pages);
+        if (rc != KERR_OK) {
+            return rc;
+        }
     }
-    base = fixed ? at : place_mapping(p, at, pages);
+    base = m->fixed ? m->at : place_mapping(p, m->at, pages);
     if (base == 0) {
         return KERR_NOMEM;
     }
-    /* A fixed mapping replaces whatever is there, which is how a runtime
-     * commits part of a reservation it already holds. A mapping the caller
-     * did *not* insist on must never replace anything — it was placed
-     * somewhere free — so when it does, that is a placement bug destroying
-     * live memory, and it is counted rather than left to be inferred from
-     * the program misbehaving later. */
-    for (uint64_t i = 0; i < pages; i++) {
-        virt_t va = base + i * PAGE_SIZE;
-        if (!fixed) {
-            phys_t was = 0;
-            uint64_t f = 0, sz = 0;
-            if (pgtable_lookup(&p->pt, va, &was, &f, &sz)) {
-                replaced_pages++;
-            }
-        }
-        /* **Unmapped, and not re-backed.**
-         *
-         * This used to call `back_one_page` here, which is what made a
-         * large mapping cost all of its pages the moment it was asked for.
-         * The region is recorded below, and the first touch of each page
-         * faults into `back_on_demand`, which backs it with the region's
-         * rights.
-         *
-         * The pages still have to go: a fixed mapping replaces what was
-         * there, and leaving the old frame mapped under a new region's
-         * rights would be the previous contents showing through a fresh
-         * mapping — which a caller is entitled to assume is zero.
-         *
-         * `drop_pages` and not `uspace_unmap`, because the record is this
-         * function's to rewrite: it removes and re-inserts the whole range
-         * below. Going through `munmap`'s half would remove the record a
-         * page at a time, splitting a region once per page on the way. */
-        (void)drop_pages(p, va, PAGE_SIZE);
+    clear_the_range(p, m->fixed, base, pages);
+    rc = record_the_mapping(p, base, pages, m->prot);
+    if (rc != KERR_OK) {
+        return rc;
     }
-    /* Recorded whatever its rights are: a reservation is a region of the
-     * address space that is spoken for, and the whole point of the set is
-     * that it says so. A fixed mapping replaces what was there, so the old
-     * regions go first.
-     *
-     * **A mapping that cannot be recorded is refused**, and the pages it
-     * had been given are handed back. An unrecorded region is worse than a
-     * failed `mmap`: the next gap search cannot see it, so it hands the same
-     * addresses out again and two allocations share pages. A program that
-     * is told `ENOMEM` can cope; one that is given memory somebody else is
-     * using cannot. The failure is silent and total — measured, a kernel
-     * that kept going here stopped producing any output at all. */
-    if (vma_remove(&p->vmas, base, base + pages * PAGE_SIZE, NULL, NULL) != KERR_OK ||
-        vma_insert(&p->vmas, base, base + pages * PAGE_SIZE, prot, 0) != KERR_OK) {
-        unrecorded_regions++;
-        (void)drop_pages(p, base, pages * PAGE_SIZE);
-        return KERR_NOMEM;
+    if (m->populate) {
+        populate(p, base, pages, m->prot);
     }
     *out = base;
     published_addition();
