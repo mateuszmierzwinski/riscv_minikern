@@ -6,16 +6,68 @@
 #include "core/errno.h"
 #include "kernel/mem.h"
 #include "kernel/sched.h"
+#include "kernel/tty.h"
+#include "kernel/uspace.h"
 
 /* ── the console ────────────────────────────────────────────────────────── */
 
-/* Reading from the console is end of file. There is no input device wired to
- * a process yet, and 0 is a true answer a runtime handles; an error is not. */
+/* Reading the console is reading the **terminal** now: a line at a time,
+ * blocking until one is typed, and refused with `SIGTTIN` for a process
+ * that is not in the foreground group.
+ *
+ * It used to return 0 — end of file — because nothing was wired to the
+ * input side, and the comment said so. That answer was true and is now
+ * wrong, which is the usual fate of a stub that reports success. */
 static int32_t console_file_read(struct file *f, void *buf, uint32_t n) {
     (void)f;
-    (void)buf;
-    (void)n;
-    return 0;
+    return ktty_read(buf, n);
+}
+
+/* Ready when a line is waiting, so `poll` on the console means something.
+ * `NULL` meant "always ready both ways", which for the read side was a lie
+ * that a runtime acts on by reading and getting nothing. */
+static uint32_t console_file_poll(struct file *f) {
+    (void)f;
+    /* Writable always; readable when a line is waiting. `NULL` here meant
+     * "always ready for everything", which for the read side was a lie a
+     * runtime acts on by reading and getting nothing. */
+    return EPOLLOUT | (ktty_ready() ? EPOLLIN : 0u);
+}
+
+/* `ioctl`, for the two things a program asks a terminal.
+ *
+ * A program that cannot get a window size lays itself out for 0x0, and one
+ * that cannot find the foreground group cannot do job control at all. The
+ * rest of `ioctl` is refused rather than pretended: returning 0 for an
+ * unknown request tells a caller its request was honoured. */
+static int32_t console_file_ioctl(struct file *f, uint32_t request, virt_t arg) {
+    struct user_winsize ws;
+    uint32_t pgid;
+    (void)f;
+    switch (request) {
+    case TIOCGWINSZ:
+        ktty_window(&ws.rows, &ws.cols);
+        ws.xpixel = 0;
+        ws.ypixel = 0;
+        return uspace_copy_out(arg, &ws, sizeof ws) == KERR_OK ? 0 : KERR_FAULT;
+    case TIOCSWINSZ:
+        if (uspace_copy_in(&ws, arg, sizeof ws) != KERR_OK) {
+            return KERR_FAULT;
+        }
+        ktty_set_window(ws.rows, ws.cols);
+        return 0;
+    case TIOCGPGRP:
+        pgid = ktty_foreground();
+        return uspace_copy_out(arg, &pgid, sizeof pgid) == KERR_OK ? 0 : KERR_FAULT;
+    case TIOCSPGRP:
+        if (uspace_copy_in(&pgid, arg, sizeof pgid) != KERR_OK) {
+            return KERR_FAULT;
+        }
+        ktty_set_foreground(pgid);
+        return 0;
+    default:
+        return KERR_NOTTY;
+    }
 }
 
 /* Named for the object rather than the operation, because `console_write`
@@ -30,7 +82,8 @@ static int32_t console_file_write(struct file *f, const void *buf, uint32_t n) {
 static const struct file_ops console_ops = {
     .read = console_file_read,
     .write = console_file_write,
-    .poll = NULL, /* always ready both ways */
+    .poll = console_file_poll,
+    .ioctl = console_file_ioctl,
 };
 
 int fdobjects_open_console(void) {

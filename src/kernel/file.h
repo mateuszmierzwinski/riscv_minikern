@@ -24,6 +24,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "core/types.h"
+
 /* How many descriptors a process may hold. Go opens a handful per
  * connection; 64 is enough for the programs this kernel runs and small
  * enough that the table is scanned without thinking about it. */
@@ -59,6 +61,12 @@ struct file_ops {
     /* Called when the last reference goes. NULL when there is nothing to
      * undo. */
     void (*release)(struct file *f);
+    /* A device request. NULL means this object is not a device, and the
+     * syscall answers `ENOTTY` — which is what a program checks to find out
+     * whether its output is a terminal, so answering 0 instead would make
+     * every pipe claim to be one. `arg` is a user pointer and belongs to the
+     * implementation to validate. */
+    int32_t (*ioctl)(struct file *f, uint32_t request, virt_t arg);
 };
 
 struct file {

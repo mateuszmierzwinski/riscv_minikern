@@ -61,6 +61,28 @@ cc_test(
     ],
 )
 
+# The line discipline: what turns bytes from a wire into the lines a program
+# expects from a terminal. Pure and host-tested, because every mistake in it
+# is a plausible behaviour that needs a human's fingers to notice — a
+# backspace that erases the prompt, an echo that prints a control character
+# as itself, a ^D that throws away the line it was meant to deliver.
+cc_library(
+    name = "tty",
+    srcs = ["src/core/tty.c"],
+    hdrs = ["src/core/tty.h"],
+    strip_include_prefix = "src",
+)
+
+cc_test(
+    name = "tty_test",
+    size = "small",
+    srcs = ["test/tty_test.c"],
+    deps = [
+        ":ktest",
+        ":tty",
+    ],
+)
+
 cc_library(
     name = "console",
     srcs = ["src/core/console.c"],
@@ -697,6 +719,7 @@ cc_library(
         "src/arch/riscv/uspace_entry.S",
         "src/kernel/sched.c",
         "src/kernel/fdobjects.c",
+        "src/kernel/tty.c",
         "src/kernel/sock_tcp.c",
         "src/kernel/sys_proc.c",
         "src/kernel/sys_socket.c",
@@ -710,6 +733,7 @@ cc_library(
     hdrs = [
         "src/arch/riscv/sigframe.h",
         "src/kernel/fdobjects.h",
+        "src/kernel/tty.h",
         "src/kernel/socket.h",
         "src/kernel/file.h",
         "src/kernel/signal.h",
@@ -722,6 +746,7 @@ cc_library(
     deps = [
         ":vma",
         ":arch_riscv",
+        ":tty",
         ":console",
         ":exec",
         ":fair",

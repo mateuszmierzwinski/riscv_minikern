@@ -372,6 +372,14 @@ uint32_t sched_stop_process(uint32_t pid);
  * a shell sends, and not right for a multi-threaded program catching them.
  * Returns false if the process has no thread to raise it on. */
 bool sched_raise_on_process(uint32_t pid, uint32_t signo);
+
+/* Whether the running thread has an unblocked signal waiting.
+ *
+ * A blocking read needs it: a read interrupted by a signal has to return so
+ * the handler can run, and a read that keeps waiting makes `^C` do nothing
+ * until the user types a line — which looks exactly like the key being
+ * ignored. */
+bool sched_signal_pending(void);
 uint32_t sched_continue_process(uint32_t pid);
 
 uint32_t sched_rt_priority(void);

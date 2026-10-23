@@ -380,6 +380,25 @@ static int64_t sys_sched_get_priority_min(struct trapframe *tf) {
     return policy == SCHED_OTHER ? 0 : KERR_INVAL;
 }
 
+/* `ioctl(fd, request, arg)`.
+ *
+ * Dispatched to the object, and **`ENOTTY` when the object has no `ioctl`**
+ * rather than 0. A program uses exactly this to find out whether its output
+ * is a terminal, so answering 0 for a pipe would have every pipe claim to
+ * be one — and then the program emits escape sequences into a file. */
+static int64_t sys_ioctl(struct trapframe *tf) {
+    struct file *f = fd_get((int32_t)sysarg(tf, 0));
+    uint32_t request = (uint32_t)sysarg(tf, 1);
+    virt_t arg = (virt_t)sysarg(tf, 2);
+    if (f == NULL) {
+        return KERR_BADF;
+    }
+    if (f->ops->ioctl == NULL) {
+        return KERR_NOTTY;
+    }
+    return f->ops->ioctl(f, request, arg);
+}
+
 /* ── descriptors ───────────────────────────────────────────────────────────
  *
  * Everything goes through the file layer now. It used to be a `switch` on
@@ -901,6 +920,7 @@ static const struct syscall_entry table[] = {
     {SYS_RT_SIGACTION, "rt_sigaction", sys_rt_sigaction},
     {SYS_RT_SIGPROCMASK, "rt_sigprocmask", sys_rt_sigprocmask},
     {SYS_RT_SIGRETURN, "rt_sigreturn", sys_rt_sigreturn},
+    {29u, "ioctl", sys_ioctl},
     {SYS_SCHED_GETAFFINITY, "sched_getaffinity", sys_sched_getaffinity},
     {SYS_SCHED_SETAFFINITY, "sched_setaffinity", sys_sched_setaffinity},
     {SYS_SCHED_SETSCHEDULER, "sched_setscheduler", sys_sched_setscheduler},

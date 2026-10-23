@@ -37,6 +37,11 @@
 int jh7110_uart_init(const struct fdt *fdt, struct console_port *out);
 
 /* Where it was found, for the boot log: the node's path and its address. */
+/* One received byte, or **-1 when there is none**. Polled and
+ * non-blocking: the caller is a line discipline with other work, and a
+ * received NUL is a byte, so "nothing" cannot be reported as 0. */
+int jh7110_uart_getc(void);
+
 const char *jh7110_uart_path(void);
 phys_t jh7110_uart_base(void);
 

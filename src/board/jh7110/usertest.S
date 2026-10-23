@@ -29,6 +29,8 @@
 #define SYS_KILL 129
 #define SYS_GETPGID 155
 #define SYS_GETPID 172
+#define SYS_IOCTL 29
+#define SYS_READ 63
 
 user_program_start:
     /* write(1, message, length) — the address comes from the program
@@ -731,6 +733,77 @@ pgrp_wait_failed:
     ecall
 7:  j       7b
 user_pgrp_end:
+
+/* A tenth program: **reads a line from the terminal.**
+ *
+ * Roadmap §1's controlling-terminal step. Everything about the line
+ * discipline is tested on the host, because the editing rules need a
+ * human's fingers to notice. What only a board can show is the rest of the
+ * path: a byte arriving on the UART, reaching the discipline from the
+ * housekeeping beat, waking a blocked reader, and coming back through
+ * `read` on descriptor 0.
+ *
+ * It asks the terminal its size first, because a program that cannot do
+ * that lays itself out for a window with no room in it — and because
+ * `ioctl` returning `ENOTTY` for a terminal is the failure that makes every
+ * program think its output is a pipe.
+ *
+ * Then it reads one line and writes it back. The harness types `hi` and
+ * looks for it echoed: the echo proves the discipline ran, and the write
+ * proves the line reached the program.
+ */
+    .globl user_term_start
+    .globl user_term_end
+user_term_start:
+    /* ioctl(1, TIOCGWINSZ, &ws) */
+    addi    sp, sp, -32
+    li      a0, 1
+    li      a1, 0x5413
+    mv      a2, sp
+    li      a7, SYS_IOCTL
+    ecall
+    bltz    a0, term_no_tty
+    lhu     t0, 0(sp)            /* rows */
+    lhu     t1, 2(sp)            /* cols */
+    li      t2, 24
+    bne     t0, t2, term_bad_size
+    li      t2, 80
+    bne     t1, t2, term_bad_size
+
+    /* read(0, buf, 64) — blocks until a line is typed. */
+    addi    sp, sp, -64
+    li      a0, 0
+    mv      a1, sp
+    li      a2, 64
+    li      a7, SYS_READ
+    ecall
+    blez    a0, term_read_failed
+    mv      s1, a0
+
+    /* write(1, buf, n) — hand the line straight back. */
+    li      a0, 1
+    mv      a1, sp
+    mv      a2, s1
+    li      a7, SYS_WRITE
+    ecall
+    li      a0, 0
+    li      a7, SYS_EXIT_GROUP
+    ecall
+
+term_no_tty:
+    li      a0, 121
+    li      a7, SYS_EXIT_GROUP
+    ecall
+term_bad_size:
+    li      a0, 122
+    li      a7, SYS_EXIT_GROUP
+    ecall
+term_read_failed:
+    li      a0, 123
+    li      a7, SYS_EXIT_GROUP
+    ecall
+6:  j       6b
+user_term_end:
 
 /* A second program, which faults on purpose: it reads an address that is
  * mapped for the kernel and not for user mode. */

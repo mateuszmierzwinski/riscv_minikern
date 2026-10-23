@@ -87,9 +87,29 @@ Ordering inside a section is roughly by what unblocks the most.
       process's first live thread, since there is no process-wide pending
       set — right for what a shell sends, wrong for a multi-threaded
       program catching them, and said so in the code.
-- [ ] **A controlling terminal.** (M) Line discipline, canonical mode,
-      `TIOCGWINSZ`. Today the console is a write-only sink with a read path
-      that is not a terminal.
+- [x] **A controlling terminal.** (M) **Done.** Canonical mode with echo,
+      `^C`/`^Z`/`^D`/erase/kill, `TIOCGWINSZ`/`TIOCSWINSZ`,
+      `TIOCGPGRP`/`TIOCSPGRP`, and `SIGTTIN` for a background reader —
+      because two programs reading one keyboard would each get an arbitrary
+      half of every line.
+      The editing rules are **pure and host-tested** (`core/tty.c`,
+      `test/tty_test.c`): every mistake in them is a plausible behaviour
+      that needs a human's fingers to notice — a backspace that erases the
+      prompt, an echo that prints a control character as itself, a `^D`
+      that throws away the line it was meant to deliver.
+      The kernel half does what only it can: pull bytes off the wire,
+      raise the key's signal **on the foreground group**, and block a
+      reader. `ioctl` exists now and answers `ENOTTY` for anything that is
+      not a device, which is how a program finds out whether its output is
+      a terminal.
+      Verified on the board by **typing at it**: a program asks its window
+      size, blocks on `read`, and a line typed over the serial line arrives
+      through the discipline and comes back out. That needed a harness that
+      sends as well as captures.
+- [ ] **`SIGTSTP` from the keyboard to a shell's job.** (S) The terminal
+      raises it on the foreground group already; what is missing is
+      anything that sets a foreground group, which is a shell's job and
+      waits for one to exist.
 - [ ] **Users and groups.** (M) There is one privilege level: everything
       runs as root with no checks. `getuid` and friends are absent; file
       permissions are stored and ignored.

@@ -88,6 +88,26 @@ static void wait_for_room(void) {
     }
 }
 
+/* **The receive side.** Polled, one byte at a time, and non-blocking: the
+ * caller is a line discipline that has other things to do, and a UART at
+ * 115200 delivers a byte every 87 microseconds, which no amount of spinning
+ * improves on.
+ *
+ * `LSR_DATA_READY` and `UART_RBR` have been defined in this file since it
+ * was written and never used, because the console was a write-only sink.
+ * Reading goes through the same `get` as everything else, so it inherits
+ * the spacing and width the device tree gave — which is the whole reason
+ * this driver works on both the emulator and the board.
+ *
+ * Returns -1 when there is nothing, rather than 0: a received NUL is a
+ * byte, and a reader that cannot tell it from "no byte" loses it. */
+int jh7110_uart_getc(void) {
+    if (uart.regs == NULL || (get(UART_LSR) & LSR_DATA_READY) == 0) {
+        return -1;
+    }
+    return (int)get(UART_RBR);
+}
+
 static void uart_write(void *self, const char *data, size_t len) {
     (void)self;
     for (size_t i = 0; i < len; i++) {

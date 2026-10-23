@@ -189,6 +189,12 @@ uint32_t uspace_count_children(uint32_t parent_pid);
  * reach into the struct — the scheduler, which knows about threads and
  * their processes but has no business reading a process's fields. */
 uint32_t uspace_pid_of(const struct uproc *p);
+uint32_t uspace_pgid_of(const struct uproc *p);
+
+/* Raises a signal on every process in a group, the way a terminal must: a
+ * pipeline is several processes and a key reaching one of them leaves the
+ * others running with their input gone. Returns how many it reached. */
+uint32_t uspace_signal_group(uint32_t pgid, uint32_t signo);
 
 /* Every process in a group, for a signal sent to one. Calls `fn` with each,
  * and returns how many it called it for. */

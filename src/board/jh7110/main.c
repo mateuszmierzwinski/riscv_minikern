@@ -47,6 +47,7 @@
 #include "kernel/net.h"
 #include "kernel/random.h"
 #include "kernel/sched.h"
+#include "kernel/tty.h"
 #include "kernel/signal.h"
 #include "kernel/syscall.h"
 #include "kernel/uspace.h"
@@ -591,6 +592,50 @@ static void on_net_interrupt(void *self) {
     virtio_net_poll(knet_interface());
 }
 
+/* The UART as the terminal's input port.
+ *
+ * A port rather than a direct call, because `kernel/tty.c` must not name a
+ * UART: the hexagon rule is what let the whole input side be written and
+ * tested before a byte of it ran on a board. */
+static int32_t console_input_read(void *self, void *buf, uint32_t n) {
+    int byte;
+    (void)self;
+    if (n == 0) {
+        return 0;
+    }
+    /* **Whichever console this kernel is actually using.** With
+     * `minikern.uart=sbi` the kernel never takes the UART over, so reading
+     * its registers reads an uninitialised device and returns nothing for
+     * ever — which presented as a terminal that blocked correctly and never
+     * saw a keystroke. The driver reports -1 when it has no device, so
+     * asking it first and falling back to the firmware covers both consoles
+     * without the board needing to say which it is. */
+    byte = jh7110_uart_getc();
+    if (byte < 0) {
+        byte = sbi_console_getchar();
+    }
+    if (byte < 0) {
+        return 0; /* nothing waiting, which is not an error */
+    }
+    *(uint8_t *)buf = (uint8_t)byte;
+    return 1;
+}
+
+static int console_input_ready(void *self) {
+    (void)self;
+    return 0; /* polled: readiness is whatever the next read finds */
+}
+
+/* The terminal, driven from the housekeeping beat.
+ *
+ * The same mechanism the polled network uses, for the same reason: there is
+ * no interrupt wired from the UART yet. A 10 ms beat is well inside a
+ * typist's tolerance and would be visible on a paste, which is why the poll
+ * drains everything waiting rather than one byte a beat. */
+static void poll_tty_from_beat(void) {
+    ktty_poll();
+}
+
 static void poll_net_from_tick(void) {
     virtio_net_poll(knet_interface());
 }
@@ -940,6 +985,7 @@ extern const char user_rt_start[], user_rt_end[];
 extern const char user_hostile_start[], user_hostile_end[];
 extern const char user_wait_start[], user_wait_end[];
 extern const char user_pgrp_start[], user_pgrp_end[];
+extern const char user_term_start[], user_term_end[];
 
 static void run_one_user_program(const char *name, const char *from, const char *to) {
     struct uproc *proc = uspace_alloc();
@@ -1081,6 +1127,13 @@ static void run_user_programs(void) {
         uspace_set_extra_env(env, (uint32_t)envlen);
     }
     syscall_allow_tgkill(!cmdline_has(boot_cmdline, "minikern.nopreempt"));
+    /* The controlling terminal, before anything can read it. */
+    {
+        static const struct console_input_port port = {.read = console_input_read,
+                                                       .ready = console_input_ready};
+        ktty_init(&port, 1u);
+        (void)timer_add_housekeeping_hook(poll_tty_from_beat);
+    }
     if (cmdline_has(boot_cmdline, "minikern.user")) {
         run_one_user_program("hello", user_program_start, user_program_end);
         run_one_user_program("faulter", user_faulter_start, user_faulter_end);
@@ -1134,6 +1187,12 @@ static void run_user_programs(void) {
      * which one did not. */
     if (cmdline_has(boot_cmdline, "minikern.pgrp")) {
         run_one_user_program("pgrp", user_pgrp_start, user_pgrp_end);
+    }
+    /* Roadmap §1: the controlling terminal. Asks its size, reads a line,
+     * writes it back. 0 means the whole path worked; 121..123 name where it
+     * stopped. */
+    if (cmdline_has(boot_cmdline, "minikern.term")) {
+        run_one_user_program("term", user_term_start, user_term_end);
     }
     if (cmdline_has(boot_cmdline, "minikern.init")) {
         run_init_from_disk("/init");

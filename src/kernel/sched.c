@@ -747,6 +747,11 @@ uint32_t sched_stop_process(uint32_t pid) {
     return moved;
 }
 
+bool sched_signal_pending(void) {
+    const struct thread *t = running_thread();
+    return t != NULL && (t->signals.pending & ~t->signals.blocked) != 0;
+}
+
 bool sched_raise_on_process(uint32_t pid, uint32_t signo) {
     for (uint32_t i = 0; i < SCHED_MAX_THREADS; i++) {
         if (threads[i].state == THREAD_FREE || threads[i].state == THREAD_DYING ||
@@ -1525,18 +1530,28 @@ static void report_lost_deadline(const char *where, uint64_t soonest) {
  * if this reasoning is ever wrong. */
 static uint64_t housekeeping_deadline(const struct hartstate *h) {
     uint64_t chores = timer_housekeeping_due();
-    if (h->current != SCHED_NO_THREAD || chores == 0) {
+    (void)h;
+    if (chores == 0) {
         return 0;
     }
-    /* **One idle hart, not all of them.** Without this every idle hart arms
-     * for the same beat and every one of them wakes for it: measured at 992
-     * interrupts each on three idle harts, where one hart on the beat and
-     * two on the backstop is 1200 for the machine instead of 2977. The
-     * first to arrive claims it; the rest see it covered and take the
-     * backstop. If the claimer later picks up a thread, the next poke wakes
-     * the others and one of them claims it again — and
-     * `check_deadline_is_armed` is what says so if that reasoning is
-     * wrong. */
+    /* **One hart, and whichever one is free to take it.**
+     *
+     * The rule is only "is anybody already armed for it?" — the first to
+     * arrive claims the beat and the rest see it covered, which is what
+     * stops every idle hart waking for the same one (measured: 992
+     * interrupts each on three idle harts, against 1200 for the machine
+     * when one takes it).
+     *
+     * It used to also require the hart to be **idle**, and that was wrong
+     * in the case where no hart is: every hart armed for its own slice,
+     * all of those later than the beat, and the beat simply ran late. The
+     * invariant found it — 152 reports in one run, each naming a deadline
+     * 5 ms sooner than anything armed — which is what the invariant is for
+     * and the reason it reports rather than being reasoned about.
+     *
+     * The cost of the fix is that a busy hart sometimes takes a beat
+     * interrupt. That is the right trade: the beat is what drives a polled
+     * network and a terminal, and a late beat is a late keystroke. */
     return armed_covering(chores, smp_hart_index()) ? 0u : chores;
 }
 

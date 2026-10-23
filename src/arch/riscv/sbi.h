@@ -52,6 +52,11 @@ struct sbi_ret sbi_call(long eid, long fid, long a0, long a1, long a2, long a3);
  * for a banner and wrong for a terminal. */
 void sbi_console_putchar(char c);
 
+/* One character from the firmware's console, or -1 when none is waiting.
+ * Polled; the legacy call, which is the only console read that is
+ * universally present. */
+int sbi_console_getchar(void);
+
 /* True when the firmware implements an extension. Asked before use, because
  * a kernel that assumes DBCN and finds legacy-only prints nothing at all
  * and looks dead. */

@@ -914,6 +914,26 @@ uint32_t uspace_pid_of(const struct uproc *p) {
     return p == NULL ? 0u : p->pid;
 }
 
+uint32_t uspace_pgid_of(const struct uproc *p) {
+    return p == NULL ? 0u : p->pgid;
+}
+
+static void raise_one(struct uproc *p, uint32_t signo) {
+    if (signo == SIGSTOP) {
+        (void)sched_stop_process(p->pid);
+        return;
+    }
+    if (signo == SIGCONT) {
+        (void)sched_continue_process(p->pid);
+        return;
+    }
+    (void)sched_raise_on_process(p->pid, signo);
+}
+
+uint32_t uspace_signal_group(uint32_t pgid, uint32_t signo) {
+    return uspace_for_each_in_group(pgid, raise_one, signo);
+}
+
 uint32_t uspace_for_each_in_group(uint32_t pgid, void (*fn)(struct uproc *p, uint32_t arg),
                                   uint32_t arg) {
     uint32_t n = 0;

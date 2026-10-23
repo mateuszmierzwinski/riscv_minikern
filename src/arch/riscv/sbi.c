@@ -26,6 +26,23 @@ struct sbi_ret sbi_call(long eid, long fid, long a0, long a1, long a2, long a3) 
     return (struct sbi_ret){.error = r_a0, .value = r_a1};
 }
 
+/* One character from the firmware's console, or **-1 when there is none**.
+ *
+ * The legacy call, whose `a0` is the character or -1 — the only SBI console
+ * read that is universally present. `SBI_EXT_LEGACY_GETCHAR` has been
+ * defined in this header since it was written and never used, because the
+ * console was write-only.
+ *
+ * -1 rather than 0 for "nothing", because a received NUL is a character and
+ * a caller that cannot tell them apart loses it. */
+int sbi_console_getchar(void) {
+    struct sbi_ret r = sbi_call(SBI_EXT_LEGACY_GETCHAR, 0, 0, 0, 0, 0);
+    /* The legacy extensions return their value in `error`, not `value` —
+     * which is the opposite of every other call in this file and exactly
+     * the kind of detail that makes a working call look broken. */
+    return (int)r.error;
+}
+
 void sbi_console_putchar(char c) {
     (void)sbi_call(SBI_EXT_LEGACY_PUTCHAR, 0, (unsigned char)c, 0, 0, 0);
 }
