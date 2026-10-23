@@ -125,6 +125,8 @@ struct xfs {
      * growth passes either way unless it reads these. */
     uint64_t grew_to_block;
     uint64_t grew_to_leaf;
+    /* Data blocks added to a directory that had filled the ones it had. */
+    uint64_t dir_blocks_added;
     /* Where a directory block that spans several filesystem blocks is
      * gathered. Per filesystem rather than a module static, so that nothing
      * about reading a directory depends on there being one mount or one

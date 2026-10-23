@@ -170,6 +170,13 @@
  * startblock 20, count 49 (XFS.md §2). */
 #define XFS_EXTENT_BYTES 16u
 
+/* Extents this writer will put in a directory's fork, which bounds an array
+ * on a stack rather than the format: a 512-byte inode's literal area holds
+ * twenty-one and a 256-byte one holds five, so a fork that needs more than
+ * this has needed a b-tree for a long time already — and a b-tree
+ * *directory* fork is not written. */
+#define XFS_DIR_FORK_EXTENTS 24u
+
 /* ── directories ──────────────────────────────────────────────────────── */
 /* Shortform, inside the inode: count, i8count, then the parent inode in
  * four or eight bytes, then entries of

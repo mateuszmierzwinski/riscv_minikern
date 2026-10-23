@@ -114,6 +114,6 @@ uint64_t xfsmount_inode_chunks_added(void);
 
 /* Directories that changed shape, by the shape reached. A zero in either is
  * the difference between growth that works and growth never reached. */
-void xfsmount_growth_counts(uint64_t *to_block, uint64_t *to_leaf);
+void xfsmount_growth_counts(uint64_t *to_block, uint64_t *to_leaf, uint64_t *data_blocks);
 
 #endif

@@ -163,8 +163,12 @@ CASES = [
       # second inode chunk, a block directory and then a leaf directory; a
       # run that needed none of them would report every step passing while
       # never touching the code that makes them.
-      "grew to block, 1 to leaf"],
-     220, None, "small"),
+      # **And every growth path was reached.** Four hundred names need a
+      # block directory, a leaf directory, a second data block under it and
+      # six chunks of inodes; a run that needed none of them would report
+      # every step passing while never touching the code that makes them.
+      "1 to block, 1 to leaf, 1 data block(s)"],
+     300, None, "small"),
 ]
 
 

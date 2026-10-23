@@ -264,9 +264,10 @@ uint64_t xfsmount_inode_chunks_added(void) {
     return fs.inode_chunks_added;
 }
 
-void xfsmount_growth_counts(uint64_t *to_block, uint64_t *to_leaf) {
+void xfsmount_growth_counts(uint64_t *to_block, uint64_t *to_leaf, uint64_t *data_blocks) {
     *to_block = fs.grew_to_block;
     *to_leaf = fs.grew_to_leaf;
+    *data_blocks = fs.dir_blocks_added;
 }
 
 /* ── writing ───────────────────────────────────────────────────────────── */

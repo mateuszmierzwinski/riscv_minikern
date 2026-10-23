@@ -945,22 +945,43 @@ sparse inodes, `nrext64`, exchange-range, parent pointers, `bigtime`,
       giving its largest free span, with a `bestcount` tail. `xfs_repair`
       and Linux read it and will call a filesystem corrupt if it lies.
 
-      **One data block**, for now. A second means extending the directory's
-      size, allocating at the next logical offset and growing `bests` —
-      `KERR_NOSPC` until then, rather than a block written where the format
-      does not expect one. That is about a hundred and sixty names in leaf
-      format, and the next step up is node format, which this reads.
+      **And more than one data block**, added in the same round. When every
+      block it has is full the directory gains one at the next logical
+      offset — far below the leaf's 32 GiB, which is the whole reason the
+      format puts the leaf up there — and three things move with it: the
+      directory's size, a data extent in the fork, and a slot in `bests`.
+
+      Two details that only break once there is a *second* of something, and
+      so were right by accident until now. A leaf entry's **address is a
+      byte offset within the directory's data, not within its block**: the
+      reader has always divided it by the directory block size to decide
+      which block to read (`name_at`), and a block-relative offset agreed
+      with that for exactly as long as there was one block. And `bests` is
+      indexed **upwards from its start while the array is anchored at the
+      tail**, so growing it moves every existing value *down* — the other
+      direction writes block zero's free span into block one's slot, which
+      nothing here would notice and `xfs_repair` would.
+
+      Data extents are **merged when contiguous**, which is not tidiness: a
+      256-byte inode's literal area holds five extents, so a directory that
+      never merged would run out of *inode* long before it ran out of disk.
+
+      A removal does not give a block back. XFS itself keeps them and reuses
+      the space; reclaiming one means removing an extent and a `bests` slot,
+      which is a step of its own. The next shape up is **node** format,
+      which this already reads — reached when the hash array grows into
+      `bests`.
 
       The pairs are held in the filesystem rather than on a stack: the frame
       guard refused a 16 KiB array, which is the second time that rule has
       caught this work.
 
-      **On the board**: two hundred names added, found and removed, twice
-      over — with `1 grew to block, 1 to leaf` and three inode chunks, so
-      every growth path is known to have run rather than assumed. The
-      second pass adds to a directory that is *already* leaf format, since
-      one is never shrunk back, which is what exercises the add and remove
-      rather than the conversion.
+      **On the board**: four hundred names added, found and removed, twice
+      over — with `1 to block, 1 to leaf, 1 data block(s)` and six inode
+      chunks, so every growth path is known to have run rather than
+      assumed. The second pass adds to a directory that is *already* a leaf
+      with two data blocks, since neither is ever given back, which is what
+      exercises the add and remove rather than the conversion.
 - [x] **A second inode chunk.** (S–M) **Done, and measured to have run.**
       `take_inode` allocated from the inode b-tree records that existed, so
       when every chunk in a group was full it answered `KERR_NOSPC` — a
