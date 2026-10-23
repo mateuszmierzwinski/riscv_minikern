@@ -182,13 +182,32 @@ static int ctx_get(struct xfs *fs, uint32_t agno, struct alloc_ctx *c) {
 }
 
 /* Takes one block off the front of the record at i, in whichever tree. */
-static void take_front(struct bbuf *b, uint32_t i) {
+/* Takes `n` blocks off the front of the record at i, removing it when that
+ * is all of them. */
+static void take_front_n(struct bbuf *b, uint32_t i, uint32_t n) {
     uint8_t *rec = leaf_rec(b, i);
-    if (rec_count(rec) == 1u) {
+    if (rec_count(rec) == n) {
         leaf_remove(b, i);
         return;
     }
-    rec_set(rec, rec_start(rec) + 1u, rec_count(rec) - 1u);
+    rec_set(rec, rec_start(rec) + n, rec_count(rec) - n);
+}
+
+/* The smallest free extent that holds `n` blocks, by its start.
+ *
+ * The by-count tree is kept sorted by count, so the first record big enough
+ * is the **best fit** — which is what XFS does, and what leaves the large
+ * extents intact for the next caller that needs one. Returns 0 when nothing
+ * fits, which is not a block number any allocation can return: block 0 of a
+ * group holds its superblock. */
+static uint32_t smallest_fit(struct bbuf *cnt, uint32_t n) {
+    uint32_t records = leaf_count(cnt);
+    for (uint32_t i = 0; i < records; i++) {
+        if (rec_count(leaf_rec(cnt, i)) >= n) {
+            return rec_start(leaf_rec(cnt, i));
+        }
+    }
+    return 0;
 }
 
 /* The index of the record starting exactly here, or -1. */
@@ -207,40 +226,52 @@ static int find_start(struct bbuf *b, uint32_t start) {
  * Preferring a particular block is what lets a growing file keep one
  * extent instead of collecting them: ask for the block after the file's
  * last one and, when it is free, the file's extent simply gets longer. */
-int xfs_alloc_block(struct xfs *fs, uint32_t agno, uint32_t want, uint32_t *got) {
+/* Whether the free extent starting at `at` is long enough for `n`. */
+static bool long_enough(struct bbuf *bno, int at, uint32_t n) {
+    return at >= 0 && rec_count(leaf_rec(bno, (uint32_t)at)) >= n;
+}
+
+int xfs_alloc_extent(struct xfs *fs, uint32_t agno, uint32_t count, uint32_t want,
+                     uint32_t *got) {
     struct alloc_ctx c;
-    int rc = ctx_get(fs, agno, &c);
+    int rc;
     int at;
+    if (count == 0) {
+        return KERR_INVAL;
+    }
+    rc = ctx_get(fs, agno, &c);
     if (rc != KERR_OK) {
         return rc;
     }
     at = want != 0 ? find_start(&*c.bnob, want) : -1;
-    if (at < 0) {
-        /* The by-count tree's last record is the largest free extent. */
-        uint32_t n = leaf_count(c.cntb);
-        if (n == 0) {
+    if (!long_enough(c.bnob, at, count)) {
+        /* **The best fit rather than the largest.** A single block used to
+         * take the largest extent there was, which is harmless when every
+         * allocation is one block and wasteful the moment one asks for
+         * eight: it breaks up the one run a later caller may need whole. */
+        want = smallest_fit(c.cntb, count);
+        at = want != 0 ? find_start(&*c.bnob, want) : -1;
+        if (!long_enough(c.bnob, at, count)) {
             ctx_put(fs, &c, false);
-            return KERR_NOSPC;
+            return want == 0 ? KERR_NOSPC : KERR_IO;
         }
-        want = rec_start(leaf_rec(c.cntb, n - 1u));
-        at = find_start(&*c.bnob, want);
     }
+    take_front_n(c.bnob, (uint32_t)at, count);
+    at = find_start(&*c.cntb, want);
     if (at < 0) {
         ctx_put(fs, &c, false); /* the two trees disagree: not ours to fix */
         return KERR_IO;
     }
-    take_front(c.bnob, (uint32_t)at);
-    at = find_start(&*c.cntb, want);
-    if (at < 0) {
-        ctx_put(fs, &c, false);
-        return KERR_IO;
-    }
-    take_front(c.cntb, (uint32_t)at);
+    take_front_n(c.cntb, (uint32_t)at, count);
     leaf_sort_by_count(c.cntb);
-    xfs_put_be32(c.agf + XFS_AGF_FREEBLKS, xfs_be32(c.agf + XFS_AGF_FREEBLKS) - 1u);
+    xfs_put_be32(c.agf + XFS_AGF_FREEBLKS, xfs_be32(c.agf + XFS_AGF_FREEBLKS) - count);
     ctx_put(fs, &c, true);
     *got = want;
-    return count_blocks_free(fs, -1);
+    return count_blocks_free(fs, -(int32_t)count);
+}
+
+int xfs_alloc_block(struct xfs *fs, uint32_t agno, uint32_t want, uint32_t *got) {
+    return xfs_alloc_extent(fs, agno, 1u, want, got);
 }
 
 /* Puts an extent back, joined to whatever it touches.

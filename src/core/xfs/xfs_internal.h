@@ -143,6 +143,19 @@ void xfs_extent_unpack(const uint8_t *p, struct xfs_extent *out);
 /* Packs one back, which is the exact inverse (there is a round-trip test). */
 void xfs_extent_pack(uint8_t *p, const struct xfs_extent *e);
 
+/* Takes `count` contiguous free blocks from a group, preferring to start at
+ * `want` and otherwise taking the **smallest** free extent that fits.
+ *
+ * Best fit rather than largest: taking the largest run for every request
+ * breaks up the one a later caller may need whole, which did not matter
+ * while every allocation was a single block. */
+int xfs_alloc_extent(struct xfs *fs, uint32_t agno, uint32_t count, uint32_t want, uint32_t *got);
+
+/* Adds a chunk of sixty-four inodes to a group, so that a filesystem whose
+ * existing chunks are full can still make a file. Reports the first inode
+ * number of the new chunk. */
+int xfs_inode_chunk_add(struct xfs *fs, uint32_t agno, uint32_t *startino);
+
 /* Adds an entry to a directory of whatever shape, growing it when the
  * shape it has cannot hold one more. What `create`, `link` and `rename` all
  * want, so that none of them has to know about formats. */

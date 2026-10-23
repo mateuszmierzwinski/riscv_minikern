@@ -1316,12 +1316,16 @@ static int read_back(const char *name, const char *want, uint32_t len) {
  * free spans behind, and the next addition has to reuse one. The second
  * pass of adds is what tests that.
  */
-/* How many names to add. Past shortform's dozen, and inside the budget of
- * free inodes a fresh filesystem's first inode chunk holds: allocating a
- * *second* chunk is its own gap (`ROADMAP.md` §3), so a test that asked for
- * sixty names would be measuring that instead and failing with
- * `KERR_NOSPC`. */
-#define NAMES 20u
+/* How many names to add.
+ *
+ * Past shortform's dozen, so the directory must become a block directory —
+ * and past the sixty-odd free inodes a fresh filesystem's first chunk
+ * holds, so the inode allocator must make a **second chunk**. Both were
+ * gaps this number found: at twenty it stopped at the shortform boundary,
+ * and at sixty it stopped at `KERR_NOSPC` from an allocator that would not
+ * grow. Asking for more than the fixture was built for is how a test finds
+ * the next thing rather than confirming the last one. */
+#define NAMES 60u
 
 static int grow_a_directory(void) {
     char name[8] = "g00";
@@ -1394,6 +1398,12 @@ static void run_write_selftest(void) {
                                  xfsmount_inode_of("w3", &two, &links) == KERR_OK ? KERR_IO
                                                                                   : KERR_OK);
     ok = ok && wrote_and_checked("grow past shortform", grow_a_directory());
+    /* **Said out loud, because the alternative is a test that cannot
+     * fail.** Sixty names need a second chunk of inodes only if the first
+     * one runs out, and a run where it did not would print every step as
+     * passing while never touching the allocator's new path. */
+    kprintf("fswrite: %llu inode chunk(s) added\n",
+            (unsigned long long)xfsmount_inode_chunks_added());
     kprintf("fswrite: %s\n", ok ? "every step passed" : "a step FAILED");
 }
 

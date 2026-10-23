@@ -114,6 +114,11 @@ struct xfs {
      * nearly shipped unexercised. */
     uint64_t hash_lookups;
     uint64_t walked_lookups;
+    /* Chunks of inodes added because every existing one was full. Counted
+     * for the same reason the lookup paths are: a test that creates enough
+     * files to need one passes identically if the allocator happened not to
+     * need one, so the number is the only thing that says the path ran. */
+    uint64_t inode_chunks_added;
     /* Where a directory block that spans several filesystem blocks is
      * gathered. Per filesystem rather than a module static, so that nothing
      * about reading a directory depends on there being one mount or one

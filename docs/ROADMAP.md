@@ -909,20 +909,56 @@ sparse inodes, `nrext64`, exchange-range, parent pointers, `bigtime`,
       creates worked first, because every offset below 32 happens to share
       no bits with 96.
 
-      **On the board**: twenty names added, all twenty found, all twenty
+      **On the board**: sixty names added, all sixty found, all sixty
       removed, twice over — the second pass being what proves a removed
-      entry's space is reused.
+      entry's space is reused, and sixty being what also forces a second
+      chunk of inodes.
+
+      A third bug, found by raising that number from twenty to sixty:
+      `find_room` required a free span to lie **entirely** below the hash
+      array, and the trailing span records the length it had when it was
+      written while the array grows down into it. After one addition the
+      only span there is was rejected and the directory reported itself full
+      with three and a half kilobytes free. It uses the part of the span
+      that is still free.
 
 - [ ] **Directory growth: block format into leaf.** (M) Past about a
       hundred and twenty names a block directory is full and the entries
       have to move into their own blocks with the hashes in a leaf block of
       their own (`KERR_NOSPC`). Reading both formats already works, as does
       growing into the first of them.
-- [ ] **A second inode chunk.** (S–M) `take_inode` allocates from the inode
-      b-tree records that exist; when every chunk in a group is full it
-      answers `KERR_NOSPC` rather than allocating a new chunk, so a fresh
-      filesystem accepts about sixty new files and then stops. Found by the
-      write test asking for sixty.
+- [x] **A second inode chunk.** (S–M) **Done, and measured to have run.**
+      `take_inode` allocated from the inode b-tree records that existed, so
+      when every chunk in a group was full it answered `KERR_NOSPC` — a
+      fresh filesystem took about sixty files and then stopped, the limit
+      being the one chunk `mkfs` had made rather than anything about the
+      disk.
+
+      It makes another now: sixty-four inodes' worth of **contiguous**
+      blocks, each written as a *valid empty inode* rather than zeroes —
+      `xfs_inode_read` checks the magic, the version and the checksum, and a
+      reader meeting a zeroed inode cannot tell "never used" from
+      "corrupt" — then a record into each of the two inode b-trees, and the
+      group's and superblock's counts.
+
+      Contiguity is why the allocator grew an extent interface:
+      `xfs_alloc_extent` takes `count` blocks and picks the **smallest free
+      extent that fits** rather than the largest. Taking the largest run for
+      every request is harmless when every request is one block and wasteful
+      the moment one asks for eight, because it breaks up the one run a
+      later caller may need whole. `xfs_alloc_block` is now that function
+      with `count` of one.
+
+      A b-tree **leaf**, singular: a full leaf would have to split and that
+      is refused rather than approximated. A group's first leaf holds a few
+      hundred records — tens of thousands of inodes — so the refusal is far
+      away, and a wrong b-tree is much worse than a filesystem that stops
+      growing.
+
+      `fs->inode_chunks_added` is counted and the board case requires it to
+      be **1**, because sixty names need a second chunk only if the first
+      runs out and a run where it did not would report every step passing
+      while never touching this path.
 - [ ] **Allocation under fragmentation.** (M) The allocator takes the first
       run it finds that is big enough. A filesystem with no such run has
       nothing it can do, where a real one would take several smaller

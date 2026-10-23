@@ -337,7 +337,14 @@ static uint32_t find_room(const struct xfs *fs, uint32_t need) {
         if (len < XFS_DIR2_DATA_ALIGN) {
             return 0; /* a free span that cannot be true */
         }
-        if (at + len <= end && len >= need) {
+        /* **The part of the span that is still free, not the part it
+         * claims.** The trailing span records the length it had when it was
+         * written, and the hash array has been growing down into it ever
+         * since — so requiring the *whole* span to lie below the array
+         * rejects the only span there is. The first version did exactly
+         * that: after one addition the directory reported itself full with
+         * three and a half kilobytes free. */
+        if (at < end && (len <= end - at ? len : end - at) >= need) {
             return at;
         }
         at += len;

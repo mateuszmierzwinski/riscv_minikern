@@ -260,6 +260,10 @@ void xfsmount_lookup_counts(uint64_t *hashed, uint64_t *walked) {
     *walked = fs.walked_lookups;
 }
 
+uint64_t xfsmount_inode_chunks_added(void) {
+    return fs.inode_chunks_added;
+}
+
 /* ── writing ───────────────────────────────────────────────────────────── */
 
 /* What goes in a timestamp, given that this board has no clock.

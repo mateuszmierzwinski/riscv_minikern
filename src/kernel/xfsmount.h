@@ -108,4 +108,8 @@ int xfsmount_inode_of(const char *name, uint64_t *ino, uint32_t *nlink);
  * where "it stopped being a directory" needs to say which field says so. */
 void xfsmount_root_shape(void);
 
+/* Chunks of inodes the allocator had to add. Zero means a test that
+ * created many files never actually needed one. */
+uint64_t xfsmount_inode_chunks_added(void);
+
 #endif

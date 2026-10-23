@@ -153,10 +153,14 @@ CASES = [
     # one claimed rather than its return value, and the last pair is the
     # reason a link count exists: removing one name leaves the file
     # readable under the other.
-    ("§3: create, write, link, rename and unlink",
+    ("§3: create, write, link, rename, unlink, and growth",
      "minikern.fswrite",
-     ["fswrite: every step passed"],
-     120, None, "small"),
+     ["fswrite: every step passed",
+      # **And the allocator's growth path was reached.** Sixty names need a
+      # second chunk of inodes only if the first runs out; a run where it
+      # did not would report every step passing while never touching it.
+      "fswrite: 1 inode chunk(s) added"],
+     180, None, "small"),
 ]
 
 
