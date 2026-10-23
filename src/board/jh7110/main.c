@@ -999,15 +999,17 @@ extern const char user_rlimit_start[], user_rlimit_end[];
 extern const char user_mremap_start[], user_mremap_end[];
 extern const char user_mapflags_start[], user_mapflags_end[];
 extern const char user_endsib_start[], user_endsib_end[];
+extern const char user_huge_start[], user_huge_end[];
 
 /* The three numbers that tell how a mapping's pages were paid for: on first
  * touch, up front because the caller asked, and re-pointed by a move. They
  * are what turn "demand paging works" and "nothing is copied" into
  * measurements rather than claims, so they are printed together. */
 static void report_mapping_counters(void) {
-    kprintf("mem: %llu pages backed on demand, %llu populated up front, %llu moved by mremap\n",
+    kprintf("mem: %llu pages backed on demand, %llu populated up front, %llu moved by mremap,"
+            " %llu huge\n",
             (unsigned long long)uspace_demand_pages(), (unsigned long long)uspace_populated_pages(),
-            (unsigned long long)uspace_moved_pages());
+            (unsigned long long)uspace_moved_pages(), (unsigned long long)uspace_huge_pages());
 }
 
 /* Whether the kernel had to catch a thread mid-flight on another hart, and
@@ -1272,6 +1274,12 @@ static void run_user_programs(void) {
      * on another hart. **5** means the whole sequence worked; the kernel's
      * own "waited for" line says whether it had to catch anything, which is
      * what makes the closing of the window a measurement. */
+    /* Roadmap §2: huge pages. **127** is a pass, and the count of 2 MiB
+     * entries below is the half the program cannot see. */
+    if (cmdline_has(boot_cmdline, "minikern.huge")) {
+        run_one_user_program("huge", user_huge_start, user_huge_end);
+        report_mapping_counters();
+    }
     if (cmdline_has(boot_cmdline, "minikern.endsib")) {
         run_one_user_program("endsib", user_endsib_start, user_endsib_end);
         report_await();

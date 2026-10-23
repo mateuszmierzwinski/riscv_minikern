@@ -372,8 +372,47 @@ Ordering inside a section is roughly by what unblocks the most.
       wants both. The record goes first, since it is the only step that can
       fail having changed nothing.
 - [ ] **Swap.** (L) Not planned; listed so the absence is deliberate.
-- [ ] **Huge pages for user space.** (M) The kernel's own identity map uses
-      1 GiB pages; user mappings are 4 KiB only.
+- [x] **Huge pages for user space.** (M) **Done**, for 2 MiB pages, and only
+      when a program asks: `MAP_HUGETLB` was in the refused list until there
+      were huge pages to give, which is the right place for a flag to wait.
+      Sv39 needs nothing special for one — a leaf at level 1 **is** a 2 MiB
+      page — but it does require the virtual *and* physical addresses to be
+      2 MiB aligned, so the frames are asked for with that alignment and
+      **placement had to learn about it too**: aligning an address after a
+      gap has been found is not the same as finding an aligned gap, because
+      the aligned address can fall out of the bottom of a gap that was only
+      just big enough and land on the region below. `vma_find_free` takes
+      the alignment, and the host test covers the case where the only gap
+      cannot hold an aligned mapping — the answer there is no, not an
+      address inside somebody else's memory.
+      **Not transparent, on purpose.** A Go runtime reserves tens of
+      megabytes of `PROT_NONE` arena and commits corners of it; backing any
+      large mapping with 2 MiB pages would commit 2 MiB per first touch and
+      waste most of it. The flag is the program saying it wants that trade.
+      A block that cannot be allocated contiguously falls back to 4 KiB
+      pages rather than failing — a mapping that works slowly is worth more
+      than one that does not exist — so `uspace_huge_pages` counts the
+      entries that were really huge. It has to, because **a program cannot
+      see the difference**: the only thing distinguishing this from a
+      quietly 4 KiB mapping is that number.
+      Three paths had to learn the difference between a page and a mapping.
+      Freeing reads the span: `pgtable_lookup` reports the physical address
+      *inside* a megapage, so freeing what it returns would hand back one
+      frame from the middle of a block and leak 511 while the unmap took all
+      512 out of the address space. A partial `munmap` or an `mremap` of a
+      huge region is **refused** rather than splitting it, because splitting
+      is the opposite of what the caller asked for. And `fork` **copies** a
+      touched block: copy-on-write marks live in the page-table entry, and
+      one entry covers all 2 MiB, so a copy-on-write fault would have to
+      copy the whole thing anyway or split the page and stop being what the
+      program asked for — paying it at `fork`, once and predictably, is the
+      better half of that trade. An untouched block is not copied.
+      Verified on the board (`minikern.huge=1`): **127**, all seven checks
+      — accepted, 2 MiB aligned, both blocks writable, the last word 4 MiB
+      in, a partial unmap refused, a forked child seeing the markers, and
+      the child's write *not* reaching the parent's copy — with the kernel
+      reporting **4 huge pages**: two backed in the parent and two copied
+      into the child.
 - [x] **`MAP_FIXED_NOREPLACE`, `MAP_NORESERVE`, `MAP_POPULATE`.** (S)
       **Done**, and the item turned out to be about more than three flags.
       What it said — "flags are largely ignored rather than honoured or

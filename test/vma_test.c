@@ -54,7 +54,7 @@ static void test_overlap_is_refused(void) {
 static void test_the_search_works_above_four_gibibytes(void) {
     virt_t at = 0;
     fresh();
-    KTEST_CHECK(vma_find_free(&set, 16u * PAGE, 0, WINDOW_LO, WINDOW_HI, &at) == KERR_OK);
+    KTEST_CHECK(vma_find_free(&set, 16u * PAGE, 0, WINDOW_LO, WINDOW_HI, 0, &at) == KERR_OK);
     KTEST_CHECK(at >= WINDOW_LO);
     KTEST_CHECK(at + 16u * PAGE <= WINDOW_HI);
     KTEST_CHECK(at > 0xFFFFFFFFull);
@@ -63,11 +63,11 @@ static void test_the_search_works_above_four_gibibytes(void) {
 static void test_the_highest_gap_is_taken(void) {
     virt_t at = 0;
     fresh();
-    KTEST_CHECK(vma_find_free(&set, PAGE, 0, WINDOW_LO, WINDOW_HI, &at) == KERR_OK);
+    KTEST_CHECK(vma_find_free(&set, PAGE, 0, WINDOW_LO, WINDOW_HI, 0, &at) == KERR_OK);
     KTEST_CHECK(at == WINDOW_HI - PAGE);
     KTEST_CHECK(vma_insert(&set, at, WINDOW_HI, 3u, 0) == KERR_OK);
     /* The next one goes below it, not on top of it. */
-    KTEST_CHECK(vma_find_free(&set, PAGE, 0, WINDOW_LO, WINDOW_HI, &at) == KERR_OK);
+    KTEST_CHECK(vma_find_free(&set, PAGE, 0, WINDOW_LO, WINDOW_HI, 0, &at) == KERR_OK);
     KTEST_CHECK(at == WINDOW_HI - 2u * PAGE);
 }
 
@@ -75,7 +75,7 @@ static void test_a_free_hint_is_honoured(void) {
     virt_t want = WINDOW_LO + 0x100000ull;
     virt_t at = 0;
     fresh();
-    KTEST_CHECK(vma_find_free(&set, PAGE, want, WINDOW_LO, WINDOW_HI, &at) == KERR_OK);
+    KTEST_CHECK(vma_find_free(&set, PAGE, want, WINDOW_LO, WINDOW_HI, 0, &at) == KERR_OK);
     KTEST_CHECK(at == want);
 }
 
@@ -86,7 +86,7 @@ static void test_an_occupied_hint_is_ignored(void) {
     virt_t at = 0;
     fresh();
     KTEST_CHECK(vma_insert(&set, want, want + PAGE, 3u, 0) == KERR_OK);
-    KTEST_CHECK(vma_find_free(&set, PAGE, want, WINDOW_LO, WINDOW_HI, &at) == KERR_OK);
+    KTEST_CHECK(vma_find_free(&set, PAGE, want, WINDOW_LO, WINDOW_HI, 0, &at) == KERR_OK);
     KTEST_CHECK(at != want);
 }
 
@@ -98,7 +98,7 @@ static void test_a_reservation_occupies_its_range(void) {
     virt_t at = 0;
     fresh();
     KTEST_CHECK(vma_insert(&set, want, want + 0x100000ull, 0u, 0) == KERR_OK); /* PROT_NONE */
-    KTEST_CHECK(vma_find_free(&set, PAGE, want + PAGE, WINDOW_LO, WINDOW_HI, &at) == KERR_OK);
+    KTEST_CHECK(vma_find_free(&set, PAGE, want + PAGE, WINDOW_LO, WINDOW_HI, 0, &at) == KERR_OK);
     KTEST_CHECK(at < want || at >= want + 0x100000ull);
 }
 
@@ -124,7 +124,7 @@ static void test_a_full_window_has_no_room(void) {
     virt_t at = 0;
     fresh();
     KTEST_CHECK(vma_insert(&set, WINDOW_LO, WINDOW_HI, 3u, 0) == KERR_OK);
-    KTEST_CHECK(vma_find_free(&set, PAGE, 0, WINDOW_LO, WINDOW_HI, &at) == KERR_NOMEM);
+    KTEST_CHECK(vma_find_free(&set, PAGE, 0, WINDOW_LO, WINDOW_HI, 0, &at) == KERR_NOMEM);
 }
 
 /* Looking a region up by address, which demand paging needs: a fault is
@@ -189,11 +189,11 @@ static void test_a_removed_range_is_offered_again(void) {
     virt_t at = 0;
     fresh();
     KTEST_CHECK(vma_insert(&set, WINDOW_HI - 4u * PAGE, WINDOW_HI, 3u, 0) == KERR_OK);
-    KTEST_CHECK(vma_find_free(&set, 4u * PAGE, 0, WINDOW_LO, WINDOW_HI, &at) == KERR_OK);
+    KTEST_CHECK(vma_find_free(&set, 4u * PAGE, 0, WINDOW_LO, WINDOW_HI, 0, &at) == KERR_OK);
     KTEST_CHECK(at == WINDOW_HI - 8u * PAGE);
     KTEST_CHECK(vma_remove(&set, WINDOW_HI - 4u * PAGE, WINDOW_HI, NULL, NULL) == KERR_OK);
     KTEST_CHECK(vma_find(&set, WINDOW_HI - PAGE) == NULL);
-    KTEST_CHECK(vma_find_free(&set, 4u * PAGE, 0, WINDOW_LO, WINDOW_HI, &at) == KERR_OK);
+    KTEST_CHECK(vma_find_free(&set, 4u * PAGE, 0, WINDOW_LO, WINDOW_HI, 0, &at) == KERR_OK);
     KTEST_CHECK(at == WINDOW_HI - 4u * PAGE);
 }
 
@@ -215,6 +215,30 @@ static void test_a_range_is_free_only_if_all_of_it_is(void) {
     KTEST_CHECK(vma_range_free(&set, WINDOW_LO + 8u * PAGE, WINDOW_LO + 12u * PAGE));
 }
 
+/* Placement for a huge page: the result has to be aligned to the page size
+ * being asked for, and aligning *after* a gap is found is not the same
+ * thing — the aligned address can fall out of the bottom of a gap that was
+ * only just big enough, which would put the mapping on top of the region
+ * below it. */
+static void test_an_aligned_gap_is_found_or_refused(void) {
+    const virt_t mega = 2u * 1024u * 1024u;
+    virt_t at = 0;
+    fresh();
+    /* An empty window: the highest 2 MiB-aligned address that fits. */
+    KTEST_CHECK(vma_find_free(&set, mega, 0, WINDOW_LO, WINDOW_HI, mega, &at) == KERR_OK);
+    KTEST_CHECK(at % mega == 0 && at + mega <= WINDOW_HI);
+    /* A gap of exactly the length asked for, at an address that is not
+     * aligned: there is nowhere to put it, and the answer is no rather than
+     * an address inside the region below. */
+    fresh();
+    KTEST_CHECK(vma_insert(&set, WINDOW_LO, WINDOW_LO + mega + PAGE, 3u, 0) == KERR_OK);
+    KTEST_CHECK(vma_insert(&set, WINDOW_LO + 2u * mega + PAGE, WINDOW_HI, 3u, 0) == KERR_OK);
+    KTEST_CHECK(vma_find_free(&set, mega, 0, WINDOW_LO, WINDOW_HI, mega, &at) == KERR_NOMEM);
+    /* The same gap without the alignment demand is perfectly usable. */
+    KTEST_CHECK(vma_find_free(&set, mega, 0, WINDOW_LO, WINDOW_HI, 0, &at) == KERR_OK);
+    KTEST_CHECK(at == WINDOW_LO + mega + PAGE);
+}
+
 int main(void) {
     KTEST_RUN(test_insert_and_find);
     KTEST_RUN(test_overlap_is_refused);
@@ -231,5 +255,6 @@ int main(void) {
     KTEST_RUN(test_an_occupied_tail_refuses_the_growth);
     KTEST_RUN(test_a_removed_range_is_offered_again);
     KTEST_RUN(test_a_range_is_free_only_if_all_of_it_is);
+    KTEST_RUN(test_an_aligned_gap_is_found_or_refused);
     return ktest_failures();
 }

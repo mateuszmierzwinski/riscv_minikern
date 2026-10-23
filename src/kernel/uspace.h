@@ -336,6 +336,7 @@ struct uspace_mapping {
     bool fixed;     /* MAP_FIXED: this address, replacing what is there */
     bool noreplace; /* MAP_FIXED_NOREPLACE: this address, and over nothing */
     bool populate;  /* MAP_POPULATE: back the pages now, not on first touch */
+    bool huge;      /* MAP_HUGETLB: 2 MiB pages, one table entry each */
 };
 
 /* Maps anonymous zeroed pages into the running process.
@@ -466,6 +467,12 @@ uint64_t uspace_populated_pages(void);
  * zero means this kernel restored the wrong registers, and the fault that
  * follows happens later and somewhere else. */
 uint32_t uspace_impossible_frames(void);
+
+/* How many 2 MiB pages have been handed to user space. It is the only way
+ * to tell a huge mapping from an ordinary one from outside: the program
+ * cannot see the difference, and a kernel that quietly used 4 KiB pages
+ * would look identical in every other respect. */
+uint64_t uspace_huge_pages(void);
 
 /* A child with an address space of its own, made of the parent's pages
  * copy-on-write. Unlike `uspace_fork_shared` (which is `vfork`), the two

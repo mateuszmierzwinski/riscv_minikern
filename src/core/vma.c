@@ -156,8 +156,14 @@ bool vma_range_free(const struct vma_set *s, virt_t start, virt_t end) {
 }
 
 /* The highest address a len-byte gap inside [lo, hi) can start at,
- * scanning regions from the top. KERR_NOMEM when none fits. */
-static int highest_gap(const struct vma_set *s, virt_t len, virt_t lo, virt_t hi, virt_t *addr) {
+ * scanning regions from the top, with the result aligned down to `align`.
+ *
+ * The alignment is applied **inside** the gap and then checked against the
+ * gap's own lower edge, because aligning down can walk out of the bottom of
+ * a gap that was only just big enough — which would hand out an address
+ * overlapping the region below it. */
+static int highest_gap(const struct vma_set *s, virt_t len, virt_t lo, virt_t hi, virt_t align,
+                       virt_t *addr) {
     /* 64 bits, like everything else here. This held `hi` in a `uint32_t`,
      * which on a 39-bit address space silently searched the bottom 4 GiB of
      * a window that starts at 128 GiB — so every search failed and every
@@ -165,12 +171,14 @@ static int highest_gap(const struct vma_set *s, virt_t len, virt_t lo, virt_t hi
      * built on RISC-V, and a missed declaration reproduces the original
      * defect exactly. */
     virt_t top = hi;
+    virt_t floor = lo;
     for (uint32_t i = s->n; i-- > 0;) {
         const struct vma *v = &s->v[i];
         if (v->start >= top) {
             continue;
         }
         if (v->end <= top && top - (v->end > lo ? v->end : lo) >= len) {
+            floor = v->end > lo ? v->end : lo;
             break;
         }
         top = v->start;
@@ -182,16 +190,24 @@ static int highest_gap(const struct vma_set *s, virt_t len, virt_t lo, virt_t hi
         return KERR_NOMEM;
     }
     *addr = top - len;
+    if (align > 1u) {
+        *addr &= ~(align - 1u);
+        if (*addr < floor || *addr < lo) {
+            return KERR_NOMEM;
+        }
+    }
     return KERR_OK;
 }
 
-int vma_find_free(const struct vma_set *s, virt_t len, virt_t hint, virt_t lo, virt_t hi, virt_t *addr) {
+int vma_find_free(const struct vma_set *s, virt_t len, virt_t hint, virt_t lo, virt_t hi,
+                  virt_t align, virt_t *addr) {
+    virt_t want = align > 1u ? align : VMA_PAGE;
     if (len == 0 || len % VMA_PAGE != 0 || hi <= lo || len > hi - lo) {
         return KERR_NOMEM;
     }
-    if (hint % VMA_PAGE == 0 && hint >= lo && hint <= hi - len && vma_range_free(s, hint, hint + len)) {
+    if (hint % want == 0 && hint >= lo && hint <= hi - len && vma_range_free(s, hint, hint + len)) {
         *addr = hint;
         return KERR_OK;
     }
-    return highest_gap(s, len, lo, hi, addr);
+    return highest_gap(s, len, lo, hi, align, addr);
 }

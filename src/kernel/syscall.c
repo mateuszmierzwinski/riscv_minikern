@@ -127,9 +127,10 @@ static uint64_t complained[8];
  *   - **refused**: it would otherwise be accepted and not delivered.
  *     `MAP_SHARED` without shared frames is a private mapping that two
  *     processes each believe the other can see — writes that silently go
- *     nowhere. `MAP_HUGETLB` answered with 4 KiB pages breaks the one
- *     assumption that is the reason to ask. `MAP_GROWSDOWN` would promise a
- *     mapping that grows downwards, and nothing here grows one.
+ *     nowhere. `MAP_GROWSDOWN` would promise a mapping that grows
+ *     downwards, and nothing here grows one. `MAP_HUGETLB` was in this list
+ *     until there were huge pages to give, which is the right place for a
+ *     flag to wait.
  */
 #define MAP_SHARED 0x000001u
 #define MAP_PRIVATE 0x000002u
@@ -143,7 +144,7 @@ static uint64_t complained[8];
 #define MAP_POPULATE 0x008000u
 #define MAP_NONBLOCK 0x010000u
 #define MAP_STACK 0x020000u
-#define MAP_HUGETLB 0x040000u
+#define MAP_HUGETLB 0x040000u /* honoured: 2 MiB pages, one entry each */
 #define MAP_FIXED_NOREPLACE 0x100000u
 
 /* A flag the kernel will not deliver, and its name — because `EINVAL` tells
@@ -157,7 +158,6 @@ struct refused_map_flag {
 static const struct refused_map_flag refused_map_flags[] = {
     {MAP_SHARED, "MAP_SHARED"},
     {MAP_GROWSDOWN, "MAP_GROWSDOWN"},
-    {MAP_HUGETLB, "MAP_HUGETLB"},
 };
 
 /* The flags `mremap` is called with. `MREMAP_FIXED` is the only one that
@@ -238,6 +238,13 @@ static int64_t sys_mmap(struct trapframe *tf) {
     m.fixed = (flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) != 0;
     m.noreplace = (flags & MAP_FIXED_NOREPLACE) != 0;
     m.populate = (flags & (MAP_POPULATE | MAP_LOCKED)) != 0;
+    /* `MAP_HUGETLB` was **refused** until there were huge pages to give,
+     * because 4 KiB pages behind that flag break the one assumption that is
+     * the reason to ask for it. It is honoured now: the mapping is placed on
+     * a 2 MiB boundary and each block is backed as a single entry. A block
+     * that cannot be had contiguously falls back to 4 KiB pages rather than
+     * failing the mapping — `uspace_huge_pages` says how many were real. */
+    m.huge = (flags & MAP_HUGETLB) != 0;
     rc = uspace_map_anon(uspace_current(), &m, &out);
     return rc == KERR_OK ? (int64_t)out : rc;
 }

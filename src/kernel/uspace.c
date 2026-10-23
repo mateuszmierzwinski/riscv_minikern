@@ -32,6 +32,7 @@ static uint64_t demand_pages;
 /* Defined further down, next to the rest of the mapping machinery: the
  * fault handler is above it because the trap path is read first. */
 static int back_one_page(struct uproc *p, virt_t va, uint32_t prot);
+static int back_for_region(struct uproc *p, const struct vma *r, virt_t va);
 static int drop_pages(struct uproc *p, virt_t at, uint64_t bytes);
 static void record_stack(struct uproc *p);
 static void published_addition(void);
@@ -520,7 +521,7 @@ static bool back_on_demand(struct trapframe *tf) {
     if ((region->prot & want) == 0) {
         return false; /* the region does not allow what was attempted */
     }
-    if (back_one_page(me, page, region->prot) != KERR_OK) {
+    if (back_for_region(me, region, page) != KERR_OK) {
         return false; /* out of memory: a fault the process must be told about */
     }
     demand_pages++;
@@ -1303,7 +1304,7 @@ static bool make_present(struct uproc *p, virt_t va, uint64_t want) {
     if ((region->prot & need) == 0) {
         return false;
     }
-    if (back_one_page(p, va & ~(virt_t)(PAGE_SIZE - 1u), region->prot) != KERR_OK) {
+    if (back_for_region(p, region, va) != KERR_OK) {
         return false;
     }
     demand_pages++;
@@ -1543,6 +1544,64 @@ static int back_one_page(struct uproc *p, virt_t va, uint32_t prot) {
     return rc;
 }
 
+/* How many 4 KiB frames a 2 MiB page is made of. */
+#define MEGAPAGE_PAGES ((uint32_t)(MEGAPAGE_SIZE / PAGE_SIZE))
+
+/* Megapages handed to user space, and the frames they cost. */
+static uint64_t huge_pages;
+
+uint64_t uspace_huge_pages(void) {
+    return huge_pages;
+}
+
+/* Backs one 2 MiB block as a **single** leaf entry.
+ *
+ * The whole point is the one entry: 512 frames reached through one
+ * translation, so a program walking that memory takes one TLB entry where
+ * it would have taken 512. Sv39 says nothing special about it — a leaf at
+ * level 1 *is* a 2 MiB page — but it does demand that both the virtual and
+ * the physical address be 2 MiB aligned, which is why the frames are asked
+ * for with that alignment and the placement had to learn about it too.
+ *
+ * It is a contiguous physical allocation, which is a thing that gets harder
+ * as memory fragments: the caller falls back to 4 KiB pages rather than
+ * failing, because a mapping that works slowly is worth more than one that
+ * does not exist. */
+static int back_one_megapage(struct uproc *p, virt_t base, uint32_t prot) {
+    phys_t block = 0;
+    int rc = mem_alloc_pages(MEGAPAGE_PAGES, MEGAPAGE_PAGES, &block);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    for (uint64_t i = 0; i < MEGAPAGE_SIZE; i++) {
+        ((volatile uint8_t *)(uintptr_t)block)[i] = 0;
+    }
+    rc = pgtable_map(&p->pt, base, block, MEGAPAGE_SIZE, prot_bits(prot));
+    if (rc != KERR_OK) {
+        mem_free_pages(block, MEGAPAGE_PAGES);
+        return rc;
+    }
+    huge_pages++;
+    return KERR_OK;
+}
+
+/* Backs whatever the region says belongs at `va`: a 2 MiB block for a
+ * region that asked for huge pages and has room for a whole one, a 4 KiB
+ * page otherwise.
+ *
+ * Both conditions matter. A region's *edges* are not necessarily 2 MiB
+ * aligned even when its interior is, and a megapage mapped past the end of
+ * its region would give the program memory it never asked for — reachable,
+ * and in the way of the next mapping. */
+static int back_for_region(struct uproc *p, const struct vma *r, virt_t va) {
+    virt_t base = va & ~(virt_t)(MEGAPAGE_SIZE - 1u);
+    if ((r->flags & VMA_HUGE) != 0 && base >= r->start && r->end - base >= MEGAPAGE_SIZE &&
+        back_one_megapage(p, base, r->prot) == KERR_OK) {
+        return KERR_OK;
+    }
+    return back_one_page(p, va & ~(virt_t)(PAGE_SIZE - 1u), r->prot);
+}
+
 /* Live pages destroyed by a mapping nobody insisted on. Always a bug. */
 static uint32_t replaced_pages;
 
@@ -1619,15 +1678,56 @@ static int give_page_cow(struct uproc *child, struct uproc *parent, virt_t va) {
 }
 
 /* Gives a child every region the parent has, page by page. */
+/* One of a parent's 2 MiB pages, given to a child by **copying it**.
+ *
+ * Copy-on-write would be better and is not what this does. The mark lives
+ * in the page-table entry, and for a megapage there is one entry over 512
+ * frames — so a copy-on-write fault would have to copy all 2 MiB anyway,
+ * or split the page into 4 KiB entries and stop being what the program
+ * asked for. Copying at `fork` is 2 MiB of memcpy per huge page the parent
+ * has touched, paid once and predictably, instead of the same work paid at
+ * an unpredictable moment plus the machinery to decide.
+ *
+ * An untouched block is not copied: with demand paging a huge mapping is
+ * mostly nothing, and the child faults its own blocks in from its own
+ * record. */
+static int give_megapage(struct uproc *child, struct uproc *parent, virt_t at, uint32_t prot) {
+    phys_t from = 0, to = 0;
+    uint64_t flags = 0, size = 0;
+    int rc;
+    if (!pgtable_lookup(&parent->pt, at, &from, &flags, &size) || size != MEGAPAGE_SIZE) {
+        return KERR_OK;
+    }
+    from &= ~(phys_t)(MEGAPAGE_SIZE - 1u);
+    rc = mem_alloc_pages(MEGAPAGE_PAGES, MEGAPAGE_PAGES, &to);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    for (uint64_t i = 0; i < MEGAPAGE_SIZE; i++) {
+        ((volatile uint8_t *)(uintptr_t)to)[i] = ((const volatile uint8_t *)(uintptr_t)from)[i];
+    }
+    rc = pgtable_map(&child->pt, at, to, MEGAPAGE_SIZE, prot_bits(prot));
+    if (rc != KERR_OK) {
+        mem_free_pages(to, MEGAPAGE_PAGES);
+        return rc;
+    }
+    huge_pages++;
+    return KERR_OK;
+}
+
 static int give_address_space(struct uproc *child, struct uproc *parent) {
     for (uint32_t i = 0; i < parent->vmas.n; i++) {
         virt_t at = parent->vmas.v[i].start;
         virt_t end = parent->vmas.v[i].end;
-        for (; at < end; at += PAGE_SIZE) {
-            int rc = give_page_cow(child, parent, at);
+        bool huge = (parent->vmas.v[i].flags & VMA_HUGE) != 0;
+        uint32_t prot = parent->vmas.v[i].prot;
+        for (; at < end;) {
+            int rc = huge ? give_megapage(child, parent, at, prot)
+                          : give_page_cow(child, parent, at);
             if (rc != KERR_OK) {
                 return rc;
             }
+            at += huge ? MEGAPAGE_SIZE : PAGE_SIZE;
         }
     }
     /* The break is not an `mmap` region and is not recorded as one, so it
@@ -1713,10 +1813,11 @@ int uspace_fork(struct uproc *child, struct uproc *parent) {
  * is why the bump cursor is gone: a cursor can only ever move forwards, so
  * it could not step over a reservation without eventually walking off the
  * end of user space. */
-static virt_t place_mapping(struct uproc *p, virt_t at, uint64_t pages) {
+static virt_t place_mapping(struct uproc *p, virt_t at, uint64_t pages, virt_t align) {
     virt_t bytes = pages * PAGE_SIZE;
     virt_t chosen = 0;
-    if (vma_find_free(&p->vmas, bytes, at, USER_MMAP_BASE, USER_STACK_TOP, &chosen) != KERR_OK) {
+    if (vma_find_free(&p->vmas, bytes, at, USER_MMAP_BASE, USER_STACK_TOP, align, &chosen) !=
+        KERR_OK) {
         return 0;
     }
     return chosen;
@@ -1864,9 +1965,10 @@ static void clear_the_range(struct uproc *p, bool fixed, virt_t base, uint64_t p
  * `ENOMEM` can cope; one that is given memory somebody else is using
  * cannot. The failure is silent and total — measured, a kernel that kept
  * going here stopped producing any output at all. */
-static int record_the_mapping(struct uproc *p, virt_t base, uint64_t pages, uint32_t prot) {
+static int record_the_mapping(struct uproc *p, virt_t base, uint64_t pages, uint32_t prot,
+                              uint32_t flags) {
     if (vma_remove(&p->vmas, base, base + pages * PAGE_SIZE, NULL, NULL) == KERR_OK &&
-        vma_insert(&p->vmas, base, base + pages * PAGE_SIZE, prot, 0) == KERR_OK) {
+        vma_insert(&p->vmas, base, base + pages * PAGE_SIZE, prot, flags) == KERR_OK) {
         return KERR_OK;
     }
     unrecorded_regions++;
@@ -1887,12 +1989,12 @@ int uspace_map_anon(struct uproc *p, const struct uspace_mapping *m, virt_t *out
             return rc;
         }
     }
-    base = m->fixed ? m->at : place_mapping(p, m->at, pages);
+    base = m->fixed ? m->at : place_mapping(p, m->at, pages, m->huge ? MEGAPAGE_SIZE : 0u);
     if (base == 0) {
         return KERR_NOMEM;
     }
     clear_the_range(p, m->fixed, base, pages);
-    rc = record_the_mapping(p, base, pages, m->prot);
+    rc = record_the_mapping(p, base, pages, m->prot, m->huge ? VMA_HUGE : 0u);
     if (rc != KERR_OK) {
         return rc;
     }
@@ -1918,21 +2020,33 @@ static int drop_pages(struct uproc *p, virt_t at, uint64_t bytes) {
     if ((at & (PAGE_SIZE - 1u)) != 0 || !page_count(bytes, &pages)) {
         return KERR_INVAL;
     }
-    for (uint64_t i = 0; i < pages; i++) {
+    for (virt_t va = at; va < at + pages * PAGE_SIZE;) {
         phys_t phys = 0;
         uint64_t flags = 0, size = 0;
-        if (pgtable_lookup(&p->pt, at + i * PAGE_SIZE, &phys, &flags, &size)) {
-            (void)pgtable_unmap(&p->pt, at + i * PAGE_SIZE);
-            /* The mapping is gone from the tables, but another hart may
-             * still have it cached — so the page cannot be handed back to
-             * the allocator until every hart has been told. Freeing first
-             * would let a hart write through a stale translation into memory
-             * that now belongs to something else. That is also why the flush
-             * is inside the loop and there is no second one after it: every
-             * removal is already published before its frame is reusable. */
-            published_removal();
-            mem_free_pages(phys, 1);
+        uint64_t span;
+        if (!pgtable_lookup(&p->pt, va, &phys, &flags, &size)) {
+            va += PAGE_SIZE;
+            continue;
         }
+        /* **However big the mapping is.** A 2 MiB page is one entry over
+         * 512 frames, and `pgtable_lookup` reports the physical address
+         * *inside* it — so freeing the value it returns would hand back one
+         * frame from the middle of a block and leak the rest, while
+         * unmapping took all 512 out of the address space. The base and the
+         * count both come from the span. */
+        span = size < PAGE_SIZE ? PAGE_SIZE : size;
+        phys &= ~(phys_t)(span - 1u);
+        (void)pgtable_unmap(&p->pt, va);
+        /* The mapping is gone from the tables, but another hart may still
+         * have it cached — so the page cannot be handed back to the
+         * allocator until every hart has been told. Freeing first would let
+         * a hart write through a stale translation into memory that now
+         * belongs to something else. That is also why the flush is inside
+         * the loop and there is no second one after it: every removal is
+         * already published before its frame is reusable. */
+        published_removal();
+        mem_free_pages(phys, (uint32_t)(span / PAGE_SIZE));
+        va = (va & ~(virt_t)(span - 1u)) + span;
     }
     return KERR_OK;
 }
@@ -1956,9 +2070,27 @@ static int drop_pages(struct uproc *p, virt_t at, uint64_t bytes) {
  * nothing (a partial unmap splits a region, and the split needs a slot), so
  * doing it first means a refusal leaves the mapping intact rather than
  * leaving pages freed under a record that still promises them. */
+/* Whether a range would cut a huge region in half.
+ *
+ * A 2 MiB page is one entry: there is no such thing as unmapping a quarter
+ * of it, and the honest answers are to split it into 4 KiB pages or to
+ * refuse. **It refuses**, because splitting is the opposite of what the
+ * caller asked for and doing it silently would make `MAP_HUGETLB` a hint
+ * again. A huge mapping is unmapped and moved whole. */
+static bool cuts_a_huge_region(struct uproc *p, virt_t at, uint64_t bytes) {
+    const struct vma *r = vma_find(&p->vmas, at);
+    if (r == NULL || (r->flags & VMA_HUGE) == 0) {
+        return false;
+    }
+    return at != r->start || bytes != r->end - r->start;
+}
+
 int uspace_unmap(struct uproc *p, virt_t at, uint64_t bytes) {
     uint64_t pages = 0;
     if ((at & (PAGE_SIZE - 1u)) != 0 || !page_count(bytes, &pages)) {
+        return KERR_INVAL;
+    }
+    if (cuts_a_huge_region(p, at, pages * PAGE_SIZE)) {
         return KERR_INVAL;
     }
     if (vma_remove(&p->vmas, at, at + pages * PAGE_SIZE, NULL, NULL) != KERR_OK) {
@@ -2081,7 +2213,7 @@ static int grow_in_place(struct uproc *p, virt_t at, uint64_t old_bytes, uint64_
  * insert itself, which is `EINVAL` and the right answer. */
 static int move_mapping(struct uproc *p, virt_t at, uint64_t old_bytes, uint64_t new_bytes,
                         uint32_t prot, virt_t to, virt_t *out) {
-    virt_t base = to != 0 ? to : place_mapping(p, 0, new_bytes / PAGE_SIZE);
+    virt_t base = to != 0 ? to : place_mapping(p, 0, new_bytes / PAGE_SIZE, 0u);
     int rc;
     if (base == 0) {
         return KERR_NOMEM; /* no gap in the window is large enough */
@@ -2135,6 +2267,12 @@ int uspace_remap(struct uproc *p, virt_t at, uint64_t old_bytes, uint64_t new_by
     region = whole_region(p, at, old_bytes);
     if (region == NULL) {
         return KERR_FAULT;
+    }
+    if ((region->flags & VMA_HUGE) != 0) {
+        /* Resizing would have to split or extend a 2 MiB page, and moving
+         * would have to re-point one — both are real work and neither is
+         * what this does. Refused rather than half done. */
+        return KERR_INVAL;
     }
     prot = region->prot; /* read now: the next insert or remove invalidates it */
     *out = at;

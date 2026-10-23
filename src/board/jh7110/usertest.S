@@ -1280,7 +1280,8 @@ user_mremap_end:
  * of the point as the honourings: a flag that is accepted and not delivered
  * leaves the caller's assumption standing, and `MAP_SHARED` answered with
  * private memory is two processes each believing the other can see their
- * writes.
+ * writes. The second check used to be `MAP_HUGETLB` being refused for
+ * exactly that reason, and is now the same flag being honoured.
  *
  * What a program cannot see from here is whether `MAP_POPULATE` actually
  * backed anything — the memory reads as zeroes either way. That half is the
@@ -1304,17 +1305,24 @@ user_mapflags_start:
     bgez    a0, mf_huge
     ori     s2, s2, 1
 
-    /* 2: MAP_HUGETLB, rather than 4 KiB pages pretending. */
+    /* 2: MAP_HUGETLB is **accepted** — it was refused here until there were
+     * 2 MiB pages to give, which is the right place for a flag to wait, and
+     * this check moved from "is it refused?" to "is it honoured?" with the
+     * same number. A 4 MiB length, because a flag asking for 2 MiB pages
+     * with 4 KiB of length asks for nothing. What it actually gets is the
+     * huge test's business (`minikern.huge=1`); here it is one of the three
+     * answers a flag can have. */
 mf_huge:
     li      a0, 0
-    li      a1, 4096
+    li      a1, 4
+    slli    a1, a1, 20
     li      a2, 3
     li      a3, 0x40022          /* MAP_HUGETLB | MAP_PRIVATE | MAP_ANONYMOUS */
     li      a4, -1
     li      a5, 0
     li      a7, SYS_MMAP
     ecall
-    bgez    a0, mf_grow
+    bltz    a0, mf_grow
     ori     s2, s2, 2
 
     /* 3: MAP_GROWSDOWN, rather than a mapping that will not grow. */
@@ -1509,3 +1517,156 @@ es_child_failed:
     ecall
 7:  j       7b
 user_endsib_end:
+
+/* Roadmap §2: huge pages, asked for with `MAP_HUGETLB`.
+ *
+ * Seven checks, one bit each. What a program can see is
+ * only that the memory works and that the mapping is 2 MiB aligned — it
+ * cannot see how many table entries are behind it, which is the whole
+ * reason to ask. That half is the kernel's own counter, printed after this
+ * runs: `uspace_huge_pages` is the number of 2 MiB entries handed out, and
+ * a kernel quietly using 4 KiB pages would look identical here.
+ *
+ *   1. the mapping is accepted
+ *   2. it is 2 MiB aligned, which it has to be to be mapped as one entry
+ *   3. the first byte of each of its two blocks is writable and reads back
+ *   4. so is the last byte of the second block, 4 MiB in
+ *   5. a partial `munmap` of it is **refused**, because a 2 MiB page cannot
+ *      be unmapped in quarters and splitting it silently would make the
+ *      flag a hint again
+ *   6. a forked child sees the markers
+ *   7. and the child's write does not reach the parent's copy, which is
+ *      what distinguishes a 2 MiB page *copied* into the child from the
+ *      same entry shared with it
+ *
+ * **127 is a pass**, not 31.
+ */
+    .globl user_huge_start
+    .globl user_huge_end
+user_huge_start:
+    li      s2, 0
+
+    /* mmap(NULL, 4 MiB, RW, MAP_HUGETLB|MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) */
+    li      a0, 0
+    li      a1, 4
+    slli    a1, a1, 20           /* 4 MiB */
+    li      a2, 3
+    li      a3, 0x40022
+    li      a4, -1
+    li      a5, 0
+    li      a7, SYS_MMAP
+    ecall
+    bltz    a0, hp_done
+    mv      s3, a0
+    ori     s2, s2, 1
+
+    /* Aligned to 2 MiB: anything else could not be a 2 MiB page. */
+    li      t0, 2
+    slli    t0, t0, 20
+    addi    t0, t0, -1
+    and     t1, s3, t0
+    bnez    t1, hp_blocks
+    ori     s2, s2, 2
+
+    /* One marker in each block. */
+hp_blocks:
+    li      t0, 0x1111
+    sd      t0, 0(s3)
+    li      t2, 2
+    slli    t2, t2, 20
+    add     t3, s3, t2           /* the second block */
+    li      t0, 0x2222
+    sd      t0, 0(t3)
+    ld      t4, 0(s3)
+    li      t0, 0x1111
+    bne     t4, t0, hp_tail
+    ld      t4, 0(t3)
+    li      t0, 0x2222
+    bne     t4, t0, hp_tail
+    ori     s2, s2, 4
+
+    /* The last word of the whole mapping, 4 MiB in. */
+hp_tail:
+    li      t2, 4
+    slli    t2, t2, 20
+    add     t3, s3, t2
+    addi    t3, t3, -8
+    li      t0, 0x3333
+    sd      t0, 0(t3)
+    ld      t4, 0(t3)
+    bne     t4, t0, hp_partial
+    ori     s2, s2, 8
+
+    /* A partial unmap must be refused. */
+hp_partial:
+    mv      a0, s3
+    li      a1, 4096
+    li      a7, SYS_MUNMAP
+    ecall
+    bgez    a0, hp_fork
+    ori     s2, s2, 16
+
+    /* 6 and 7: **fork**, which is where a 2 MiB page is most likely to be
+     * got wrong. The child must see the markers and must have its *own*
+     * copy: a megapage given by sharing the one table entry would let the
+     * child's write change the parent's memory, which is the bug this pair
+     * of checks exists to catch. */
+hp_fork:
+    li      a0, 17               /* SIGCHLD */
+    li      a1, 0
+    li      a2, 0
+    li      a3, 0
+    li      a4, 0
+    li      a7, SYS_CLONE
+    ecall
+    bltz    a0, hp_done
+    bnez    a0, hp_parent
+
+    /* The child: both markers, then overwrite the first. */
+    ld      t4, 0(s3)
+    li      t0, 0x1111
+    bne     t4, t0, hp_child_bad
+    li      t2, 2
+    slli    t2, t2, 20
+    add     t3, s3, t2
+    ld      t4, 0(t3)
+    li      t0, 0x2222
+    bne     t4, t0, hp_child_bad
+    li      t0, 0x9999
+    sd      t0, 0(s3)
+    li      a0, 0
+    li      a7, SYS_EXIT_GROUP
+    ecall
+hp_child_bad:
+    li      a0, 1
+    li      a7, SYS_EXIT_GROUP
+    ecall
+
+hp_parent:
+    addi    sp, sp, -16
+    sw      zero, 0(sp)
+    li      a0, -1
+    mv      a1, sp
+    li      a2, 0
+    li      a3, 0
+    li      a7, SYS_WAIT4
+    ecall
+    bltz    a0, hp_done
+    lw      t0, 0(sp)
+    srli    t0, t0, 8
+    andi    t0, t0, 0xff
+    bnez    t0, hp_mine
+    ori     s2, s2, 32
+    /* And the parent's own copy is untouched. */
+hp_mine:
+    ld      t4, 0(s3)
+    li      t0, 0x1111
+    bne     t4, t0, hp_done
+    ori     s2, s2, 64
+
+hp_done:
+    mv      a0, s2
+    li      a7, SYS_EXIT_GROUP
+    ecall
+8:  j       8b
+user_huge_end:

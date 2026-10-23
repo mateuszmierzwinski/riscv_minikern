@@ -19,6 +19,7 @@
 
 /* prot is Linux PROT_* (1 read, 2 write, 4 exec; 0 = reserved, no access). */
 #define VMA_GROWSDOWN 1u  /* the main stack: not merged with neighbours */
+#define VMA_HUGE 2u       /* asked for in 2 MiB pages, and backed in them */
 
 struct vma {
     virt_t start;
@@ -76,7 +77,14 @@ bool vma_range_free(const struct vma_set *s, virt_t start, virt_t end);
 
 /* A free gap of len bytes inside [lo, hi): the highest one below hi, or
  * exactly hint when [hint, hint+len) is free and inside the window.
- * KERR_OK with *addr, or KERR_NOMEM. */
-int vma_find_free(const struct vma_set *s, virt_t len, virt_t hint, virt_t lo, virt_t hi, virt_t *addr);
+ * KERR_OK with *addr, or KERR_NOMEM.
+ *
+ * `align` is the alignment the result must have, in bytes, and 0 or 1 means
+ * any. It exists for huge pages: a 2 MiB page can only be mapped at a 2 MiB
+ * boundary, so a mapping that wants one has to be *placed* at one — and
+ * aligning afterwards is not the same thing, because the aligned address
+ * may have walked out of the gap that was found. */
+int vma_find_free(const struct vma_set *s, virt_t len, virt_t hint, virt_t lo, virt_t hi,
+                  virt_t align, virt_t *addr);
 
 #endif
