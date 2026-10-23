@@ -41,6 +41,26 @@ cc_library(
     strip_include_prefix = "src",
 )
 
+# The arithmetic of proportional-share scheduling: weights, virtual time and
+# slices. Pure and host-tested on purpose — every mistake in it is a silent
+# wrong answer that reads as "the scheduler is unfair" rather than a failure.
+cc_library(
+    name = "fair",
+    srcs = ["src/core/fair.c"],
+    hdrs = ["src/core/fair.h"],
+    strip_include_prefix = "src",
+)
+
+cc_test(
+    name = "fair_test",
+    size = "small",
+    srcs = ["test/fair_test.c"],
+    deps = [
+        ":fair",
+        ":ktest",
+    ],
+)
+
 cc_library(
     name = "console",
     srcs = ["src/core/console.c"],
@@ -468,6 +488,94 @@ cc_library(
     deps = [":core_boot"],
 )
 
+# The frequency governor's policy: pure, and until Phase 3 went looking for
+# it, **not in the build at all** — carried over from the ARM project,
+# compiled nowhere and tested nowhere. Its test is the policy's half of the
+# ARM lesson that a fake proves the policy and nothing about the registers.
+cc_library(
+    name = "cpufreq",
+    srcs = ["src/core/cpufreq.c"],
+    hdrs = ["src/core/cpufreq.h"],
+    strip_include_prefix = "src",
+)
+
+# ── Rule 25: the CVE regression suite ────────────────────────────────────
+#
+# The product class is a kernel that parses untrusted input, and it has four
+# such surfaces: a filesystem on a removable card, an ELF a user supplies,
+# packets off a network, and syscall arguments. Each test here is written
+# from the attacker's side and asserts a *refusal*, not an absence of
+# obvious breakage — a test satisfied by "it did not crash" would pass
+# against a parser that read out of bounds and got away with it.
+#
+# Run as `bazel test //:cve`.
+cc_test(
+    name = "elf_cve_test",
+    size = "small",
+    srcs = ["test/cve/elf_cve_test.c"],
+    deps = [
+        ":exec",
+        ":ktest",
+    ],
+)
+
+test_suite(
+    name = "cve",
+    tests = [
+        ":elf_cve_test",
+        ":fdt_test",
+        ":partition_test",
+        ":tcp_hostile_test",
+        ":xfs_test",
+    ],
+)
+
+cc_test(
+    name = "cpufreq_test",
+    size = "small",
+    srcs = ["test/cpufreq_test.c"],
+    deps = [
+        ":cpufreq",
+        ":ktest",
+    ],
+)
+
+# The DesignWare I2C master, polled. Seven of them on this board; the one
+# that matters holds the PMIC that holds the core voltage. It checks the
+# block's own identity register before writing anything, which is the
+# cheapest possible defence against the mistake this project has made twice
+# with memory-mapped registers.
+cc_library(
+    name = "drivers_i2c",
+    srcs = ["src/drivers/i2c_dw.c"],
+    hdrs = ["src/drivers/i2c_dw.h"],
+    strip_include_prefix = "src",
+    target_compatible_with = ["//platforms:riscv64"],
+    deps = [
+        ":arch_riscv",
+        ":console",
+        ":core_boot",
+        ":drivers_gpio",
+    ],
+)
+
+# Frequency scaling's hardware half: one register, and the measurement that
+# proved which one. The policy it serves is `core/cpufreq.c`, which is pure
+# and host-tested and knows nothing about this board.
+cc_library(
+    name = "drivers_cpufreq",
+    srcs = ["src/drivers/cpufreq_jh7110.c"],
+    hdrs = ["src/drivers/cpufreq_jh7110.h"],
+    strip_include_prefix = "src",
+    target_compatible_with = ["//platforms:riscv64"],
+    deps = [
+        ":console",
+        ":core_boot",
+        ":cpufreq",
+        ":drivers_gpio",
+    ],
+)
+
 cc_test(
     name = "crg_jh7110_test",
     size = "small",
@@ -616,6 +724,7 @@ cc_library(
         ":arch_riscv",
         ":console",
         ":exec",
+        ":fair",
         ":kernel_mem",
         ":kernel_net",
         ":kernel_xfs",
@@ -655,7 +764,7 @@ cc_library(
 
 # The live block device and the cache over it.
 # What this machine actually is, measured: the numbers the scheduler's
-# design depends on (ROADMAP.md, and the scheduler plan's Phase 0).
+# design depends on (docs/ROADMAP.md, and the scheduler plan's Phase 0).
 cc_library(
     name = "kernel_probe",
     srcs = ["src/kernel/probe.c"],
@@ -666,6 +775,10 @@ cc_library(
         ":arch_riscv",
         ":console",
         ":core_boot",
+        ":cpufreq",
+        ":drivers_cpufreq",
+        ":drivers_gpio",
+        ":drivers_i2c",
     ],
 )
 
@@ -855,7 +968,7 @@ kernel_image(
 # trusting the kernel's own account of it.
 
 # Four threads and a shared counter, with no runtime between the kernel and
-# the result: the reproducer for the four-hart race (CLAUDE.md, ROADMAP.md
+# the result: the reproducer for the four-hart race (CLAUDE.md, docs/ROADMAP.md
 # §0). It **passes** — raw clone, atomics and a futex mutex are all correct
 # at this scale — which is what narrowed the remaining fault to something a
 # Go runtime does that this does not.
@@ -887,6 +1000,22 @@ user_binary(
 user_image(
     name = "forktest.elf",
     program = ":forktest",
+)
+
+# One busy thread and nothing else, for measuring the preemption model: with
+# no competition there is no slice to end, so the timer interrupt count this
+# produces is the model's own overhead.
+user_binary(
+    name = "spin",
+    srcs = [
+        "src/userland/spin/main.c",
+        "src/userland/start.S",
+    ],
+)
+
+user_image(
+    name = "spin.elf",
+    program = ":spin",
 )
 
 user_binary(
@@ -1035,6 +1164,68 @@ sh_test(
         "//src/userland/netgo:netgo",
     ],
     tags = ["manual"],
+)
+
+# Static analysis, in SonarQube's place — and a better fit than it, because
+# these can be told the target triple and the absence of a libc, where Sonar's
+# rules are tuned for application code and argue with memory-mapped registers,
+# inline assembly and bare-metal patterns. (The server also has no C analyser
+# at all: 27 languages, none of them C.)
+#
+# Tagged `manual` for the same reason the packaging targets are: they shell out
+# to host tools that are not on every machine, and the whole-tree green check
+# has to stay green. The consequence is the same too — run them explicitly,
+# with `bazel test //:analysis`.
+sh_test(
+    name = "clang_tidy_test",
+    size = "large",
+    srcs = ["test/clang_tidy_test.sh"],
+    data = glob([
+        "src/**/*.c",
+        "src/**/*.h",
+    ]),
+    tags = [
+        "external",
+        "manual",
+    ],
+)
+
+sh_test(
+    name = "clang_analyze_test",
+    size = "large",
+    srcs = ["test/clang_analyze_test.sh"],
+    data = glob([
+        "src/**/*.c",
+        "src/**/*.h",
+    ]),
+    tags = [
+        "external",
+        "manual",
+    ],
+)
+
+sh_test(
+    name = "cppcheck_test",
+    size = "large",
+    srcs = ["test/cppcheck_test.sh"],
+    data = glob([
+        "src/**/*.c",
+        "src/**/*.h",
+    ]),
+    tags = [
+        "external",
+        "manual",
+    ],
+)
+
+test_suite(
+    name = "analysis",
+    tags = ["manual"],
+    tests = [
+        ":clang_analyze_test",
+        ":clang_tidy_test",
+        ":cppcheck_test",
+    ],
 )
 
 test_suite(

@@ -106,6 +106,21 @@ static virt_t phdr_address(const struct elf_image *img, uint64_t phoff, uint64_t
 int elf_parse(const uint8_t *data, size_t len, virt_t user_top, struct elf_image *out) {
     uint64_t phoff;
     uint32_t phent, phnum;
+    /* **The pointers first, before the length.**
+     *
+     * This used to begin `len < EH_SIZE || !is_ours(data)`, which reads the
+     * file whenever the length is plausible — so a NULL `data` with any
+     * length over 64 dereferenced it. In a kernel a fault is a panic, so
+     * that is the machine stopping inside a parser's entry condition, from
+     * one caller's mistake.
+     *
+     * No caller passes NULL today, which is the argument for leaving it out
+     * and is not good enough: this function's whole job is to be total over
+     * input it does not control, and its callers are the paths that grow.
+     * Found by the Rule 25 suite on its first run. */
+    if (data == NULL || out == NULL) {
+        return KERR_INVAL;
+    }
     if (len < EH_SIZE || !is_ours(data)) {
         return KERR_NOEXEC;
     }

@@ -132,7 +132,16 @@ static int probe_each(const struct fdt *fdt, uint32_t device_id, struct virtio_d
                       char *path, uint32_t cap, uint32_t *found_id) {
     phys_t base = 0;
     uint64_t size = 0;
-    int rc = fdt_device_reg(fdt, path, 0, &base, &size);
+    int rc;
+    /* **Before any return.** This function promises to report an id, and it
+     * has two failure paths that used to return without writing one — so the
+     * caller added a garbage stack value into `occupied`, the counter whose
+     * entire purpose is to tell "there are no devices" from "I could not see
+     * the devices that are there". A diagnostic that lies in the failure case
+     * is worse than no diagnostic, and that is the case it exists for.
+     * Found by `clang-tidy` on its first run over this tree. */
+    *found_id = 0;
+    rc = fdt_device_reg(fdt, path, 0, &base, &size);
     if (rc != KERR_OK) {
         kprintf("virtio: %s has no readable reg (rc %d)\n", path, rc);
         return KERR_NOENT;
@@ -145,7 +154,6 @@ static int probe_each(const struct fdt *fdt, uint32_t device_id, struct virtio_d
     }
     out->regs = (volatile uint32_t *)(uintptr_t)base;
     out->base = base;
-    *found_id = 0;
     if (read_reg(out, VIRTIO_MAGIC) != VIRTIO_MAGIC_VALUE) {
         kprintf("virtio: %s at %016llx reads magic %08x, not %08x\n", path,
                 (unsigned long long)base, read_reg(out, VIRTIO_MAGIC), VIRTIO_MAGIC_VALUE);
@@ -186,7 +194,7 @@ int virtio_find(const struct fdt *fdt, uint32_t device_id, uint32_t queues,
      * and they have completely different causes. */
     for (uint32_t skip = 0; skip < 64u; skip++) {
         char path[64];
-        uint32_t id;
+        uint32_t id = 0;
         int rc = fdt_find_compatible_nth(fdt, "virtio,mmio", skip, path, sizeof path);
         if (rc != KERR_OK) {
             break;

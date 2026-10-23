@@ -21,6 +21,14 @@
 #include "core/fdt.h"
 
 /* Measures the machine and prints what it found. */
-void probe_report(const struct fdt *fdt);
+/* Measures and reports what this machine is.
+ *
+ * `cpu_divider` of 0 reports only. Non-zero runs the one experiment that
+ * writes anything: it puts that value in the CPU core clock's divider,
+ * measures the loop rate either side of it, and restores it. Passed in
+ * rather than read from the command line here, because the composition root
+ * owns the command line and a measurement module that parses options is a
+ * module with two jobs. */
+void probe_report(const struct fdt *fdt, uint32_t cpu_divider);
 
 #endif

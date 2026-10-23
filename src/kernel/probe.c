@@ -9,6 +9,9 @@
 #include "arch/riscv/trap.h"
 #include "core/console.h"
 #include "core/errno.h"
+#include "drivers/cpufreq_jh7110.h"
+#include "drivers/crg_jh7110.h"
+#include "drivers/i2c_dw.h"
 
 /* `stimecmp`, the CSR the Sstc extension adds. Reading it from S-mode is an
  * illegal instruction on a machine without Sstc, which is exactly how its
@@ -195,6 +198,260 @@ static uint64_t cost_of_ipi(void) {
  * Read rather than invented: a voltage this kernel made up is a voltage that
  * can damage the part, and the frequencies have to match what the PLL can
  * actually produce. */
+/* **How fast the processor is actually going, measured rather than asked.**
+ *
+ * The `time` CSR is a fixed 4 MHz on this board whatever the cores are
+ * doing, which makes it the one honest reference for a frequency change:
+ * a loop of known length, timed against it, gives a rate that moves exactly
+ * as the clock does.
+ *
+ * Reported as **iterations a second**, not as megahertz. The loop is two
+ * instructions and the U74 is dual-issue and out of order, so the cycles it
+ * takes per iteration is not something to assert — but the *ratio* between
+ * two measurements is exact, and the ratio is what a frequency change has to
+ * prove. Calling it MHz would be inventing a calibration this does not have.
+ */
+static uint64_t measure_loop_rate(void) {
+    uint64_t started = timer_now();
+    uint64_t ticks;
+    uint32_t spins = 2000000u;
+    /* `volatile` so the loop survives the optimiser; the asm keeps it to the
+     * two instructions it is meant to be. */
+    for (volatile uint32_t i = spins; i != 0; i--) {
+    }
+    ticks = timer_now() - started;
+    if (ticks == 0) {
+        return 0;
+    }
+    return (uint64_t)spins * timer_frequency() / ticks;
+}
+
+static void report_cpu_rate(void) {
+    uint64_t a = measure_loop_rate();
+    uint64_t b = measure_loop_rate();
+    kprintf("probe: loop rate %llu/s, then %llu/s (the reference clock is fixed,\n",
+            (unsigned long long)a, (unsigned long long)b);
+    kprintf("probe:   so this moves with the core clock and its ratio is the proof)\n");
+}
+
+/* The clock generator's own registers for the CPU, read and not written.
+ *
+ * Changing a CPU clock means knowing which field is the mux and which the
+ * divider, and this project's rule is that the datasheet and a measurement
+ * decide. So the first step is to look: a running board's values say what the
+ * firmware chose, and that is the ground truth a write has to respect.
+ *
+ * Indices 0..3 of the system generator are the CPU's — root, core, bus and
+ * the APB that follows them — per the JH7110's clock list. Printed raw,
+ * because a field this code has not verified yet should not be decoded as
+ * though it had been. */
+static void report_cpu_clock_registers(void) {
+    phys_t base = crg_base(CRG_SYS);
+    if (!crg_present(CRG_SYS)) {
+        kprintf("probe: no system clock generator, so no frequency scaling\n");
+        return;
+    }
+    kprintf("probe: syscrg at %016llx, CPU clock words:\n", (unsigned long long)base);
+    for (uint32_t i = 0; i < 4u; i++) {
+        volatile const uint32_t *reg =
+            (volatile const uint32_t *)(uintptr_t)(base + crg_clock_offset(i));
+        kprintf("probe:   [%u] %08x\n", i, *reg);
+    }
+}
+
+/* **The experiment that settles what word [1] is**, under
+ * `minikern.cpudiv=<n>`.
+ *
+ * The hypothesis from the board's own numbers: the four operating points are
+ * 1500 MHz divided by 1, 2, 3 and 4, and word [1] of the system generator —
+ * reading `00000001` on a machine running at 1500 MHz — is that divider. If
+ * that is right, writing 2 halves the measured loop rate, and the ratio says
+ * so exactly because the reference clock does not move.
+ *
+ * **Lowering the frequency is electrically safe at the voltage already set.**
+ * The board boots at 1.04 V for its top operating point, and every point
+ * below it is specified at 800 mV, so running slower on more volts than
+ * required is wasteful and never unsafe. The unsafe direction is *raising*
+ * frequency before voltage, and this only ever divides. That is why this
+ * experiment can be run at all without a PMIC driver.
+ *
+ * It restores the divider afterwards, and reports both rates so that a
+ * ratio which is not the one asked for is visible rather than assumed. */
+/* Every operating point the board offers, set through the driver and
+ * **measured** — one run that proves the whole table rather than four runs
+ * that each prove a divider.
+ *
+ * The loop rate is the evidence: the reference clock does not move, so the
+ * ratio against the top point is the frequency ratio. A point that reports
+ * the right frequency and does not move the rate has not changed anything,
+ * which is the failure a register write can produce and the reason this
+ * measures instead of reading back. */
+/* **What is on this board's I2C, and where its regulator is.**
+ *
+ * Reconnaissance for voltage scaling, which is the half of DVFS the divider
+ * cannot do. Three questions, and the tree answers all three: is there an
+ * I2C controller and what kind, is the PMIC described, and does the device
+ * tree name the regulator that feeds the cores.
+ *
+ * Reported and not acted on. A regulator is the one peripheral on this board
+ * where a wrong write is not a hang but a *damaged part* — over-volting a
+ * core is permanent — so the write comes after the layout is known from the
+ * tree and the datasheet together, not from a guess that happened to work.
+ */
+/* **Reads the PMIC, and lets the board confirm the encoding.**
+ *
+ * The AXP15060's DCDC2 rail feeds the cores, and its voltage register is
+ * documented as 0.5 V plus 10 mV a step. This board is running at its top
+ * operating point, which its device tree says is **1040 mV** — so if the
+ * register reads a value that decodes to 1040, the register number *and* the
+ * encoding are both confirmed by the hardware itself, against a number that
+ * came from somewhere else entirely.
+ *
+ * That is the only kind of confirmation worth having before writing to a
+ * regulator. Every other peripheral on this board punishes a wrong write
+ * with a hang; this one can destroy the part, and an over-volted core does
+ * not come back. Nothing here writes.
+ */
+#define AXP15060_ADDR 0x36u
+#define AXP15060_DCDC2_VOLTAGE 0x25u
+
+static void report_pmic(const struct fdt *fdt) {
+    struct i2c_dw bus;
+    uint8_t raw = 0;
+    int rc = i2c_dw_init(&bus, fdt, "/soc/i2c@12050000");
+    if (rc != KERR_OK) {
+        kprintf("probe: i2c@12050000 did not come up (rc %d), so no PMIC read\n", rc);
+        return;
+    }
+    kprintf("probe: i2c@12050000 is a DesignWare block (type %08x, version %08x)\n",
+            i2c_dw_component_type(&bus), i2c_dw_component_version(&bus));
+    /* **Which register holds the core rail, asked rather than assumed.**
+     *
+     * The first attempt read 0x25 as "DCDC2" from memory of a related part
+     * and got 0x0b — 610 mV under the documented encoding, against a board
+     * the device tree says is running at 1040 mV. So the register number was
+     * wrong, and that mismatch is the whole value of reading before writing.
+     *
+     * 1040 mV encodes as 0.5 V + 10 mV a step, so the register this board's
+     * cores are on must read **0x36**. Printing the whole voltage block and
+     * marking that value identifies the rail from the hardware, against a
+     * number that came from the device tree — two independent sources
+     * agreeing, which is the only basis on which this will ever be written.
+     */
+    /* **The identity registers first.** The same discipline the I2C block
+     * itself allowed: a register whose correct value is known from somewhere
+     * other than this code is the only way to tell a working read path from
+     * one returning plausible nonsense. */
+    for (uint8_t r = 0x00u; r <= 0x04u; r++) {
+        if (i2c_dw_read_u8(&bus, AXP15060_ADDR, r, &raw) == KERR_OK) {
+            kprintf("probe: PMIC id register %02x = %02x\n", r, raw);
+        }
+    }
+    /* **The whole register map, as a diagnostic, and no conclusion drawn.**
+     *
+     * The search for the core rail did not find it, and that is the result
+     * rather than a step on the way to one. The device tree says the cores
+     * want 1040 mV, which encodes as 0x36 under this family's documented
+     * 0.5 V + 10 mV a step — and **no register on this part holds 0x36**.
+     * 0x20..0x2b, where a related AXP keeps its DCDC voltages, read 0x0b
+     * almost uniformly, and the identity registers prove the read path is
+     * real and per-register, so that block is simply not the voltage map
+     * here.
+     *
+     * So the register to write is not known, and this is the one peripheral
+     * on the board where guessing is not a hang but a destroyed part: an
+     * over-volted core does not come back. The project's rule is that the
+     * datasheet and a measurement decide, and for this register there is
+     * neither — so the map is printed for whoever has the datasheet, and
+     * nothing is written.
+     */
+    kprintf("probe: PMIC register map (read-only; the core rail is NOT identified):\n");
+    for (uint8_t row = 0x10u; row < 0x40u; row = (uint8_t)(row + 8u)) {
+        kprintf("probe:   %02x:", row);
+        for (uint8_t c = 0; c < 8u; c++) {
+            if (i2c_dw_read_u8(&bus, AXP15060_ADDR, (uint8_t)(row + c), &raw) == KERR_OK) {
+                kprintf(" %02x", raw);
+            } else {
+                kprintf(" --");
+            }
+        }
+        kprintf("\n");
+    }
+    kprintf("probe:   no register holds 36 (1040 mV), which the device tree says the\n");
+    kprintf("probe:   cores run at — so voltage scaling waits for an authoritative map\n");
+}
+
+static void report_i2c_and_regulators(const struct fdt *fdt) {
+    static const char *const compats[] = {"snps,designware-i2c", "x-powers,axp15060",
+                                          "starfive,jh7110-temp", "starfive,jh7100-temp"};
+    for (uint32_t c = 0; c < sizeof compats / sizeof compats[0]; c++) {
+        char path[160];
+        bool any = false;
+        for (uint32_t n = 0; n < 8u; n++) {
+            if (fdt_find_compatible_nth(fdt, compats[c], n, path, sizeof path) != KERR_OK) {
+                break;
+            }
+            kprintf("probe: %s at %s\n", compats[c], path);
+            any = true;
+        }
+        if (!any) {
+            kprintf("probe: no %s in the tree\n", compats[c]);
+        }
+    }
+}
+
+static void sweep_operating_points(const struct fdt *fdt) {
+    struct cpufreq_policy policy;
+    uint32_t points = cpufreq_jh7110_init(fdt, &policy);
+    uint64_t top;
+    if (points == 0) {
+        kprintf("probe: no usable operating points, so no sweep\n");
+        return;
+    }
+    top = measure_loop_rate();
+    kprintf("probe: sweeping %u operating points (loop rate at the top: %llu/s)\n", points,
+            (unsigned long long)top);
+    for (uint32_t i = points; i > 0; i--) {
+        uint32_t want = policy.opps[i - 1u].khz;
+        uint32_t got = cpufreq_jh7110_set_khz(want);
+        uint64_t rate = measure_loop_rate();
+        kprintf("probe:   asked %u kHz, set %u kHz (divider %u): %llu/s", want, got,
+                cpufreq_jh7110_divider(), (unsigned long long)rate);
+        if (rate != 0) {
+            kprintf(", %llu%% of the top", (unsigned long long)(rate * 100u / top));
+        }
+        kprintf("\n");
+    }
+    /* Back to the top, because leaving a board slow after a measurement is
+     * a measurement that changed the machine. */
+    (void)cpufreq_jh7110_set_khz(policy.opps[points - 1u].khz);
+    kprintf("probe: restored to %u kHz\n", cpufreq_jh7110_current_khz());
+}
+
+static void try_cpu_divider(uint32_t want) {
+    volatile uint32_t *reg;
+    uint32_t was;
+    uint64_t before, after;
+    if (want == 0 || !crg_present(CRG_SYS)) {
+        return;
+    }
+    reg = (volatile uint32_t *)(uintptr_t)(crg_base(CRG_SYS) + crg_clock_offset(1u));
+    was = *reg;
+    before = measure_loop_rate();
+    *reg = (was & ~0xffu) | (want & 0xffu);
+    kprintf("probe: cpu core word [1] %08x -> %08x\n", was, *reg);
+    after = measure_loop_rate();
+    kprintf("probe: loop rate %llu/s -> %llu/s", (unsigned long long)before,
+            (unsigned long long)after);
+    if (after != 0) {
+        kprintf(" (ratio %llu/100)", (unsigned long long)(before * 100u / after));
+    }
+    kprintf("\n");
+    *reg = was;
+    kprintf("probe: restored [1] to %08x, rate %llu/s\n", *reg,
+            (unsigned long long)measure_loop_rate());
+}
+
 static void report_operating_points(const struct fdt *fdt) {
     char path[64];
     uint32_t found = 0;
@@ -226,7 +483,7 @@ static void report_operating_points(const struct fdt *fdt) {
     }
 }
 
-void probe_report(const struct fdt *fdt) {
+void probe_report(const struct fdt *fdt, uint32_t cpu_divider) {
     uint32_t asid = asid_bits();
     bool sstc = !faults(read_stimecmp);
     kprintf("\nprobe: ---- what this machine is ----\n");
@@ -255,6 +512,12 @@ void probe_report(const struct fdt *fdt) {
     }
     kprintf("\n");
     report_operating_points(fdt);
+    report_cpu_rate();
+    report_cpu_clock_registers();
+    try_cpu_divider(cpu_divider);
+    sweep_operating_points(fdt);
+    report_i2c_and_regulators(fdt);
+    report_pmic(fdt);
     kprintf("probe: NOT measured yet: PMIC voltage ramp and PLL relock need an I2C and a\n");
     kprintf("probe:   clock driver, which do not exist — so no DVFS timing is reported\n");
     kprintf("probe: ---------------------------------\n\n");

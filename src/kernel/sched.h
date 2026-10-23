@@ -317,9 +317,77 @@ void sched_wake_idle_harts(void);
  * because of a timeout rather than because the scheduler was right. */
 uint32_t sched_missed_pokes(void);
 
+/* How many times a hart stopped looking for work while the soonest deadline
+ * in the system was armed on no hart at all. **Every one of these is a hang
+ * that did not happen yet**: nothing will interrupt any hart, so whoever was
+ * waiting waits for ever. It must be zero. */
+uint32_t sched_lost_deadlines(void);
+
+/* The running thread's nice value, and setting it. Setting clamps to the
+ * permitted range rather than refusing, as POSIX requires, and recomputes
+ * the weight the scheduler divides by — so it takes effect at the next
+ * scheduling decision rather than at the next slice boundary. False only if
+ * there is no running thread to set it on. */
+int32_t sched_nice(void);
+bool sched_set_nice(int32_t nice);
+
+/* **Affinity**: which harts may run the calling thread, as a bitmask of
+ * indices into the hart table — not of hart ids, which are the firmware's
+ * and start at 1 on this board. Inherited at `clone`.
+ *
+ * Setting is refused when the mask leaves nowhere to run, rather than
+ * accepted into a thread that will never be chosen again. */
+uint64_t sched_affinity(void);
+bool sched_set_affinity(uint64_t mask);
+
+/* **Isolation**: harts the scheduler places no work on at all, so that
+ * something else can have them. A property of the machine's configuration,
+ * set once from the command line (`minikern.isolate=<mask>`), where
+ * affinity is a property of a thread. An isolated hart still idles inside
+ * the scheduler, so it can be given work again without being restarted. */
+/* The round-robin quantum, for `SCHED_RR` only. 10 ms, which is long
+ * against the 1.5 ms fair floor on purpose: a real-time thread is not
+ * sharing, it is taking turns with its own equals. */
+#define SCHED_RR_QUANTUM_NS 10000000ull
+
+/* The real-time priority range. 0 is the fair class; 1..99 are real-time,
+ * higher first — the range POSIX and Linux both use, so a program that asks
+ * `sched_get_priority_max` gets the answer it expects. */
+#define SCHED_RT_PRIORITY_MAX 99u
+
+/* The real-time class: priority 0 is the fair class, 1..99 real-time.
+ * Inherited at `clone`, like nice and affinity. Setting it yields, because
+ * a thread that has just raised itself above the one it shares a hart with
+ * should be the one running. */
+uint32_t sched_rt_priority(void);
+bool sched_rt_is_round_robin(void);
+bool sched_set_rt(uint32_t priority, bool round_robin);
+
+void sched_set_isolated(uint64_t mask);
+uint64_t sched_isolated(void);
+
+
 /* How long a slice is, in nanoseconds. One value for now: the fair class
  * in Phase 2 computes it per thread from the runnable count and weights. */
+/* The floor on a slice: below this, switching costs more than the slice
+ * delivers. 1.5 ms, which Phase 0 settled by measurement — an
+ * address-space switch on this machine costs about 330 ns more than a
+ * thread switch (no ASID, so the TLB is flushed), which is 0.02% of this,
+ * so the plan's fallback of widening the quantum was not needed.
+ * `docs/scheduler-phase0.md` has the table. */
 #define SCHED_SLICE_NS 1500000ull
+
+/* The period in which every runnable thread should get a turn. A thread's
+ * slice is its share of this by weight, floored at `SCHED_SLICE_NS` — so
+ * eight runnable threads of equal weight get 1.5 ms each and the period
+ * stretches to 12 ms rather than the slices shrinking to nothing. */
+#define SCHED_TARGET_LATENCY_NS 12000000ull
+
+/* What waking is worth, as a credit against the smallest virtual clock.
+ * Half the target period: enough that a thread which has just been woken is
+ * served before threads that have been running, and bounded so that
+ * sleeping repeatedly does not accumulate a claim. */
+#define SCHED_WAKE_CREDIT_NS 6000000ull
 uint32_t sched_deadline_wakes(void);
 
 #endif

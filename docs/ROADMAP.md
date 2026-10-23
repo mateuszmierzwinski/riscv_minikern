@@ -37,12 +37,30 @@ Ordering inside a section is roughly by what unblocks the most.
 
 ## 1. Process model
 
-- [ ] **Real `fork` with copy-on-write.** (L) Today `clone` makes either a
-      thread or a **vfork** child that borrows its parent's address space
-      until `execve`. Everything that expects `fork` — a shell, `os/exec`
-      with a pipe between parent and child, anything that forks and keeps
-      running — does not work. Needs COW in the page tables, a fault handler
-      that copies, and refcounted physical pages.
+- [x] **Real `fork` with copy-on-write.** (L) **Done.** The child gets an
+      address space of its own, made of the parent's pages copy-on-write;
+      nothing is copied until one of them writes. Underneath: refcounted
+      physical frames (saturating, and sticky at saturation), Sv39's
+      software bits carrying the copy-on-write mark, and a fault handler
+      that copies or takes over depending on how many holders remain.
+      `src/userland/forktest` is the proof rather than a demonstration —
+      both processes write the same global, the same stack local and the
+      same mapped page, and each checks it sees only its own.
+      **The "still owed" note here was wrong and is withdrawn.** It said
+      `wait4` does not wake a forked child and leaves the parent blocked.
+      Measured on the board: a child exits with 7, the parent's `wait4`
+      wakes **after one round**, reaps it, and reads the status back through
+      the `WEXITSTATUS` shift. `minikern.wait=1` is that test.
+      What the measurement did find was a different bug, in the raw
+      embedded-program path rather than in `wait4`: `uspace_build` mapped
+      its text page without **recording** it, and `give_address_space`
+      walks the record and nothing else — so a forked child resumed with no
+      text and took an instruction page fault at its own entry. The ELF
+      path records its segments, which is why real programs forked
+      correctly and only the hand-written ones did not. Fixed, and it is
+      the third instance of the rule this kernel keeps relearning: the
+      address-space record has to include everything in the address space,
+      because placement reads it too.
 - [ ] **Process groups and sessions.** (M) `setpgid`, `getpgid`, `setsid`,
       and the job-control signals (`SIGTSTP`, `SIGCONT`, `SIGTTIN`). Needed
       before a shell is usable.
@@ -61,8 +79,9 @@ Ordering inside a section is roughly by what unblocks the most.
 - [ ] **Demand paging.** (M) Pages are backed eagerly at `mmap` time, so a
       large reservation that is never touched still costs nothing (it is
       left unmapped), but a large *mapping* costs all of it immediately.
-- [ ] **Copy-on-write.** (L) Needed by `fork`, and by `MAP_PRIVATE` file
-      mappings. Shares the refcounting work with `fork`.
+- [x] **Copy-on-write.** (L) **Done** for anonymous memory, with `fork`
+      above. Not done for `MAP_PRIVATE` file mappings, which need
+      file-backed mappings first.
 - [ ] **File-backed mappings.** (M) `mmap` of a file is not supported, so a
       dynamic loader cannot work and neither can anything that maps a file
       to read it.
@@ -138,8 +157,35 @@ sparse inodes, `nrext64`, exchange-range, parent pointers, `bigtime`,
       function means the `sys_iomux` registers, which should be *measured*
       on the board rather than taken from a datasheet — see how the
       pad-config block was found (`CLAUDE.md`).
-- [ ] **Thermal and frequency scaling.** (M) `sfctemp` and the clock tree.
-      Nothing reads the temperature, so nothing throttles.
+- [x] **Frequency scaling.** (M) **Done**, and it needed one register rather
+      than the clock-tree work this entry assumed: the board's four
+      operating points are 1500 MHz divided by 1, 2, 3 and 4, and the system
+      generator's word at index 1 is that divider. Measured on the board at
+      100%, 50%, 33% and 25% of the top rate. `drivers/cpufreq_jh7110.c`.
+- [ ] **Voltage scaling.** (M) The remaining part of DVFS and where the
+      power saving is: three of the four operating points want 800 mV while
+      the board runs at 1040 mV for the top one, so every low point is
+      currently run at a wasteful voltage.
+      **The I²C driver is no longer the blocker — it is written and
+      verified** (`drivers/i2c_dw.c`, identity register `44570140`), the
+      PMIC answers, and its chip id reads `0x54` at register `0x03`. What is
+      missing is which register holds the core rail. The device tree says
+      the cores want 1040 mV, which encodes as `0x36` under this family's
+      documented 0.5 V + 10 mV a step, and **no register on the part holds
+      `0x36`**. `0x20..0x2b`, where a related AXP keeps its DCDC voltages,
+      read `0x0b` almost uniformly — and the identity registers prove the
+      read path is real and per-register, so that block is not the voltage
+      map here.
+      This is the one peripheral where a wrong write destroys the part
+      rather than hanging the machine, so it waits for an authoritative
+      AXP15060 register map. `minikern.probe=1` prints the whole map for
+      whoever has one.
+- [ ] **The thermal half.** (S–M) Nothing reads `sfctemp`, so the
+      governor's thermal thresholds are configured and inert — which the
+      code says of itself rather than looking live. The policy underneath
+      them is built and host-tested now, including that an impossible
+      reading is treated as the worst case, so this is a sensor driver
+      rather than a design.
 - [ ] **USB.** (L) The board's VL805 is enumerated on PCIe and otherwise
       ignored. No XHCI driver, no HID, no mass storage.
 - [ ] **eMMC.** (S) The DesignWare driver already binds to both controllers;
@@ -147,7 +193,18 @@ sparse inodes, `nrext64`, exchange-range, parent pointers, `bigtime`,
       module fitted.
 - [ ] **SPI, I²C, PWM, RTC, watchdog.** (M each) None exist.
 - [ ] **Interrupt-driven storage and network.** (M) Both drivers poll. The
-      PLIC is wired and the tick uses it, but no device does.
+      PLIC is wired and the tick uses it, but no device does — virtio-net
+      registers a handler and the poll is still what drives it.
+      **This is now the last periodic interrupt in the system.** With
+      dynamic ticks a busy thread takes 1 timer interrupt in 10 seconds and
+      an idle hart 101; turn a network on and the machine pays a 10 ms beat
+      for ever, because a polled device has to be asked. Measured:
+      ~1,200 interrupts in 10 seconds against 304 with no network. The beat
+      also exists for the stack's own timers (retransmit, DHCP renewal, ARP
+      expiry), and those do not need polling either — they need a
+      **deadline**: if the stack reported when it next wants to be called,
+      the scheduler would arm a one-shot and an idle network would cost
+      nothing at all. Doing both would make the kernel genuinely tickless.
 - [ ] **DMA for SD.** (S–M) The DesignWare controller has an internal DMA
       engine; the driver uses the FIFO, a word at a time. That is most of
       what stands between 8.2 MB/s and the bus limit.
@@ -177,14 +234,25 @@ sparse inodes, `nrext64`, exchange-range, parent pointers, `bigtime`,
 - [ ] **ASLR.** (M) The stack, the heap and `mmap` are all at fixed
       addresses. `AT_RANDOM` is filled from the entropy pool, but nothing is
       actually randomised.
-- [ ] **A CVE regression suite (Rule 25).** (M) **This gate has not been
-      run for this project.** The claim that it "carries over from the ARM
-      project" was false and is withdrawn in `CLAUDE.md`: the ARM tree was
-      deleted and nothing was carried. What exists is `tcp_hostile_test`,
-      which is one class of one. The product class is a kernel that parses
-      untrusted input — a filesystem on a **removable card**, an ELF a user
-      supplies, packets off a network — and that is what the suite has to
-      cover.
+- [x] **A CVE regression suite (Rule 25).** (M) **Run, and it found three
+      real defects.** Four surfaces parse untrusted input here. Three are
+      pure parsers tested adversarially on the host — the device tree, XFS,
+      the partition table and now the ELF loader (`test/cve/`) — grouped as
+      `//:cve`. The fourth, **syscall arguments**, needs page tables and a
+      process, so it is an embedded program run on the board
+      (`minikern.hostile=1`) whose exit status is a bitmask of the hostile
+      arguments the kernel *accepted*; it reads 0.
+      What it found: a NULL dereference in `elf_parse`'s entry condition,
+      and two from the bottom-half mapping below — user space could read
+      and write the kernel's own memory through any syscall that took a
+      pointer.
+- [ ] **Extend it as the kernel grows.** (S, repeatedly) Rule 25.2 says the
+      audit is repeated and not a one-time event. The syscall-surface
+      program covers pointers and one arithmetic argument; it does not yet
+      cover TOCTOU across a syscall, descriptor-table exhaustion, or the
+      signal-delivery path. Every new syscall is a new case — the suite
+      caught `sched_setaffinity` as *already correct* only because it was
+      written days before the suite.
 - [ ] **W^X enforcement for user mappings.** (S) `mprotect` is honoured, but
       nothing refuses a mapping that is both writable and executable.
 
@@ -201,8 +269,13 @@ sparse inodes, `nrext64`, exchange-range, parent pointers, `bigtime`,
       over; nothing is wired to it.
 - [ ] **The kernel in the top half of the address space.** (M) It still runs
       identity-mapped in the bottom half, which `share_kernel_mappings`
-      works around — and that workaround has already cost one
-      memory-corruption bug.
+      works around — and that workaround has now cost **three** bugs: one
+      memory-corruption bug in the teardown path, and two security holes
+      the CVE suite found, where the kernel's own addresses passed every
+      `< USER_TOP` pointer check in the syscall layer. Those are fixed by
+      checking permissions instead of a constant, which is the right fix
+      regardless; moving the kernel out of the user half would make the
+      whole class unrepresentable.
 - [ ] **A device-tree overlay or command-line way to describe a board**
       this kernel has not met. (S)
 

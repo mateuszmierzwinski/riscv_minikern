@@ -18,6 +18,7 @@ struct knet {
     struct tcp_stack tcp;
     uint64_t last_tick_ns;
     uint32_t pings_sent;
+    uint32_t net_ticks;
     uint64_t next_ping_ms;
 };
 
@@ -78,6 +79,7 @@ static void on_tick(void *self, uint64_t now_ns) {
         return;
     }
     k->last_tick_ns = now_ns;
+    k->net_ticks++;
     net_tick(&k->nif, now_ns / 1000000u);
     tcp_tick(&k->tcp, now_ns / 1000000u);
     maybe_ping(k);
@@ -101,7 +103,7 @@ void knet_tick(void) {
 void knet_start(uint32_t xid) {
     knet.nif.now_ms = timer_ns() / 1000000u;
     dhcp_start(&knet.nif, xid);
-    (void)timer_add_tick_hook(knet_tick);
+    (void)timer_add_housekeeping_hook(knet_tick);
 }
 
 void knet_start_static(ip4_t addr, uint32_t prefix, ip4_t gateway, ip4_t dns) {
@@ -117,11 +119,14 @@ void knet_start_static(ip4_t addr, uint32_t prefix, ip4_t gateway, ip4_t dns) {
          * know that there is an address now, not where it came from. */
         knet.nif.events.dhcp_bound(knet.nif.events.self, &knet.nif);
     }
-    (void)timer_add_tick_hook(knet_tick);
+    (void)timer_add_housekeeping_hook(knet_tick);
 }
 
 void knet_report(void) {
     const struct net_stats *n = &knet.nif.stats;
+    kprintf("net: %u housekeeping beats, %u net ticks, now_ms %llu, next ping %llu\n",
+            timer_housekeeping_beats(), knet.net_ticks,
+            (unsigned long long)knet.nif.now_ms, (unsigned long long)knet.next_ping_ms);
     const struct tcp_stats *t = &knet.tcp.stats;
     kprintf("net: rx %u tx %u; dropped: malformed %u checksum %u fragment %u not-ours %u arp %u "
             "rate %u no-port %u loop %u\n", n->rx_frames, n->tx_frames, n->drop_malformed, n->drop_checksum,

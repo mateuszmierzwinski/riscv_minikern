@@ -14,7 +14,7 @@ two things that cannot be measured yet say so.
 | **`satp` ASID bits** | **0** | the hardware implements no address-space ids, so **every** switch between address spaces flushes the whole TLB |
 | `sfence.vma` (all) | **32 ns** | the fence itself is cheap — it is not what a flush costs |
 | TLB refill, 64 pages | **296 ns** | this is what a flush costs: ten times the fence, paid by the next thread as it faults its working set back in |
-| **Context switch, same address space** | **46 ns** | registers and a stack pointer, nothing more |
+| **`context_switch` alone, same address space** | **46 ns** | registers and a stack pointer, **and nothing else** — see the warning below |
 | SBI IPI, send | **1499 ns** | **four and a half times a timer arm, and thirty times a context switch** |
 | `time` CSR | **4 MHz**, 249 ns a tick | the clock everything is measured against. Coarse: a 100 µs rounding is 400 ticks |
 | Operating points | **375 / 500 / 750 MHz at 0.80 V, 1500 MHz at 1.04 V** | read from the board's own `/opp-table-0`. Three of the four share a voltage |
@@ -28,7 +28,24 @@ when there is no ASID is **not needed on this chip** — the measurement says
 1.5 ms costs two parts in ten thousand. Keeping the slice short is worth more
 than avoiding a flush.
 
-**An IPI is expensive — 1.5 µs, thirty context switches.** "Send a wakeup IPI
+**Do not read 46 ns as "what a preemption costs".** It is what the
+`context_switch` function costs: twelve callee-saved registers, `ra`, and a
+stack pointer. A *preemption* is the whole trap path — entry, the 32-register
+frame and its CSRs, the floating-point state (saved unconditionally today),
+the kernel lock, the scheduler's arming, and `sret` — plus whatever the
+interrupted thread loses in cache and branch state. That path has **not** been
+measured in isolation, and the 46 ns figure invites exactly the wrong
+conclusion, which is why it is labelled narrowly here.
+
+What *has* been measured, on the board, is the consequence of avoiding them:
+switching the same Go workload from the periodic tick to dynamic ticks removed
+**2,567 of 3,111 context switches** and took the parallel phase from 35 ms to
+**24 ms** — a speedup of 2.4x to **3.6x** on eight units. Twelve milliseconds
+of total runtime for 2,567 avoided preemptions puts the full path in the
+**microseconds**, three orders of magnitude above the bare register swap. That
+is the number to reason with.
+
+**An IPI is expensive — 1.5 µs, about a thousandth of a slice.** "Send a wakeup IPI
 only if the target is in `wfi` or should be preempted" is therefore not an
 optimisation but a requirement: a scheduler that pokes a hart on every wakeup
 would spend more time sending interrupts than running threads.

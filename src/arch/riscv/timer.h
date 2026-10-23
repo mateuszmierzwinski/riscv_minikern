@@ -95,6 +95,49 @@ void timer_on_tick(void);
  * is full. */
 int timer_add_tick_hook(void (*hook)(void));
 
+/* **Work that needs a beat rather than an edge.**
+ *
+ * A tick hook runs on every timer interrupt, which is right for the
+ * scheduler — it is asked "has this thread had its turn?" and the answer is
+ * computed from the clock. It is wrong for anything that needs to run *at
+ * intervals*, because without a periodic tick there may be no interrupt for
+ * ten seconds. A polled network device is the example that matters: its hook
+ * was on the tick list, so turning the periodic clock off stopped the
+ * network, and a test that transfers 64 KiB hung rather than failing.
+ *
+ * Housekeeping hooks are run by the scheduler, on **one** hart, at a fixed
+ * interval it arms for. Registering one is therefore a statement that this
+ * work has a deadline of its own, and the machine pays a periodic interrupt
+ * for it — on one hart, not on four. The cure for the cost is an interrupt
+ * from the device rather than a poll, which is a driver's job and is on the
+ * roadmap. */
+int timer_add_housekeeping_hook(void (*hook)(void));
+
+/* How often the beat runs: 10 ms, which is what the periodic tick used to
+ * give a polled network device. Chosen to keep that behaviour identical
+ * rather than to be a new decision. */
+#define TIMER_HOUSEKEEPING_NS 10000000ull
+
+/* Runs every housekeeping hook. Called from the timer interrupt when the
+ * interval has elapsed; not meant for anyone else. */
+void timer_run_housekeeping(void);
+
+/* When the next beat is due, or 0 if nothing has registered housekeeping.
+ * The scheduler includes it in the deadline it arms for, so that a hart with
+ * a thread to run does not have to be interrupted twice. */
+uint64_t timer_housekeeping_due(void);
+
+/* How many times the beat has run. Reported, because a beat that does not
+ * run is a polled device that has stopped and a stack whose timers never
+ * fire — and that failure is silent. */
+uint32_t timer_housekeeping_beats(void);
+
+
+/* Whether anything has registered housekeeping. The scheduler asks so that a
+ * machine with nothing to poll — no network device in the tree — pays no
+ * periodic interrupt at all. */
+bool timer_has_housekeeping(void);
+
 /* ── deadlines ─────────────────────────────────────────────────────────── */
 
 /* Arms this hart's timer for `ns`, or leaves it alone if that is already
@@ -134,6 +177,13 @@ void timer_disarm(void);
 
 /* What this hart is armed for, in nanoseconds, or 0 when it is disarmed. */
 uint64_t timer_armed_at(void);
+
+/* The deadline hart `hart` is waiting for, in nanoseconds, or 0 if it is not
+ * armed. **Any** hart's, not only this one's, because the question worth
+ * asking about a one-shot timer is global: is the soonest deadline anybody
+ * waits for armed on at least one hart? A kernel that cannot answer that
+ * turns a lost wake-up into a hang with no output. */
+uint64_t timer_armed_ns_of(uint32_t hart);
 
 /* How many timer interrupts this hart has taken. The measure of whether
  * dynticks is working: a hart running one thread with nothing asleep should

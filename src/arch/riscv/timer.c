@@ -6,6 +6,7 @@
 #include "arch/riscv/sbi.h"
 #include "arch/riscv/smp.h"
 #include "core/errno.h"
+#include "core/console.h"
 
 /* The supervisor interrupt-enable bit for the timer. */
 #define SIE_STIMER (1ull << 5)
@@ -176,6 +177,28 @@ void timer_rearm(void) {
  * since there is no way to switch the comparator off. */
 #define TIMER_NEVER ((uint64_t)-1)
 
+/* **The one place that changes this hart's timer state.**
+ *
+ * `armed` and the comparator are two records of the same fact, and keeping
+ * them in step is not something to spread around: every path that fires,
+ * disarms or arms goes through here, so "armed is non-zero exactly when the
+ * comparator holds a live deadline and the interrupt is enabled" is an
+ * invariant of one function rather than a convention several functions try
+ * to honour.
+ *
+ * `at` of 0 means "no deadline": the interrupt is masked, because the
+ * comparator cannot be switched off and an expired one left enabled is a
+ * hart that takes the same interrupt for ever. */
+static void set_hart_timer(uint32_t me, uint64_t at) {
+    per_hart[me].armed = at;
+    if (at == 0) {
+        __asm__ volatile("csrc sie, %0" : : "r"(SIE_STIMER) : "memory");
+        return;
+    }
+    sbi_set_timer(at);
+    __asm__ volatile("csrs sie, %0" : : "r"(SIE_STIMER) : "memory");
+}
+
 void timer_arm_at(uint64_t ns) {
     uint32_t me = smp_hart_index();
     uint64_t rounded = ((ns + TIMER_GRANULARITY_NS - 1u) / TIMER_GRANULARITY_NS) *
@@ -187,11 +210,7 @@ void timer_arm_at(uint64_t ns) {
     if (per_hart[me].armed == at) {
         return; /* already waiting for exactly this: no firmware call */
     }
-    per_hart[me].armed = at;
-    sbi_set_timer(at);
-    /* Whatever `timer_disarm` masked, this unmasks: an armed timer that
-     * cannot interrupt is not armed. */
-    __asm__ volatile("csrs sie, %0" : : "r"(SIE_STIMER) : "memory");
+    set_hart_timer(me, at);
 }
 
 void timer_disarm(void) {
@@ -199,32 +218,31 @@ void timer_disarm(void) {
     if (!timer.up) {
         return;
     }
-    /* **No early-out on `armed == 0`.**
+    /* **No early-out on "already disarmed".**
      *
-     * It is tempting — "already disarmed, nothing to do" — and it is wrong,
-     * because `armed` records what was *asked for* and the comparator
-     * records what the hardware will *do*. A timer interrupt clears the
-     * first and leaves the second holding a time that has now passed, so
-     * the pending bit stays set. Returning early then skips the mask, the
-     * interrupt is taken again the instant it returns, and the hart does
-     * nothing else for ever.
+     * It is tempting and it is wrong, because the two records are not the
+     * same thing: `armed` is what was asked for and the comparator is what
+     * the hardware will do. A timer interrupt clears the first and leaves
+     * the second holding a time that has now passed, so an early-out here
+     * skips the mask, the pending interrupt is taken again the instant it
+     * returns, and the hart does nothing else for ever.
      *
      * Measured: a storm of supervisor timer interrupts that looked exactly
-     * like a load access fault, because both report cause 5 and only the
-     * interrupt bit tells them apart. The program made four syscalls and
-     * then never ran another instruction of its own. */
-    per_hart[me].armed = 0;
-    /* **Masked, not set far away.** The obvious way to say "no deadline" is
-     * `sbi_set_timer` with an enormous value, and it is a trap: the
-     * comparator is a *comparison*, the implementation is free to treat an
-     * out-of-range value how it likes, and a timer interrupt that stays
-     * pending is a hart that takes it again the instant it returns — an
-     * interrupt storm that looks exactly like a hang. Measured: a kernel
-     * that disarmed that way stopped before its first program printed a
-     * character.
+     * like a load access fault, because **both report cause 5** and only
+     * the interrupt bit tells them apart. The program made four syscalls
+     * and then never ran another instruction of its own.
      *
-     * Clearing the enable bit is local, certain and reversible. */
-    __asm__ volatile("csrc sie, %0" : : "r"(SIE_STIMER) : "memory");
+     * `set_hart_timer` is unconditional, which is the point of having one
+     * place: the question "is it already in that state?" is the question
+     * that got this wrong. */
+    set_hart_timer(me, 0);
+}
+
+uint64_t timer_armed_ns_of(uint32_t hart) {
+    if (!timer.up || hart >= SMP_MAX_HARTS || per_hart[hart].armed == 0) {
+        return 0;
+    }
+    return ns_of_counter(per_hart[hart].armed);
 }
 
 uint64_t timer_armed_at(void) {
@@ -239,6 +257,101 @@ uint64_t timer_interrupts_of(uint32_t hart_index) {
 #define TICK_HOOKS 4u
 
 static void (*tick_hooks[TICK_HOOKS])(void);
+static void (*housekeeping_hooks[TICK_HOOKS])(void);
+
+/* **The beat has no owner, and is claimed by whichever hart gets to it.**
+ *
+ * Two designs were tried and both were wrong in a way worth recording.
+ *
+ * *Armed from the scheduler*: `sched_arm_timer` runs on returns to user mode
+ * and at scheduling decisions, so a kernel doing its own network work with
+ * **no user process at all** never armed it. The symptom was precise — a
+ * DHCP lease was obtained, because that path polls in a loop of its own, and
+ * then a ping got no answer, because nothing was turning the stack's crank.
+ * The kernel's final idle loop is not the scheduler, and once the scheduler
+ * had taken the comparator, nothing armed that hart ever again.
+ *
+ * *Pinned to one hart*: a hart that owns the beat and then picks up a
+ * compute-bound thread charges that thread a hundred interrupts a second and
+ * runs the polling inside them — on the thread's slice, attributed to
+ * nobody. Whichever thread lands there loses the property the whole model
+ * exists for, and which thread that is depends on the scheduler.
+ *
+ * So: one due time, no owner, and whoever reaches it first advances it and
+ * runs the hooks. The advance happens under the kernel lock, which is what
+ * makes "first" meaningful and stops two harts polling the same beat. Which
+ * harts bother to arm for it is the scheduler's choice, and it prefers one
+ * that has stopped anyway — see `sched_arm_timer`. */
+static uint32_t hk_runs;
+static uint64_t housekeeping_due;
+
+uint32_t timer_housekeeping_beats(void) {
+    return hk_runs;
+}
+
+uint64_t timer_housekeeping_due(void) {
+    return timer_has_housekeeping() ? housekeeping_due : 0u;
+}
+
+/* Runs the hooks if the interval has elapsed, says when the next beat is
+ * due, and arms for it — the arming is what makes the beat survive a kernel
+ * with nothing else going on. */
+static void housekeeping_if_due(bool may_arm) {
+    uint64_t now;
+    if (!timer_has_housekeeping()) {
+        return;
+    }
+    now = timer_ns();
+    if (now < housekeeping_due) {
+        return;
+    }
+    housekeeping_due = now + TIMER_HOUSEKEEPING_NS;
+    hk_runs++;
+    timer_run_housekeeping();
+    /* Only when this scheduler owns the comparator. Under the periodic
+     * clock the tick is already 10 ms, so the beat rides it and arming here
+     * would overwrite the periodic schedule — the same mistake, in the
+     * other direction, as arming from the scheduler while the clock ran. */
+    /* Arming again here is what keeps the beat alive on a hart that nobody
+     * else will arm — the kernel's own idle loop, which is not the
+     * scheduler and does not call it. */
+    if (may_arm) {
+        timer_arm_at(housekeeping_due);
+    }
+}
+
+int timer_add_housekeeping_hook(void (*hook)(void)) {
+    for (uint32_t i = 0; i < TICK_HOOKS; i++) {
+        if (housekeeping_hooks[i] == NULL) {
+            housekeeping_hooks[i] = hook;
+            if (housekeeping_due == 0) {
+                housekeeping_due = timer_ns() + TIMER_HOUSEKEEPING_NS;
+            }
+            return KERR_OK;
+        }
+        if (housekeeping_hooks[i] == hook) {
+            return KERR_OK;
+        }
+    }
+    return KERR_NOSPC;
+}
+
+void timer_run_housekeeping(void) {
+    for (uint32_t i = 0; i < TICK_HOOKS; i++) {
+        if (housekeeping_hooks[i] != NULL) {
+            housekeeping_hooks[i]();
+        }
+    }
+}
+
+bool timer_has_housekeeping(void) {
+    for (uint32_t i = 0; i < TICK_HOOKS; i++) {
+        if (housekeeping_hooks[i] != NULL) {
+            return true;
+        }
+    }
+    return false;
+}
 
 int timer_add_tick_hook(void (*hook)(void)) {
     for (uint32_t i = 0; i < TICK_HOOKS; i++) {
@@ -264,12 +377,14 @@ void timer_remove_tick_hook(void (*hook)(void)) {
 void timer_on_tick(void) {
     uint32_t me = smp_hart_index();
     per_hart[me].interrupts++;
-    /* The deadline that fired is spent. Whoever wants another says so; a
-     * hart that does not ask is a hart that will not be interrupted. */
-    per_hart[me].armed = 0;
     if (timer.handed_over) {
-        /* No periodic reload: the hooks below decide what happens next, and
-         * one of them is a scheduler that knows when the next event is. */
+        /* **Acknowledged here, in the one place that owns the pair.** The
+         * deadline that fired is spent, so the record of it goes and the
+         * interrupt is masked — the comparator still holds a time in the
+         * past and an enabled interrupt against it fires again immediately.
+         * Whoever wants another deadline asks for one; a hart that does not
+         * ask is a hart that will not be interrupted. */
+        set_hart_timer(me, 0);
         timer.ticks++;
         per_hart[me].ticks++;
         for (uint32_t i = 0; i < TICK_HOOKS; i++) {
@@ -277,6 +392,7 @@ void timer_on_tick(void) {
                 tick_hooks[i]();
             }
         }
+        housekeeping_if_due(true);
         return;
     }
     /* A **tick** only when the periodic deadline has passed. An early
@@ -285,6 +401,7 @@ void timer_on_tick(void) {
     bool periodic = timer_now() >= per_hart[me].next_deadline;
     timer.ticks += periodic ? 1u : 0u;
     per_hart[me].ticks += periodic ? 1u : 0u;
+    housekeeping_if_due(false);
     timer_rearm();
     /* Rearmed first, then the hook: a scheduler's tick may not return for a
      * long time — it is where a thread switch happens — and a timer that is

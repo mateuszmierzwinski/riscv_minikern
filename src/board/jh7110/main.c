@@ -618,7 +618,7 @@ static void bring_up_network(uint64_t dtb) {
         static const struct irq_handler handler = {.handle = on_net_interrupt, .self = NULL};
         (void)irq_register(virtio_net_irq(), &handler);
     }
-    (void)timer_add_tick_hook(poll_net_from_tick);
+    (void)timer_add_housekeeping_hook(poll_net_from_tick);
     random_fill(&xid, sizeof xid);
     knet_start(xid);
     if (knet_wait_address(5000u) != KERR_OK) {
@@ -933,6 +933,12 @@ static void drive_a_pin(void) {
  * rather than the kernel. */
 extern const char user_program_start[], user_program_end[];
 extern const char user_faulter_start[], user_faulter_end[];
+extern const char user_spin_start[], user_spin_end[];
+extern const char user_nice_start[], user_nice_end[];
+extern const char user_pin_start[], user_pin_end[];
+extern const char user_rt_start[], user_rt_end[];
+extern const char user_hostile_start[], user_hostile_end[];
+extern const char user_wait_start[], user_wait_end[];
 
 static void run_one_user_program(const char *name, const char *from, const char *to) {
     struct uproc *proc = uspace_alloc();
@@ -942,7 +948,12 @@ static void run_one_user_program(const char *name, const char *from, const char 
         kprintf("uspace: no free process slot for %s\n", name);
         return;
     }
-    rc = uspace_build(proc, from, (uint32_t)(to - from));
+    /* Through integers, not as pointers. `from` and `to` are two separate
+     * linker symbols, and subtracting pointers that the standard cannot see
+     * into one array is undefined behaviour however reliably it works — they
+     * do bound one section here, but the compiler is not told that. Casting
+     * first makes it ordinary integer arithmetic. */
+    rc = uspace_build(proc, from, (uint32_t)((uintptr_t)to - (uintptr_t)from));
     if (rc != KERR_OK) {
         kprintf("uspace: could not build %s (rc %d)\n", name, rc);
         uspace_release(proc);
@@ -972,6 +983,10 @@ static void report_hart_usage(void) {
         kprintf("sched: %llu sleeps, woken %llu us late on average, %llu us at worst\n",
                 (unsigned long long)sleeps, (unsigned long long)average,
                 (unsigned long long)worst);
+        /* Both must be zero. A missed poke is a wake-up that a timeout
+         * rescued; a lost deadline is one nothing would have rescued. */
+        kprintf("sched: %u missed pokes, %u lost deadlines\n", sched_missed_pokes(),
+                sched_lost_deadlines());
     }
     kprintf("smp: switches/ticks by hart:");
     for (uint32_t i = 0; i < smp_hart_count(); i++) {
@@ -1041,7 +1056,16 @@ static void run_user_programs(void) {
      * starts half way through is worse than none, because the first half
      * looks quiet. */
     sched_set_trace(cmdline_has(boot_cmdline, "minikern.trace"));
-    sched_set_dynticks(cmdline_has(boot_cmdline, "minikern.dynticks"));
+    /* **On**, with `minikern.periodic` to put the old clock back. Keeping
+     * the switch is worth one flag: it separates "this is broken" from
+     * "this is broken without a tick nudging it", which is how both of the
+     * timer bugs above were identified. */
+    /* `minikern.isolate=<mask>` reserves harts, by index into the hart
+     * table. Indices rather than ids because the ids are the firmware's and
+     * start at 1 on this board, so a mask of ids would be off by one
+     * against every per-hart array in the kernel. */
+    sched_set_isolated(cmdline_number(boot_cmdline, "minikern.isolate", 0u));
+    sched_set_dynticks(!cmdline_has(boot_cmdline, "minikern.periodic"));
     /* `minikern.calls=N` traces the first N calls. A fixed budget was
      * useless for anything that happens late — the budget was gone long
      * before a child process made its first call. */
@@ -1059,6 +1083,50 @@ static void run_user_programs(void) {
     if (cmdline_has(boot_cmdline, "minikern.user")) {
         run_one_user_program("hello", user_program_start, user_program_end);
         run_one_user_program("faulter", user_faulter_start, user_faulter_end);
+    }
+    /* Phase 1's measurement: one busy thread, no syscalls, and whatever
+     * timer interrupts the model takes for it. Embedded because the board's
+     * only other way to run a program is the operator's SD card. */
+    if (cmdline_has(boot_cmdline, "minikern.spin")) {
+        uint64_t started = timer_ns();
+        run_one_user_program("spin", user_spin_start, user_spin_end);
+        kprintf("spin: %llu ms of one busy thread\n",
+                (unsigned long long)((timer_ns() - started) / 1000000u));
+        report_hart_usage();
+    }
+    /* Phase 2's measurement: two threads, nice +5 against nice -5, dividing
+     * one hart. Run it with `minikern.smp=off` — with four harts the two
+     * threads simply run and no weighting is observable, which is a property
+     * of proportional share rather than a limitation of this test. */
+    if (cmdline_has(boot_cmdline, "minikern.nice")) {
+        run_one_user_program("nice", user_nice_start, user_nice_end);
+        report_hart_usage();
+    }
+    /* Phase 4's measurement: a thread pinned to hart index 2. The per-hart
+     * report below is the whole test — that hart does the switches and the
+     * others do none. */
+    if (cmdline_has(boot_cmdline, "minikern.pin")) {
+        run_one_user_program("pin", user_pin_start, user_pin_end);
+        report_hart_usage();
+    }
+    /* Phase 5's measurement: a SCHED_FIFO thread against a fair one on one
+     * hart. Run with `minikern.smp=off` for the same reason as the nice
+     * test — a class only shows under contention. */
+    if (cmdline_has(boot_cmdline, "minikern.rt")) {
+        run_one_user_program("rt", user_rt_start, user_rt_end);
+        report_hart_usage();
+    }
+    /* Rule 25's syscall-surface suite. The exit status is a bitmask of the
+     * hostile arguments the kernel **accepted**, so 0 is a pass and any
+     * other value names the missing check. */
+    if (cmdline_has(boot_cmdline, "minikern.hostile")) {
+        run_one_user_program("hostile", user_hostile_start, user_hostile_end);
+    }
+    /* Roadmap §1: fork, then wait for the child. The exit status is the
+     * answer — 7 means the whole path works, 101 or 102 name where it
+     * stops, and a run that never finishes means the parent is blocked. */
+    if (cmdline_has(boot_cmdline, "minikern.wait")) {
+        run_one_user_program("wait", user_wait_start, user_wait_end);
     }
     if (cmdline_has(boot_cmdline, "minikern.init")) {
         run_init_from_disk("/init");
@@ -1113,7 +1181,8 @@ void kmain(uint64_t hart, uint64_t dtb) {
     if (cmdline_has(boot_cmdline, "minikern.probe")) {
         struct fdt probe_tree;
         if (fdt_open(&probe_tree, (const void *)(uintptr_t)dtb, FDT_MAX_BYTES) == KERR_OK) {
-            probe_report(&probe_tree);
+            probe_report(&probe_tree,
+                         (uint32_t)cmdline_number(boot_cmdline, "minikern.cpudiv", 0u));
         }
     }
     bring_up_network(dtb);

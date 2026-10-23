@@ -19,6 +19,10 @@
 #include "kernel/signal.h"
 #include "kernel/syscall.h"
 
+/* Mappings the address-space record could not hold. Any value but zero means
+ * placement may hand out an address that is already in use. */
+static uint32_t unrecorded_regions;
+
 /* The generic Linux syscall numbers, which is the set RISC-V uses — and the
  * modern one: there is no `mmap2`, no `_llseek`, no `stat64`, no
  * `*_time64` duplicate of anything. The architecture this migrated from
@@ -106,7 +110,7 @@ static void *proc_to_virt(void *self, phys_t phys) {
  * rather than papered over.
  *
  * **This whole function disappears when the kernel moves to the top half**
- * (DEVELOPMENT_PROGRESS.md P0.4): with the kernel above the sign-extension
+ * (docs/DEVELOPMENT_PROGRESS.md P0.4): with the kernel above the sign-extension
  * hole and user space below it, the two cannot share a root entry at all,
  * and sharing becomes copying 256 entries that can never collide. */
 static int share_kernel_mappings(struct pgtable *pt) {
@@ -161,6 +165,24 @@ int uspace_build(struct uproc *p, const void *program, uint32_t bytes) {
      * hand-written instructions with no data section, and splitting it would
      * need an ELF to say where the split is. */
     rc = pgtable_map(&p->pt, USER_TEXT, text, PAGE_SIZE, PT_PROT_RWX | PT_PROT_USER);
+    /* **And recorded, not only mapped.**
+     *
+     * The address-space record has to include everything in the address
+     * space — the rule this file already states, and the third thing to be
+     * caught breaking it. `give_address_space` walks the record and nothing
+     * else, so a page that is mapped and unrecorded is a page a forked
+     * child does not get: the child of an embedded program resumed with no
+     * text at all and took an instruction page fault at its own entry.
+     *
+     * The ELF path records its segments (see `add_load`), which is why a
+     * real program forks correctly and only these hand-written ones did
+     * not. Placement reads the same record, so an unrecorded text page is
+     * also an address `mmap` believes is free. */
+    if (rc == KERR_OK &&
+        vma_insert(&p->vmas, USER_TEXT, USER_TEXT + PAGE_SIZE,
+                   PROT_READ | PROT_WRITE | PROT_EXEC, 0) != KERR_OK) {
+        unrecorded_regions++;
+    }
     for (uint32_t i = 0; rc == KERR_OK && i < USER_STACK_PAGES; i++) {
         rc = pgtable_map(&p->pt, USER_STACK_TOP - (uint64_t)(i + 1u) * PAGE_SIZE,
                          stack + (uint64_t)i * PAGE_SIZE, PAGE_SIZE, PT_PROT_RW | PT_PROT_USER);
@@ -741,9 +763,6 @@ static int map_signal_trampoline(struct uproc *p) {
 
 static void record_fixed_regions(struct uproc *p);
 
-/* Mappings the address-space record could not hold. Any value but zero means
- * placement may hand out an address that is already in use. */
-static uint32_t unrecorded_regions;
 
 uint32_t uspace_unrecorded_regions(void) {
     return unrecorded_regions;

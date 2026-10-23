@@ -63,6 +63,28 @@ static void test_next_walks_every_word(void) {
     KTEST_CHECK(cmdline_next(NULL, &at, &len) == NULL);
 }
 
+/* Hexadecimal, which a bitmask option needs and which this parser silently
+ * refused — returning the fallback, so `minikern.isolate=0x8` read as "the
+ * operator did not ask" and a hart that should have been reserved went on
+ * taking work. */
+static void test_numbers_in_hexadecimal(void) {
+    KTEST_CHECK(cmdline_number("a=0x8", "a", 99u) == 8u);
+    KTEST_CHECK(cmdline_number("a=0xff", "a", 99u) == 255u);
+    KTEST_CHECK(cmdline_number("a=0XFF", "a", 99u) == 255u);
+    KTEST_CHECK(cmdline_number("a=0xdeadbeef", "a", 99u) == 0xdeadbeefu);
+    /* Decimal still is decimal: `0x` is the only prefix, so a leading zero
+     * does not make a number octal the way C would. */
+    KTEST_CHECK(cmdline_number("a=10", "a", 99u) == 10u);
+    KTEST_CHECK(cmdline_number("a=010", "a", 99u) == 10u);
+    /* And malformed is still the fallback, which every caller relies on. */
+    KTEST_CHECK(cmdline_number("a=0x", "a", 99u) == 99u);
+    KTEST_CHECK(cmdline_number("a=0xg", "a", 99u) == 99u);
+    KTEST_CHECK(cmdline_number("a=8x", "a", 99u) == 99u);
+    KTEST_CHECK(cmdline_number("a=", "a", 99u) == 99u);
+    /* The full width, since this is what a 64-hart mask would need. */
+    KTEST_CHECK(cmdline_number("a=0xffffffffffffffff", "a", 0u) == 0xffffffffffffffffull);
+}
+
 int main(void) {
     KTEST_RUN(test_next_walks_every_word);
     KTEST_RUN(test_finds_value);
@@ -71,5 +93,6 @@ int main(void) {
     KTEST_RUN(test_equals_is_exact);
     KTEST_RUN(test_prefix_of_a_key_is_not_the_key);
     KTEST_RUN(test_absent_and_degenerate);
+    KTEST_RUN(test_numbers_in_hexadecimal);
     return ktest_failures();
 }

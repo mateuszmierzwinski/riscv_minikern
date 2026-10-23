@@ -20,8 +20,9 @@ now reached on RISC-V.
 **On real hardware.** A StarFive VisionFive 2 boots this kernel, brings up
 its SD card and an NVMe drive in its M.2 slot, reads the GPT on the drive,
 mounts XFS, loads that Go binary off the card and runs it on all four U74
-cores — 3.3x on eight units of work. `FEATURES.md` lists what the board
-proved and what each of those things cost, and `ROADMAP.md` lists what is
+cores — **3.6x on eight units of work**. It forks, with copy-on-write and the
+two processes properly isolated. `docs/FEATURES.md` lists what the board
+proved and what each of those things cost, and `docs/ROADMAP.md` lists what is
 missing, because an emulator had agreed
 with every mistake they found: a response with no CRC whose CRC was being
 checked, a configuration read to an unrouted bus that never returns, a
@@ -59,16 +60,34 @@ includes nothing from `arch/` or `board/`** — the network stack, TCP, XFS, NBD
 the allocators, the ELF loader, the device-tree reader — and its host tests run
 on day one of this port rather than at the end of it.
 
-## State
-
-Early. The kernel boots on QEMU's `virt` machine under real OpenSBI firmware,
-in S-mode, reads its device tree, and powers the machine off through SBI. Four
-host tests and one boot test, all green. `DEVELOPMENT_PROGRESS.md` is the plan and the record, `GOALS.md` the design and the measured hardware facts.
+## Building and running it
 
 ```bash
-bazel test //...          # host tests
-bazel test //:qemu_tests   # under the emulator
+bazel test  //...            # host tests: no board, no emulator
+bazel test  //:qemu_tests     # under the emulator (tagged manual)
+bazel build //:minikern       # the image for QEMU
+bazel build //:minikern_board # the image for a VisionFive 2
+bazel test  //:analysis       # clang-tidy, clang --analyze, cppcheck
 ```
+
+The analysers are a Bazel gate rather than a convention, and the gate is
+**zero findings**: a check whose findings are noise for freestanding C is
+excluded in the test with the reason written beside it, and a tolerated count
+is never raised. SonarQube is not used here — the server has no C analyser at
+all, and for a kernel these are the better tools anyway, since they can be
+told the target triple and the absence of a libc where Sonar's rules are tuned
+for application code and argue with memory-mapped registers and inline
+assembly.
+
+Two images, because they are not interchangeable: the board's DRAM starts at
+`0x4000_0000` and the emulator's at `0x8000_0000`. A board measurement taken
+with the emulator's image is the commonest way to waste an afternoon here.
+
+`docs/DEVELOPMENT_PROGRESS.md` is the plan and the record,
+`docs/GOALS.md` the design and why this board, `docs/FEATURES.md` what works
+today, `docs/ROADMAP.md` what does not, `docs/BENCHMARKS.md` the numbers and
+`docs/PREEMPTION_MODEL.md` how the scheduler decides when to interrupt a
+thread.
 
 ## Why the VisionFive 2 is a better target than the board before it
 
@@ -81,8 +100,17 @@ QEMU's `virt` machine models everything this kernel needs — SBI, the PLIC, the
 CLINT, virtio — so the bring-up is verifiable without a board at all. The
 JH7110's own peripherals still need the board, but it is a better-documented
 part: upstream Linux support, a published technical reference manual, and
-standard IP blocks (a DesignWare GMAC, a Cadence SD host controller, a generic
-NVMe-over-PCIe root port) with independent implementations to check against.
+standard IP blocks (a DesignWare GMAC, a DesignWare mobile-storage controller,
+a generic NVMe-over-PCIe root port) with independent implementations to check
+against.
+
+One of those turned out to be worth more as a lesson than as a shortcut. This
+file used to call the SD host controller **Cadence SDHCI-compatible**, from
+the documentation, and the board's own device tree says
+`starfive,jh7110-mmc` — a Synopsys DesignWare part with a different register
+set entirely. The driver that had been proved against the emulator was not a
+driver with a bug in it; it was the wrong driver, and only hardware could say
+so.
 
 ## The toolchain is clang
 

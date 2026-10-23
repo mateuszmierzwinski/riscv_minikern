@@ -62,8 +62,28 @@ static uint64_t be64(const uint8_t *p) {
     return v;
 }
 
+/* Eight bytes, big-endian.
+ *
+ * The suppression below is a **documented false positive**, and the three
+ * attempts to make it unnecessary are all still in `sha512_final` because
+ * each one improved the code:
+ *
+ *   1. `have % SHA512_BLOCK` — the analyser does not model modulo precisely
+ *      and ignored it.
+ *   2. `if (have >= SHA512_BLOCK)` — it acknowledged modelling the branch
+ *      ("Assuming 'have' is < SHA512_BLOCK") and then still reported an
+ *      index of 4294967288, which is **-8**: it could not carry the bound
+ *      through the unsigned subtraction that follows.
+ *   3. a check on `pad + 16u > sizeof tail`, bounding the offset that
+ *      actually indexes the buffer — same result.
+ *
+ * With `have < 128`, `pad` is at most 128 and the furthest byte written is
+ * at offset 143 of a 256-byte buffer. Every caller is in this file and both
+ * are bounded; the checker stays on for the rest of the tree, where it is
+ * worth having. */
 static void put_be64(uint8_t *p, uint64_t v) {
     for (uint32_t i = 0; i < 8; i++) {
+        /* NOLINTNEXTLINE(clang-analyzer-security.ArrayBound) */
         p[i] = (uint8_t)(v >> (56u - 8u * i));
     }
 }
@@ -131,7 +151,41 @@ void sha512_update(struct sha512 *s, const void *data, uint32_t len) {
 void sha512_final(struct sha512 *s, uint8_t out[SHA512_DIGEST]) {
     uint64_t bits = s->len * 8u;
     uint8_t tail[SHA512_BLOCK * 2u];
-    uint32_t pad = s->have < 112u ? 112u - s->have : 240u - s->have;
+    /* **The invariant, made local and therefore true.**
+     *
+     * `have` is the partial block's length and `sha512_update` keeps it below
+     * one block — but nothing here required that, and the arithmetic below is
+     * unsigned: a `have` above 240 makes `240u - have` wrap to something near
+     * 2^32 and the writes that follow go wherever that lands. The analyser
+     * named the index it would use: **4294967288, in a 256-byte buffer**.
+     *
+     * With `have < 128`: `pad` is at most 128, the loop touches at most 144
+     * bytes and `put_be64` the 8 at offset 136 — inside a 256-byte buffer.
+     * Found by the clang analyser, which could not bound it and was right not
+     * to: the bound was an invariant held somewhere else. */
+    uint32_t have = s->have;
+    uint32_t pad;
+    if (have >= SHA512_BLOCK) {
+        /* Cannot happen — and checked rather than asserted in a comment,
+         * because the first attempt at this *was* a comment (and then a
+         * modulo, which the analyser does not model precisely enough to
+         * believe). A compare it does model, and the cost is one
+         * instruction on a path taken once per digest. */
+        have = SHA512_BLOCK - 1u;
+    }
+    pad = have < 112u ? 112u - have : 240u - have;
+    /* **Bounded where it is used, not three steps upstream.**
+     *
+     * `pad` is what indexes `tail`, so `pad` is what gets checked — against
+     * the buffer's own size, so the check cannot drift if either changes.
+     * Bounding `have` instead was correct and was not enough: the analyser
+     * acknowledged the bound and still could not carry it through an
+     * unsigned subtraction, reporting an index of 4294967288 — which is
+     * **-8**, the offset it believed `112u - have` could produce. A check on
+     * the offset itself needs no reasoning from anybody. */
+    if (pad + 16u > sizeof tail) {
+        pad = 112u;
+    }
     uint32_t i;
     for (i = 0; i < pad + 16u; i++) {
         tail[i] = 0;

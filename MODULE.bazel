@@ -21,5 +21,5 @@ go_sdk = use_extension("@io_bazel_rules_go//go:extensions.bzl", "go_sdk")
 go_sdk.download(version = "1.25.5")
 
 # rules_pkg (a root filesystem) comes back with the phase that needs it; see
-# DEVELOPMENT_PROGRESS.md. A module that declares what it does not use is a
+# docs/DEVELOPMENT_PROGRESS.md. A module that declares what it does not use is a
 # dependency nobody checked.

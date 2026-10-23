@@ -7,9 +7,15 @@
 #include "arch/riscv/timer.h"
 #include "core/console.h"
 #include "core/errno.h"
+#include "core/fair.h"
 #include "kernel/klock.h"
 #include "kernel/mem.h"
 #include "kernel/uspace.h"
+
+/* The fair class's two aggregates, declared here because the thread
+ * table's own helpers use them above their definitions. */
+static uint64_t min_vruntime(void);
+static uint32_t total_weight(void);
 
 /* 16 KiB of kernel stack per thread. A trap frame is 288 bytes and the
  * handlers nest shallowly, so this is generous — but a kernel stack that
@@ -79,6 +85,25 @@ struct thread {
     bool owns_stack;
     struct thread_signals signals;
     struct uproc *proc;  /* the process this thread belongs to */
+    /* The fair class. `nice` is what a program sets, `weight` is what the
+     * scheduler divides by, and `vruntime` is the clock that decides who
+     * runs next — smallest first. The weight is kept beside the nice value
+     * rather than looked up each time because it is read on every
+     * scheduling decision and the nice value changes almost never. */
+    int32_t nice;
+    uint32_t weight;
+    uint64_t vruntime;
+    /* Which harts may run this thread, by **index** into the hart table and
+     * not by hart id — the ids are the firmware's and on this board they
+     * start at 1, so a mask of ids would be off by one against every other
+     * per-hart array. Inherited at clone; all schedulable harts by default. */
+    uint64_t harts;
+    /* The real-time class. `rt_priority` of 0 means the fair class above —
+     * one field for both the class and its priority, because "SCHED_FIFO at
+     * priority 0" is not a thing and a separate enum would allow it to be
+     * written down. 1..99 are real-time, higher first. */
+    uint32_t rt_priority;
+    bool rt_round_robin; /* SCHED_RR rather than SCHED_FIFO */
     /* The floating-point registers, which are this thread's state as much
      * as the integer ones. Aligned because the save instructions address it
      * directly. */
@@ -115,6 +140,7 @@ struct hartstate {
      * thread for ever unless something tells it the situation has changed —
      * it has no clock of its own to find out with. */
     bool untimed;
+    bool backstop; /* the armed deadline is the idle timeout, not a real one */
     /* **Per hart, because a timer interrupt is per hart.** This was one
      * global: every hart's tick set it and whichever hart next returned to
      * user space consumed it. So a hart that had just been given a thread
@@ -137,11 +163,41 @@ struct hartstate {
 
 static struct thread threads[SCHED_MAX_THREADS];
 
+/* Harts the scheduler must not place work on.
+ *
+ * A hart is isolated so that something else can have it — a measurement that
+ * must not be disturbed, or (later) a real-time thread that must not share.
+ * It is a property of the *machine's configuration*, set once from the
+ * command line, rather than something a thread can ask for: a thread asking
+ * to be alone on a hart is affinity, and that is the mask above. */
+static uint64_t isolated;
+
+/* The harts a thread may actually be placed on: what it asked for, minus
+ * what the machine has reserved. Computed rather than stored, so isolating a
+ * hart takes effect on threads that already exist. */
+static uint64_t placeable(const struct thread *t) {
+    uint64_t want = t->harts == 0 ? ~0ull : t->harts;
+    return want & ~isolated;
+}
+
+static bool may_run_here(const struct thread *t, uint32_t hart) {
+    return (placeable(t) & (1ull << hart)) != 0;
+}
+
+void sched_set_isolated(uint64_t mask) {
+    isolated = mask;
+}
+
+uint64_t sched_isolated(void) {
+    return isolated;
+}
+
+
 static void poke_idle_harts(void);
 
 /* Whether this scheduler arms its own timer rather than riding a periodic
  * tick. See `sched_run`. */
-static bool dynticks_wanted;
+static bool dynticks_wanted = true;
 
 void sched_set_dynticks(bool on) {
     dynticks_wanted = on;
@@ -318,6 +374,21 @@ static int spawn(struct uproc *proc, const struct trapframe *frame, uint64_t sp,
         const struct thread_signals *parent = sched_current_signals();
         threads[slot].signals.blocked = parent != NULL ? parent->blocked : 0u;
     }
+    /* **The nice value is inherited, as the ABI requires**, and the virtual
+     * clock is placed rather than started at zero: a new thread with a clock
+     * of zero is maximally behind every existing one and would take the
+     * processor until it caught up — which is how a runtime that creates
+     * threads in a burst would stall the threads already working. */
+    {
+        const struct thread *creator = running_thread();
+        threads[slot].nice = creator != NULL ? creator->nice : 0;
+        threads[slot].weight = fair_weight_of_nice(threads[slot].nice);
+        threads[slot].vruntime = fair_wake_vruntime(0, min_vruntime(),
+                                                    SCHED_WAKE_CREDIT_NS);
+        threads[slot].harts = creator != NULL ? creator->harts : ~0ull;
+        threads[slot].rt_priority = creator != NULL ? creator->rt_priority : 0u;
+        threads[slot].rt_round_robin = creator != NULL && creator->rt_round_robin;
+    }
     prepare_stack(&threads[slot], frame, sp, is_child);
     /* A new thread is work that has just appeared, and an idle hart has no
      * clock to notice it with. */
@@ -372,17 +443,151 @@ uint32_t sched_end_siblings(const struct uproc *proc) {
  * it, and under the kernel lock that is enough — two harts cannot both see
  * it RUNNABLE. Round-robin from one shared cursor, so harts do not all
  * start their search at the same thread and collide on it. */
-static uint32_t claim_runnable(void) {
-    static uint32_t cursor;
-    for (uint32_t step = 0; step < SCHED_MAX_THREADS; step++) {
-        uint32_t i = (cursor + step) % SCHED_MAX_THREADS;
-        if (threads[i].state == THREAD_RUNNABLE) {
-            cursor = (i + 1u) % SCHED_MAX_THREADS;
-            threads[i].state = THREAD_RUNNING;
-            return i;
+/* **The thread whose virtual clock is furthest behind.**
+ *
+ * This is the whole of the fair class's decision. A thread's virtual clock
+ * advances at a rate inversely proportional to its weight, so the smallest
+ * one belongs to whoever has had least of the processor *for their weight* —
+ * and picking it shares the machine in proportion to weight without any
+ * thread being starved, because a thread that is passed over keeps its
+ * clock while the others advance and becomes the smallest eventually and
+ * unconditionally.
+ *
+ * The cursor survives as the tie-break. Equal clocks are the common case —
+ * every thread of the same nice value that has run for the same time — and
+ * breaking the tie by position rather than by index keeps the round-robin
+ * behaviour the previous implementation had, instead of favouring whichever
+ * thread happens to sit lowest in the table. */
+/* A thread becoming runnable after not being so — new, woken, or its sleep
+ * expired — placed relative to the threads already waiting.
+ *
+ * It must not simply keep the clock it had: a thread that slept for a second
+ * is a second behind and would monopolise the processor until it caught up.
+ * Nor may it take the minimum outright, which hands a thread that sleeps
+ * repeatedly a fresh claim every time. `fair_wake_vruntime` does neither,
+ * and the arithmetic is tested on the host. */
+/* **A waking real-time thread evicts a lower-priority one immediately.**
+ *
+ * This is what makes the class real-time rather than merely preferred: the
+ * latency that matters is from the wake to the first instruction, and
+ * waiting for the running thread's slice to end would put a fair thread's
+ * 1.5 ms in front of it. Every hart running something it outranks is marked
+ * for preemption and poked; the poke is what reaches a hart that is running
+ * untimed and would otherwise not look again until its next trap.
+ *
+ * Marked rather than switched, because a thread cannot be taken off a hart
+ * from another hart — the preemption happens where it always does, on the
+ * way back to user mode. */
+static void preempt_for_rt(uint32_t slot) {
+    bool any = false;
+    if (threads[slot].rt_priority == 0) {
+        return;
+    }
+    for (uint32_t i = 0; i < SMP_MAX_HARTS; i++) {
+        uint32_t running = harts[i].current;
+        if (!harts[i].joined || running == SCHED_NO_THREAD) {
+            continue;
+        }
+        if (threads[running].rt_priority < threads[slot].rt_priority) {
+            harts[i].preempt_pending = true;
+            any = true;
         }
     }
-    return SCHED_NO_THREAD;
+    if (any) {
+        poke_idle_harts();
+    }
+}
+
+static void place_on_runqueue(uint32_t slot) {
+    threads[slot].state = THREAD_RUNNABLE;
+    threads[slot].vruntime = fair_wake_vruntime(threads[slot].vruntime, min_vruntime(),
+                                                SCHED_WAKE_CREDIT_NS);
+    preempt_for_rt(slot);
+}
+
+/* What the thread just ran, charged to its virtual clock.
+ *
+ * Done on the way *out* of the switch rather than on the way in, because
+ * "how long did it run" is only known once it has stopped — and it is the
+ * one place every exit path passes through, whether the thread yielded,
+ * blocked, was preempted or ended. */
+static void charge_vruntime(uint32_t slot, uint64_t started) {
+    uint64_t now = timer_ns();
+    uint64_t ran = now > started ? now - started : 0u;
+    threads[slot].vruntime += fair_vruntime_delta(ran, threads[slot].weight);
+}
+
+/* Whether a runnable thread in `slot` can be placed on this hart. */
+static bool candidate(uint32_t slot, uint32_t hart) {
+    return threads[slot].state == THREAD_RUNNABLE && may_run_here(&threads[slot], hart);
+}
+
+/* The highest-priority runnable real-time thread, or none.
+ *
+ * **Priority order, absolutely.** A real-time thread runs in preference to
+ * every fair thread and to every lower-priority real-time one, for as long
+ * as it wants to: that is what the class promises, and a kernel that mixed
+ * it with proportional share would be promising something weaker. The cost
+ * is that a runaway real-time thread can starve everything else, which is
+ * the caller's responsibility and is why setting the class is privileged
+ * everywhere it exists.
+ *
+ * Among equal priorities the cursor decides, which makes it round-robin for
+ * `SCHED_RR` (those threads also get a quantum) and arrival-ordered enough
+ * for `SCHED_FIFO`, whose threads run until they block. */
+static uint32_t claim_rt(uint32_t cursor, uint32_t hart) {
+    uint32_t best = SCHED_NO_THREAD;
+    uint32_t top = 0;
+    for (uint32_t step = 0; step < SCHED_MAX_THREADS; step++) {
+        uint32_t i = (cursor + step) % SCHED_MAX_THREADS;
+        if (!candidate(i, hart) || threads[i].rt_priority == 0) {
+            continue;
+        }
+        if (threads[i].rt_priority > top) {
+            best = i;
+            top = threads[i].rt_priority;
+        }
+    }
+    return best;
+}
+
+/* The fair class's choice: the thread whose virtual clock is furthest
+ * behind. */
+static uint32_t claim_fair(uint32_t cursor, uint32_t hart) {
+    uint32_t best = SCHED_NO_THREAD;
+    uint64_t least = 0;
+    for (uint32_t step = 0; step < SCHED_MAX_THREADS; step++) {
+        uint32_t i = (cursor + step) % SCHED_MAX_THREADS;
+        if (!candidate(i, hart) || threads[i].rt_priority != 0) {
+            continue;
+        }
+        if (best == SCHED_NO_THREAD || threads[i].vruntime < least) {
+            best = i;
+            least = threads[i].vruntime;
+        }
+    }
+    return best;
+}
+
+static uint32_t claim_runnable(void) {
+    static uint32_t cursor;
+    uint32_t me_index = smp_hart_index();
+    uint32_t best;
+    /* An isolated hart takes nothing at all, which is what isolating it
+     * means. It still idles in the scheduler rather than being parked, so it
+     * can be given work again without being restarted. */
+    if ((isolated & (1ull << me_index)) != 0) {
+        return SCHED_NO_THREAD;
+    }
+    best = claim_rt(cursor, me_index);
+    if (best == SCHED_NO_THREAD) {
+        best = claim_fair(cursor, me_index);
+    }
+    if (best != SCHED_NO_THREAD) {
+        cursor = (best + 1u) % SCHED_MAX_THREADS;
+        threads[best].state = THREAD_RUNNING;
+    }
+    return best;
 }
 
 /* Wakes the harts that need to look again.
@@ -447,13 +652,155 @@ void sched_wake_idle_harts(void) {
  * poke went missing, and the machine was saved by a timeout rather than by
  * being correct. */
 static uint32_t missed_pokes;
+static uint32_t lost_deadlines;
+
+static void report_lost_deadline(const char *where, uint64_t soonest);
+static bool armed_somewhere(uint64_t deadline);
+static bool armed_covering(uint64_t deadline, uint32_t except);
 
 uint32_t sched_missed_pokes(void) {
     return missed_pokes;
 }
 
+uint32_t sched_lost_deadlines(void) {
+    return lost_deadlines;
+}
+
+uint64_t sched_affinity(void) {
+    const struct thread *t = running_thread();
+    return t != NULL ? placeable(t) : ~isolated;
+}
+
+/* Sets the running thread's affinity.
+ *
+ * Refused when the mask leaves nowhere to run, as Linux refuses it: a thread
+ * pinned to a hart that does not exist, or to one the machine has reserved,
+ * would simply never be chosen again — a hang that looks like the scheduler
+ * losing a thread rather than like a bad argument. The caller is told
+ * instead, and keeps the affinity it had. */
+bool sched_set_affinity(uint64_t mask) {
+    struct thread *t = running_thread();
+    uint64_t exists = smp_hart_count() >= 64u ? ~0ull : (1ull << smp_hart_count()) - 1u;
+    if (t == NULL || (mask & exists & ~isolated) == 0) {
+        return false;
+    }
+    t->harts = mask & exists;
+    /* **Moved now, not at its next slice.** If this hart is no longer
+     * allowed, the thread must leave it — otherwise a thread can pin itself
+     * away from the hart it is running on and carry on running there, which
+     * makes the call look as though it did nothing. */
+    if (!may_run_here(t, smp_hart_index())) {
+        sched_yield_now();
+    }
+    return true;
+}
+
+/* The running thread's scheduling class and priority. */
+uint32_t sched_rt_priority(void) {
+    const struct thread *t = running_thread();
+    return t != NULL ? t->rt_priority : 0u;
+}
+
+bool sched_rt_is_round_robin(void) {
+    const struct thread *t = running_thread();
+    return t != NULL && t->rt_round_robin;
+}
+
+/* Puts the running thread in the real-time class, or takes it out.
+ *
+ * A priority of 0 returns it to the fair class, and its virtual clock is
+ * **placed** rather than kept: a thread that has been real-time has not been
+ * accumulating virtual time anybody can compare, so handing it back its old
+ * clock would make it either immortal or instantly starved depending on how
+ * long it was away.
+ *
+ * Entering the class **yields**, because the decision has already been
+ * made by the time this returns: a thread that raises itself above the one
+ * it is sharing a hart with should be running, and the way a thread gets
+ * onto a hart here is by going through the scheduler. */
+bool sched_set_rt(uint32_t priority, bool round_robin) {
+    struct thread *t = running_thread();
+    if (t == NULL || priority > SCHED_RT_PRIORITY_MAX) {
+        return false;
+    }
+    t->rt_priority = priority;
+    t->rt_round_robin = round_robin;
+    if (priority == 0) {
+        t->vruntime = fair_wake_vruntime(0, min_vruntime(), SCHED_WAKE_CREDIT_NS);
+    }
+    sched_yield_now();
+    return true;
+}
+
+int32_t sched_nice(void) {
+    const struct thread *t = running_thread();
+    return t != NULL ? t->nice : 0;
+}
+
+bool sched_set_nice(int32_t nice) {
+    struct thread *t = running_thread();
+    if (t == NULL) {
+        return false;
+    }
+    t->nice = fair_clamp_nice(nice);
+    t->weight = fair_weight_of_nice(t->nice);
+    /* The virtual clock is **left alone**. It records what this thread has
+     * had, which does not change because its weight did; re-basing it here
+     * would hand a thread a fresh claim on the processor every time it
+     * renices, which is a way to get more than its share by asking twice. */
+    return true;
+}
+
 /* How many threads could run right now, counting the one that is. Two or
  * more is what makes a slice mean anything. */
+/* Threads **waiting for a hart**, which is not the same question as
+ * `runnable_count`: that one counts the running ones too, because it is
+ * asked to decide whether the running thread has competition. A lost
+ * wake-up is about work nobody has picked up, so it counts only the
+ * waiting. Counting the running ones here made every idle hart's legitimate
+ * timer interrupt look like a lost poke — 196 of them in a run that had
+ * none. */
+static uint32_t waiting_count(void) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < SCHED_MAX_THREADS; i++) {
+        n += threads[i].state == THREAD_RUNNABLE ? 1u : 0u;
+    }
+    return n;
+}
+
+/* The smallest virtual clock among threads that want to run, or 0 if none
+ * do. A waking thread is placed relative to this, which is what stops it
+ * either monopolising the processor to catch up or being handed a fresh
+ * claim every time it sleeps. */
+static uint64_t min_vruntime(void) {
+    uint64_t least = 0;
+    bool any = false;
+    for (uint32_t i = 0; i < SCHED_MAX_THREADS; i++) {
+        if (threads[i].state != THREAD_RUNNABLE && threads[i].state != THREAD_RUNNING) {
+            continue;
+        }
+        if (!any || threads[i].vruntime < least) {
+            least = threads[i].vruntime;
+            any = true;
+        }
+    }
+    return least;
+}
+
+/* What the runnable threads weigh between them, which is the denominator of
+ * every slice. Saturated rather than allowed to wrap: 64 threads at the
+ * heaviest weight is 5.6 million, far inside 32 bits, so this is a guard
+ * against a corrupt weight rather than against arithmetic. */
+static uint32_t total_weight(void) {
+    uint64_t sum = 0;
+    for (uint32_t i = 0; i < SCHED_MAX_THREADS; i++) {
+        if (threads[i].state == THREAD_RUNNABLE || threads[i].state == THREAD_RUNNING) {
+            sum += threads[i].weight == 0 ? FAIR_NICE0_WEIGHT : threads[i].weight;
+        }
+    }
+    return sum > 0xffffffffull ? 0xffffffffu : (uint32_t)sum;
+}
+
 static uint32_t runnable_count(void) {
     uint32_t n = 0;
     for (uint32_t i = 0; i < SCHED_MAX_THREADS; i++) {
@@ -613,6 +960,7 @@ void sched_run(void) {
          * `idle_ksp` is written before the switch because the thread will
          * use it to come back. */
         context_switch(&h->idle_ksp, threads[t].ksp);
+        charge_vruntime(t, h->slice_started);
         check_kernel_stack(t);
         /* Back on this hart's own stack, so the thread that just left is no
          * longer standing on anything: its slot can be reused now and not
@@ -730,7 +1078,7 @@ uint32_t sched_futex_wake(virt_t addr, uint32_t count) {
     for (uint32_t i = 0; i < SCHED_MAX_THREADS && woke < count; i++) {
         if (threads[i].state == THREAD_BLOCKED && threads[i].wait_chan == NULL &&
             threads[i].futex_addr == addr) {
-            threads[i].state = THREAD_RUNNABLE;
+            place_on_runqueue(i);
             threads[i].woken = true;
             threads[i].futex_addr = 0;
             woke++;
@@ -769,7 +1117,7 @@ uint32_t sched_wake_on(const void *chan, uint32_t max) {
     }
     for (uint32_t i = 0; i < SCHED_MAX_THREADS && woke < max; i++) {
         if (threads[i].state == THREAD_BLOCKED && threads[i].wait_chan == chan) {
-            threads[i].state = THREAD_RUNNABLE;
+            place_on_runqueue(i);
             threads[i].woken = true;
             threads[i].wait_chan = NULL;
             woke++;
@@ -954,82 +1302,246 @@ uint32_t sched_ticks_seen(void) {
 
 /* When this hart's running thread must give way, or 0 when nothing says it
  * must. */
-static uint64_t slice_deadline(const struct hartstate *h) {
-    if (h->current == SCHED_NO_THREAD || runnable_count() < 2u) {
-        return 0; /* nobody is waiting for this hart: let it run */
+/* When the running thread's turn ends.
+ *
+ * Its share of the target period, by weight — so a nice -5 thread beside a
+ * nice 0 one gets the larger slice as well as being chosen more often. The
+ * floor is the old fixed quantum: below it a slice costs more in switching
+ * than it delivers, so the period stretches instead (`fair_slice_ns`).
+ *
+ * Zero when nothing else is runnable, which is what dynamic ticks need: a
+ * thread with no competition is not taking a turn from anybody and there is
+ * nothing to interrupt it for. */
+/* Whether another runnable real-time thread shares this one's priority —
+ * the only thing a round-robin quantum is for. */
+static bool rt_peer_waiting(uint32_t slot) {
+    for (uint32_t i = 0; i < SCHED_MAX_THREADS; i++) {
+        if (i != slot && threads[i].state == THREAD_RUNNABLE &&
+            threads[i].rt_priority == threads[slot].rt_priority) {
+            return true;
+        }
     }
-    return h->slice_started + SCHED_SLICE_NS;
+    return false;
+}
+
+/* Whether any runnable real-time thread outranks the one in `slot`. A fair
+ * thread is outranked by every real-time thread. */
+static bool outranked(uint32_t slot) {
+    uint32_t mine = threads[slot].rt_priority;
+    for (uint32_t i = 0; i < SCHED_MAX_THREADS; i++) {
+        if (threads[i].state == THREAD_RUNNABLE && threads[i].rt_priority > mine) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static uint64_t slice_deadline(const struct hartstate *h) {
+    uint64_t slice;
+    if (h->current == SCHED_NO_THREAD) {
+        return 0;
+    }
+    /* **A real-time thread is not on a clock.**
+     *
+     * `SCHED_FIFO` runs until it blocks or yields — a slice would be the
+     * proportional share the class exists to escape. `SCHED_RR` gets a
+     * quantum, but only against another real-time thread of its *own*
+     * priority: being preempted for a lower-priority one would invert the
+     * order the class promises.
+     *
+     * Either way, a higher-priority thread becoming runnable preempts it,
+     * and that happens on the wake rather than on a timer — see
+     * `preempt_for_rt`. Nothing here needs to poll for it. */
+    if (threads[h->current].rt_priority != 0) {
+        if (!threads[h->current].rt_round_robin || !rt_peer_waiting(h->current)) {
+            return 0;
+        }
+        return h->slice_started + SCHED_RR_QUANTUM_NS;
+    }
+    if (runnable_count() < 2u) {
+        return 0;
+    }
+    slice = fair_slice_ns(threads[h->current].weight, total_weight(),
+                          SCHED_TARGET_LATENCY_NS, SCHED_SLICE_NS);
+    return h->slice_started + slice;
+}
+
+/* **The invariant that makes a lost deadline loud.**
+ *
+ * With a one-shot timer, every sleeper in the system depends on some hart
+ * holding a comparator value at or before its deadline. If none does, the
+ * machine is not slow — it is stopped, and nothing will restart it. That is
+ * a hang with no output, which is the hardest kind of bug there is.
+ *
+ * So it is checked rather than reasoned about: whenever a hart is about to
+ * stop looking (entering `wfi`, or running a thread with no timer of its
+ * own), the soonest deadline anybody waits for must be armed somewhere. The
+ * tolerance is one granularity, because arming rounds up.
+ *
+ * Reported once and counted, not panicked: the report is what a run leaves
+ * behind, and a kernel that stops on the first one cannot show how often it
+ * happens or whether a fix moved the number.
+ */
+static void check_deadline_is_armed(const char *where) {
+    uint64_t soonest = earliest_deadline();
+    uint64_t chores = timer_housekeeping_due();
+    /* The beat counts: a lost one is a polled device that has stopped and a
+     * protocol whose timers never fire, which is as silent as a lost sleep. */
+    if (chores != 0 && (soonest == 0 || chores < soonest)) {
+        soonest = chores;
+    }
+    if (soonest == 0 || armed_somewhere(soonest)) {
+        return;
+    }
+    report_lost_deadline(where, soonest);
+}
+
+/* The report half of the check above, separate so that the check itself is
+ * the condition and nothing else. */
+static void report_lost_deadline(const char *where, uint64_t soonest) {
+    lost_deadlines++;
+    if (lost_deadlines > 3u) {
+        return;
+    }
+    kprintf("sched: LOST DEADLINE at %s: soonest %llu ns, now %llu ns, armed:",
+            where, (unsigned long long)soonest, (unsigned long long)timer_ns());
+    for (uint32_t h = 0; h < SMP_MAX_HARTS; h++) {
+        kprintf(" %u=%llu", h, (unsigned long long)timer_armed_ns_of(h));
+    }
+    kprintf("\n");
+}
+
+/* **When housekeeping is next due, for the one hart that owns it.**
+ *
+ * Zero for every other hart, and zero when nothing has registered any — a
+ * machine with no polled device pays no periodic interrupt at all, which is
+ * most of why a single busy thread can run for ten seconds undisturbed.
+ *
+ * Hart index 0 owns it. Any fixed choice would do; what matters is that it
+ * is **one** hart, because the whole point is not paying the beat four
+ * times. An idle hart is the ideal owner and this one usually is: it has no
+ * thread to interrupt, so the interrupt costs a wake from `wfi` rather than
+ * a thread's slice. */
+/* **The beat, but only for a hart that has stopped anyway.**
+ *
+ * A hart running a thread does not arm for housekeeping: it would charge
+ * that thread an interrupt every 10 ms for work the thread did not ask for,
+ * and with one runnable thread per hart there is no competition to justify
+ * interrupting it at all. An idle hart arms instead — the interrupt costs it
+ * a wake from `wfi`, which is what it is for.
+ *
+ * The exception is a hart that would otherwise be **untimed**: if every hart
+ * is running a thread with no competition, nobody is idle, nobody would arm,
+ * and the beat would stop. That case arms rather than disarming, so the
+ * beat is always somebody's — and `check_deadline_is_armed` says so out loud
+ * if this reasoning is ever wrong. */
+static uint64_t housekeeping_deadline(const struct hartstate *h) {
+    uint64_t chores = timer_housekeeping_due();
+    if (h->current != SCHED_NO_THREAD || chores == 0) {
+        return 0;
+    }
+    /* **One idle hart, not all of them.** Without this every idle hart arms
+     * for the same beat and every one of them wakes for it: measured at 992
+     * interrupts each on three idle harts, where one hart on the beat and
+     * two on the backstop is 1200 for the machine instead of 2977. The
+     * first to arrive claims it; the rest see it covered and take the
+     * backstop. If the claimer later picks up a thread, the next poke wakes
+     * the others and one of them claims it again — and
+     * `check_deadline_is_armed` is what says so if that reasoning is
+     * wrong. */
+    return armed_covering(chores, smp_hart_index()) ? 0u : chores;
+}
+
+/* Whether a hart's comparator already covers `deadline`, ignoring hart
+ * `except` — pass `SMP_MAX_HARTS` to ask about all of them. The tolerance is
+ * one granularity, because arming rounds up.
+ *
+ * The exclusion matters: a hart asking "does anyone else have this?" must
+ * not count its own arm, or it answers yes to itself, stops arming, and the
+ * deadline it was holding is lost on the next arm. */
+static bool armed_covering(uint64_t deadline, uint32_t except) {
+    for (uint32_t i = 0; i < SMP_MAX_HARTS; i++) {
+        uint64_t armed = i == except ? 0u : timer_armed_ns_of(i);
+        if (armed != 0 && armed <= deadline + TIMER_GRANULARITY_NS) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool armed_somewhere(uint64_t deadline) {
+    return armed_covering(deadline, SMP_MAX_HARTS);
+}
+
+/* The soonest of the three things that can be due, or 0 for none of them. */
+static uint64_t next_deadline(const struct hartstate *h) {
+    uint64_t when = slice_deadline(h);
+    uint64_t chores = housekeeping_deadline(h);
+    uint64_t sleeper = earliest_deadline();
+    if (chores != 0 && (when == 0 || chores < when)) {
+        when = chores;
+    }
+    if (sleeper != 0 && (when == 0 || sleeper < when)) {
+        when = sleeper;
+    }
+    return when;
+}
+
+/* **Nothing is due: what that means depends on what the hart is doing.**
+ *
+ * Running a thread with nobody waiting for the hart — genuinely no timer.
+ * This is the case Phase 1 measures: one busy task takes *no* timer
+ * interrupts, and arming anything here would be the periodic tick back
+ * under another name. Measured at one interrupt in ten seconds, against
+ * 1001 for the periodic clock.
+ *
+ * The exception is the beat. If housekeeping is registered and no hart is
+ * armed for it, this hart takes it even though it is running a thread —
+ * because the alternative is a polled device that stops. That happens only
+ * when **no hart is idle**, since an idle one arms for the beat in
+ * preference; so the thread pays for it only when every hart is busy, and
+ * then only once per beat across the machine.
+ *
+ * Idle — a backstop, long enough to cost nothing (ten times a second on a
+ * hart with nothing to do) and counted, so a missed poke is a number rather
+ * than a machine that stopped.
+ */
+static void stop_the_clock(struct hartstate *h) {
+    uint64_t chores = timer_housekeeping_due();
+    if (h->current != SCHED_NO_THREAD) {
+        if (chores != 0 && !armed_somewhere(chores)) {
+            h->backstop = false;
+            timer_arm_at(chores);
+            return;
+        }
+        h->untimed = true;
+        timer_disarm();
+        return;
+    }
+    h->backstop = true;
+    timer_arm_at(timer_ns() + IDLE_BACKSTOP_NS);
 }
 
 void sched_arm_timer(void) {
     struct hartstate *h = me();
-    uint64_t slice;
+    uint64_t when;
     /* **Nothing at all unless this scheduler owns the timer.** With the
      * periodic clock still running, arming and disarming here fights it:
-     * the comparator holds whatever the periodic schedule last set and this
-     * would overwrite it, or mask the interrupt that drives it. One owner
-     * at a time. */
+     * the comparator holds whatever the periodic schedule last set, and
+     * this would overwrite it or mask the interrupt that drives it. One
+     * owner at a time. */
     if (!dynticks_wanted) {
         return;
     }
-    slice = slice_deadline(h);
-    {
-    uint64_t sleeper = earliest_deadline();
-    uint64_t when = slice;
-    if (sleeper != 0 && (when == 0 || sleeper < when)) {
-        when = sleeper;
-    }
-    if (h->housekeeping != 0 && (when == 0 || h->housekeeping < when)) {
-        when = h->housekeeping;
-    }
+    when = next_deadline(h);
     h->untimed = false;
     if (when == 0) {
-        /* **Nothing is due.** What that means depends on what the hart is
-         * doing.
-         *
-         * Running a thread with nobody waiting for the hart: genuinely no
-         * timer. This is the case Phase 1 measures — one busy task should
-         * take *no* timer interrupts at all — and arming anything here
-         * would be the periodic tick back under another name.
-         *
-         * Idle: a backstop. An idle hart is woken by another hart poking
-         * it, and a poke that is never sent is a hart that sleeps for ever.
-         * The backstop is long enough to cost nothing (ten times a second
-         * on a hart that has nothing to do) and it **counts itself**, so a
-         * missed poke shows up as a number rather than as a machine that
-         * stopped. A backstop that fires with work already runnable is a
-         * bug, not a safety net doing its job. */
-        if (h->current != SCHED_NO_THREAD) {
-            /* **Running the only runnable thread: no timer at all.**
-             * This is what dynticks is for and what Phase 1 measures. The
-             * hart depends on being poked if that stops being true, which
-             * is what `untimed` records. */
-            h->untimed = true;
-            timer_disarm();
-            return;
-        }
-        /* **The backstop applies to an idle hart.**
-         *
-         * The intent is that a hart running the only runnable thread takes
-         * no timer interrupts at all — that is what dynticks is for, and
-         * what Phase 1's test measures. Disarming entirely is implemented
-         * and it is *not* yet correct: a Go runtime stops making progress
-         * four syscalls into its startup, in a fault loop that the timer
-         * was evidently papering over. Until that is understood, a hart is
-         * never left without a clock.
-         *
-         * An idle hart is woken by another hart poking it, and a poke that
-         * is never sent is a hart that sleeps for ever. The backstop costs
-         * ten interrupts a second on a hart with nothing to do and it
-         * **counts itself**: `sched_missed_pokes` is the number of times it
-         * fired with work already runnable, which is a lost wakeup saved by
-         * a timeout rather than by being right. That number must be zero. */
-        h->untimed = false;
-        timer_arm_at(timer_ns() + IDLE_BACKSTOP_NS);
+        stop_the_clock(h);
         return;
     }
+    h->backstop = false;
     timer_arm_at(when);
-    }
+    check_deadline_is_armed(h->current == SCHED_NO_THREAD ? "idle" : "running");
 }
 
 void sched_tick(void) {
@@ -1040,19 +1552,31 @@ void sched_tick(void) {
     /* **The slice ends here, not on a periodic clock.** Without a tick
      * counting down, the only thing that knows a thread has had its turn is
      * this comparison against when the turn started. */
-    if (h->current != SCHED_NO_THREAD && now >= h->slice_started + SCHED_SLICE_NS) {
+    if (h->current != SCHED_NO_THREAD && outranked(h->current)) {
         h->preempt_pending = true;
+    } else if (h->current != SCHED_NO_THREAD) {
+        uint64_t ends = slice_deadline(h);
+        /* Agreeing with `slice_deadline` rather than re-deriving it: the two
+         * used to share a constant, and a per-thread slice is computed. A
+         * preemption test that disagreed with the deadline it was armed for
+         * would fire early for light threads and late for heavy ones. */
+        h->preempt_pending = ends != 0 && now >= ends;
     }
-    /* Was this hart's wake the backstop, with work that should have poked
-     * it already runnable? Then a poke was lost. */
-    if (h->current == SCHED_NO_THREAD && runnable_count() > 0) {
+    /* **Was this hart's wake the backstop, with work already waiting?**
+     * Then a poke was lost: something made a thread runnable and did not
+     * tell a hart that had stopped looking, and only the timeout saved it.
+     *
+     * All three conditions are needed. Without `backstop` this counts an
+     * idle hart's legitimate wake for a sleeper's deadline; without
+     * `waiting_count` it counts threads already running on other harts. */
+    if (h->current == SCHED_NO_THREAD && h->backstop && waiting_count() > 0) {
         missed_pokes++;
     }
     watch_for_deadlock();
     for (uint32_t i = 0; i < SCHED_MAX_THREADS; i++) {
         if (threads[i].state == THREAD_BLOCKED && threads[i].futex_deadline != 0 &&
             now >= threads[i].futex_deadline) {
-            threads[i].state = THREAD_RUNNABLE;
+            place_on_runqueue(i);
             threads[i].woken = false;
             threads[i].futex_addr = 0;
             deadline_wakes++;

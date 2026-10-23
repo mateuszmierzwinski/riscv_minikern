@@ -1,5 +1,14 @@
 #include "kernel/syscall.h"
 
+/* `setpriority`'s first argument. Only the process one is meaningful here:
+ * there are no process groups and one user. */
+#define PRIO_PROCESS 0u
+
+/* The scheduling policies, as user space numbers them. */
+#define SCHED_OTHER 0
+#define SCHED_FIFO 1
+#define SCHED_RR 2
+
 #include <stddef.h>
 
 #include "core/console.h"
@@ -12,6 +21,39 @@
 #include "kernel/signal.h"
 #include "arch/riscv/timer.h"
 #include "kernel/uspace.h"
+
+/* **A user pointer is acceptable only if the process has it mapped.**
+ *
+ * Every check in this file used to be `p == 0 || p >= USER_TOP`, and on this
+ * kernel that is not a check at all: `USER_TOP` is 0x4000000000 and the
+ * kernel is **identity-mapped in the bottom half**, at 0x80200000 — far
+ * below it. So the kernel's own addresses are "valid user addresses" by that
+ * test, and a program could hand one to any syscall.
+ *
+ * The Rule 25 suite found two of them on its first run: `write` printed the
+ * kernel's own text to the console, and `clock_gettime` wrote a timespec
+ * into it. The first is kernel memory disclosure and the second is arbitrary
+ * kernel memory corruption, both from an unprivileged program, and both
+ * needed one line to ask for.
+ *
+ * `uspace_can_read` and `uspace_can_write` were already here and already
+ * right: they walk the *calling process's* page tables and require `PTE_U`,
+ * which the kernel's mapping does not have. One syscall was using them —
+ * `sched_setaffinity`, written days ago — which is why it was the one case
+ * the suite found already closed.
+ *
+ * `CLAUDE.md` lists the bottom-half mapping as a known cost, and records
+ * that the workaround had "already cost one memory-corruption bug". This is
+ * the second and third, and the lesson is narrower than the layout: a bounds
+ * check against a constant is not a permission check, and only the page
+ * tables know what a process may touch. */
+static bool may_read(const volatile void *p, uint64_t n) {
+    return uspace_can_read((virt_t)(uintptr_t)p, (uint32_t)n);
+}
+
+static bool may_write(const volatile void *p, uint64_t n) {
+    return uspace_can_write((virt_t)(uintptr_t)p, (uint32_t)n);
+}
 
 static uint64_t calls;
 static uint32_t trace_budget;
@@ -129,7 +171,7 @@ static int64_t sys_clock_gettime(struct trapframe *tf) {
     if (sysarg(tf, 0) != CLOCK_REALTIME && sysarg(tf, 0) != CLOCK_MONOTONIC) {
         return KERR_INVAL;
     }
-    if (out == NULL || (uint64_t)(uintptr_t)out >= USER_TOP) {
+    if (!may_write(out, sizeof *out)) {
         return KERR_FAULT;
     }
     out->sec = (int64_t)(ns / 1000000000ull);
@@ -140,7 +182,7 @@ static int64_t sys_clock_gettime(struct trapframe *tf) {
 static int64_t sys_getrandom(struct trapframe *tf) {
     uint8_t *to = (uint8_t *)(uintptr_t)sysarg(tf, 0);
     uint64_t n = sysarg(tf, 1);
-    if (to == NULL || (uint64_t)(uintptr_t)to >= USER_TOP) {
+    if (!may_write(to, n)) {
         return KERR_FAULT;
     }
     n = n > 4096u ? 4096u : n;
@@ -180,11 +222,19 @@ static int64_t sys_getpid(struct trapframe *tf) {
  * 0..n-1, and this machine's hart ids are not that (the JH7110's are an S7
  * at 0 and four U74s at 1-4). Reporting hart 4 as bit 4 would describe a
  * five-CPU machine with a hole in it. */
+/* `sched_getaffinity(pid, len, mask)`.
+ *
+ * Reports **this thread's** mask, which until affinity existed was "every
+ * CPU the machine has" — true then and a lie afterwards. A runtime that sets
+ * an affinity and reads it back has to see what it set, and one that reads
+ * it without setting it has to see the harts it can actually be placed on:
+ * a reserved hart is not available to it, however present it is. */
 static int64_t sys_sched_getaffinity(struct trapframe *tf) {
     uint8_t *mask = (uint8_t *)(uintptr_t)sysarg(tf, 2);
     uint64_t bytes = sysarg(tf, 1);
     uint32_t cpus = sched_cpus();
-    if (mask == NULL || (uint64_t)(uintptr_t)mask >= USER_TOP || bytes == 0) {
+    uint64_t allowed = sched_affinity();
+    if (bytes == 0 || !may_write(mask, bytes > 128u ? 128u : bytes)) {
         return KERR_FAULT;
     }
     bytes = bytes > 128u ? 128u : bytes;
@@ -192,9 +242,142 @@ static int64_t sys_sched_getaffinity(struct trapframe *tf) {
         mask[i] = 0u;
     }
     for (uint32_t cpu = 0; cpu < cpus && cpu / 8u < bytes; cpu++) {
-        mask[cpu / 8u] |= (uint8_t)(1u << (cpu % 8u));
+        if ((allowed & (1ull << cpu)) != 0) {
+            mask[cpu / 8u] |= (uint8_t)(1u << (cpu % 8u));
+        }
     }
     return (int64_t)(bytes < 8u ? bytes : 8u);
+}
+
+/* `sched_setaffinity(pid, len, mask)`.
+ *
+ * `pid` of 0 only — another thread's affinity needs a thread table lookup
+ * this deliberately does not do yet, and answering about the caller instead
+ * would be worse than refusing.
+ *
+ * The mask is read from user memory a byte at a time through the checked
+ * copy, because it is a user pointer and the kernel must not dereference
+ * one: a wrong pointer here would fault in the kernel, where a fault is a
+ * panic, and one bad argument from any program would stop the machine. */
+static int64_t sys_sched_setaffinity(struct trapframe *tf) {
+    uint64_t pid = sysarg(tf, 0);
+    uint64_t bytes = sysarg(tf, 1);
+    virt_t user = (virt_t)sysarg(tf, 2);
+    uint64_t want = 0;
+    if (pid != 0) {
+        return KERR_PERM;
+    }
+    if (user == 0 || bytes == 0) {
+        return KERR_FAULT;
+    }
+    bytes = bytes > 8u ? 8u : bytes;
+    if (uspace_copy_in(&want, user, (uint32_t)bytes) != KERR_OK) {
+        return KERR_FAULT;
+    }
+    return sched_set_affinity(want) ? 0 : KERR_INVAL;
+}
+
+/* `setpriority(which, who, nice)`.
+ *
+ * Only `PRIO_PROCESS` with `who` of 0 — "me" — is supported, which is what a
+ * runtime asking for a nice value actually uses. Another process's priority
+ * needs the permission model this kernel does not have (there is one
+ * privilege level), so asking about one is refused rather than silently
+ * answered about the caller.
+ *
+ * POSIX says the value is **clamped, not refused**, which `fair_clamp_nice`
+ * does. A caller that asks for -30 gets -20 and a success, because the
+ * alternative — an error it almost certainly does not check — would leave it
+ * running at a priority it did not ask for and does not know about. */
+static int64_t sys_setpriority(struct trapframe *tf) {
+    uint64_t which = sysarg(tf, 0);
+    uint64_t who = sysarg(tf, 1);
+    int32_t nice = (int32_t)(int64_t)sysarg(tf, 2);
+    if (which != PRIO_PROCESS || who != 0) {
+        return KERR_INVAL;
+    }
+    return sched_set_nice(nice) ? 0 : KERR_INVAL;
+}
+
+/* `getpriority(which, who)`.
+ *
+ * Returns the nice value itself, **not** Linux's `20 - nice` encoding: that
+ * bias exists so the libc wrapper can tell -1 from an error, and it is the
+ * wrapper's job rather than the kernel's. A program using the raw syscall
+ * gets the raw value, which is what `setpriority` took. */
+static int64_t sys_getpriority(struct trapframe *tf) {
+    uint64_t which = sysarg(tf, 0);
+    uint64_t who = sysarg(tf, 1);
+    if (which != PRIO_PROCESS || who != 0) {
+        return KERR_INVAL;
+    }
+    return sched_nice();
+}
+
+/* `sched_setscheduler(pid, policy, param)`.
+ *
+ * `pid` of 0 only, as with affinity: another thread's policy needs a table
+ * lookup this does not do, and answering about the caller instead would be
+ * worse than refusing.
+ *
+ * The priority comes from a `struct sched_param` in user memory — one `int`,
+ * read through the checked copy because the kernel must not dereference a
+ * user pointer. `SCHED_OTHER` must carry priority 0, which is what the
+ * standard says and what distinguishes "put me back in the fair class" from
+ * "put me in the fair class at priority 40", a request with no meaning. */
+static int64_t sys_sched_setscheduler(struct trapframe *tf) {
+    uint64_t pid = sysarg(tf, 0);
+    int32_t policy = (int32_t)(int64_t)sysarg(tf, 1);
+    virt_t param = (virt_t)sysarg(tf, 2);
+    int32_t priority = 0;
+    if (pid != 0) {
+        return KERR_PERM;
+    }
+    if (param != 0 && uspace_copy_in(&priority, param, sizeof priority) != KERR_OK) {
+        return KERR_FAULT;
+    }
+    if (priority < 0 || (uint32_t)priority > SCHED_RT_PRIORITY_MAX) {
+        return KERR_INVAL;
+    }
+    switch (policy) {
+    case SCHED_OTHER:
+        return priority == 0 && sched_set_rt(0, false) ? 0 : KERR_INVAL;
+    case SCHED_FIFO:
+        return priority > 0 && sched_set_rt((uint32_t)priority, false) ? 0 : KERR_INVAL;
+    case SCHED_RR:
+        return priority > 0 && sched_set_rt((uint32_t)priority, true) ? 0 : KERR_INVAL;
+    default:
+        return KERR_INVAL;
+    }
+}
+
+static int64_t sys_sched_getscheduler(struct trapframe *tf) {
+    if (sysarg(tf, 0) != 0) {
+        return KERR_PERM;
+    }
+    if (sched_rt_priority() == 0) {
+        return SCHED_OTHER;
+    }
+    return sched_rt_is_round_robin() ? SCHED_RR : SCHED_FIFO;
+}
+
+/* The priority range a policy accepts. Real-time is 1..99 and the fair class
+ * is 0..0 — the range POSIX defines and every program that asks expects, so
+ * these are interface facts rather than this kernel's choices. */
+static int64_t sys_sched_get_priority_max(struct trapframe *tf) {
+    int32_t policy = (int32_t)(int64_t)sysarg(tf, 0);
+    if (policy == SCHED_FIFO || policy == SCHED_RR) {
+        return (int64_t)SCHED_RT_PRIORITY_MAX;
+    }
+    return policy == SCHED_OTHER ? 0 : KERR_INVAL;
+}
+
+static int64_t sys_sched_get_priority_min(struct trapframe *tf) {
+    int32_t policy = (int32_t)(int64_t)sysarg(tf, 0);
+    if (policy == SCHED_FIFO || policy == SCHED_RR) {
+        return 1;
+    }
+    return policy == SCHED_OTHER ? 0 : KERR_INVAL;
 }
 
 /* ── descriptors ───────────────────────────────────────────────────────────
@@ -251,7 +434,7 @@ static int64_t sys_read(struct trapframe *tf) {
     if (f->ops->read == NULL) {
         return KERR_INVAL;
     }
-    if (n != 0 && ((uint64_t)(uintptr_t)to == 0 || (uint64_t)(uintptr_t)to >= USER_TOP)) {
+    if (n != 0 && !may_write(to, n > (1u << 20) ? (1u << 20) : n)) {
         return KERR_FAULT;
     }
     return f->ops->read(f, to, (uint32_t)(n > (1u << 20) ? (1u << 20) : n));
@@ -267,7 +450,7 @@ static int64_t sys_write(struct trapframe *tf) {
     if (f->ops->write == NULL) {
         return KERR_INVAL;
     }
-    if (n != 0 && ((uint64_t)(uintptr_t)from == 0 || (uint64_t)(uintptr_t)from >= USER_TOP)) {
+    if (n != 0 && !may_read(from, n > (1u << 20) ? (1u << 20) : n)) {
         return KERR_FAULT;
     }
     return f->ops->write(f, from, (uint32_t)(n > (1u << 20) ? (1u << 20) : n));
@@ -282,7 +465,7 @@ static int64_t sys_writev(struct trapframe *tf) {
     if (f == NULL) {
         return KERR_BADF;
     }
-    if (iov == NULL || (uint64_t)(uintptr_t)iov >= USER_TOP || count > 1024u) {
+    if (count > 1024u || !may_read(iov, count * sizeof *iov)) {
         return KERR_INVAL;
     }
     if (f->ops->write == NULL) {
@@ -293,7 +476,7 @@ static int64_t sys_writev(struct trapframe *tf) {
         if (iov[i].len == 0) {
             continue;
         }
-        if (iov[i].base == 0 || iov[i].base >= USER_TOP) {
+        if (!may_read((const void *)(uintptr_t)iov[i].base, iov[i].len)) {
             return total > 0 ? total : KERR_FAULT;
         }
         wrote = f->ops->write(f, (const void *)(uintptr_t)iov[i].base, (uint32_t)iov[i].len);
@@ -374,7 +557,7 @@ static int64_t sys_epoll_create1(struct trapframe *tf) {
 static int64_t sys_epoll_ctl(struct trapframe *tf) {
     const struct user_epoll_event *event =
         (const struct user_epoll_event *)(uintptr_t)sysarg(tf, 3);
-    if (event != NULL && (uint64_t)(uintptr_t)event >= USER_TOP) {
+    if (event != NULL && !may_read(event, sizeof *event)) {
         return KERR_FAULT;
     }
     return fdobjects_epoll_ctl((int32_t)sysarg(tf, 0), (int32_t)sysarg(tf, 1),
@@ -393,7 +576,7 @@ static int64_t sys_epoll_pwait(struct trapframe *tf) {
     int32_t epfd = (int32_t)sysarg(tf, 0);
     uint64_t deadline;
     int found;
-    if (out == NULL || (uint64_t)(uintptr_t)out >= USER_TOP || max == 0) {
+    if (max == 0 || !may_write(out, (uint64_t)max * sizeof *out)) {
         return KERR_FAULT;
     }
     max = max > 64u ? 64u : max;
@@ -436,7 +619,7 @@ struct user_hwprobe {
 static int64_t sys_riscv_hwprobe(struct trapframe *tf) {
     struct user_hwprobe *pairs = (struct user_hwprobe *)(uintptr_t)sysarg(tf, 0);
     uint64_t count = sysarg(tf, 1);
-    if (pairs == NULL || (uint64_t)(uintptr_t)pairs >= USER_TOP || count > 64u) {
+    if (count > 64u || !may_read(pairs, count * sizeof *pairs)) {
         return KERR_FAULT;
     }
     for (uint64_t i = 0; i < count; i++) {
@@ -462,7 +645,7 @@ static int64_t sys_riscv_hwprobe(struct trapframe *tf) {
 static int64_t sys_nanosleep(struct trapframe *tf) {
     const struct user_timespec *req = (const struct user_timespec *)(uintptr_t)sysarg(tf, 0);
     uint64_t want, deadline;
-    if (req == NULL || (uint64_t)(uintptr_t)req >= USER_TOP) {
+    if (!may_read(req, sizeof *req)) {
         return KERR_FAULT;
     }
     if (req->sec < 0 || req->nsec < 0 || req->nsec >= 1000000000) {
@@ -501,6 +684,13 @@ int64_t syscall_clone_thread(struct trapframe *tf) {
     if ((flags & CLONE_VM) == 0 || (flags & CLONE_THREAD) == 0) {
         return KERR_NOSYS; /* fork is not implemented; a thread is */
     }
+    /* **Left as a range check, and that is correct here.** The others in
+     * this file became permission checks because the kernel dereferences
+     * those pointers; it never touches this one. It becomes the child's
+     * stack pointer, used in *user* mode — so a value pointing into the
+     * kernel's identity map faults on the child's first push, because that
+     * mapping has no `PTE_U`. A bad stack is the child's problem and shows
+     * up as its own SIGSEGV, which is what it should be. */
     if (stack == 0 || stack >= USER_TOP) {
         return KERR_INVAL;
     }
@@ -530,7 +720,7 @@ static int64_t sys_futex(struct trapframe *tf) {
     uint64_t op = sysarg(tf, 1) & ~(uint64_t)(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
     const struct user_timespec *ts = (const struct user_timespec *)(uintptr_t)sysarg(tf, 3);
     uint64_t deadline = 0;
-    if (word == NULL || (uint64_t)(uintptr_t)word >= USER_TOP) {
+    if (!may_write(word, sizeof(uint32_t))) {
         return KERR_FAULT;
     }
     if (op == FUTEX_WAKE) {
@@ -552,7 +742,7 @@ static int64_t sys_futex(struct trapframe *tf) {
     if (*word != (uint32_t)sysarg(tf, 2)) {
         return KERR_AGAIN;
     }
-    if (ts != NULL && (uint64_t)(uintptr_t)ts < USER_TOP) {
+    if (ts != NULL && may_read(ts, sizeof *ts)) {
         uint64_t ns = (uint64_t)ts->sec * 1000000000ull + (uint64_t)ts->nsec;
         trace_sleep("futex", ns);
         deadline = timer_ns() + ns;
@@ -626,7 +816,7 @@ static int64_t sys_prlimit64(struct trapframe *tf) {
     if (sysarg(tf, 2) != 0) {
         return KERR_PERM; /* setting a limit is refused, not pretended */
     }
-    if (out == NULL || (uint64_t)(uintptr_t)out >= USER_TOP) {
+    if (!may_write(out, sizeof *out)) {
         return KERR_FAULT;
     }
     out->soft = sysarg(tf, 1) == RLIMIT_STACK ? USER_STACK_PAGES * PAGE_SIZE : RLIM_INFINITY;
@@ -651,7 +841,8 @@ static int64_t sys_rt_sigaction(struct trapframe *tf) {
     if (sysarg(tf, 3) != SIGSET_BYTES) {
         return KERR_INVAL;
     }
-    if ((uint64_t)(uintptr_t)in >= USER_TOP || (uint64_t)(uintptr_t)out >= USER_TOP) {
+    if ((in != NULL && !may_read(in, sizeof *in)) ||
+        (out != NULL && !may_write(out, sizeof *out))) {
         return KERR_FAULT;
     }
     return signal_action((uint32_t)sysarg(tf, 0), in, out);
@@ -663,7 +854,8 @@ static int64_t sys_rt_sigprocmask(struct trapframe *tf) {
     if (sysarg(tf, 3) != SIGSET_BYTES) {
         return KERR_INVAL;
     }
-    if ((uint64_t)(uintptr_t)set >= USER_TOP || (uint64_t)(uintptr_t)old >= USER_TOP) {
+    if ((set != NULL && !may_read(set, SIGSET_BYTES)) ||
+        (old != NULL && !may_write(old, SIGSET_BYTES))) {
         return KERR_FAULT;
     }
     return signal_mask((uint32_t)sysarg(tf, 0), set, old);
@@ -673,7 +865,8 @@ static int64_t sys_sigaltstack(struct trapframe *tf) {
     const struct user_sigaltstack *in =
         (const struct user_sigaltstack *)(uintptr_t)sysarg(tf, 0);
     struct user_sigaltstack *out = (struct user_sigaltstack *)(uintptr_t)sysarg(tf, 1);
-    if ((uint64_t)(uintptr_t)in >= USER_TOP || (uint64_t)(uintptr_t)out >= USER_TOP) {
+    if ((in != NULL && !may_read(in, sizeof *in)) ||
+        (out != NULL && !may_write(out, sizeof *out))) {
         return KERR_FAULT;
     }
     return signal_altstack_at(tf->x[2], in, out);
@@ -709,6 +902,13 @@ static const struct syscall_entry table[] = {
     {SYS_RT_SIGPROCMASK, "rt_sigprocmask", sys_rt_sigprocmask},
     {SYS_RT_SIGRETURN, "rt_sigreturn", sys_rt_sigreturn},
     {SYS_SCHED_GETAFFINITY, "sched_getaffinity", sys_sched_getaffinity},
+    {SYS_SCHED_SETAFFINITY, "sched_setaffinity", sys_sched_setaffinity},
+    {SYS_SCHED_SETSCHEDULER, "sched_setscheduler", sys_sched_setscheduler},
+    {SYS_SCHED_GETSCHEDULER, "sched_getscheduler", sys_sched_getscheduler},
+    {SYS_SCHED_GET_PRIORITY_MAX, "sched_get_priority_max", sys_sched_get_priority_max},
+    {SYS_SCHED_GET_PRIORITY_MIN, "sched_get_priority_min", sys_sched_get_priority_min},
+    {SYS_SETPRIORITY, "setpriority", sys_setpriority},
+    {SYS_GETPRIORITY, "getpriority", sys_getpriority},
     {SYS_SCHED_YIELD, "sched_yield", sys_sched_yield},
     {SYS_FUTEX, "futex", sys_futex},
     {SYS_TGKILL, "tgkill", sys_tgkill},

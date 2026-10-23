@@ -90,36 +90,14 @@ Ed25519-verified offers · XFS (mount, read, logged writes, create, remove,
 grow) · a network block device client · a buffer cache · the VMA tree · an
 ELF loader · a ustar reader.
 
-## What is missing
+## What is missing, and what is planned
 
-`ROADMAP.md` is the list, with sizes and reasons — including the things this
-kernel deliberately does not do. The short version: no real `fork` (only
-`vfork`), no VFS or second filesystem, no `/proc`, no demand paging or
-copy-on-write, XFS cannot read b-tree-format forks or multi-block
-directories, the board has no Ethernet driver, and there is one privilege
-level.
+**`ROADMAP.md` is the only list**, with sizes, reasons, and the things this
+kernel deliberately does not do.
 
-## Planned
-
-In the order it will be built, because each step needs the one before it:
-
-| | |
-|---|---|
-| **The pad function** | GPIO writes reach a pad only if the pin controller's mux selects GPIO for it. Without that, a pin muxed to a peripheral ignores them in silence — which is what the board showed |
-| **The board's Ethernet** | the DesignWare GMAC. The cable is in the second of the two, which is the one that negotiates |
-| **Modern XFS** | `nrext64` changes the inode core's layout, and sparse inodes change the inode b-tree's records. Until both are read, a filesystem made with `mkfs.xfs`'s defaults is refused rather than guessed at |
-| **`fork` and `exec`** | so `os/exec` works. The ARM kernel had them; this one does not yet |
-| **The top half** | the kernel still lives in the bottom half of the address space |
-| **Thermal and frequency scaling** | the temperature sensor, then the clock tree |
-| **The real boot path** | an SD-card image with U-Boot, and the documented flash procedure |
-
-## Deliberately not planned
-
-- **A second architecture.** This kernel targets the JH7110. The ARM work is
-  archived at [arm_minikern](https://github.com/mateuszmierzwinski/arm_minikern),
-  and keeping both would mean an abstraction layer whose only user is history.
-- **SACK**, in TCP. It improves on reassembly rather than replacing it, and
-  with the reassembly queue a loss already costs one round trip.
-- **XFS log replay.** A filesystem whose log is not clean is refused at mount,
-  so a crash is `xfs_repair`'s to deal with rather than something this kernel
-  guesses at.
+There used to be a summary of it here, and it is worth saying why it is gone
+rather than just deleting it: it drifted. It still listed `fork` and modern
+XFS as *planned* after both had shipped and been proved on the board, because
+a second copy of a list is a second thing to remember to update, and the one
+that is not the owner is the one that gets forgotten. A reader who found the
+two copies disagreeing had no way to tell which was current.
