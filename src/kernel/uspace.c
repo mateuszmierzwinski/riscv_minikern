@@ -299,8 +299,51 @@ void uspace_destroy(struct uproc *p) {
  * its own kernel stack — but when it does, this frame is intact and the
  * trap return carries on, which is the whole point of a kernel stack per
  * thread. */
+/* Frames that could not possibly belong to user mode, and how many. */
+static uint32_t impossible_frames;
+
+uint32_t uspace_impossible_frames(void) {
+    return impossible_frames;
+}
+
+/* **A frame that cannot be a user frame**, caught on the way out instead of
+ * as a fault afterwards.
+ *
+ * A user thread's `sepc` and stack pointer are both below `USER_TOP`, always
+ * — there is nothing a program can do to make either one a kernel address.
+ * So a frame about to be returned through that holds one is not a program's
+ * mistake, it is this kernel having restored the wrong registers, and the
+ * fault it causes happens later and somewhere else.
+ *
+ * Measured, once in roughly twenty runs on the board: `store access fault
+ * at sepc 0x4020f3fe, stval 0x40000000` with `sp 0x407b7e30` — a PC inside
+ * the kernel's own text and a stack pointer in the kernel's identity map,
+ * reported as a fault "in user code". By then everything that could say
+ * where those values came from is gone. This says it at the moment of
+ * restoration, with the thread and the hart that did it, which is the whole
+ * difference between a signature and a cause.
+ *
+ * Reported once and then counted: the frame is left alone, because refusing
+ * to return would strand the thread and the program's own fault handling is
+ * still the most informative thing that can happen next. */
+static void check_the_frame_is_user(const struct trapframe *tf) {
+    bool bad_pc = tf->sepc == 0 || tf->sepc >= USER_TOP;
+    bool bad_sp = tf->x[2] == 0 || tf->x[2] >= USER_TOP;
+    if (!bad_pc && !bad_sp) {
+        return;
+    }
+    if (impossible_frames++ == 0) {
+        kprintf("\nuspace: **this frame cannot be a user frame** (pid %u tid %llu):"
+                " sepc %016llx sp %016llx sstatus %016llx\n",
+                uspace_current() != NULL ? uspace_current()->pid : 0u,
+                (unsigned long long)sched_current_tid(), (unsigned long long)tf->sepc,
+                (unsigned long long)tf->x[2], (unsigned long long)tf->sstatus);
+    }
+}
+
 static void on_user_return(struct trapframe *tf) {
     uint32_t fatal = 0;
+    check_the_frame_is_user(tf);
     if (sched_take_preempt_request()) {
         sched_yield_now();
     }

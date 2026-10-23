@@ -336,9 +336,22 @@ static int64_t sys_getpid(struct trapframe *tf) {
  * `tgkill` resolves by thread id, every preemption signal was delivered to
  * whichever thread happened to be numbered 1: the right signal, to the
  * wrong thread. */
+static bool one_tid;
+
+void syscall_one_tid(bool on) {
+    one_tid = on;
+}
+
 static int64_t sys_gettid(struct trapframe *tf) {
     (void)tf;
-    return (int64_t)sched_current_tid();
+    /* **A lever that puts the defect back**, because the only way to find
+     * out what a wrong answer was costing is to ask for it again. The
+     * four-hart race in `ROADMAP.md` §0 was measured at one run in eight on
+     * the board while this returned 1 for every thread; `minikern.onetid=1`
+     * is how that measurement is repeated rather than remembered. It is the
+     * same kind of switch as `minikern.nopreempt` and `minikern.tlbsafe`:
+     * one mechanism off, everything else unchanged. */
+    return one_tid ? 1 : (int64_t)sched_current_tid();
 }
 
 /* Which CPUs this thread may run on.

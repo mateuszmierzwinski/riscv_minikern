@@ -461,6 +461,12 @@ uint32_t uspace_stale_records(void);
  * here and never in the demand count. */
 uint64_t uspace_populated_pages(void);
 
+/* Frames about to be returned through to user mode whose `sepc` or stack
+ * pointer was a kernel address. A program cannot cause one: any value but
+ * zero means this kernel restored the wrong registers, and the fault that
+ * follows happens later and somewhere else. */
+uint32_t uspace_impossible_frames(void);
+
 /* A child with an address space of its own, made of the parent's pages
  * copy-on-write. Unlike `uspace_fork_shared` (which is `vfork`), the two
  * processes are isolated from the moment it returns. */

@@ -112,6 +112,11 @@ bool syscall_tracing_errors(void);
  * runtime its asynchronous preemption and nothing else. */
 void syscall_allow_tgkill(bool on);
 
+/* Makes every thread report thread id 1, which is what `gettid` did before
+ * it was fixed — a lever for measuring what that cost rather than arguing
+ * about it. See `sys_gettid`. */
+void syscall_one_tid(bool on);
+
 /* The socket domain's own table, in `sys_socket.c`, terminated by a zero
  * entry. A table per domain is how this grows without one file becoming the
  * place every syscall lives: the dispatcher searches the domains in turn,

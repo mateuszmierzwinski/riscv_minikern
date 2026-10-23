@@ -563,6 +563,10 @@ static void bring_up_other_harts(uint64_t dtb, uint64_t boot_hart) {
         kprintf("uspace: **%u live pages replaced by an unfixed mapping**\n",
                 uspace_replaced_pages());
     }
+    if (uspace_impossible_frames() != 0) {
+        kprintf("uspace: **%u frames returned to user mode with a kernel pc or sp**\n",
+                uspace_impossible_frames());
+    }
     if (uspace_stale_records() != 0) {
         kprintf("uspace: **%u pages mapped at an address the record called free**\n",
                 uspace_stale_records());
@@ -1168,6 +1172,8 @@ static void run_user_programs(void) {
         uspace_set_extra_env(env, (uint32_t)envlen);
     }
     syscall_allow_tgkill(!cmdline_has(boot_cmdline, "minikern.nopreempt"));
+    /* Puts `gettid`'s old wrong answer back, for measuring what it cost. */
+    syscall_one_tid(cmdline_has(boot_cmdline, "minikern.onetid"));
     /* The controlling terminal, before anything can read it. */
     {
         static const struct console_input_port port = {.read = console_input_read,

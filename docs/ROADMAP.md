@@ -17,16 +17,51 @@ Ordering inside a section is roughly by what unblocks the most.
 
 ## 0. Known defects
 
-- [ ] **A four-hart race that corrupts user memory.** (M) A stock Go binary
-      fails its own concurrency checks about 3 runs in 40 under emulation
-      and 1 in 8 on the board: a contended counter ends short, or a channel
-      yields values nobody sent. Down from one run in three after two fixes
-      (a thread slot freed while still in use; an `mmap` hint that checked
-      only the first page of its range). A minimal four-thread C program
-      using the same primitives — raw `clone`, atomics and a futex mutex —
-      **passes**, so what remains is something a Go runtime does that it
-      does not. `CLAUDE.md` lists everything ruled out and the detectors
-      left in the tree.
+- [ ] **A four-hart race that corrupts user memory.** (M) **Still open**, and
+      measured again rather than remembered. A stock Go binary fails its own
+      concurrency checks: a contended counter ends short, a channel yields
+      values nobody sent, a `WaitGroup` reports its own state as impossible,
+      or a thread faults at an address no program could have produced. Down
+      from one run in three after two fixes (a thread slot freed while still
+      in use; an `mmap` hint that checked only the first page of its range).
+      A minimal four-thread C program using the same primitives — raw
+      `clone`, atomics and a futex mutex — **passes**, so what remains is
+      something a Go runtime does that it does not.
+      **Today's rates**, measured in one session with one binary:
+
+      | Configuration | Runs | Failures |
+      |---|---|---|
+      | Board | 24 | 1 |
+      | Board, `minikern.onetid=1` | 16 | 1 |
+      | QEMU | 60 | 1 |
+      | QEMU, `minikern.onetid=1` | 60 | 1 |
+
+      So it is now **about one run in twenty on the board**, against the one
+      in eight this file recorded, and the emulator and the board agree for
+      the first time. What changed in between is this session's work; which
+      part of it is not established, and the table is here so the next
+      measurement has something to be compared against.
+      **One thing it is not**: the thread-id defect fixed in §1. Every
+      thread used to report id 1, so a Go runtime preempted goroutines with
+      `tgkill(pid, 1, SIGURG)` and every preemption signal reached whichever
+      thread was numbered 1. That looked like an excellent candidate — and
+      `minikern.onetid=1` puts it back, which is what the second and fourth
+      rows are. They are indistinguishable from the first and third. The
+      lever stays in the tree because a cause that has been *excluded by
+      measurement* is worth more than one that was never suspected, and
+      because the first small sample (1 in 8 against 0 in 16) pointed the
+      other way: it took 40 more runs to stop believing it.
+      **A sharper signature than before**, from the one board failure:
+      `store access fault at sepc 0x4020f3fe, stval 0x40000000` with
+      `sp 0x407b7e30`, reported as a fault *in user code*, after 306,450
+      signals and 3 million syscalls. That pc is inside the kernel's own
+      text and that sp is in the kernel's identity map: the thread was
+      returned to user mode with **kernel registers**, which no program can
+      arrange. `uspace_impossible_frames` now tests exactly that on every
+      return to user mode and reports the frame where it is restored rather
+      than where it faults.
+      `CLAUDE.md` lists everything ruled out and the detectors left in the
+      tree.
 - [x] **An embedded program's stack was not in its own address-space
       record.** (S) **Found and fixed** by §2's `mremap` test, which is the
       first embedded program to both use its stack and call `mmap`. The raw
