@@ -198,11 +198,15 @@ static int take_inode(struct xfs *fs, uint32_t agno, uint64_t *ino) {
          * adding a chunk changes all three. */
         bcache_put(fs->cache, inob);
         bcache_put(fs->cache, agib);
-        rc = xfs_inode_chunk_add(fs, agno, &startino);
+        uint32_t landed = agno;
+        rc = xfs_inode_chunk_add(fs, &landed, &startino);
         if (rc == KERR_OK) {
             fs->inode_chunks_added++;
         }
-        return rc != KERR_OK ? rc : take_inode(fs, agno, ino);
+        /* **Retried in the group the chunk landed in**, which need not be
+         * the one asked for. Retrying in the original would find it just as
+         * full as a moment ago and recurse until the stack ran out. */
+        return rc != KERR_OK ? rc : take_inode(fs, landed, ino);
     }
     startino = xfs_be32(rec + XFS_INOBT_REC_STARTINO);
     rc = xfs_tree_get(fs, agno, xfs_be32(agi + XFS_AGI_FREE_ROOT), XFS_FINOBT_MAGIC, &finob);
@@ -620,30 +624,36 @@ static int count_inodes(struct xfs *fs, int32_t delta) {
     return KERR_OK;
 }
 
-int xfs_inode_chunk_add(struct xfs *fs, uint32_t agno, uint32_t *startino) {
+int xfs_inode_chunk_add(struct xfs *fs, uint32_t *agno, uint32_t *startino) {
     uint32_t blocks = XFS_INODES_PER_CHUNK / fs->inopblock;
     uint32_t agbno = 0;
     struct bbuf *agib, *inob, *finob;
     uint8_t *agi;
-    int rc = xfs_alloc_extent(fs, agno, blocks, 0, &agbno);
+    int rc = xfs_alloc_somewhere(fs, agno, blocks, 0, &agbno);
     if (rc != KERR_OK) {
         return rc;
     }
     /* **The inode number a chunk starts at is its block times the inodes a
      * block holds** — which is why a chunk must be contiguous and aligned,
-     * and why this allocates an extent rather than eight blocks. */
+     * and why this allocates an extent rather than eight blocks.
+     *
+     * The number is relative to the group, and `*agno` may not be the group
+     * that was asked for: a full one sends the search elsewhere, and the
+     * inodes then belong to whichever group answered. The caller composes
+     * the full inode number from both, which is why the group goes back
+     * out. */
     *startino = agbno * fs->inopblock;
     for (uint32_t i = 0; i < blocks && rc == KERR_OK; i++) {
-        uint64_t fsb = ((uint64_t)agno << fs->agblklog) | (agbno + i);
+        uint64_t fsb = ((uint64_t)*agno << fs->agblklog) | (agbno + i);
         rc = fill_inode_block(fs, xfs_fsb_to_block(fs, fsb), *startino + i * fs->inopblock);
     }
-    rc = rc != KERR_OK ? rc : xfs_agi_get(fs, agno, &agib, &agi);
+    rc = rc != KERR_OK ? rc : xfs_agi_get(fs, *agno, &agib, &agi);
     if (rc != KERR_OK) {
         return rc;
     }
-    rc = xfs_tree_get(fs, agno, xfs_be32(agi + XFS_AGI_ROOT), XFS_INOBT_MAGIC, &inob);
+    rc = xfs_tree_get(fs, *agno, xfs_be32(agi + XFS_AGI_ROOT), XFS_INOBT_MAGIC, &inob);
     rc = rc != KERR_OK ? rc
-                       : xfs_tree_get(fs, agno, xfs_be32(agi + XFS_AGI_FREE_ROOT),
+                       : xfs_tree_get(fs, *agno, xfs_be32(agi + XFS_AGI_FREE_ROOT),
                                       XFS_FINOBT_MAGIC, &finob);
     if (rc != KERR_OK) {
         bcache_put(fs->cache, agib);

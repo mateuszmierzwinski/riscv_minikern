@@ -96,6 +96,11 @@ bool xfsmount_writable(void);
  */
 int xfsmount_create(const char *name, uint16_t mode);
 int xfsmount_write(const char *name, uint64_t off, const void *buf, uint32_t len);
+
+/* Reads a range of a file in the root directory. The whole-file reader
+ * needs the file to fit in one allocation, which a test that fills an
+ * allocation group deliberately does not. */
+int xfsmount_read_at(const char *name, uint64_t off, void *buf, uint32_t len);
 int xfsmount_link(const char *existing, const char *newname);
 int xfsmount_rename(const char *from, const char *to);
 int xfsmount_unlink(const char *name);
@@ -111,6 +116,13 @@ void xfsmount_root_shape(void);
 /* Chunks of inodes the allocator had to add. Zero means a test that
  * created many files never actually needed one. */
 uint64_t xfsmount_inode_chunks_added(void);
+
+/* Allocations that had to leave the group they asked for. */
+uint64_t xfsmount_alloc_other_group(void);
+
+/* Puts the allocator's old single-group behaviour back, so that a test can
+ * show a full group refusing a write that the search satisfies. */
+void xfsmount_single_group(bool on);
 
 /* Directories that changed shape, by the shape reached. A zero in either is
  * the difference between growth that works and growth never reached. */

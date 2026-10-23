@@ -88,7 +88,7 @@ static int store(struct xfs *fs, uint64_t fsb) {
 static int take_block(struct xfs *fs, uint64_t near, uint64_t *fsb) {
     uint32_t agno = xfs_fsb_ag(fs, near);
     uint32_t agbno = 0;
-    int rc = xfs_alloc_extent(fs, agno, 1u, 0, &agbno);
+    int rc = xfs_alloc_somewhere(fs, &agno, 1u, 0, &agbno);
     if (rc != KERR_OK) {
         return rc;
     }

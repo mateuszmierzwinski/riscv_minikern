@@ -274,6 +274,34 @@ int xfs_alloc_block(struct xfs *fs, uint32_t agno, uint32_t want, uint32_t *got)
     return xfs_alloc_extent(fs, agno, 1u, want, got);
 }
 
+int xfs_alloc_somewhere(struct xfs *fs, uint32_t *agno, uint32_t count, uint32_t want,
+                        uint32_t *got) {
+    uint32_t first = *agno < fs->agcount ? *agno : 0;
+    int rc = xfs_alloc_extent(fs, first, count, want, got);
+    if (rc != KERR_NOSPC || fs->single_group) {
+        *agno = first;
+        return rc;
+    }
+    /* **Every other group, in order.** A filesystem is several groups and
+     * an allocator that only ever asked the one it started in would refuse
+     * a write with most of the disk free: four groups is `mkfs`'s default
+     * for a small filesystem, so that refusal arrives at about a quarter
+     * full. The hint is dropped — it was an address inside the group that
+     * had no room, and it means nothing in any other one. */
+    for (uint32_t i = 0; i < fs->agcount; i++) {
+        if (i == first) {
+            continue;
+        }
+        rc = xfs_alloc_extent(fs, i, count, 0, got);
+        if (rc != KERR_NOSPC) {
+            *agno = i;
+            fs->alloc_other_group += rc == KERR_OK ? 1u : 0u;
+            return rc;
+        }
+    }
+    return KERR_NOSPC;
+}
+
 /* Puts an extent back, joined to whatever it touches.
  *
  * Free space is kept as maximal extents, so an extent that abuts the one

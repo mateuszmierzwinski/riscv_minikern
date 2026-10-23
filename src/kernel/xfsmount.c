@@ -260,6 +260,14 @@ void xfsmount_lookup_counts(uint64_t *hashed, uint64_t *walked) {
     *walked = fs.walked_lookups;
 }
 
+void xfsmount_single_group(bool on) {
+    fs.single_group = on;
+}
+
+uint64_t xfsmount_alloc_other_group(void) {
+    return fs.alloc_other_group;
+}
+
 uint64_t xfsmount_inode_chunks_added(void) {
     return fs.inode_chunks_added;
 }
@@ -334,6 +342,20 @@ int xfsmount_write(const char *name, uint64_t off, const void *buf, uint32_t len
         return KERR_IO; /* a short write with no reason is not a success */
     }
     return rc != KERR_OK ? rc : xfs_flush(&fs);
+}
+
+int xfsmount_read_at(const char *name, uint64_t off, void *buf, uint32_t len) {
+    struct xfs_inode root, ip;
+    uint64_t ino = 0;
+    uint32_t got = 0;
+    int rc = root_inode(&root);
+    rc = rc != KERR_OK ? rc : xfs_dir_lookup(&fs, &root, name, name_length(name), &ino);
+    rc = rc != KERR_OK ? rc : xfs_inode_read(&fs, ino, &ip);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    rc = xfs_file_read(&fs, &ip, off, buf, len, &got);
+    return rc != KERR_OK ? rc : (got == len ? KERR_OK : KERR_IO);
 }
 
 int xfsmount_link(const char *existing, const char *newname) {

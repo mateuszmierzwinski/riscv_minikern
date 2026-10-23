@@ -70,12 +70,16 @@ def big_directory(at, entries, dirblksize=None):
 def small_directory(at):
     """An image whose root directory still fits inside its inode.
 
-    The write path adds and removes entries in a **shortform** directory —
-    one small enough to live in the inode's literal area — so a fixture for
-    it has to be nearly empty. The big-directory images refuse every write
-    with `KERR_NOTSUP`, which is the honest answer: growing a directory out
-    of its inode is a separate gap (`ROADMAP.md` §3) and until it is closed,
-    writing is for small directories.
+    The write path starts from a **shortform** directory — one that lives in
+    the inode's literal area — and grows it from there, so the fixture is
+    nearly empty and the test does the growing.
+
+    It is also what the group-crossing test fills. `mkfs.xfs` here will not
+    make a filesystem under 300 MB, and raising the group count to shrink a
+    group makes it demand a 64 MB log that will not fit in one — so the
+    groups are the default four of eighty megabytes, and the test writes its
+    way out of the first. That is twenty thousand blocks, which costs
+    nothing against a RAM disk and would be unreasonable against a card.
     """
     os.makedirs(at, exist_ok=True)
     data = payload(at)

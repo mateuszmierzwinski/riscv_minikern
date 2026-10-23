@@ -127,6 +127,15 @@ struct xfs {
     uint64_t grew_to_leaf;
     /* Data blocks added to a directory that had filled the ones it had. */
     uint64_t dir_blocks_added;
+    /* Allocations answered by a group other than the one asked for. Zero
+     * means the search never had to leave its first choice, so a test of
+     * that search proved nothing. */
+    uint64_t alloc_other_group;
+    /* Keeps the allocator inside the group it was asked for — the old
+     * behaviour, kept so that a test can prove the search matters instead
+     * of asserting it. `MADV_DONTNEED` cost this project three attempts at
+     * one claim for want of exactly this. */
+    bool single_group;
     /* Where a directory block that spans several filesystem blocks is
      * gathered. Per filesystem rather than a module static, so that nothing
      * about reading a directory depends on there being one mount or one

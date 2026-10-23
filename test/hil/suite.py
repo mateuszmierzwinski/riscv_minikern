@@ -167,8 +167,11 @@ CASES = [
       # block directory, a leaf directory, a second data block under it and
       # six chunks of inodes; a run that needed none of them would report
       # every step passing while never touching the code that makes them.
-      "1 to block, 1 to leaf, 1 data block(s)"],
-     300, None, "small"),
+      "1 to block, 1 to leaf, 1 data block(s)",
+      # The allocator left a full group — and its control, in this same
+      # run, shows the write being refused without that search.
+      "crossed a group after"],
+     360, None, "small"),
 ]
 
 

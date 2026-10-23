@@ -222,7 +222,7 @@ static int grow_file(struct xfs *fs, struct xfs_inode *ip, uint64_t end) {
             agno = xfs_fsb_ag(fs, last.startblock);
             want = (uint32_t)((last.startblock + last.blockcount) & mask);
         }
-        rc = xfs_alloc_block(fs, agno, want, &got);
+        rc = xfs_alloc_somewhere(fs, &agno, 1u, want, &got);
         if (rc != KERR_OK) {
             break;
         }

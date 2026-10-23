@@ -1014,10 +1014,42 @@ sparse inodes, `nrext64`, exchange-range, parent pointers, `bigtime`,
       be **1**, because sixty names need a second chunk only if the first
       runs out and a run where it did not would report every step passing
       while never touching this path.
-- [ ] **Allocation under fragmentation.** (M) The allocator takes the first
-      run it finds that is big enough. A filesystem with no such run has
-      nothing it can do, where a real one would take several smaller
-      extents.
+- [x] **Allocation beyond one group.** (M) **Done, with a control.** This
+      entry used to say the gap was fragmentation — one contiguous run or
+      nothing — and reading the code to close it found something worse and
+      simpler: **nothing ever asked a second allocation group.** `agcount`
+      appeared nowhere in the allocator. Every caller passed the group its
+      inode lived in, and `xfs_alloc_extent` answers `KERR_NOSPC` for the
+      whole filesystem when that one group is full — so a default
+      four-group filesystem refused writes at about **a quarter full**, with
+      three-quarters of the disk free.
+
+      Fragmentation itself turned out to be already handled, which is why
+      the entry was wrong: `grow_file` allocates **one block at a time** and
+      merges each into the previous extent when it is contiguous, so a file
+      on a fragmented filesystem collects several extents rather than
+      failing. The description had been written from the allocator's
+      signature instead of from its caller.
+
+      `xfs_alloc_somewhere` prefers a group and then tries every other one,
+      reporting which answered — because an inode number, a file's extents
+      and a directory's blocks all have to be composed from it. The locality
+      hint is dropped once the search leaves the preferred group, an address
+      inside one group meaning nothing in another. An inode **chunk** is the
+      case that needed care: it may land in a group other than the one the
+      directory asked for, so the group travels back out and `take_inode` is
+      retried in the one that answered — retrying in the original would find
+      it just as full and recurse until the stack ran out.
+
+      **On the board**: a file written until the allocator leaves its group,
+      which happens at `81600 KiB` — the group's size — and the last chunk,
+      which lives in the *second* group, read back byte for byte, because an
+      allocation from another group is also a second extent and a file whose
+      extents are right in the inode and wrong on disk reads back as
+      somebody else's data. **And its control in the same run**: with the
+      search switched off (`single_group`, kept for this) the same write is
+      refused with `KERR_NOSPC`. Without that control the test would show
+      only that writing works.
 
 ---
 

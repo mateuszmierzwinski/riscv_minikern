@@ -146,7 +146,7 @@ static uint32_t copy_shortform(struct xfs *fs, const uint8_t *sf, uint32_t count
 static int take_a_block(struct xfs *fs, const struct xfs_inode *dir, uint64_t *fsb) {
     uint32_t agno = xfs_fsb_ag(fs, dir->ino >> fs->inopblog);
     uint32_t got = 0;
-    int rc = xfs_alloc_block(fs, agno, 0, &got);
+    int rc = xfs_alloc_somewhere(fs, &agno, 1u, 0, &got);
     if (rc != KERR_OK) {
         return rc;
     }

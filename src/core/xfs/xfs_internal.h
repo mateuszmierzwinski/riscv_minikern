@@ -154,9 +154,22 @@ int xfs_alloc_extent(struct xfs *fs, uint32_t agno, uint32_t count, uint32_t wan
 /* Adds a chunk of sixty-four inodes to a group, so that a filesystem whose
  * existing chunks are full can still make a file. Reports the first inode
  * number of the new chunk. */
-int xfs_inode_chunk_add(struct xfs *fs, uint32_t agno, uint32_t *startino);
+int xfs_inode_chunk_add(struct xfs *fs, uint32_t *agno, uint32_t *startino);
 
 /* ── the pieces a directory data block is made of ──────────────────────── */
+
+/* Allocates `count` contiguous blocks, preferring the group in `*agno` and
+ * trying **every other group** before giving up; `*agno` comes back as the
+ * group that answered.
+ *
+ * This is what every caller that does not need a particular group should
+ * use. `xfs_alloc_extent` asks one group and answers `KERR_NOSPC` for the
+ * whole filesystem if that one is full, which is a refusal with the disk
+ * mostly empty. `want` is a locality hint within the preferred group and is
+ * dropped once the search leaves it, because an address inside one group
+ * means nothing in another. */
+int xfs_alloc_somewhere(struct xfs *fs, uint32_t *agno, uint32_t count, uint32_t want,
+                        uint32_t *got);
 
 /* Marks a directory's own inode as changed: its times, and nothing else,
  * because an edit inside an existing block moves neither its size nor its

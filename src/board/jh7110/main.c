@@ -1367,6 +1367,65 @@ static int grow_a_directory(void) {
     return KERR_OK;
 }
 
+/* Writes until the allocator has to leave the group it started in.
+ *
+ * **The only way to reach that path is to fill a group**, and the fixture's
+ * are the default four of eighty megabytes — raising the count to make them
+ * smaller makes `mkfs` demand a log that will not fit in one. So this
+ * writes twenty thousand blocks, which costs nothing against a RAM disk.
+ * It stops the moment the counter moves rather than writing a fixed
+ * amount, because how much it takes depends on where `mkfs` put the log.
+ *
+ * The bytes are checked afterwards: an allocation from a second group is
+ * also a second *extent*, and a file whose extents are right in the inode
+ * and wrong on disk reads back as somebody else's data. */
+static int fill_past_one_group(void) {
+    static uint8_t chunk[65536];
+    uint64_t at = 0;
+    for (uint32_t i = 0; i < sizeof chunk; i++) {
+        chunk[i] = (uint8_t)(i * 7u + 3u); /* neither zeroes nor random */
+    }
+    int rc = xfsmount_create("gg", 0100644u);
+    while (rc == KERR_OK && xfsmount_alloc_other_group() == 0 && at < 120u * 1024u * 1024u) {
+        rc = xfsmount_write("gg", at, chunk, sizeof chunk);
+        at += sizeof chunk;
+    }
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    if (xfsmount_alloc_other_group() == 0) {
+        return KERR_NOSPC; /* never crossed: the test proved nothing */
+    }
+    kprintf("fswrite: crossed a group after %llu KiB\n", (unsigned long long)(at / 1024u));
+    {
+        static uint8_t got[sizeof chunk];
+        rc = xfsmount_read_at("gg", at - sizeof chunk, got, sizeof got);
+        for (uint32_t i = 0; rc == KERR_OK && i < sizeof got; i++) {
+            rc = got[i] == chunk[i] ? rc : KERR_IO;
+        }
+    }
+    return rc;
+}
+
+/* The control: the same write, with the search switched off, must fail.
+ *
+ * **Without this the test above proves only that writing works.** The first
+ * group is full by the time it runs, so an allocator confined to it has
+ * nowhere to go — and if this *succeeds*, the crossing above happened for
+ * some other reason and the claim is wrong. The guarantee and its control
+ * belong in one run on one machine; this project has the scar for learning
+ * that twice. */
+static int one_group_refuses(void) {
+    static uint8_t chunk[65536];
+    int rc = xfsmount_create("gh", 0100644u);
+    xfsmount_single_group(true);
+    for (uint64_t at = 0; rc == KERR_OK && at < 4u * 1024u * 1024u; at += sizeof chunk) {
+        rc = xfsmount_write("gh", at, chunk, sizeof chunk);
+    }
+    xfsmount_single_group(false);
+    return rc == KERR_NOSPC ? KERR_OK : (rc == KERR_OK ? KERR_IO : rc);
+}
+
 static void run_write_selftest(void) {
     static const char text[] = "a file this kernel wrote";
     const uint32_t len = (uint32_t)(sizeof text - 1u);
@@ -1401,6 +1460,8 @@ static void run_write_selftest(void) {
                                  xfsmount_inode_of("w3", &two, &links) == KERR_OK ? KERR_IO
                                                                                   : KERR_OK);
     ok = ok && wrote_and_checked("grow past shortform", grow_a_directory());
+    ok = ok && wrote_and_checked("allocate past one group", fill_past_one_group());
+    ok = ok && wrote_and_checked("one group alone must refuse", one_group_refuses());
     /* **Said out loud, because the alternative is a test that cannot
      * fail.** Sixty names need a second chunk of inodes only if the first
      * one runs out, and a run where it did not would print every step as
