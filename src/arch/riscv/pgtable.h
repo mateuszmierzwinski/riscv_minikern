@@ -152,6 +152,16 @@ uint64_t pgtable_unmap(struct pgtable *pt, virt_t va);
  * is. Walks the tables, so it is not for a hot path. */
 uint32_t pgtable_find_mappings(const struct pgtable *pt, phys_t phys, virt_t *out, uint32_t max);
 
+/* Every leaf in this table, reported to `each`.
+ *
+ * The walk itself, handed over rather than repeated: an audit that asks
+ * "which frame does each address use?" needs the whole set, and the
+ * alternative is a copy of this loop wherever the question is asked. `span`
+ * is the mapping's size, so a 2 MiB leaf is one call rather than 512. */
+void pgtable_each_leaf(const struct pgtable *pt,
+                       void (*each)(void *ctx, virt_t va, phys_t pa, uint64_t span, uint64_t flags),
+                       void *ctx);
+
 /* Records that `va`'s page has gone out to `slot`, replacing its mapping
  * with an invalid entry that remembers where. The page must be mapped now;
  * KERR_NOENT when it is not. */

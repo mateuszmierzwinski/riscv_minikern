@@ -73,25 +73,62 @@ Ordering inside a section is roughly by what unblocks the most.
       | Configuration | Reproduced |
       |---|---|
       | baseline | 20 of 20 |
-      | `minikern.tlbsafe` — broadcast TLB *additions* too | 19 of 20 |
+      | `minikern.tlbsafe` — broadcast TLB *additions* too | 10 of 10 |
       | `GODEBUG=asyncpreemptoff=1` — Go stops preempting | 19 of 20 |
-      | `minikern.nopreempt` — the kernel drops `tgkill` | 18 of 20 |
-      | `minikern.eager` — every mapping backed at `mmap` | 4 of 10 |
-      | `minikern.heapkeep` — the heap never returns a frame | 3 of 10 |
-      | `minikern.nomigrate` — a thread stays on one hart | **9 of 10** |
-      | `minikern.smp=off` — one hart | **0 of 20** |
+      | `minikern.nopreempt` — the kernel drops `tgkill`, so **0 signals are delivered** | 8 of 8 |
+      | `minikern.eager` — every mapping backed at `mmap`, no demand faults | 9 of 10 |
+      | `minikern.neverreuse` — **no frame is ever handed out twice** | 10 of 10 |
+      | `minikern.cooperative` — the tick never takes a hart from a thread | 5 of 5 |
+      | `minikern.nomigrate` — a thread stays on one hart | 10 of 10 |
+      | `minikern.isolate=0xe` — every thread confined to **one** hart | 3 of 6 |
+      | `GOMAXPROCS=1` — one goroutine runs at a time | 5 of 6 |
+      | `GODEBUG=gcstoptheworld=2` — no concurrent mark or sweep | 6 of 6 |
+      | `minikern.smp=off` — **one hart** | 2 of 6 |
+      | `minikern.smp=off` **with `GOMAXPROCS=8`** | **6 of 6** |
+      | **`GOGC=off`** — no garbage collection | **0 of 6** |
+      | `GOGC=off`, with every thread on one hart | **0 of 6** |
 
-      So it needs **more than one hart** and nothing else on that list. The
-      last two rows are the informative pair: pinning each thread to a hart
-      makes it *more* likely rather than less, so it is not a thread's state
-      passing between harts — four harts running user code at once is
-      enough. (`nomigrate` is also the configuration to hunt in.)
-      Also ruled out by instrument rather than by knob: a thread resumed on
-      a stack that is not its own, a thread claimed by two harts at once, a
-      frame handed out twice by the allocator, **two harts inside the frame
-      allocator at once** — which is the assumption the whole big-lock design
-      rests on and had never been checked — and the kernel heap handing a
-      page it had finished with to a user mapping.
+      **It does not need SMP at all, and this entry said for months that it
+      did.** One hart with `GOMAXPROCS=8` reproduces six times in six. The
+      `0 of 20` that founded the four-hart story was **exposure, not
+      immunity**: with one hart Go reads `NumCPU` as 1, runs one `P`,
+      allocates a fraction as much and switches far less, so the rate fell
+      under what twenty runs could see. Forcing the goroutine count back up
+      brings it straight back. That is this file's own lesson about rates
+      arriving a second time, and it cost every conclusion below it: thread
+      migration, cross-hart visibility, TLB shootdown, the kernel lock and
+      `satp` handling were all eliminated the moment one hart was enough.
+
+      **What it is**: *the collector frees an object the program is still
+      using.* `GODEBUG=clobberfree=1` fills a span with `0xdeadbeef` as it
+      is freed, and the failing worker's live 60,000-byte sieve then
+      contains **nothing else** — 15,000 bytes each of `de`, `ad`, `be`,
+      `ef` — while that worker reports its sum as 0. The worker also says
+      its sum was *already wrong when it computed it*, so the span is freed
+      **while the loop is still writing to it**. Everything earlier in this
+      entry — a counter ending short, a channel yielding values nobody
+      sent, an impossible `WaitGroup` — is that one fact seen from
+      different angles.
+
+      **What it is not**, now by instrument rather than by argument. Each of
+      these is a counter in the tree that reads zero in failing runs, and
+      each closes a hypothesis that looked excellent:
+
+      | Instrument | What it would have caught |
+      |---|---|
+      | `uspace_audit_aliases` | any frame reachable from two user addresses, over the **whole address space**, asked at the moment the program notices (`madvise` with a private advice) |
+      | `uspace_backed_twice` | two deciders both backing one absent page, each with its own frame |
+      | `uspace_misplaced_mappings` | a mapping placed where the record says something already is — including a `PROT_NONE` reservation, which has no pages and which `replaced_pages` therefore cannot see |
+      | `uspace_fixed_over_live` | a `MAP_FIXED` mapping throwing away live pages, which is legitimate and is evidence when the program thinks the range is free |
+      | `klock_breaches` | the one kernel lock not being exclusive — the assumption every "but the lock prevents that" argument rests on |
+      | `minikern.regs` | a user register lost across a switch: 28 of them, canaried through hundreds of involuntary preemptions **and** fifty blocking `nanosleep`s, with three spinners for company. Exit 0 on four harts and on one |
+
+      The slice **header** is intact too — each worker records where `make`
+      put its sieve and the address still matches — so the pointer is
+      sound and the bytes under it are not. And giving the sieve a heap root
+      *before* filling it changes nothing (5 of 5), so the root being missed
+      is **not** the running goroutine's own stack.
+
       **Caught in the act, once.** With `minikern.paranoid` the kernel reads
       back every page it zeroes, and one page, zeroed and mapped
       microseconds earlier, already held `0x000000000000ea60` — **60000**,

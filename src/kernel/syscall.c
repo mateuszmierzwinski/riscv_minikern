@@ -322,11 +322,33 @@ static int64_t sys_munmap(struct trapframe *tf) {
  * discard pages and this one keeps them, which is allowed and is what a
  * runtime copes with. Advice is advice; the only thing a kernel may not do
  * is *claim* to have taken it. */
+/* `madvise(0, 0, MADV_AUDIT)` — **the audit, asked for by the program that
+ * noticed something wrong.**
+ *
+ * The corruption is transient and the kernel cannot see it: by the time any
+ * periodic check runs, the memory reads correctly again. The program is the
+ * only thing that knows the moment, so it is given a way to say "now" — and
+ * the number is a private one far outside the advice Linux defines, because
+ * a program on a real kernel must get `EINVAL` for it rather than a
+ * surprise.
+ *
+ * It is a debugging interface and it is only honoured under
+ * `minikern.paranoid`, which is also what makes the audit affordable. */
+#define MADV_AUDIT 0x4d494eu
+
 static int64_t sys_madvise(struct trapframe *tf) {
     uint64_t at = sysarg(tf, 0);
     uint64_t bytes = sysarg(tf, 1);
     uint32_t advice = (uint32_t)sysarg(tf, 2);
     uint64_t pages = (bytes + PAGE_SIZE - 1u) / PAGE_SIZE;
+    if (advice == MADV_AUDIT) {
+        if (at != 0) {
+            uspace_audit_address(uspace_current(), at);
+        } else {
+            uspace_audit_aliases(uspace_current());
+        }
+        return 0;
+    }
     if (advice != MADV_PAGEOUT) {
         return 0;
     }

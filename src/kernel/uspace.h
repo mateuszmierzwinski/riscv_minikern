@@ -442,6 +442,20 @@ void uspace_set_extra_env(const char *text, uint32_t len);
  * underneath it. */
 uint32_t uspace_replaced_pages(void);
 
+/* Live pages thrown away by a `MAP_FIXED` mapping. A program is entitled to
+ * do this; it is evidence when that program thought the range was free. */
+uint32_t uspace_fixed_over_live(void);
+
+/* Mappings placed where the address-space record says something already is.
+ * The one placement error a page-table check cannot see, because a
+ * reservation has no pages. */
+uint32_t uspace_misplaced_mappings(void);
+
+/* Pages that two harts both set out to back, each with its own frame. Any
+ * value but zero means one of those frames was live in a hart's TLB while
+ * the page table named the other — two copies of one page. */
+uint32_t uspace_backed_twice(void);
+
 /* Mappings the address-space record could not hold, so placement may reuse
  * an address that is live. */
 uint32_t uspace_unrecorded_regions(void);
@@ -477,6 +491,19 @@ void uspace_back_eagerly(bool on);
  * every page the kernel zeroes, and walking the tables for a second mapping
  * of a frame that turns out dirty. For a hunt, not for a boot. */
 void uspace_set_paranoid(bool on);
+
+/* Walks a process's whole address space and reports any frame two
+ * addresses can reach. The §0 hunt's central question, asked about
+ * everything at once instead of in a microsecond-wide window. */
+void uspace_audit_aliases(struct uproc *p);
+
+/* What backs one address right now: its entry, the region that claims it,
+ * and every other address that reaches the same frame. */
+void uspace_audit_address(struct uproc *p, virt_t at);
+
+/* Frames the audit found mapped twice. Any value but zero is one page with
+ * two owners, which is what the corruption looks like from outside. */
+uint32_t uspace_aliased_frames(void);
 
 /* Sends up to `want` of a process's pages out to swap, reporting how many
  * went. Anonymous pages only: a huge mapping is one entry over 2 MiB, a

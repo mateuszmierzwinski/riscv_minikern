@@ -2094,11 +2094,29 @@ void sched_tick(void) {
  * happens on the way *out* of a trap and not inside the interrupt handler,
  * because switching from inside an interrupt would resume the other thread
  * with the interrupt still unacknowledged. */
+/* Whether the kernel preempts a thread that has not asked to yield.
+ *
+ * **A diagnostic, and the one that matters most now.** With it off, a thread
+ * runs until it blocks, exits or is ended — the tick still arrives, still
+ * keeps time and still wakes sleepers, but it never takes the hart away. So
+ * threads still switch, and they switch at points the *thread* chose.
+ *
+ * It separates "a context switch happens" from "a context switch happens at
+ * an arbitrary instruction". Everything a switch must preserve is the same
+ * either way; what differs is whether the thread was in the middle of
+ * something when it was taken. That is the difference between a bug in what
+ * a switch saves and a bug in when it is allowed to occur. */
+static bool preempt_involuntarily = true;
+
+void sched_set_preemption(bool on) {
+    preempt_involuntarily = on;
+}
+
 bool sched_take_preempt_request(void) {
     struct hartstate *h = me();
     bool want = h->preempt_pending;
     h->preempt_pending = false;
-    return want;
+    return want && preempt_involuntarily;
 }
 
 void sched_shutdown(void) {

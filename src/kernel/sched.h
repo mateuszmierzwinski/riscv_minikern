@@ -438,6 +438,11 @@ bool sched_rt_is_round_robin(void);
 bool sched_set_rt(uint32_t priority, bool round_robin);
 
 void sched_set_isolated(uint64_t mask);
+
+/* Whether the tick may take a hart from a thread that has not yielded.
+ * Off means threads switch only at points they chose, which separates what
+ * a context switch saves from when one is allowed to happen. */
+void sched_set_preemption(bool on);
 uint64_t sched_isolated(void);
 
 

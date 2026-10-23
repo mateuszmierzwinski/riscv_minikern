@@ -52,4 +52,9 @@ void klock_state(uint32_t *next, uint32_t *serving, uint64_t *owner);
  * wakes the hart arrives while it does not hold the lock. */
 void klock_idle_wait(void);
 
+/* Times a hart won the lock while another hart was still recorded as its
+ * owner. Anything but zero means the one lock this kernel relies on is not
+ * exclusive, and every "the lock prevents that" argument is void. */
+uint32_t klock_breaches(void);
+
 #endif

@@ -1661,6 +1661,132 @@ uint32_t uspace_dirty_frames(void) {
  * So the question is asked where it can still be attributed: right after
  * this page was zeroed and mapped. A frame that is already dirty here is a
  * frame somebody else is writing — one the allocator handed out twice. */
+/* ── the alias audit ───────────────────────────────────────────────────── */
+
+/* **Is any frame reachable from two addresses at once?**
+ *
+ * The question the whole §0 hunt comes down to. A page the kernel had just
+ * zeroed and mapped was found holding a user value microseconds later, with
+ * the kernel lock held and the allocator insisting the frame had been handed
+ * out once — which leaves one possibility: the frame is mapped somewhere
+ * else as well. Every earlier attempt at this looked in a microsecond-wide
+ * window and found nothing, which says only that the window is narrow.
+ *
+ * So this asks the question about the **whole address space, at once**: walk
+ * every leaf, count how many addresses use each frame, and report any frame
+ * used twice along with the addresses. A duplicate that exists is found
+ * whenever this runs, rather than when the timing happens to be right —
+ * which is the difference between a measurement and a lottery ticket.
+ *
+ * One byte per frame of the machine, borrowed for the duration: 512 KiB for
+ * QEMU's 2 GiB, 2 MiB for the board's 8 GiB. Behind `minikern.paranoid`,
+ * because it is a walk of everything and a megabyte of scratch. */
+struct alias_audit {
+    uint8_t *seen;      /* how many addresses use each frame, saturating */
+    virt_t *first;      /* where the first one was, for frames used twice */
+    uint32_t frames;    /* how many frames the array covers */
+    phys_t base;        /* the physical address frame 0 starts at */
+    uint32_t duplicates;
+    uint32_t reported;
+};
+
+static void count_one_leaf(void *ctx, virt_t va, phys_t pa, uint64_t span, uint64_t flags) {
+    struct alias_audit *a = ctx;
+    /* **User pages only.** The kernel's own identity map covers all of RAM
+     * — every frame is "mapped" by it, and counting those would report
+     * every page in the machine. A frame a *process* can reach twice is the
+     * thing being looked for. */
+    if ((flags & PTE_U) == 0) {
+        return;
+    }
+    for (uint64_t off = 0; off < span; off += PAGE_SIZE) {
+        phys_t frame = pa + off;
+        virt_t here = va + off;
+        uint64_t i = (frame - a->base) / PAGE_SIZE;
+        if (frame < a->base || i >= a->frames) {
+            continue;
+        }
+        if (a->seen[i] == 0) {
+            a->seen[i] = 1;
+            a->first[i] = here;
+            continue;
+        }
+        a->duplicates++;
+        if (a->reported++ < 4u) {
+            kprintf("uspace: **frame %016llx is mapped twice**: %016llx and %016llx\n",
+                    (unsigned long long)frame, (unsigned long long)a->first[i],
+                    (unsigned long long)here);
+        }
+    }
+}
+
+/* Frames found reachable from two user addresses. */
+static uint32_t aliased_frames;
+
+uint32_t uspace_aliased_frames(void) {
+    return aliased_frames;
+}
+
+/* What backs one address, and what else can reach that frame.
+ *
+ * The whole-space audit answers "is anything mapped twice"; this answers
+ * "what is at *this* address, right now" — which is the question a program
+ * that has just read the wrong bytes is in a position to ask, and the only
+ * moment the answer is still true. It prints the entry, the region that
+ * claims the address, and every other address mapping the same frame. */
+void uspace_audit_address(struct uproc *p, virt_t at) {
+    virt_t page = at & ~(virt_t)(PAGE_SIZE - 1u);
+    phys_t phys = 0;
+    uint64_t flags = 0, span = 0;
+    const struct vma *r;
+    virt_t others[4];
+    uint32_t n;
+    if (p == NULL || !p->built) {
+        return;
+    }
+    if (!pgtable_lookup(&p->pt, page, &phys, &flags, &span)) {
+        kprintf("uspace: %016llx is **not mapped at all**\n", (unsigned long long)page);
+        return;
+    }
+    r = vma_find(&p->vmas, at);
+    n = pgtable_find_mappings(&p->pt, phys, others, 4u);
+    kprintf("uspace: %016llx -> frame %016llx span %llu flags %llx, region %s, %u mapping(s)\n",
+            (unsigned long long)page, (unsigned long long)phys, (unsigned long long)span,
+            (unsigned long long)(flags & 0x3ffu), r == NULL ? "**none**" : "ok", n);
+    for (uint32_t i = 0; i < n && i < 4u; i++) {
+        if (others[i] != page) {
+            kprintf("uspace: **that frame is also at %016llx**\n", (unsigned long long)others[i]);
+        }
+    }
+}
+
+void uspace_audit_aliases(struct uproc *p) {
+    struct alias_audit a = {0};
+    uint32_t frames = mem_total_pages();
+    if (p == NULL || !p->built || frames == 0) {
+        return;
+    }
+    a.seen = kzalloc(frames);
+    a.first = kzalloc(frames * (uint32_t)sizeof(virt_t));
+    if (a.seen == NULL || a.first == NULL) {
+        kfree(a.seen);
+        kfree(a.first);
+        kprintf("uspace: no memory for the alias audit\n");
+        return;
+    }
+    a.frames = frames;
+    a.base = mem_base_address();
+    pgtable_each_leaf(&p->pt, count_one_leaf, &a);
+    aliased_frames += a.duplicates;
+    if (a.duplicates == 0) {
+        kprintf("uspace: the alias audit found no frame mapped twice\n");
+    } else {
+        kprintf("uspace: **%u frames are mapped twice**\n", a.duplicates);
+    }
+    kfree(a.seen);
+    kfree(a.first);
+}
+
 /* Whether the costly checks run. Off by default: reading back every page
  * the kernel zeroes is 4 KiB per fault, which is both a real cost and —
  * measured — enough of a change in timing to hide the race it is looking
@@ -1719,11 +1845,48 @@ static void check_the_frame_is_clean(phys_t page, virt_t va) {
     }
 }
 
+/* Pages two harts both decided to back. Each one is a frame that was live
+ * in somebody's TLB while the page table pointed somewhere else. */
+static uint32_t backed_twice;
+
+uint32_t uspace_backed_twice(void) {
+    return backed_twice;
+}
+
 static int back_one_page(struct uproc *p, virt_t va, uint32_t prot) {
     phys_t page = 0;
+    phys_t already = 0;
+    uint64_t flags = 0, span = 0;
     int rc;
     if (prot == 0) {
         return KERR_OK;
+    }
+    /* **Already backed, so back nothing.**
+     *
+     * Every caller decided to back this address by finding it absent, and
+     * that decision is a test followed by an act. If the two are not one
+     * step, two harts can both find the page absent and both back it: each
+     * allocates a frame, each maps it, and the second entry replaces the
+     * first. The process is left with the *second* frame, and the first one
+     * is still live in any hart whose TLB cached the first translation —
+     * so two harts write to two different copies of one page, each losing
+     * the other's stores, until something flushes.
+     *
+     * Nothing already built could see it. One address holds one entry, so
+     * an alias audit finds nothing; the two frames are different, so the
+     * allocator's double-hand-out check finds nothing; and never reusing a
+     * frame does not help, because both frames are genuinely new.
+     *
+     * So the check lives **here**, where the act is, rather than being
+     * repeated at each caller — and the answer is `KERR_OK` because the
+     * caller's goal is that the page be present, which it is — so this is
+     * `KERR_EXIST` rather than `KERR_OK`, and every caller reads it as
+     * success. The distinction is not pedantry: a file-backed region fills
+     * the page from its file *after* backing it, and "already there" must
+     * not be followed by reading the file over whatever is in it. */
+    if (pgtable_lookup(&p->pt, va, &already, &flags, &span)) {
+        backed_twice++;
+        return KERR_EXIST;
     }
     rc = mem_alloc_pages(1, 1, &page);
     if (rc != KERR_OK) {
@@ -1835,10 +1998,30 @@ static int back_for_region(struct uproc *p, const struct vma *r, virt_t va) {
         return KERR_OK;
     }
     rc = back_one_page(p, page, r->prot);
+    if (rc == KERR_EXIST) {
+        return KERR_OK; /* somebody else backed it; its contents are theirs */
+    }
     if (rc == KERR_OK && r->file != NULL) {
         fill_from_file(p, r, page);
     }
     return rc;
+}
+
+/* Mappings placed on a range the address-space record says is taken. Always
+ * a bug: the placement asked the record for a free range and got one that
+ * is not, and a reservation with no pages is the case nothing else sees. */
+static uint32_t misplaced_mappings;
+
+uint32_t uspace_misplaced_mappings(void) {
+    return misplaced_mappings;
+}
+
+/* Live pages a `MAP_FIXED` mapping threw away. Legitimate on its own, and
+ * evidence when the program doing it believes the range was never used. */
+static uint32_t fixed_over_live;
+
+uint32_t uspace_fixed_over_live(void) {
+    return fixed_over_live;
 }
 
 /* Live pages destroyed by a mapping nobody insisted on. Always a bug. */
@@ -2066,6 +2249,22 @@ static virt_t place_mapping(struct uproc *p, virt_t at, uint64_t pages, virt_t a
         KERR_OK) {
         return 0;
     }
+    /* **The placement, checked against the record it came from.**
+     *
+     * The gap every other counter here leaves. `replaced_pages` notices a
+     * placement that destroys *mapped* pages, which cannot see the case
+     * that matters most: a `PROT_NONE` reservation has no pages at all, so
+     * a mapping placed inside a runtime's reserved heap arena looks like it
+     * landed on empty space — and the runtime then commits that arena over
+     * the top of whatever was put there, or puts two arenas in one place.
+     * From outside, that is objects being freed while they are still in
+     * use, which is exactly the shape of §0's corruption.
+     *
+     * So the answer is checked rather than trusted: `vma_find_free` has
+     * just said this range is free, and the record is asked again. */
+    if (!vma_range_free(&p->vmas, chosen, chosen + bytes)) {
+        misplaced_mappings++;
+    }
     return chosen;
 }
 
@@ -2174,7 +2373,8 @@ static void populate(struct uproc *p, virt_t base, uint64_t pages, uint32_t prot
         return;
     }
     for (uint64_t i = 0; i < pages; i++) {
-        if (back_one_page(p, base + i * PAGE_SIZE, prot) != KERR_OK) {
+        int rc = back_one_page(p, base + i * PAGE_SIZE, prot);
+        if (rc != KERR_OK && rc != KERR_EXIST) {
             return;
         }
         populated_pages++;
@@ -2205,6 +2405,21 @@ static void clear_the_range(struct uproc *p, bool fixed, virt_t base, uint64_t p
         virt_t va = base + i * PAGE_SIZE;
         phys_t was = 0;
         uint64_t f = 0, sz = 0;
+        if (fixed && pgtable_lookup(&p->pt, va, &was, &f, &sz)) {
+            /* **A mapping that *was* insisted on, over live pages.**
+             *
+             * Not a bug by itself: `MAP_FIXED` means "put it here and throw
+             * away whatever is there", and a program that asks for that is
+             * entitled to it. It is counted because of what it would mean
+             * *here*: this program's runtime maps its heap with `MAP_FIXED`
+             * at addresses it believes it has not used yet, so a fixed
+             * mapping landing on live pages says the runtime was told
+             * those addresses were free — and the only thing that tells it
+             * that is this kernel's placement. A number separate from
+             * `replaced_pages`, because the two have different meanings and
+             * adding them would hide both. */
+            fixed_over_live++;
+        }
         if (!fixed && pgtable_lookup(&p->pt, va, &was, &f, &sz)) {
             replaced_pages++;
         }

@@ -47,6 +47,15 @@ void mem_heap_traffic(uint64_t *taken, uint64_t *given_back);
  * page it has finished with can never become a user page. It leaks, and it
  * is a diagnostic: see `mem.c`. */
 void mem_heap_keep_pages(bool on);
+
+/* Stops a frame ever being handed out twice: a free becomes a leak. The
+ * diagnostic that separates "a page with two owners" from everything else
+ * in the §0 hunt, because both kinds of two-owner bug need reuse. */
+void mem_never_reuse(bool on);
+
+/* Where the machine's frames start, which the alias audit needs to index an
+ * array by frame (`mem_total_pages` above says how many there are). */
+phys_t mem_base_address(void);
 int mem_free_pages(phys_t phys, uint32_t npages);
 
 /* Says that one more address space is using this frame, so freeing it once

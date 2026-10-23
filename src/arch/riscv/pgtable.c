@@ -336,6 +336,41 @@ bool pgtable_swapped_slot(const struct pgtable *pt, virt_t va, uint32_t *slot) {
     return true;
 }
 
+void pgtable_each_leaf(const struct pgtable *pt,
+                       void (*each)(void *ctx, virt_t va, phys_t pa, uint64_t span, uint64_t flags),
+                       void *ctx) {
+    for (uint32_t i2 = 0; i2 < PT_ENTRIES; i2++) {
+        uint64_t e2 = pt->root[i2];
+        const uint64_t *t1;
+        if (pte_is_leaf(e2)) {
+            each(ctx, (virt_t)i2 << 30, pte_phys(e2), GIGAPAGE_SIZE, e2);
+            continue;
+        }
+        if (!pte_is_table(e2)) {
+            continue;
+        }
+        t1 = pt->mem.to_virt(pt->mem.self, pte_phys(e2));
+        for (uint32_t i1 = 0; i1 < PT_ENTRIES; i1++) {
+            uint64_t e1 = t1[i1];
+            const uint64_t *t0;
+            virt_t base1 = ((virt_t)i2 << 30) | ((virt_t)i1 << 21);
+            if (pte_is_leaf(e1)) {
+                each(ctx, base1, pte_phys(e1), MEGAPAGE_SIZE, e1);
+                continue;
+            }
+            if (!pte_is_table(e1)) {
+                continue;
+            }
+            t0 = pt->mem.to_virt(pt->mem.self, pte_phys(e1));
+            for (uint32_t i0 = 0; i0 < PT_ENTRIES; i0++) {
+                if (pte_is_leaf(t0[i0])) {
+                    each(ctx, base1 | ((virt_t)i0 << 12), pte_phys(t0[i0]), PAGE_SIZE, t0[i0]);
+                }
+            }
+        }
+    }
+}
+
 uint64_t pgtable_satp(const struct pgtable *pt, uint16_t asid) {
     return SATP_MODE_SV39 | ((uint64_t)asid << 44) | (pt->root_phys >> 12);
 }

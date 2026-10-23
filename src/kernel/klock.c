@@ -14,12 +14,39 @@ bool klock_held(void) {
     return __atomic_load_n(&owner_plus_one, __ATOMIC_ACQUIRE) == smp_this_hart() + 1u;
 }
 
+/* Harts that were inside the kernel while another hart owned the lock.
+ *
+ * **The number every other theory rests on.** "Two harts cannot both be in
+ * that function, because the lock prevents it" is the argument that
+ * eliminated most of the §0 candidates, and nothing had ever checked the
+ * lock itself — the existing counter beside it in `trap.c` counts trap
+ * *frames*, which nest on one hart, so its reading of seven on four harts
+ * says nothing either way.
+ *
+ * There are two ways the lock could fail to be exclusive, and this catches
+ * both. The spinlock could hand two harts the same ticket, and
+ * `klock_held` could answer **yes** on a hart that owns nothing — which it
+ * decides by comparing the owner against `smp_this_hart`, so a hart that
+ * misidentifies itself skips the lock entirely and returns `false` for
+ * "somebody else took it", which the trap path reads as "I already hold
+ * it". Checking at the moment of acquisition covers the pair: having just
+ * won the spinlock, nobody else may be recorded as the owner. */
+static uint32_t lock_breaches;
+
+uint32_t klock_breaches(void) {
+    return __atomic_load_n(&lock_breaches, __ATOMIC_RELAXED);
+}
+
 bool klock_enter(void) {
+    uint64_t was;
     if (klock_held()) {
         return false;
     }
     spin_lock(&the_lock);
-    __atomic_store_n(&owner_plus_one, smp_this_hart() + 1u, __ATOMIC_RELEASE);
+    was = __atomic_exchange_n(&owner_plus_one, smp_this_hart() + 1u, __ATOMIC_ACQ_REL);
+    if (was != 0u) {
+        __atomic_add_fetch(&lock_breaches, 1u, __ATOMIC_RELAXED);
+    }
     return true;
 }
 

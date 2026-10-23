@@ -2082,3 +2082,326 @@ sw_came_back_wrong:
     ecall
 11: j       11b
 user_swap_end:
+
+/* Roadmap §0: does a preempted thread get all of its registers back?
+ *
+ * **The question the race hunt came down to, asked directly.** Everything
+ * else about §0 was measured through a Go program, which can only say that
+ * *something* went wrong somewhere; this asks the kernel the narrow
+ * question and gets a register number for an answer.
+ *
+ * Every register the ABI lets a program keep is loaded with a value only
+ * this program would choose — its own number, in the high half so that a
+ * small arithmetic slip cannot look like a match — and then the program
+ * spins long enough to be preempted many times over. The kernel's tick is
+ * 100 Hz and a slice is milliseconds, so a loop of a few hundred million
+ * iterations is preempted hundreds of times. Then every register is
+ * compared against what it should still hold.
+ *
+ * `t0`..`t2` and `a0`..`a7` are left out: they are the loop's counter and
+ * the exit syscall's arguments, so they cannot hold a canary across both.
+ * That is not a gap worth closing here — a kernel that restored only the
+ * temporaries correctly and lost a saved register is the case this is
+ * looking for, and the saved registers are where a compiler keeps a live
+ * pointer across a call.
+ *
+ * **0 is a pass.** Any other value is the number of the first register that
+ * came back wrong, which is the whole point: a count would say the kernel
+ * is broken and a number says where.
+ */
+    .globl user_regs_start
+    .globl user_regs_end
+user_regs_start:
+    /* **Company first.** A single thread is never preempted, because the
+     * kernel has nothing to put on the hart instead — so the first version
+     * of this test passed without ever being interrupted, which is the
+     * oldest mistake in this file wearing new clothes. Three spinners are
+     * cloned, and only then does the canary thread start timing itself. */
+    li      s7, 3
+regs_spawn:
+    li      a0, 0
+    li      a1, 8192
+    li      a2, 3
+    li      a3, 0x22
+    li      a4, -1
+    li      a5, 0
+    li      a7, SYS_MMAP
+    ecall
+    bltz    a0, regs_no_memory
+    li      t0, 8192
+    add     a1, a0, t0              /* a stack grows down, so its top */
+    li      a0, 0x00050f00          /* VM|FS|FILES|SIGHAND|THREAD */
+    li      a2, 0
+    li      a3, 0
+    li      a4, 0
+    li      a7, SYS_CLONE
+    ecall
+    beqz    a0, regs_spin_forever   /* the child: just keep the hart busy */
+    addi    s7, s7, -1
+    bnez    s7, regs_spawn
+
+    /* The canaries. Every register the ABI lets this program keep across an
+     * interruption, **including the caller-saved ones**: `t0`..`t2` are the
+     * only ones left out, because checking needs scratch, and `sp`, which
+     * is the stack. A runtime keeps a live pointer in a temporary across a
+     * preemption as readily as in a saved register, so leaving the
+     * temporaries out — which the first version of this did — leaves out
+     * the half that matters. The value is its own register number with a
+     * distinctive high half, so a small arithmetic slip cannot pass. */
+    li      t0, 0x5EC0
+    slli    t0, t0, 48
+    ori     ra, t0, 1
+    ori     gp, t0, 3
+    ori     tp, t0, 4
+    ori     s0, t0, 8
+    ori     s1, t0, 9
+    ori     a0, t0, 10
+    ori     a1, t0, 11
+    ori     a2, t0, 12
+    ori     a3, t0, 13
+    ori     a4, t0, 14
+    ori     a5, t0, 15
+    ori     a6, t0, 16
+    ori     a7, t0, 17
+    ori     s2, t0, 18
+    ori     s3, t0, 19
+    ori     s4, t0, 20
+    ori     s5, t0, 21
+    ori     s6, t0, 22
+    ori     s7, t0, 23
+    ori     s8, t0, 24
+    ori     s9, t0, 25
+    ori     s10, t0, 26
+    ori     s11, t0, 27
+    ori     t3, t0, 28
+    ori     t4, t0, 29
+    ori     t5, t0, 30
+    ori     t6, t0, 31
+
+    /* Spin, touching only `t1`. Long enough that a 100 Hz tick with three
+     * other runnable threads cannot miss it. */
+    li      t1, 60000000
+regs_spin:
+    addi    t1, t1, -1
+    bnez    t1, regs_spin
+
+    /* Check. `t2` carries the first register that came back wrong, and 0
+     * means every one of them survived. */
+    li      t0, 0x5EC0
+    slli    t0, t0, 48
+    li      t2, 0
+
+    ori     t1, t0, 1
+    bne     ra, t1, regs_bad_1
+    ori     t1, t0, 3
+    bne     gp, t1, regs_bad_3
+    ori     t1, t0, 4
+    bne     tp, t1, regs_bad_4
+    ori     t1, t0, 8
+    bne     s0, t1, regs_bad_8
+    ori     t1, t0, 9
+    bne     s1, t1, regs_bad_9
+    ori     t1, t0, 10
+    bne     a0, t1, regs_bad_10
+    ori     t1, t0, 11
+    bne     a1, t1, regs_bad_11
+    ori     t1, t0, 12
+    bne     a2, t1, regs_bad_12
+    ori     t1, t0, 13
+    bne     a3, t1, regs_bad_13
+    ori     t1, t0, 14
+    bne     a4, t1, regs_bad_14
+    ori     t1, t0, 15
+    bne     a5, t1, regs_bad_15
+    ori     t1, t0, 16
+    bne     a6, t1, regs_bad_16
+    ori     t1, t0, 17
+    bne     a7, t1, regs_bad_17
+    ori     t1, t0, 18
+    bne     s2, t1, regs_bad_18
+    ori     t1, t0, 19
+    bne     s3, t1, regs_bad_19
+    ori     t1, t0, 20
+    bne     s4, t1, regs_bad_20
+    ori     t1, t0, 21
+    bne     s5, t1, regs_bad_21
+    ori     t1, t0, 22
+    bne     s6, t1, regs_bad_22
+    ori     t1, t0, 23
+    bne     s7, t1, regs_bad_23
+    ori     t1, t0, 24
+    bne     s8, t1, regs_bad_24
+    ori     t1, t0, 25
+    bne     s9, t1, regs_bad_25
+    ori     t1, t0, 26
+    bne     s10, t1, regs_bad_26
+    ori     t1, t0, 27
+    bne     s11, t1, regs_bad_27
+    ori     t1, t0, 28
+    bne     t3, t1, regs_bad_28
+    ori     t1, t0, 29
+    bne     t4, t1, regs_bad_29
+    ori     t1, t0, 30
+    bne     t5, t1, regs_bad_30
+    ori     t1, t0, 31
+    bne     t6, t1, regs_bad_31
+
+    /* **The second half: a switch the thread asked for.**
+     *
+     * Everything above is about being interrupted. A thread that *blocks*
+     * takes a different path out of the kernel and back — it switches away
+     * from inside a syscall, on its own kernel stack, and is resumed by
+     * whoever wakes it — and the two have nothing in common but the frame.
+     * `minikern.cooperative` showed that the §0 corruption needs only this
+     * kind of switch, so this is the one that had to be tested.
+     *
+     * The saved registers are reloaded first, because a syscall is entitled
+     * to the argument and return registers: `a0`..`a7` and `t0`..`t2` carry
+     * the call, so they cannot also carry a canary across it. Everything
+     * the ABI says a *call* preserves must still be here afterwards.
+     *
+     * 1 ms, fifty times, with three spinners competing: fifty blocks, fifty
+     * wake-ups and fifty resumptions. */
+    li      s0, 50
+regs_block:
+    li      t0, 0x5EC0
+    slli    t0, t0, 48
+    ori     gp, t0, 3
+    ori     tp, t0, 4
+    ori     s1, t0, 9
+    ori     s2, t0, 18
+    ori     s3, t0, 19
+    ori     s4, t0, 20
+    ori     s5, t0, 21
+    ori     s6, t0, 22
+    ori     s7, t0, 23
+    ori     s8, t0, 24
+    ori     s9, t0, 25
+    ori     s10, t0, 26
+    ori     s11, t0, 27
+    ori     t3, t0, 28
+    ori     t4, t0, 29
+    ori     t5, t0, 30
+    ori     t6, t0, 31
+
+    addi    sp, sp, -16
+    li      t1, 0
+    sd      t1, 0(sp)               /* tv_sec  = 0 */
+    li      t1, 1000000
+    sd      t1, 8(sp)               /* tv_nsec = 1 ms */
+    mv      a0, sp
+    li      a1, 0
+    li      a7, SYS_NANOSLEEP
+    ecall
+    addi    sp, sp, 16
+
+    li      t0, 0x5EC0
+    slli    t0, t0, 48
+    ori     t1, t0, 3
+    bne     gp, t1, regs_bad_3
+    ori     t1, t0, 4
+    bne     tp, t1, regs_bad_4
+    ori     t1, t0, 9
+    bne     s1, t1, regs_bad_9
+    ori     t1, t0, 18
+    bne     s2, t1, regs_bad_18
+    ori     t1, t0, 19
+    bne     s3, t1, regs_bad_19
+    ori     t1, t0, 20
+    bne     s4, t1, regs_bad_20
+    ori     t1, t0, 21
+    bne     s5, t1, regs_bad_21
+    ori     t1, t0, 22
+    bne     s6, t1, regs_bad_22
+    ori     t1, t0, 23
+    bne     s7, t1, regs_bad_23
+    ori     t1, t0, 24
+    bne     s8, t1, regs_bad_24
+    ori     t1, t0, 25
+    bne     s9, t1, regs_bad_25
+    ori     t1, t0, 26
+    bne     s10, t1, regs_bad_26
+    ori     t1, t0, 27
+    bne     s11, t1, regs_bad_27
+    ori     t1, t0, 28
+    bne     t3, t1, regs_bad_28
+    ori     t1, t0, 29
+    bne     t4, t1, regs_bad_29
+    ori     t1, t0, 30
+    bne     t5, t1, regs_bad_30
+    ori     t1, t0, 31
+    bne     t6, t1, regs_bad_31
+    addi    s0, s0, -1
+    bnez    s0, regs_block
+
+    j       regs_exit
+
+regs_spin_forever:
+    j       regs_spin_forever
+
+regs_no_memory:
+    li      t2, 180
+    j       regs_exit
+
+regs_bad_1:  li t2, 1
+    j regs_exit
+regs_bad_3:  li t2, 3
+    j regs_exit
+regs_bad_4:  li t2, 4
+    j regs_exit
+regs_bad_8:  li t2, 8
+    j regs_exit
+regs_bad_9:  li t2, 9
+    j regs_exit
+regs_bad_10: li t2, 10
+    j regs_exit
+regs_bad_11: li t2, 11
+    j regs_exit
+regs_bad_12: li t2, 12
+    j regs_exit
+regs_bad_13: li t2, 13
+    j regs_exit
+regs_bad_14: li t2, 14
+    j regs_exit
+regs_bad_15: li t2, 15
+    j regs_exit
+regs_bad_16: li t2, 16
+    j regs_exit
+regs_bad_17: li t2, 17
+    j regs_exit
+regs_bad_18: li t2, 18
+    j regs_exit
+regs_bad_19: li t2, 19
+    j regs_exit
+regs_bad_20: li t2, 20
+    j regs_exit
+regs_bad_21: li t2, 21
+    j regs_exit
+regs_bad_22: li t2, 22
+    j regs_exit
+regs_bad_23: li t2, 23
+    j regs_exit
+regs_bad_24: li t2, 24
+    j regs_exit
+regs_bad_25: li t2, 25
+    j regs_exit
+regs_bad_26: li t2, 26
+    j regs_exit
+regs_bad_27: li t2, 27
+    j regs_exit
+regs_bad_28: li t2, 28
+    j regs_exit
+regs_bad_29: li t2, 29
+    j regs_exit
+regs_bad_30: li t2, 30
+    j regs_exit
+regs_bad_31: li t2, 31
+regs_exit:
+    /* **`exit_group`, not `exit`.** The spinners never stop by themselves,
+     * and `exit` ends only the thread that calls it — so the first version
+     * of this ended the one thread that had an answer and left the process
+     * alive with three threads spinning, which from outside is a hang. */
+    mv      a0, t2
+    li      a7, SYS_EXIT_GROUP
+    ecall
+user_regs_end:

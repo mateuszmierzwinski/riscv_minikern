@@ -33,6 +33,27 @@ static uint32_t total_pages;
 
 /* The heap asks for pages through a port, so it has no idea what is under
  * it — which is what let it be host-tested before any of this existed. */
+/* Whether a frame is ever handed out a second time.
+ *
+ * **A diagnostic that splits the §0 hunt in half.** The corruption looks
+ * like a page with two owners, and the two ways that can happen are a frame
+ * mapped at two addresses — which an audit of the whole address space says
+ * never happens — and a frame serving two *purposes*: a user page that is
+ * also a thread's kernel stack, a page table, or a block of the kernel
+ * heap. The second kind is invisible to that audit, because the kernel
+ * reaches its own memory through the identity map and not through a user
+ * entry.
+ *
+ * Both require **reuse**. With this on, nothing is ever reused: a free is a
+ * leak. If the corruption survives that, no frame ever serves two purposes
+ * and the whole aliasing family is wrong. 2 GiB is far more than this
+ * reproducer allocates, so leaking everything costs nothing but honesty. */
+static bool never_reuse;
+
+void mem_never_reuse(bool on) {
+    never_reuse = on;
+}
+
 /* Pages the kernel heap has taken from the frame allocator and given back.
  *
  * **The frames the heap gives back go to user pages**, which makes the heap
@@ -74,7 +95,7 @@ void mem_heap_keep_pages(bool on) {
 static void heap_free_page(void *self, void *virt, uint32_t npages) {
     (void)self;
     heap_pages_given_back += npages;
-    if (heap_keeps_its_pages) {
+    if (heap_keeps_its_pages || never_reuse) {
         /* Leaked on purpose: a page the heap never gives back cannot be
          * handed to a user mapping, so if the corruption stops when this is
          * on, what reaches user memory is a write through a pointer into
@@ -154,6 +175,10 @@ int mem_init(const struct bootinfo *info, phys_t arena_base, uint64_t arena_byte
     return KERR_OK;
 }
 
+phys_t mem_base_address(void) {
+    return frames.base;
+}
+
 const struct pmm *mem_frames(void) {
     return &frames;
 }
@@ -197,8 +222,13 @@ int mem_alloc_pages(uint32_t npages, uint32_t align_pages, phys_t *phys) {
 }
 
 int mem_free_pages(phys_t phys, uint32_t npages) {
-    bool mine = enter_the_allocator();
-    int rc = pmm_free(&frames, phys, npages);
+    bool mine;
+    int rc;
+    if (never_reuse) {
+        return KERR_OK;
+    }
+    mine = enter_the_allocator();
+    rc = pmm_free(&frames, phys, npages);
     leave_the_allocator(mine);
     return rc;
 }

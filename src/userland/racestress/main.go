@@ -26,7 +26,29 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"syscall"
+	"unsafe"
 )
+
+// Asks the kernel to audit its own page tables, at the moment this program
+// has noticed something wrong.
+//
+// The corruption is transient: by the time anything periodic looks, the
+// memory reads correctly again. This program is the only thing that knows
+// the moment, so it says so. The number is a private advice value far
+// outside the ones Linux defines, which is what makes this harmless
+// anywhere else — a real kernel answers EINVAL and the program carries on
+// to report what it saw.
+func askTheKernelToAudit() {
+	_, _, _ = syscall.Syscall(syscall.SYS_MADVISE, 0, 0, 0x4d494e)
+}
+
+// The same question about one address: what backs it, and what else reaches
+// that frame. Asked at the moment the bytes there were read wrong, which is
+// the only moment the answer is still the one that matters.
+func askTheKernelAbout(p unsafe.Pointer) {
+	_, _, _ = syscall.Syscall(syscall.SYS_MADVISE, uintptr(p), 4096, 0x4d494e)
+}
 
 // How many times round. A constant rather than an argument or an environment
 // variable: this kernel passes one environment variable to `/init`, and that
@@ -113,6 +135,17 @@ func throughInterfaces(n int) (string, bool) {
 // reproducing anything.
 func sumOfPrimesBelow(n int) (int, []bool) {
 	sieve := make([]bool, n)
+	return fillSieve(sieve), sieve
+}
+
+// Whether a worker gives its sieve a heap root before filling it. A
+// diagnostic: see the comment at the call site.
+var publishFirst = os.Getenv("PUBLISH_FIRST") != ""
+
+// The sieve itself, over a slice somebody else owns, so that the caller
+// decides what roots the memory while it is being filled.
+func fillSieve(sieve []bool) int {
+	n := len(sieve)
 	total := 0
 	for i := 2; i < n; i++ {
 		if sieve[i] {
@@ -123,13 +156,26 @@ func sumOfPrimesBelow(n int) (int, []bool) {
 			sieve[j] = true
 		}
 	}
-	return total, sieve
+	return total
 }
 
 // The same work on every hart at once, which is what makes the overlap real
 // rather than a matter of scheduling luck.
 func inParallel(workers, n int) ([]int, [][]bool) {
 	got := make([]int, workers)
+	/* **Where each worker's sieve actually was**, recorded by the worker
+	 * itself the moment `make` returned it.
+	 *
+	 * Two different faults look identical from the outside. The slice's
+	 * *bytes* may have been changed under it, or the slice **header** may
+	 * have been changed to point at some other span — one the collector
+	 * then freed quite correctly, because nothing pointed at it any more.
+	 * Reading either gives the freed-span pattern, so the pattern cannot
+	 * tell them apart; comparing the address against the one the worker
+	 * was given can. A header that still points where `make` put it means
+	 * the data moved under a sound pointer. */
+	bases := make([]uintptr, workers)
+	owned := make([]bool, workers)
 	/* **Each worker's own sieve, kept.** The first version of this threw
 	 * them away and, on a wrong sum, computed a *fresh* sieve to compare
 	 * against the reference — which answers a question nobody asked. The
@@ -140,10 +186,62 @@ func inParallel(workers, n int) ([]int, [][]bool) {
 		wg.Add(1)
 		go func(w int) {
 			defer wg.Done()
-			got[w], sieves[w] = sumOfPrimesBelow(n)
+			/* **The sieve is published before it is filled.**
+			 *
+			 * Which root holds it is the whole question. While
+			 * `sumOfPrimesBelow` ran, the only reference to its slice was a
+			 * local in this running goroutine — a register or a stack slot
+			 * — so a collector that scans a running goroutine's stack
+			 * imprecisely would free the slice *while the loop was still
+			 * writing it*, which is exactly what "the sum was already wrong
+			 * when it was computed" looks like. Storing it into the shared
+			 * slice first gives it a root on the heap, reachable from
+			 * `main`, for the whole computation. If that is enough to make
+			 * the corruption stop, the root that was being missed was this
+			 * goroutine's own stack. */
+			sieve := make([]bool, n)
+			if publishFirst {
+				sieves[w] = sieve
+			}
+			sum := fillSieve(sieve)
+			bases[w] = uintptr(unsafe.Pointer(&sieve[0]))
+			/* Checked here, by the goroutine that just built it, before it
+			 * is handed anywhere: "already wrong when it was computed" and
+			 * "wrong by the time anyone looked" are different bugs. */
+			owned[w] = sum == wantedSum
+			got[w], sieves[w] = sum, sieve
 		}(w)
 	}
 	wg.Wait()
+	/* **Did two workers get the same memory?**
+	 *
+	 * Every sign points at it: the bytes change between two passes of the
+	 * same report, and a snapshot of them looks like a sieve part way
+	 * through being built. Two owners of one range explains all of it, and
+	 * it is one comparison to prove rather than infer — the slices are
+	 * right here, and either their addresses overlap or they do not. */
+	for w := 0; w < workers; w++ {
+		at := uintptr(unsafe.Pointer(&sieves[w][0]))
+		if at != bases[w] {
+			fmt.Printf("stress: **worker %d's slice header moved**: %#x, was %#x\n",
+				w, at, bases[w])
+			os.Exit(4)
+		}
+		if !owned[w] {
+			fmt.Printf("stress: worker %d's sum was **already wrong when it computed it**\n", w)
+		}
+	}
+	for a := 0; a < workers; a++ {
+		for b := a + 1; b < workers; b++ {
+			x := uintptr(unsafe.Pointer(&sieves[a][0]))
+			y := uintptr(unsafe.Pointer(&sieves[b][0]))
+			if x < y+uintptr(n) && y < x+uintptr(n) {
+				fmt.Printf("stress: **workers %d and %d share memory**: %#x and %#x, %d bytes each\n",
+					a, b, x, y, n)
+				os.Exit(3)
+			}
+		}
+	}
 	return got, sieves
 }
 
@@ -156,23 +254,156 @@ func inParallel(workers, n int) ([]int, [][]bool) {
 // are missing one at a time, or a cache line at a time, or **a page at a
 // time**, is the difference between a lost store and a lost mapping, and it
 // is visible only by looking at the slice itself.
+// What the damage looks like, not just how much of it there is.
+//
+// A count of wrong bytes cannot tell a page of foreign data from a
+// scattered sprinkle, and those have different causes: a page-sized,
+// page-aligned run means a whole mapping went somewhere else, while
+// isolated bytes mean something wrote through a stale pointer. So this
+// reports the **runs** — how many, the longest, and where the first few
+// start and end — and the slice's own address, because a run that begins
+// on a page boundary is saying something a run that begins at 1,234 is not.
 func describeSieve(sieve, reference []bool) string {
 	n := len(sieve)
-	first, last, wrong := -1, -1, 0
+	base := uintptr(unsafe.Pointer(&sieve[0]))
+	wrong, runs, longest := 0, 0, 0
+	var where string
 	for i := 0; i < n; i++ {
-		if sieve[i] != reference[i] {
-			if first < 0 {
-				first = i
+		if sieve[i] == reference[i] {
+			continue
+		}
+		wrong++
+		if i == 0 || sieve[i-1] == reference[i-1] {
+			runs++
+			start := i
+			end := i
+			for end+1 < n && sieve[end+1] != reference[end+1] {
+				end++
 			}
-			last = i
-			wrong++
+			longest = max(longest, end-start+1)
+			if runs <= 4 {
+				where += fmt.Sprintf(" [%d..%d at +%d%%4096=%d]",
+					start, end, start, (base+uintptr(start))%4096)
+			}
 		}
 	}
 	if wrong == 0 {
 		return "the sieve it summed is **correct**, so the arithmetic lost the number"
 	}
-	return fmt.Sprintf("%d of %d marks wrong, first at %d (page %d, offset %d), last at %d",
-		wrong, n, first, first/4096, first%4096, last)
+	/* **Which way each one is wrong**, which the positions cannot say. A mark
+	 * that is missing means a store was lost; a mark that is *extra* at a
+	 * prime means something marked a position no pass ever visits, because
+	 * every pass starts at p*p. The two have nothing to do with each other,
+	 * and a count of "wrong" hides which one this is. */
+	var values string
+	shown := 0
+	for i := 0; i < n && shown < 16; i++ {
+		if sieve[i] != reference[i] {
+			values += fmt.Sprintf(" %d:%t/%t", i, sieve[i], reference[i])
+			shown++
+		}
+	}
+	/* **Whose data is this?** The positions and the direction say the bytes
+	 * are foreign; only the bytes themselves say where they came from. A
+	 * run of small equal numbers is one of the stamped slabs, 0 and 1 is
+	 * another sieve, and eight-byte values that look like addresses are the
+	 * Go runtime's own structures. Each points somewhere different. */
+	var hist [256]int
+	for i := 0; i < n; i++ {
+		hist[*(*byte)(unsafe.Add(unsafe.Pointer(&sieve[0]), i))]++
+	}
+	raw := ""
+	for v, c := range hist {
+		if c != 0 {
+			raw += fmt.Sprintf(" %#02x:%d", v, c)
+		}
+	}
+	zeros := ""
+	count := 0
+	for i := 0; i < n && count < 24; i++ {
+		if !sieve[i] {
+			zeros += fmt.Sprintf(" %d", i)
+			count++
+		}
+	}
+	raw += "\n          unmarked positions:" + zeros
+	return fmt.Sprintf("%d of %d marks wrong in %d runs, longest %d, base %#x;%s\n          got/want:%s\n          byte histogram:%s",
+		wrong, n, runs, longest, base, where, values, raw)
+}
+
+/* ── the slab test: who else owns this memory? ──────────────────────────── */
+
+// Slabs that stay alive, each stamped with a byte nobody else uses.
+//
+// **The discriminator the sieve could not be.** A wrong sieve says the bytes
+// changed; it cannot say whether the kernel changed them under their only
+// owner or whether the allocator handed the same addresses to somebody else.
+// A stamp can: every slab is filled with its own number, every slab is kept
+// reachable, and every byte is checked every round. Then a byte that is not
+// this slab's number is read for *what* it is —
+//
+//   - another slab's number: the two **overlap**. One range, two owners,
+//     and the allocator is the thing that gave it out twice.
+//   - zero: something zeroed it, which is what a fresh mapping over live
+//     memory looks like from inside.
+//   - anything else: the kernel moved bytes nobody in this program wrote.
+//
+// Those three have different causes and the sieve's symptom is identical for
+// all of them, which is why this program now carries both.
+// The right answer, computed once before anything runs in parallel, so a
+// worker can check its own arithmetic the instant it finishes.
+var wantedSum int
+
+const (
+	slabCount = 24
+	slabBytes = 60000
+)
+
+type slabReport struct {
+	slab, offset int
+	got, want    byte
+	otherSlab    int // -1 unless `got` is another slab's stamp
+}
+
+func stampSlabs() [][]byte {
+	slabs := make([][]byte, slabCount)
+	for i := range slabs {
+		slabs[i] = make([]byte, slabBytes)
+		for j := range slabs[i] {
+			slabs[i][j] = byte(i + 1)
+		}
+	}
+	return slabs
+}
+
+// Reports the first byte in any slab that is not that slab's stamp.
+func checkSlabs(slabs [][]byte) (slabReport, bool) {
+	for i, slab := range slabs {
+		want := byte(i + 1)
+		for j, got := range slab {
+			if got == want {
+				continue
+			}
+			other := -1
+			if got >= 1 && got <= slabCount {
+				other = int(got) - 1
+			}
+			return slabReport{slab: i, offset: j, got: got, want: want, otherSlab: other}, true
+		}
+	}
+	return slabReport{}, false
+}
+
+func (r slabReport) String() string {
+	what := "a value no slab stamps"
+	switch {
+	case r.got == 0:
+		what = "**zero** — something mapped fresh memory over live data"
+	case r.otherSlab >= 0:
+		what = fmt.Sprintf("**slab %d's stamp — the two share this address**", r.otherSlab)
+	}
+	return fmt.Sprintf("slab %d byte %d (page %d, offset %d) holds %d, wanted %d: %s",
+		r.slab, r.offset, r.offset/4096, r.offset%4096, r.got, r.want, what)
 }
 
 // The counter case: a mutex and an atomic under contention from every
@@ -199,6 +430,16 @@ func contended(workers, each int) (int64, int64) {
 }
 
 func main() {
+	/* **The thread count is the program's, not the machine's.**
+	 *
+	 * `GOGC=off` stops the corruption, which looked like proof that the
+	 * collector is involved — but turning the collector off also stops the
+	 * runtime creating threads for it, and the rate plainly tracks the
+	 * thread count (one hart reproduces 2 in 6 on its own and 6 in 6 with
+	 * eight `P`s). Those are different causes with the same lever, and the
+	 * kernel's one-variable `minikern.env=` cannot set both. Fixing the
+	 * count here leaves `GOGC` free to be the only thing that changes. */
+	runtime.GOMAXPROCS(8)
 	fmt.Printf("stress: %d rounds on %d cpus, GOMAXPROCS=%d\n",
 		rounds, runtime.NumCPU(), runtime.GOMAXPROCS(0))
 	const channelValues = 6
@@ -207,11 +448,23 @@ func main() {
 	const sieve = 60000
 	want := wanted(channelValues)
 	wantSum, reference := sumOfPrimesBelow(sieve)
+	wantedSum = wantSum
+	slabs := stampSlabs()
+	fmt.Printf("stress: %d slabs of %d bytes at %#x..%#x\n", slabCount, slabBytes,
+		uintptr(unsafe.Pointer(&slabs[0][0])), uintptr(unsafe.Pointer(&slabs[slabCount-1][0])))
 	for round := 1; round <= rounds; round++ {
+		if r, bad := checkSlabs(slabs); bad {
+			askTheKernelToAudit()
+			fmt.Printf("stress: FAILED round %d: %v\n", round, r)
+			os.Exit(2)
+		}
 		/* Every hart busy, allocating, before anything is checked. */
 		sums, sieves := inParallel(workers, sieve)
 		for w, sum := range sums {
 			if sum != wantSum {
+				askTheKernelAbout(unsafe.Pointer(&sieves[w][0]))
+				askTheKernelAbout(unsafe.Pointer(&sieves[w][30000]))
+				askTheKernelToAudit()
 				fmt.Printf("stress: FAILED round %d: worker %d summed %d, wanted %d (out by %d)\n",
 					round, w, sum, wantSum, sum-wantSum)
 				fmt.Printf("stress: the sieve: %s\n", describeSieve(sieves[w], reference))

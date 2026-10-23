@@ -602,6 +602,21 @@ static void report_detectors(void) {
         kprintf("uspace: **%u mappings the address-space record could not hold**\n",
                 uspace_unrecorded_regions());
     }
+    if (uspace_misplaced_mappings() != 0) {
+        kprintf("uspace: **%u mappings were placed on a range already taken**\n",
+                uspace_misplaced_mappings());
+    }
+    if (uspace_fixed_over_live() != 0) {
+        kprintf("uspace: **%u live pages were replaced by a fixed mapping**\n",
+                uspace_fixed_over_live());
+    }
+    if (klock_breaches() != 0) {
+        kprintf("klock: **the kernel lock was not exclusive %u times**\n", klock_breaches());
+    }
+    if (uspace_backed_twice() != 0) {
+        kprintf("uspace: **%u pages were backed twice** by two harts at once\n",
+                uspace_backed_twice());
+    }
     if (uspace_replaced_pages() != 0) {
         kprintf("uspace: **%u live pages replaced by an unfixed mapping**\n",
                 uspace_replaced_pages());
@@ -1058,6 +1073,7 @@ extern const char user_huge_start[], user_huge_end[];
 extern const char user_filemap_start[], user_filemap_end[];
 extern const char user_tstp_start[], user_tstp_end[];
 extern const char user_swap_start[], user_swap_end[];
+extern const char user_regs_start[], user_regs_end[];
 
 /* The three numbers that tell how a mapping's pages were paid for: on first
  * touch, up front because the caller asked, and re-pointed by a move. They
@@ -1248,10 +1264,15 @@ static void run_user_programs(void) {
     /* Keeps the kernel heap's pages out of the frame pool — a diagnostic for
      * §0's race, which leaks about 1.5 MiB. */
     mem_heap_keep_pages(cmdline_has(boot_cmdline, "minikern.heapkeep"));
+    /* No frame is ever handed out twice: a free becomes a leak. */
+    mem_never_reuse(cmdline_has(boot_cmdline, "minikern.neverreuse"));
     /* Every mapping backed at `mmap`, as it was before demand paging. */
     uspace_back_eagerly(cmdline_has(boot_cmdline, "minikern.eager"));
     /* Every thread stays on the hart it first ran on. */
     sched_pin_threads(cmdline_has(boot_cmdline, "minikern.nomigrate"));
+    /* `minikern.cooperative` stops the tick taking a hart from a running
+     * thread: threads still switch, but only where they chose to. */
+    sched_set_preemption(!cmdline_has(boot_cmdline, "minikern.cooperative"));
     /* The checks that are too expensive to leave on. */
     uspace_set_paranoid(cmdline_has(boot_cmdline, "minikern.paranoid"));
     start_swap_if_asked();
@@ -1389,6 +1410,13 @@ static void run_user_programs(void) {
     if (cmdline_has(boot_cmdline, "minikern.swapout")) {
         run_one_user_program("swap", user_swap_start, user_swap_end);
         report_swap();
+    }
+    /* Roadmap §0: every register a preempted thread is entitled to keep.
+     * **0** is a pass; any other value is the register that came back
+     * wrong. Several copies at once, because one thread alone is never
+     * preempted in favour of anything interesting. */
+    if (cmdline_has(boot_cmdline, "minikern.regs")) {
+        run_one_user_program("regs", user_regs_start, user_regs_end);
     }
     if (cmdline_has(boot_cmdline, "minikern.init")) {
         run_init_from_disk("/init");
