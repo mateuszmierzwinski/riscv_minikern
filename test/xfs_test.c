@@ -652,15 +652,112 @@ static void test_an_inode_that_cannot_be_trusted(void) {
     KTEST_CHECK(xfs_inode_read(&fs, ROOT_INO, &ip) == KERR_IO);
 }
 
+/* A file whose extent map is a b-tree, built by hand.
+ *
+ * `BTREE_FSB` holds one leaf block with a single record pointing at the
+ * file's data block, and the inode's fork holds the root that points at it.
+ * The arrays are the part worth getting right: the root's pointers begin
+ * after **as many keys as the fork could hold**, not after the one key in
+ * use, and a reader that assumes otherwise follows a key as if it were a
+ * block number. */
+#define BTREE_FSB 12u
+
+static void build_a_btree_fork(uint64_t ino, uint64_t data_fsb) {
+    uint8_t *leaf = block(BTREE_FSB);
+    uint8_t *di = inode_at(ino);
+    uint8_t *fork = di + XFS_DI_V3_SIZE;
+    uint32_t maxrecs = (ISIZE - XFS_DI_V3_SIZE - XFS_BMDR_HDR_BYTES) / 16u;
+    struct xfs_extent e = {.startoff = 0, .startblock = data_fsb, .blockcount = 1};
+    memset(leaf, 0, BS);
+    put32(leaf, XFS_BMBT_CRC_MAGIC);
+    put16(leaf + 4, 0);  /* level 0: a leaf */
+    put16(leaf + 6, 1);  /* one record */
+    put64(leaf + 8, ~0ull);
+    put64(leaf + 16, ~0ull);
+    put64(leaf + 24, BTREE_FSB);
+    memcpy(leaf + XFS_BMBT_UUID_OFF, block(0) + XFS_SB_UUID, 16);
+    put64(leaf + 56, ino);
+    xfs_extent_pack(leaf + XFS_BMBT_BLOCK_BYTES, &e);
+    seal(leaf, BS, XFS_BMBT_CRC_OFF);
+
+    di[XFS_DI_FORMAT] = XFS_DINODE_FMT_BTREE;
+    memset(fork, 0, ISIZE - XFS_DI_V3_SIZE);
+    put16(fork, 1);      /* level 1: a root over leaves */
+    put16(fork + 2, 1);  /* one key and one pointer */
+    put64(fork + XFS_BMDR_HDR_BYTES, 0);  /* the key: logical block 0 */
+    put64(fork + XFS_BMDR_HDR_BYTES + maxrecs * XFS_BMBT_KEY_BYTES, BTREE_FSB);
+    seal(di, ISIZE, XFS_DI_CRC);
+}
+
+/* **The format that used to be refused outright.** A 5,000-entry directory
+ * is enough to put an extent map in a b-tree, so this was not an exotic
+ * case: the root directory of such a filesystem could not be read at all. */
+static void test_a_btree_extent_fork_reads(void) {
+    struct xfs_inode ip;
+    char buf[8];
+    uint32_t got = 0;
+    mount_fresh();
+    build_a_btree_fork(FILE_INO, FILE_FSB);
+    bcache_invalidate(&cache);
+    KTEST_CHECK(xfs_inode_read(&fs, FILE_INO, &ip) == KERR_OK);
+    KTEST_CHECK(ip.format == XFS_DINODE_FMT_BTREE);
+    KTEST_CHECK(xfs_file_read(&fs, &ip, 0, buf, 5, &got) == KERR_OK);
+    KTEST_CHECK(got == 5);
+    KTEST_CHECK(memcmp(buf, "01234", 5) == 0);
+
+    /* A tree whose root claims to be a leaf is corrupt, not a one-block
+     * tree: the extents format is what a map that fits in the inode uses,
+     * so level 0 here can only mean the bytes are not a b-tree root. */
+    mount_fresh();
+    build_a_btree_fork(FILE_INO, FILE_FSB);
+    put16(inode_at(FILE_INO) + XFS_DI_V3_SIZE, 0);
+    seal(inode_at(FILE_INO), ISIZE, XFS_DI_CRC);
+    bcache_invalidate(&cache);
+    KTEST_CHECK(xfs_inode_read(&fs, FILE_INO, &ip) == KERR_OK);
+    KTEST_CHECK(xfs_file_read(&fs, &ip, 0, buf, 5, &got) == KERR_IO);
+
+    /* A leaf whose checksum does not match must not be read: it is a
+     * pointer to follow, which makes believing it worse than believing a
+     * bad record. */
+    mount_fresh();
+    build_a_btree_fork(FILE_INO, FILE_FSB);
+    block(BTREE_FSB)[XFS_BMBT_CRC_OFF] ^= 0xffu;
+    bcache_invalidate(&cache);
+    KTEST_CHECK(xfs_inode_read(&fs, FILE_INO, &ip) == KERR_OK);
+    KTEST_CHECK(xfs_file_read(&fs, &ip, 0, buf, 5, &got) == KERR_IO);
+
+    /* A pointer outside the filesystem. */
+    mount_fresh();
+    build_a_btree_fork(FILE_INO, FILE_FSB);
+    {
+        uint32_t maxrecs = (ISIZE - XFS_DI_V3_SIZE - XFS_BMDR_HDR_BYTES) / 16u;
+        uint8_t *fork = inode_at(FILE_INO) + XFS_DI_V3_SIZE;
+        put64(fork + XFS_BMDR_HDR_BYTES + maxrecs * XFS_BMBT_KEY_BYTES, BLOCKS + 99u);
+        seal(inode_at(FILE_INO), ISIZE, XFS_DI_CRC);
+    }
+    bcache_invalidate(&cache);
+    KTEST_CHECK(xfs_inode_read(&fs, FILE_INO, &ip) == KERR_OK);
+    KTEST_CHECK(xfs_file_read(&fs, &ip, 0, buf, 5, &got) == KERR_IO);
+}
+
 static void test_inode_formats_we_refuse(void) {
     struct xfs_inode ip;
     uint8_t *di;
+    /* **A fork that says b-tree and holds extent records is corrupt.** It
+     * used to be refused for being a b-tree at all; now it is refused for
+     * not holding one, which is the check that still protects a reader —
+     * the bytes are a plausible-looking tree and following them would read
+     * the file's own data as block numbers. */
     mount_fresh();
     di = inode_at(ROOT_INO);
     di[XFS_DI_FORMAT] = XFS_DINODE_FMT_BTREE;
     seal(di, ISIZE, XFS_DI_CRC);
     bcache_invalidate(&cache);
-    KTEST_CHECK(xfs_inode_read(&fs, ROOT_INO, &ip) == KERR_NOTSUP);
+    KTEST_CHECK(xfs_inode_read(&fs, ROOT_INO, &ip) == KERR_OK);
+    {
+        struct seen seen = {0};
+        KTEST_CHECK(xfs_dir_list(&fs, &ip, count_entry, &seen) == KERR_IO);
+    }
 
     /* **An inode with 64-bit extent counts reads, and reads them from the
      * right place.** The count does not widen where it was: it moves to the
@@ -987,6 +1084,7 @@ int main(void) {
     KTEST_RUN(test_directory_entries_that_claim_too_much);
     KTEST_RUN(test_a_block_tail_that_lies);
     KTEST_RUN(test_a_shortform_directory_that_claims_too_much);
+    KTEST_RUN(test_a_btree_extent_fork_reads);
     KTEST_RUN(test_fuzz_does_not_crash);
     return ktest_failures();
 }

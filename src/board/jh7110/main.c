@@ -168,26 +168,37 @@ static void bring_up_translation(const struct bootinfo *info) {
  * very memory the program is sitting in. */
 static phys_t loaded_at;
 static uint64_t loaded_bytes;
+static phys_t disk_image_at;
+static uint64_t disk_image_bytes;
 
-static void find_the_loaded_program(void) {
+/* An `<address>:<length>` pair from the command line, both hexadecimal.
+ *
+ * Shared by the two things the boot loader can leave in memory — a program
+ * and a filesystem image — because they differ only in what the kernel does
+ * with the bytes. A bare address is refused: without a length there is
+ * nothing to reserve and nothing to bound a read by, and guessing either is
+ * how a plausible-looking range turns into a fault somewhere else. */
+static bool find_a_loaded_range(const char *key, phys_t *at, uint64_t *bytes) {
     size_t len = 0;
-    const char *spec = cmdline_value(boot_cmdline, "minikern.loadat", &len);
+    const char *spec = cmdline_value(boot_cmdline, key, &len);
     size_t n = 0;
     if (spec == NULL || len == 0) {
-        return;
+        return false;
     }
     while (n < len && spec[n] != ':') {
         n++;
     }
     if (n == len) {
-        return; /* no length: a bare address says nothing about how much */
+        return false;
     }
-    loaded_at = (phys_t)cmdline_number_in(spec, n, 0);
-    loaded_bytes = cmdline_number_in(spec + n + 1u, len - n - 1u, 0);
-    if (loaded_at == 0 || loaded_bytes == 0) {
-        loaded_at = 0;
-        loaded_bytes = 0;
+    *at = (phys_t)cmdline_number_in(spec, n, 0);
+    *bytes = cmdline_number_in(spec + n + 1u, len - n - 1u, 0);
+    if (*at == 0 || *bytes == 0) {
+        *at = 0;
+        *bytes = 0;
+        return false;
     }
+    return true;
 }
 
 static void bring_up_memory(const struct bootinfo *info) {
@@ -196,11 +207,16 @@ static void bring_up_memory(const struct bootinfo *info) {
         kprintf("mem: no usable memory map\n");
         return;
     }
-    find_the_loaded_program();
-    if (loaded_bytes != 0) {
+    if (find_a_loaded_range("minikern.loadat", &loaded_at, &loaded_bytes)) {
         mem_reserve_range(loaded_at, loaded_bytes);
         kprintf("init: a program is already in memory at %016llx, %llu bytes\n",
                 (unsigned long long)loaded_at, (unsigned long long)loaded_bytes);
+    }
+    if (find_a_loaded_range("minikern.diskat", &disk_image_at, &disk_image_bytes)) {
+        mem_reserve_range(disk_image_at, disk_image_bytes);
+        disk_use_ram(disk_image_at, disk_image_bytes);
+        kprintf("disk: a filesystem image is in memory at %016llx, %llu bytes\n",
+                (unsigned long long)disk_image_at, (unsigned long long)disk_image_bytes);
     }
     kprintf("mem: %u of %u pages free (%u MiB of %u MiB)\n", mem_free_pages_count(),
             mem_total_pages(), mem_free_pages_count() / 256u, mem_total_pages() / 256u);
@@ -1230,6 +1246,36 @@ static void report_hart_usage(void) {
  * expects. This is the path a Go binary will take. */
 #define INIT_MAX_BYTES (4u * 1024u * 1024u)
 
+/* Reads a named file and says what it found: `minikern.cat=<path>`.
+ *
+ * **The instrument the filesystem work needs.** Listing a directory walks
+ * its data blocks; *finding* a file by name is a different operation, and on
+ * anything bigger than a single-block directory it goes through the hash
+ * index that leaf and node formats add. Reading the file then exercises the
+ * extent map, which is where a large or fragmented file moves into a b-tree.
+ * So one knob covers lookup and extent reading, which are the two halves of
+ * `ROADMAP.md` §3's open gaps.
+ *
+ * A checksum rather than the contents: the point is whether the right bytes
+ * came back, and a 5 MB file on a serial console is not an answer anybody
+ * reads. Addition is enough — this is detecting a reader that returns the
+ * wrong blocks, not an adversary. */
+static void cat_a_file(const char *path) {
+    uint8_t *bytes = NULL;
+    uint32_t size = 0;
+    uint64_t sum = 0;
+    int rc = xfsmount_read_file(path, INIT_MAX_BYTES, &bytes, &size);
+    if (rc != KERR_OK) {
+        kprintf("cat: %s cannot be read (rc %d)\n", path, rc);
+        return;
+    }
+    for (uint32_t i = 0; i < size; i++) {
+        sum += bytes[i];
+    }
+    kprintf("cat: %s is %u bytes, checksum %llu\n", path, size, (unsigned long long)sum);
+    kfree(bytes);
+}
+
 /* Builds and runs a process from an ELF already in memory.
  *
  * The disk path and this one differ only in where the bytes come from, so
@@ -1528,6 +1574,21 @@ static void run_user_programs(void) {
     }
     if (cmdline_has(boot_cmdline, "minikern.init")) {
         run_init_from_disk("/init");
+    }
+    /* `minikern.cat=<path>` — lookup and extent reading, in one answer. */
+    {
+        size_t len = 0;
+        const char *spec = cmdline_value(boot_cmdline, "minikern.cat", &len);
+        char path[128];
+        size_t n = 0;
+        while (spec != NULL && n + 1u < sizeof path && n < len) {
+            path[n] = spec[n];
+            n++;
+        }
+        if (spec != NULL && n > 0u) {
+            path[n] = '\0';
+            cat_a_file(path);
+        }
     }
     /* **A program the boot loader left in memory**, which is how a test
      * program reaches the board without the card being rewritten. The ELF

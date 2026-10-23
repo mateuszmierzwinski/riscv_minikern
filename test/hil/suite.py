@@ -28,6 +28,7 @@ import os
 import subprocess
 import sys
 
+import fixtures
 import image
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -38,6 +39,12 @@ SERVED = os.path.expanduser(os.environ.get("MINIKERN_SERVED", "~/vf2/minikern.bi
 # The reproducer, named as a Bazel target because the suite must run the one
 # that was just built rather than whatever is lying about.
 RACESTRESS = "//src/userland/racestress:racestress"
+
+# A filesystem with the shapes the reader has to cope with, built by
+# `fixtures.py` rather than kept: an image in a tree is one nobody can say
+# how to remake. 3,000 entries is past where a directory's extent map moves
+# into a b-tree and the directory into node format.
+FIXTURE_ENTRIES = 3000
 
 
 # A case is (name, bootargs, [lines that must appear], capture seconds).
@@ -109,6 +116,19 @@ CASES = [
      "minikern.disk=sd minikern.env=STRESS_ROUNDS=2500 minikern.keepadvice",
      ["stress: FAILED"],
      260, RACESTRESS),
+    # **§3: a b-tree extent fork and a node directory.** Both were refused
+    # outright — `inode 96 has a btree fork` — which meant the root
+    # directory of any filesystem with a few thousand files in it could not
+    # be listed. The checksum is the part that makes this a test: the
+    # payload is `0..255` repeated, so the number the board prints has to be
+    # the one `fixtures.py` computes, and a reader returning the wrong
+    # blocks is caught rather than merely a reader that fails.
+    ("§3: a b-tree extent fork and a 3,000-entry directory",
+     f"minikern.cat=/p{FIXTURE_ENTRIES - 1}",
+     [f"mounted read-only, {FIXTURE_ENTRIES + 2} entries in /",
+      f"cat: /p{FIXTURE_ENTRIES - 1} is {fixtures.PAYLOAD_BYTES} bytes, "
+      f"checksum {fixtures.PAYLOAD_CHECKSUM}"],
+     150, None, True),
 ]
 
 
@@ -130,13 +150,16 @@ def built(target):
     return os.path.join(workspace, rel)
 
 
-def run_case(name, bootargs, wanted, seconds, out_dir, program=None):
+def run_case(name, bootargs, wanted, seconds, out_dir, program=None, needs_image=False):
     log_path = os.path.join(out_dir, name.split(" ")[0].replace("/", "_").replace("§", "s")
                             + ".log")
     command = [sys.executable, os.path.join(HERE, "board.py"), bootargs,
                "-t", str(seconds), "-o", log_path, "-q", "-w", "900"]
     if program is not None:
         command += ["-p", built(program)]
+    if needs_image:
+        command += ["-i", fixtures.big_directory(os.path.join(out_dir, "fx"),
+                                                 FIXTURE_ENTRIES)]
     subprocess.run(command, check=False)
     text = open(log_path, "rb").read().decode("utf-8", "replace") if os.path.exists(log_path) else ""
     missing = [line for line in wanted if line not in text]
@@ -155,9 +178,11 @@ def main():
     for case in CASES:
         name, bootargs, wanted, seconds = case[:4]
         program = case[4] if len(case) > 4 else None
+        needs_image = len(case) > 5 and case[5]
         if args.only and args.only not in name:
             continue
-        missing, log_path = run_case(name, bootargs, wanted, seconds, args.out, program)
+        missing, log_path = run_case(name, bootargs, wanted, seconds, args.out, program,
+                                     needs_image)
         if missing:
             failures += 1
             print(f"FAIL  {name}")

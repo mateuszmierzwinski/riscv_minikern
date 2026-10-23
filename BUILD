@@ -712,6 +712,17 @@ cc_library(
     ],
 )
 
+# A block device over memory the boot loader fetched: the fixture that lets a
+# test filesystem be mounted on real hardware without rewriting the card.
+cc_library(
+    name = "drivers_ramdisk",
+    srcs = ["src/drivers/ramdisk.c"],
+    hdrs = ["src/drivers/ramdisk.h"],
+    strip_include_prefix = "src",
+    target_compatible_with = ["//platforms:riscv64"],
+    deps = [":storage"],
+)
+
 cc_library(
     name = "drivers_virtio",
     srcs = [
@@ -840,6 +851,7 @@ cc_library(
         ":console",
         ":drivers_dwmmc",
         ":drivers_pci",
+        ":drivers_ramdisk",
         ":drivers_virtio",
         ":kernel_mem",
         ":partition",

@@ -17,6 +17,31 @@ Ordering inside a section is roughly by what unblocks the most.
 
 ## 0. Known defects
 
+- [x] **A filesystem image can be mounted from DRAM.** (S) **The fixture
+      the filesystem work could not proceed without.** There was exactly one
+      filesystem to read — the operator's SD card — so every gap in the
+      reader could be described and not exercised, because producing a
+      filesystem with the awkward shape means writing a card, and that is
+      the operator's to do and was not available.
+
+      `minikern.disk=ram` over `minikern.diskat=<address>:<length>`: the
+      boot loader fetches an image into DRAM, the kernel reserves the range
+      before the frame allocator runs and presents it as 512-byte sectors,
+      so the partition scanner, the 4 KiB bridge and the block cache all see
+      what they see on a real disk. `test/hil/fixtures.py` builds the images
+      with `mkfs.xfs` and a protofile — no root, no mounting — and
+      `board.py -i` fetches one.
+
+      Two details that are the whole difference between a fixture that works
+      and one that lies. `mkfs.xfs` refuses a filesystem under 300 MB, and
+      such an image is nearly all holes, so it **gzips to about a megabyte**
+      and U-Boot's `unzip` expands it: a 320 MB transfer becomes a trivial
+      one. And the payload is `0..255` repeated rather than zeroes or random
+      — zeroes make a checksum that cannot tell a correct read from a read
+      of empty memory, random bytes make an image that will not compress,
+      and the board proved the second one by overwriting the archive with
+      its own decompression output and reporting it as a corrupt log.
+
 - [x] **The board harness lives in the tree.** (S) **Done**, and overdue:
       every piece of hardware work this project has done drove the board
       with a throwaway script that was never committed, so each session
@@ -727,14 +752,55 @@ and *extents* inode formats, a clean log, `reflink`/`rmapbt` read-only,
 sparse inodes, `nrext64`, exchange-range, parent pointers, `bigtime`,
 `meta_uuid`, `ftype`, `finobt`, `inobtcnt`.
 
-- [ ] **B-tree format forks** (`XFS_DINODE_FMT_BTREE`). (M) **The biggest
-      gap.** A file with enough extents — any large or fragmented file —
-      moves its extent map into a b-tree and is refused outright. A
-      filesystem that has been written to for a while is full of them.
-- [ ] **Leaf and node directories.** (M) A directory that outgrows a single
-      filesystem block becomes `leaf` and then `node` format. Neither is
-      read, so a directory of more than a few dozen entries cannot be
-      listed.
+- [x] **B-tree format forks** (`XFS_DINODE_FMT_BTREE`). (M) **Done, and
+      verified on the board.** A fork that outgrows the inode moves into a
+      b-tree and leaves only its root behind — and this was not the exotic
+      case the old entry implied: **3,000 files in a directory is enough**,
+      so the root directory of any filesystem with a few thousand entries
+      was refused outright (`inode 96 has a btree fork`).
+
+      `xfs_bmbt.c` descends it: the root inside the inode behind a four-byte
+      header, every other block behind a 72-byte v5 header, and in both the
+      keys and pointers are **separate arrays sized by what fits** — so the
+      pointers begin after the maximum number of keys rather than after the
+      ones in use, and a reader that assumes otherwise follows a key as a
+      block number. A keyed descent rather than a walk of every leaf,
+      because the question is always "which extent covers this block" and
+      answering it by reading the whole map would make each block of a large
+      file cost all of it.
+
+      It goes in `xfs_bmap`, which is the one place both shapes of extent
+      map meet: everything that asks where a block is — a file read, a
+      directory listing, a symlink — comes through there, so nothing else
+      had to learn about b-trees. `list_extents` was renamed
+      `list_data_blocks`, since its name had been a claim about the fork.
+
+      Every number from the disk is checked before it is used: the v5 magic
+      (the pre-v5 one is refused rather than carrying a second header size
+      for a case a v5 filesystem cannot contain), the CRC and the UUID, that
+      a child's level is below its parent's, that a count fits the block it
+      came from, that a pointer is inside the filesystem, and a hard cap on
+      depth — a tree that points at itself must be an error, not a loop. The
+      host tests cover a tree that reads, a root claiming to be a leaf, a
+      leaf whose checksum is wrong, and a pointer outside the filesystem.
+
+      **On the board**: a 3,000-entry directory lists completely and
+      `/p2999` reads back 65,536 bytes with the checksum `fixtures.py`
+      computes, which is a standing case in the board suite. A 40,000-entry
+      directory lists all 40,002 entries.
+
+- [ ] **The directory hash index.** (M) **Not what the old entry said.** It
+      claimed a directory past `leaf` format "cannot be listed", and that
+      was wrong: listing and lookup both walk the **data blocks by file
+      offset** through `xfs_bmap`, so every directory format reads correctly
+      once its extent map does — 40,002 entries on the board say so.
+
+      What leaf and node format actually add is the **hash index**, and that
+      is what is unused: `xfs_dir_lookup` is a linear scan of every entry,
+      so finding one name in a large directory costs reading all of them.
+      Correct, and O(n) where the format offers O(log n). A real gap, but a
+      performance one — which is a different entry from the one that was
+      here, and worth more than the one it replaces.
 - [ ] **Multi-block directory blocks** (`-n size=` greater than the block
       size). (S) Refused at mount.
 - [ ] **Log replay.** (M) A dirty log is refused rather than replayed, so an

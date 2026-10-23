@@ -138,4 +138,10 @@ void xfs_extent_pack(uint8_t *p, const struct xfs_extent *e);
  * hole. Walks the inode's inline extent list. */
 int xfs_bmap(const struct xfs *fs, const struct xfs_inode *ip, uint64_t off, struct xfs_extent *out);
 
+/* The same question for an inode whose fork is a b-tree: the extent
+ * covering logical block `off`, by descending from the root in the fork.
+ * KERR_NOENT for a hole, KERR_IO for a tree that does not hold together. */
+int xfs_bmbt_lookup(const struct xfs *fs, const struct xfs_inode *ip, uint64_t off,
+                    struct xfs_extent *out);
+
 #endif

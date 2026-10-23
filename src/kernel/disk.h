@@ -10,6 +10,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "core/types.h"
+
 #include "core/bcache.h"
 #include "core/blockdev.h"
 #include "core/fdt.h"
@@ -25,6 +27,11 @@
  * its M.2 slot *and* a card in its slot, and "the storage worth having" is
  * not always the one the operator means to boot from. */
 void disk_prefer(const char *kind, uint32_t len);
+
+/* Offers a filesystem image already in memory as the device, for
+ * `minikern.disk=ram`. Called from the composition root before `disk_attach`,
+ * with a range the frame allocator has been kept off. */
+void disk_use_ram(phys_t at, uint64_t bytes);
 
 int disk_attach(const struct fdt *fdt);
 

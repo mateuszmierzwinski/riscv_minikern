@@ -109,9 +109,8 @@ static int take(struct xfs *fs, const uint8_t *di, uint64_t ino, struct xfs_inod
         .format = di[XFS_DI_FORMAT],
         .fork_len = avail < XFS_FORK_MAX ? avail : XFS_FORK_MAX,
     };
-    if (out->format == XFS_DINODE_FMT_BTREE) {
-        kprintf("xfs: inode %u has a btree fork, which is not supported\n", (uint32_t)ino);
-        return KERR_NOTSUP;
+    if (out->format == XFS_DINODE_FMT_BTREE && out->fork_len <= XFS_BMDR_HDR_BYTES) {
+        return KERR_IO; /* a btree root with no room for even one pointer */
     }
     if (out->format == XFS_DINODE_FMT_LOCAL && out->size > out->fork_len) {
         return KERR_IO; /* says it holds more than fits inside it */
@@ -148,6 +147,13 @@ int xfs_inode_read(struct xfs *fs, uint64_t ino, struct xfs_inode *out) {
 }
 
 int xfs_bmap(const struct xfs *fs, const struct xfs_inode *ip, uint64_t off, struct xfs_extent *out) {
+    /* **The one place the two shapes of extent map meet.** Everything that
+     * asks where a block is — reading a file, listing a directory, following
+     * a symlink — comes through here, so a fork in a b-tree is handled once
+     * rather than at each caller. */
+    if (ip->format == XFS_DINODE_FMT_BTREE) {
+        return xfs_bmbt_lookup(fs, ip, off, out);
+    }
     if (ip->format != XFS_DINODE_FMT_EXTENTS) {
         return KERR_NOTSUP;
     }

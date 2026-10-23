@@ -116,7 +116,15 @@ static int block_owner_ok(const struct xfs *fs, const uint8_t *block, uint64_t i
 }
 
 /* Walks every data block of a directory held in extents. */
-static int list_extents(struct xfs *fs, const struct xfs_inode *dir, xfs_dirent_fn fn, void *self) {
+/* Walks a directory's data blocks by file offset.
+ *
+ * Named for what it does rather than for the fork it came from: it asks
+ * `xfs_bmap` where each block is, so it reads a directory whose extents are
+ * in the inode and one whose extents are in a b-tree without knowing the
+ * difference. It was called `list_extents` while the b-tree case was
+ * refused, which made the name a statement about the format. */
+static int list_data_blocks(struct xfs *fs, const struct xfs_inode *dir, xfs_dirent_fn fn,
+                            void *self) {
     uint64_t blocks = (dir->size + fs->blocksize - 1u) / fs->blocksize;
     int rc = KERR_OK;
     for (uint64_t i = 0; i < blocks && rc == KERR_OK; i++) {
@@ -154,8 +162,8 @@ int xfs_dir_list(struct xfs *fs, const struct xfs_inode *dir, xfs_dirent_fn fn, 
     if (dir->format == XFS_DINODE_FMT_LOCAL) {
         return list_shortform(fs, dir, fn, self);
     }
-    if (dir->format == XFS_DINODE_FMT_EXTENTS) {
-        return list_extents(fs, dir, fn, self);
+    if (dir->format == XFS_DINODE_FMT_EXTENTS || dir->format == XFS_DINODE_FMT_BTREE) {
+        return list_data_blocks(fs, dir, fn, self);
     }
     return KERR_NOTSUP;
 }

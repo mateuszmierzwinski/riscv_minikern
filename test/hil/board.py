@@ -30,6 +30,7 @@ why the log is always written even when a step fails.
 """
 import argparse
 import fcntl
+import gzip
 import os
 import shutil
 import sys
@@ -62,6 +63,38 @@ LOAD_AT = "0x82000000"
 # out, so nothing steps on the program before it is built.
 PROGRAM_AT = 0x50000000
 
+# Where the *compressed* image lands before U-Boot expands it.
+#
+# `mkfs.xfs` will not make a filesystem smaller than 300 MB, and an image
+# with little in it is almost entirely zeroes — it gzips to about a third of
+# a megabyte. Expanding it with U-Boot's `unzip` turns a 320 MB transfer
+# into a trivial one.
+#
+# **Above the expanded image, not below it**, and the board found out why: an
+# image full of random payloads does not compress, so a 188 MB archive
+# landed at `0x5800_0000` and ran straight through `0x6000_0000`, where
+# `unzip` was writing its output. The compressed data overwrote itself
+# mid-decompression and the kernel reported a corrupt log — a defect in the
+# harness wearing the filesystem's clothes. The ranges are checked against
+# each other now, as well as moved apart.
+IMAGE_GZ_AT = 0x80000000
+
+# How much smaller the archive has to be to be worth sending instead of the
+# image. A filesystem holding random data compresses to nothing, so the
+# archive is then twice the work: one transfer to send it, one decompression
+# to undo it.
+COMPRESS_IF_UNDER = 0.5
+
+# Where a filesystem image fetched alongside the kernel is put: another
+# 256 MiB up, so a program and an image can both be loaded in one boot.
+#
+# This is what makes the filesystem reader testable at all. Until now there
+# was exactly one filesystem to read — the operator's SD card — so every gap
+# in the XFS reader could be described and not exercised, because producing a
+# filesystem with the awkward shape means writing a card. `mkfs.xfs` on this
+# host makes any shape wanted; the board mounts it from DRAM.
+IMAGE_AT = 0x60000000
+
 # **There is one board, so there is one lock.** Two runs at once give
 # `device reports readiness to read but returned no data`, which reads like
 # a cable fault and is not one — it is the other run holding the port. A
@@ -86,6 +119,23 @@ def power(command):
         esp.write((command + "\r\n").encode())
         esp.flush()
         time.sleep(1.0)
+
+
+def send(port, line):
+    """Sends one command, terminated with a lone carriage return.
+
+    **`\r\n` is two line terminators to U-Boot, and an empty line at its
+    prompt repeats the previous command.** So every step was being run
+    twice, which went unnoticed for as long as the steps were `dhcp` and
+    `wget` — idempotent, and quick enough that the repeat finished before
+    the next command was sent. Adding `unzip`, which takes seconds to expand
+    a 320 MB image, made the repeat collide with the command after it: the
+    `setenv bootargs "..."` went into U-Boot mid-decompression and came out
+    as `setenv bootargs booti 0x82000000 ...`, with the kernel command line
+    silently gone. One character, and the whole fixture was booting with no
+    arguments."""
+    port.write(line.encode() + b"\r")
+    port.flush()
 
 
 def read_until(port, needle, timeout, log):
@@ -120,6 +170,40 @@ def take_the_board(wait_seconds):
             time.sleep(2.0)
 
 
+def offer_filesystem_image(path):
+    """Serves a filesystem image, compressed when that is worth doing.
+
+    Returns `(served name, expanded length, compressed length or None)`. The
+    expanded length is what the kernel needs — the archive's size says
+    nothing about how much memory the image occupies — and the third value
+    is what decides whether U-Boot has to expand anything at all."""
+    served_dir = os.path.dirname(image.SERVED)
+    raw = open(path, "rb").read()
+    gz_name = os.path.basename(path) + ".gz"
+    gz_target = os.path.join(served_dir, gz_name)
+    with gzip.open(gz_target, "wb", compresslevel=9) as f:
+        f.write(raw)
+    packed = os.path.getsize(gz_target)
+    if packed < len(raw) * COMPRESS_IF_UNDER:
+        os.chmod(gz_target, 0o644)
+        return gz_name, len(raw), packed
+    os.remove(gz_target)
+    name, size = serve_beside_the_image(path)
+    return name, size, None
+
+
+def ranges_overlap(spans):
+    """Refuses a layout where two things the boot loader loads collide.
+
+    Each span is `(name, address, length)`. This exists because the one that
+    collided was invisible: the transfer succeeded, the decompression
+    succeeded, and the filesystem looked corrupt."""
+    ordered = sorted(spans, key=lambda s: s[1])
+    for (an, aa, al), (bn, ba, _) in zip(ordered, ordered[1:]):
+        if aa + al > ba:
+            sys.exit(f"hil: {an} at {aa:#x} ({al} bytes) runs into {bn} at {ba:#x}")
+
+
 def serve_beside_the_image(path):
     """Copies a program next to the served kernel so U-Boot can fetch it.
 
@@ -135,7 +219,7 @@ def serve_beside_the_image(path):
     return name, os.path.getsize(target)
 
 
-def boot(bootargs, capture_seconds, out_path, wait_seconds=0.0, program=None):
+def boot(bootargs, capture_seconds, out_path, wait_seconds=0.0, program=None, fs_image=None):
     """Power-cycles, loads and boots, and captures the console."""
     log = bytearray()
     steps_ok = True
@@ -149,25 +233,33 @@ def boot(bootargs, capture_seconds, out_path, wait_seconds=0.0, program=None):
         if not read_until(port, b"Hit any key to stop autoboot", 40, log):
             print("hil: never saw the autoboot prompt", file=sys.stderr)
             steps_ok = False
-        port.write(b"\r\n")
-        port.flush()
+        send(port, "")
         if not read_until(port, PROMPT, 10, log):
             print("hil: never reached a U-Boot prompt", file=sys.stderr)
             steps_ok = False
         steps = [("dhcp", 30), (f"wget {LOAD_AT} {IMAGE_URL}", 30)]
         if program is not None:
-            name, _ = program
-            url = IMAGE_URL.rsplit("/", 1)[0] + "/" + name
-            steps.append((f"wget {PROGRAM_AT:#x} {url}", 60))
+            url = IMAGE_URL.rsplit("/", 1)[0] + "/" + program[0]
+            steps.append((f"wget {PROGRAM_AT:#x} {url}", 120))
+        if fs_image is not None:
+            url = IMAGE_URL.rsplit("/", 1)[0] + "/" + fs_image[0]
+            if fs_image[2] is None:
+                steps.append((f"wget {IMAGE_AT:#x} {url}", 180))
+            else:
+                steps.append((f"wget {IMAGE_GZ_AT:#x} {url}", 180))
+                steps.append((f"unzip {IMAGE_GZ_AT:#x} {IMAGE_AT:#x}", 180))
         steps.append((f'setenv bootargs "{bootargs}"', 5))
         for command, wait in steps:
-            port.write(command.encode() + b"\r\n")
-            port.flush()
+            send(port, command)
             if not read_until(port, PROMPT, wait, log):
                 print(f"hil: step did not finish: {command}", file=sys.stderr)
                 steps_ok = False
-        port.write(f"booti {LOAD_AT} - ".encode() + b"${fdtcontroladdr}\r\n")
-        port.flush()
+            # Nothing more is coming: a prompt can be printed while output
+            # is still arriving, and the next command must not be typed into
+            # the middle of it.
+            while port.read(4096):
+                pass
+        send(port, f"booti {LOAD_AT} - " + "${fdtcontroladdr}")
         deadline = time.time() + capture_seconds
         while time.time() < deadline:
             log.extend(port.read(4096))
@@ -186,6 +278,8 @@ def main():
                     help="how long to capture after booti (default 60)")
     ap.add_argument("-o", "--out", default="hil.log", help="where to write the log")
     ap.add_argument("-q", "--quiet", action="store_true", help="do not echo the log")
+    ap.add_argument("-i", "--image", default=None,
+                    help="a filesystem image to fetch into DRAM and mount (minikern.disk=ram)")
     ap.add_argument("-p", "--program", default=None,
                     help="a local program to fetch into DRAM and run instead of the card's")
     ap.add_argument("--no-stage", dest="stage", action="store_false",
@@ -204,7 +298,19 @@ def main():
         program = serve_beside_the_image(args.program)
         bootargs += f" minikern.loadat={PROGRAM_AT:#x}:{program[1]:#x} minikern.runloaded"
         print(f"hil: {program[0]} is {program[1]} bytes, fetched to {PROGRAM_AT:#x}")
-    ok = boot(bootargs, args.seconds, args.out, args.wait, program)
+    fs = None
+    if args.image:
+        fs = offer_filesystem_image(args.image)
+        bootargs += f" minikern.diskat={IMAGE_AT:#x}:{fs[1]:#x} minikern.disk=ram"
+        spans = [("the image", IMAGE_AT, fs[1])]
+        if program is not None:
+            spans.append(("the program", PROGRAM_AT, program[1]))
+        if fs[2] is not None:
+            spans.append(("the archive", IMAGE_GZ_AT, fs[2]))
+        ranges_overlap(spans)
+        how = "sent whole" if fs[2] is None else f"expands from {fs[2]} bytes"
+        print(f"hil: {fs[0]} is {fs[1]} bytes at {IMAGE_AT:#x}, {how}")
+    ok = boot(bootargs, args.seconds, args.out, args.wait, program, fs)
     if not args.quiet:
         text = open(args.out, "rb").read().decode("utf-8", "replace")
         start = text.find("Starting kernel")

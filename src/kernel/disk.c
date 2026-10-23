@@ -7,6 +7,7 @@
 #include "core/console.h"
 #include "core/errno.h"
 #include "drivers/nvme.h"
+#include "drivers/ramdisk.h"
 #include "drivers/pci.h"
 #include "drivers/sdhci.h"
 #include "drivers/dwmmc.h"
@@ -72,8 +73,27 @@ static bool allowed(const char *kind) {
     return true;
 }
 
+/* A filesystem image the boot loader left in memory, if the operator named
+ * one. Zero means there is none. */
+static phys_t ram_at;
+static uint64_t ram_bytes;
+
+void disk_use_ram(phys_t at, uint64_t bytes) {
+    ram_at = at;
+    ram_bytes = bytes;
+}
+
 static int attach_any(const struct fdt *fdt) {
-    bool pci = allowed("nvme") && pci_init(fdt) == KERR_OK;
+    bool pci;
+    /* **Memory first**, because asking for it is unambiguous. A filesystem
+     * image in DRAM is there because a test put it there, and a test that
+     * silently read the card instead would be worse than one that failed:
+     * it would pass against the wrong filesystem. */
+    if (allowed("ram") && ram_bytes != 0 && ramdisk_init(ram_at, ram_bytes, &raw) == KERR_OK) {
+        attached_kind = "ram";
+        return KERR_OK;
+    }
+    pci = allowed("nvme") && pci_init(fdt) == KERR_OK;
     if (pci && nvme_init(&raw) == KERR_OK) {
         attached_kind = "nvme";
         return KERR_OK;

@@ -78,7 +78,7 @@ int xfs_file_read(struct xfs *fs, const struct xfs_inode *ip, uint64_t off, void
     if (ip->format == XFS_DINODE_FMT_LOCAL) {
         return read_local(ip, off, out, len, got);
     }
-    if (ip->format != XFS_DINODE_FMT_EXTENTS) {
+    if (ip->format != XFS_DINODE_FMT_EXTENTS && ip->format != XFS_DINODE_FMT_BTREE) {
         return KERR_NOTSUP;
     }
     if (off >= ip->size) {

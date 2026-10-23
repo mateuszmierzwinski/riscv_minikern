@@ -141,7 +141,25 @@
 #define XFS_DINODE_FMT_DEV     0u
 #define XFS_DINODE_FMT_LOCAL   1u /* the fork holds the data itself */
 #define XFS_DINODE_FMT_EXTENTS 2u /* the fork holds extent records */
-#define XFS_DINODE_FMT_BTREE   3u /* the fork holds a btree root: refused */
+#define XFS_DINODE_FMT_BTREE   3u /* the fork holds a btree root (xfs_bmbt.c) */
+
+/* The extent b-tree, for a fork that has outgrown the inode.
+ *
+ * Two shapes for one tree: the root lives in the inode behind a four-byte
+ * header, and every other block on the disk behind a 72-byte v5 header. In
+ * both, a node's keys and pointers are **separate arrays sized by what fits**
+ * — so the pointers start after the maximum number of keys, not after the
+ * ones in use. `MAX_LEVELS` is a refusal threshold rather than a format
+ * limit: a real tree is a handful of levels deep, and a cap is what turns a
+ * tree that points at itself into an error instead of a loop. */
+#define XFS_BMDR_HDR_BYTES   4u          /* level and numrecs, in the fork */
+#define XFS_BMBT_BLOCK_BYTES 72u         /* a v5 long-form btree block header */
+#define XFS_BMBT_CRC_MAGIC   0x424d4133u /* "BMA3" */
+#define XFS_BMBT_KEY_BYTES   8u
+#define XFS_BMBT_PTR_BYTES   8u
+#define XFS_BMBT_MAX_LEVELS  16u
+#define XFS_BMBT_CRC_OFF     64u /* u32, little-endian */
+#define XFS_BMBT_UUID_OFF    40u /* 16 bytes */
 
 /* One extent record is sixteen bytes of packed bit fields:
  *   bit    127  unwritten
