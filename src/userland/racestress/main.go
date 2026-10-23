@@ -54,7 +54,29 @@ func askTheKernelAbout(p unsafe.Pointer) {
 // variable: this kernel passes one environment variable to `/init`, and that
 // one is needed for the experiments this program exists to make possible
 // (`GODEBUG=asyncpreemptoff=1` and the like).
-const rounds = 300
+// How many rounds, from the environment so that a board boot can be made
+// more sensitive without a rebuild.
+//
+// A boot costs about ninety seconds of power-cycling and loading whatever
+// the program then does, so the exposure per boot is what decides how long
+// a rate takes to measure. Three hundred rounds finish well inside the
+// capture window on real hardware; `STRESS_ROUNDS` is how to spend the rest
+// of it. The default stays 300 so the emulator's timings do not change.
+var rounds = roundsFromEnv()
+
+func roundsFromEnv() int {
+	n := 0
+	for _, c := range os.Getenv("STRESS_ROUNDS") {
+		if c < '0' || c > '9' {
+			return 300
+		}
+		n = n*10 + int(c-'0')
+	}
+	if n == 0 {
+		return 300
+	}
+	return n
+}
 
 // The channel case, which has failed as a `range` yielding zeroes before the
 // real values — a slice or a channel read while another goroutine was still

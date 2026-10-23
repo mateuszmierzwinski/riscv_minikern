@@ -26,6 +26,17 @@
  * in the space reserved for it. */
 int mem_init(const struct bootinfo *info, phys_t arena_base, uint64_t arena_bytes);
 
+/* Keeps a physical range out of the allocator's hands, before it has handed
+ * anything out.
+ *
+ * For memory somebody else put there and the kernel must not step on: a
+ * program the boot loader fetched into DRAM before `booti`. It has to be
+ * called between `mem_init` and the first allocation, which is why it is a
+ * separate call rather than another argument — the caller that knows about
+ * the range is the composition root, and it learns of it from the command
+ * line. */
+void mem_reserve_range(phys_t base, uint64_t bytes);
+
 /* Frames. `align_pages` of 0 or 1 means any alignment. */
 int mem_alloc_pages(uint32_t npages, uint32_t align_pages, phys_t *phys);
 

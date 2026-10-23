@@ -152,17 +152,29 @@ Ordering inside a section is roughly by what unblocks the most.
       why it has been exercised under the emulator — and the emulator is no
       longer the arbiter here.
 
-      `minikern.run=<path>` is half of what that needs: any program on the
-      card, named on the command line, instead of `/init` being the only
-      thing the filesystem could start. That made the card a fixed surface —
-      a new test program meant a new card, which only the operator can
-      produce — and a path is all that stood between the two. The other half
-      is the operator putting `racestress` on the card as `/race`, which has
-      been asked for; it is staged at `~/vf2/race` and served beside the
-      kernel image. Then `minikern.run=/race` hunts this on hardware at the
-      rate the emulator hunts it, and the alternative — embedding the binary
-      in the kernel image and adding a loader path for it — stays available
-      if the card turns out to be awkward to keep in step.
+      **It is a board one now, and it needed nobody.** The reproducer runs
+      on the VisionFive 2, fetched over the network into DRAM, with the SD
+      card untouched — which matters because writing to the card is the
+      operator's to do and was not available.
+
+      The way in was already there: U-Boot has a network, since it is how
+      the kernel image itself arrives, so it can `wget` a second file just
+      as easily. And `uspace_build_elf` takes a **buffer** — reading a file
+      is only how the filesystem path obtains one. So
+      `minikern.loadat=<address>:<length>` names what the boot loader left
+      in memory, the range is **reserved before the frame allocator hands
+      anything out** (or the kernel would step on the program it is about to
+      run), and `minikern.runloaded` builds a process straight from it.
+      `test/hil/board.py -p <file>` is the other end: it serves the file
+      beside the kernel image, has U-Boot fetch it to 256 MiB into DRAM —
+      clear of the kernel and far below where U-Boot relocates itself — and
+      appends both knobs with the real size.
+
+      `minikern.run=<path>` stays for a program that *is* on the card, and
+      `STRESS_ROUNDS` lets a board boot buy more exposure than the default
+      300 rounds, because a boot costs ninety seconds of power-cycling and
+      what happens inside the capture window is the only part that measures
+      anything.
 
       **The one piece of "caught in the act" evidence was an artefact of
       the instrument, and withdrawing it matters.** With `minikern.paranoid`

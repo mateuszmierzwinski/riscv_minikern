@@ -31,6 +31,7 @@ why the log is always written even when a step fails.
 import argparse
 import fcntl
 import os
+import shutil
 import sys
 import time
 
@@ -46,6 +47,20 @@ CONSOLE = os.environ.get("MINIKERN_CONSOLE", "/dev/ttyUSB0")
 RELAY = os.environ.get("MINIKERN_RELAY", "/dev/ttyACM0")
 IMAGE_URL = os.environ.get("MINIKERN_IMAGE_URL", "http://192.168.86.119:8780/minikern.bin")
 LOAD_AT = "0x82000000"
+
+# Where a program fetched alongside the kernel is put.
+#
+# **This is what lets a new test program reach the board without a new SD
+# card.** U-Boot already has a network — it is how the kernel image arrives —
+# so it can fetch a second file just as easily, and the kernel can build a
+# process from a buffer. Writing to the card is the operator's to do and was
+# the thing the §0 hunt was waiting on; this needs nobody.
+#
+# 256 MiB into DRAM: clear of the kernel (which loads at `0x4020_0000` and
+# whose table arena follows it) and far below where U-Boot relocates itself.
+# The kernel reserves the range before the frame allocator hands anything
+# out, so nothing steps on the program before it is built.
+PROGRAM_AT = 0x50000000
 
 # **There is one board, so there is one lock.** Two runs at once give
 # `device reports readiness to read but returned no data`, which reads like
@@ -105,7 +120,22 @@ def take_the_board(wait_seconds):
             time.sleep(2.0)
 
 
-def boot(bootargs, capture_seconds, out_path, wait_seconds=0.0):
+def serve_beside_the_image(path):
+    """Copies a program next to the served kernel so U-Boot can fetch it.
+
+    Serving the file that was just handed over, rather than trusting one to
+    already be there, is the same lesson as the image's own staleness check:
+    a board result from an unknown binary is read as evidence."""
+    served_dir = os.path.dirname(image.SERVED)
+    name = os.path.basename(path)
+    target = os.path.join(served_dir, name)
+    if os.path.abspath(target) != os.path.abspath(path):
+        shutil.copyfile(path, target)
+    os.chmod(target, 0o755)
+    return name, os.path.getsize(target)
+
+
+def boot(bootargs, capture_seconds, out_path, wait_seconds=0.0, program=None):
     """Power-cycles, loads and boots, and captures the console."""
     log = bytearray()
     steps_ok = True
@@ -124,9 +154,13 @@ def boot(bootargs, capture_seconds, out_path, wait_seconds=0.0):
         if not read_until(port, PROMPT, 10, log):
             print("hil: never reached a U-Boot prompt", file=sys.stderr)
             steps_ok = False
-        for command, wait in (("dhcp", 30),
-                              (f"wget {LOAD_AT} {IMAGE_URL}", 30),
-                              (f'setenv bootargs "{bootargs}"', 5)):
+        steps = [("dhcp", 30), (f"wget {LOAD_AT} {IMAGE_URL}", 30)]
+        if program is not None:
+            name, _ = program
+            url = IMAGE_URL.rsplit("/", 1)[0] + "/" + name
+            steps.append((f"wget {PROGRAM_AT:#x} {url}", 60))
+        steps.append((f'setenv bootargs "{bootargs}"', 5))
+        for command, wait in steps:
             port.write(command.encode() + b"\r\n")
             port.flush()
             if not read_until(port, PROMPT, wait, log):
@@ -152,6 +186,8 @@ def main():
                     help="how long to capture after booti (default 60)")
     ap.add_argument("-o", "--out", default="hil.log", help="where to write the log")
     ap.add_argument("-q", "--quiet", action="store_true", help="do not echo the log")
+    ap.add_argument("-p", "--program", default=None,
+                    help="a local program to fetch into DRAM and run instead of the card's")
     ap.add_argument("--no-stage", dest="stage", action="store_false",
                     help="boot whatever is already served, without building")
     ap.add_argument("-w", "--wait", type=float, default=0.0,
@@ -163,7 +199,12 @@ def main():
             return 2
         print(f"hil: image md5 {digest}")
     bootargs = args.bootargs if args.bare else f"{STANDARD_ARGS} {args.bootargs}"
-    ok = boot(bootargs, args.seconds, args.out, args.wait)
+    program = None
+    if args.program:
+        program = serve_beside_the_image(args.program)
+        bootargs += f" minikern.loadat={PROGRAM_AT:#x}:{program[1]:#x} minikern.runloaded"
+        print(f"hil: {program[0]} is {program[1]} bytes, fetched to {PROGRAM_AT:#x}")
+    ok = boot(bootargs, args.seconds, args.out, args.wait, program)
     if not args.quiet:
         text = open(args.out, "rb").read().decode("utf-8", "replace")
         start = text.find("Starting kernel")

@@ -152,11 +152,55 @@ static void bring_up_translation(const struct bootinfo *info) {
  * reserved and its size is only known once they are built. Every frame
  * starts out used and the free ones are released, so a reservation nobody
  * wrote loses memory rather than handing out memory in use (kernel/mem.h). */
+/* A program the boot loader fetched into DRAM, as `<address>:<length>`.
+ *
+ * **The way a new test program reaches the board without a new SD card.**
+ * U-Boot already has a network — it is how the kernel image itself arrives —
+ * so it can `wget` a second file just as easily, and the kernel can build a
+ * process from a buffer (`uspace_build_elf` takes one; reading a file is
+ * only how the filesystem path gets there). That removes the dependency this
+ * hunt was stuck behind: the fast reproducer is a Go binary, the card is the
+ * only filesystem, and writing to the card is the operator's to do.
+ *
+ * Both numbers are hexadecimal, which `cmdline_number` reads since the
+ * `minikern.isolate` fix. The range is **reserved before anything is
+ * allocated**, because the frame allocator would otherwise hand out the
+ * very memory the program is sitting in. */
+static phys_t loaded_at;
+static uint64_t loaded_bytes;
+
+static void find_the_loaded_program(void) {
+    size_t len = 0;
+    const char *spec = cmdline_value(boot_cmdline, "minikern.loadat", &len);
+    size_t n = 0;
+    if (spec == NULL || len == 0) {
+        return;
+    }
+    while (n < len && spec[n] != ':') {
+        n++;
+    }
+    if (n == len) {
+        return; /* no length: a bare address says nothing about how much */
+    }
+    loaded_at = (phys_t)cmdline_number_in(spec, n, 0);
+    loaded_bytes = cmdline_number_in(spec + n + 1u, len - n - 1u, 0);
+    if (loaded_at == 0 || loaded_bytes == 0) {
+        loaded_at = 0;
+        loaded_bytes = 0;
+    }
+}
+
 static void bring_up_memory(const struct bootinfo *info) {
     uint64_t arena = ((uint64_t)(uintptr_t)__kernel_end + PAGE_SIZE - 1u) & ~(PAGE_SIZE - 1u);
     if (mem_init(info, arena, TABLE_ARENA_BYTES) != KERR_OK) {
         kprintf("mem: no usable memory map\n");
         return;
+    }
+    find_the_loaded_program();
+    if (loaded_bytes != 0) {
+        mem_reserve_range(loaded_at, loaded_bytes);
+        kprintf("init: a program is already in memory at %016llx, %llu bytes\n",
+                (unsigned long long)loaded_at, (unsigned long long)loaded_bytes);
     }
     kprintf("mem: %u of %u pages free (%u MiB of %u MiB)\n", mem_free_pages_count(),
             mem_total_pages(), mem_free_pages_count() / 256u, mem_total_pages() / 256u);
@@ -1186,6 +1230,38 @@ static void report_hart_usage(void) {
  * expects. This is the path a Go binary will take. */
 #define INIT_MAX_BYTES (4u * 1024u * 1024u)
 
+/* Builds and runs a process from an ELF already in memory.
+ *
+ * The disk path and this one differ only in where the bytes come from, so
+ * everything after the build is the same — and the reporting is the part
+ * that matters, which is why it is repeated here rather than hidden behind
+ * a flag on one function that then has to explain itself twice. */
+static void run_program_from_memory(const uint8_t *image, uint32_t size, const char *name) {
+    struct uproc *proc = uspace_alloc();
+    int64_t status;
+    int rc;
+    if (proc == NULL) {
+        kprintf("init: no free process slot\n");
+        return;
+    }
+    rc = uspace_build_elf(proc, image, size, name);
+    if (rc != KERR_OK) {
+        kprintf("init: %s will not load (rc %d)\n", name, rc);
+        uspace_release(proc);
+        return;
+    }
+    status = uspace_run(proc);
+    if (cmdline_has(boot_cmdline, "minikern.audit")) {
+        uspace_audit_aliases(proc);
+    }
+    kprintf("init: %s exited with %lld after %llu syscalls (%llu stale-translation faults)\n",
+            name, (long long)status, (unsigned long long)uspace_syscalls(),
+            (unsigned long long)uspace_stale_faults());
+    report_mapping_counters();
+    report_hart_usage();
+    uspace_destroy(proc);
+}
+
 static void run_init_from_disk(const char *path) {
     struct uproc *proc = uspace_alloc();
     uint8_t *image = NULL;
@@ -1452,6 +1528,14 @@ static void run_user_programs(void) {
     }
     if (cmdline_has(boot_cmdline, "minikern.init")) {
         run_init_from_disk("/init");
+    }
+    /* **A program the boot loader left in memory**, which is how a test
+     * program reaches the board without the card being rewritten. The ELF
+     * is read straight out of DRAM: `uspace_build_elf` wants a buffer, and
+     * the filesystem path differs only in how it obtains one. */
+    if (loaded_bytes != 0 && cmdline_has(boot_cmdline, "minikern.runloaded")) {
+        run_program_from_memory((const uint8_t *)(uintptr_t)loaded_at,
+                                (uint32_t)loaded_bytes, "loaded");
     }
     /* **Any program on the card, named on the command line.**
      *

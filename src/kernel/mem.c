@@ -175,6 +175,13 @@ int mem_init(const struct bootinfo *info, phys_t arena_base, uint64_t arena_byte
     return KERR_OK;
 }
 
+void mem_reserve_range(phys_t base, uint64_t bytes) {
+    if (bytes == 0) {
+        return;
+    }
+    pmm_reserve(&frames, base, bytes);
+}
+
 phys_t mem_base_address(void) {
     return frames.base;
 }
