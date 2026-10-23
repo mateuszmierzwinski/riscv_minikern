@@ -32,4 +32,10 @@ bool cmdline_has(const char *cmdline, const char *key);
  * number. For the options whose interesting part is how many. */
 uint64_t cmdline_number(const char *cmdline, const char *key, uint64_t fallback);
 
+/* The same parser over a piece of text that is not a whole option — a field
+ * inside a value, like the swappiness in `minikern.swap=/swapfile:60`.
+ * `cmdline_number` is this with the key looked up first, which is why they
+ * agree about hexadecimal and about what a malformed number does. */
+uint64_t cmdline_number_in(const char *v, size_t len, uint64_t fallback);
+
 #endif

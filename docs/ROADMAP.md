@@ -527,7 +527,30 @@ Ordering inside a section is roughly by what unblocks the most.
       shrinking `brk` drops pages the record never described. Only `munmap`
       wants both. The record goes first, since it is the only step that can
       fail having changed nothing.
-- [ ] **Swap.** (L) Not planned; listed so the absence is deliberate.
+- [ ] **Swap.** (L) **Planned now and started** — the operator asked for it,
+      "Windows style": a **file** on the filesystem rather than a partition,
+      with the path and the pressure root's to choose, and **off by
+      default**.
+      A file is the better shape here, and not only because it was asked
+      for: a partition is a second thing to create and a table to agree
+      about, while a file is one `dd` on a filesystem that already exists.
+      It also needs **no filesystem write path**, which this kernel does not
+      have for the board's filesystem: a swapfile's blocks are allocated
+      once by whoever created it and are then only ever *overwritten*, which
+      changes no metadata at all. So the blocks are resolved once at enable
+      time (`xfsmount_map_file`) and read and written as blocks after that —
+      which is how Linux's `swapon` works, and for the same reason. A sparse
+      file is refused: a hole has nowhere to put a page.
+      **Done so far**: the file layer. The slot map and its bitmap, a page
+      written out and read back through the block cache, `swappiness` 0..100
+      carried from `minikern.swap=<path>[:<swappiness>]`, and the counters.
+      `minikern.swaptest=1` proves a page survives the round trip — into one
+      frame, back into a *different* one, because reading it back into the
+      frame it came from would pass even if the read did nothing.
+      **Still owed**: the page table's swap entry and the fault that reads a
+      page back, choosing a victim, the watermark that decides *when* to
+      swap, and the root-only `swapon`/`swapoff`. Verifying on the board
+      needs a swap file on the card, which only the operator can create.
 - [x] **Huge pages for user space.** (M) **Done**, for 2 MiB pages, and only
       when a program asks: `MAP_HUGETLB` was in the refused list until there
       were huge pages to give, which is the right place for a flag to wait.

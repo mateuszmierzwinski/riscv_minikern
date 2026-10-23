@@ -7,6 +7,7 @@
 #include "core/console.h"
 #include "core/errno.h"
 #include "core/xfs/xfs.h"
+#include "core/xfs/xfs_internal.h"
 #include "kernel/disk.h"
 #include "kernel/mem.h"
 
@@ -165,6 +166,55 @@ int xfsmount_stat(const char *path, uint32_t *uid, uint32_t *gid, uint32_t *mode
     }
     if (mode != NULL) {
         *mode = ip.mode;
+    }
+    return KERR_OK;
+}
+
+/* Where a file's pages actually live on the device.
+ *
+ * **What makes a swap *file* possible without a filesystem that can write.**
+ * A swapfile is only ever overwritten in place: its blocks are allocated
+ * once, by whoever created it, and swapping changes no metadata — no size,
+ * no extent map, no allocation. So the kernel resolves the file's blocks
+ * once, here, and then reads and writes them as blocks. That is how Linux
+ * does it too, and it is why this works on a filesystem this kernel mounts
+ * read-only.
+ *
+ * Every page must be backed by a **written** extent. A hole or an unwritten
+ * extent reads as zeroes and has nowhere to put a page, so a sparse file is
+ * refused rather than half used — which is also what `swapon` does on
+ * Linux, and for the same reason.
+ *
+ * Reports byte offsets into the device, because that is what the block
+ * cache takes. */
+int xfsmount_map_file(const char *path, uint64_t *offsets, uint32_t max, uint32_t *pages) {
+    struct xfs_inode ip;
+    uint32_t want;
+    int rc;
+    if (!mounted) {
+        return KERR_NODEV;
+    }
+    rc = xfs_path_lookup(&fs, path, &ip);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    if (ip.size < XFSMOUNT_PAGE_BYTES) {
+        return KERR_INVAL; /* nothing to swap into */
+    }
+    want = (uint32_t)(ip.size / XFSMOUNT_PAGE_BYTES);
+    *pages = want < max ? want : max;
+    for (uint32_t i = 0; i < *pages; i++) {
+        struct xfs_extent e;
+        uint64_t fileblock = (uint64_t)i * XFSMOUNT_PAGE_BYTES / fs.blocksize;
+        rc = xfs_bmap(&fs, &ip, fileblock, &e);
+        if (rc != KERR_OK) {
+            return rc == KERR_NOENT ? KERR_INVAL : rc; /* a hole: not usable */
+        }
+        if (e.unwritten) {
+            return KERR_INVAL; /* allocated but never written: the same */
+        }
+        offsets[i] = (uint64_t)xfs_fsb_to_block(&fs, e.startblock + (fileblock - e.startoff)) *
+                     fs.blocksize;
     }
     return KERR_OK;
 }

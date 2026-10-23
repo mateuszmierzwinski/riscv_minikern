@@ -26,6 +26,7 @@
 #define KERR_MFILE   (-24)  /* too many open files */
 #define KERR_NOTTY   (-25)  /* not a terminal */
 #define KERR_FBIG    (-27)  /* file too large */
+#define KERR_BUSY    (-16)  /* in use, so the request cannot be served */
 #define KERR_NOSPC   (-28)  /* no space left on the device */
 #define KERR_SPIPE   (-29)  /* not seekable */
 #define KERR_ROFS    (-30)  /* read-only filesystem or device */

@@ -862,6 +862,23 @@ cc_library(
     ],
 )
 
+# Swap: pages kept in a file on the filesystem, the way Windows keeps a page
+# file. It needs the filesystem only to find the file's blocks — swapping
+# overwrites them and changes no metadata — and the block cache to move the
+# pages.
+cc_library(
+    name = "kernel_swap",
+    srcs = ["src/kernel/swap.c"],
+    hdrs = ["src/kernel/swap.h"],
+    strip_include_prefix = "src",
+    target_compatible_with = ["//platforms:riscv64"],
+    deps = [
+        ":console",
+        ":kernel_disk",
+        ":kernel_xfs",
+    ],
+)
+
 # ── the kernel ─────────────────────────────────────────────────────────────
 
 # memset and friends: the kernel links no libc, and the compiler emits calls
@@ -947,6 +964,7 @@ cc_library(
         ":kernel_disk",
         ":kernel_mem",
         ":kernel_net",
+        ":kernel_swap",
         ":kernel_uspace",
         ":virtio_net",
         ":kernel_xfs",
@@ -965,6 +983,7 @@ kernel_binary(
         ":drivers_virtio",
         ":kernel_disk",
         ":kernel_mem",
+        ":kernel_swap",
         ":kernel_uspace",
         ":kernel_xfs",
         ":kmem",
@@ -988,6 +1007,7 @@ kernel_binary(
         ":drivers_virtio",
         ":kernel_disk",
         ":kernel_mem",
+        ":kernel_swap",
         ":kernel_uspace",
         ":kernel_xfs",
         ":kmem",

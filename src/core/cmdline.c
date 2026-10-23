@@ -117,6 +117,23 @@ static uint64_t parse_hex(const char *v, size_t len, uint64_t fallback) {
  *
  * It still returns the fallback on anything malformed, which is the contract
  * the callers rely on; what changed is that `0x8` is no longer malformed. */
+uint64_t cmdline_number_in(const char *v, size_t len, uint64_t fallback) {
+    uint64_t n = 0;
+    if (v == NULL || len == 0) {
+        return fallback;
+    }
+    if (len > 2u && v[0] == '0' && (v[1] == 'x' || v[1] == 'X')) {
+        return parse_hex(v + 2, len - 2u, fallback);
+    }
+    for (size_t i = 0; i < len; i++) {
+        if (v[i] < '0' || v[i] > '9') {
+            return fallback;
+        }
+        n = n * 10u + (uint64_t)(v[i] - '0');
+    }
+    return n;
+}
+
 uint64_t cmdline_number(const char *cmdline, const char *key, uint64_t fallback) {
     size_t len = 0;
     const char *v = cmdline_value(cmdline, key, &len);

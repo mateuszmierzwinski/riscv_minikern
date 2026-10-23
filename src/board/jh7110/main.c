@@ -47,6 +47,7 @@
 #include "kernel/net.h"
 #include "kernel/random.h"
 #include "kernel/sched.h"
+#include "kernel/swap.h"
 #include "kernel/tty.h"
 #include "kernel/signal.h"
 #include "kernel/syscall.h"
@@ -484,6 +485,8 @@ void _secondary_start(void);
 void smp_secondary_main(uint64_t hart, uint64_t satp);
 static void secondary_hart_loop(void);
 static void report_hart_usage(void);
+static void start_swap_if_asked(void);
+static void swap_selftest(void);
 
 void smp_secondary_main(uint64_t hart, uint64_t satp) {
     smp_set_this_hart(hart);
@@ -1249,6 +1252,7 @@ static void run_user_programs(void) {
     sched_pin_threads(cmdline_has(boot_cmdline, "minikern.nomigrate"));
     /* The checks that are too expensive to leave on. */
     uspace_set_paranoid(cmdline_has(boot_cmdline, "minikern.paranoid"));
+    start_swap_if_asked();
     /* The controlling terminal, before anything can read it. */
     {
         static const struct console_input_port port = {.read = console_input_read,
@@ -1374,9 +1378,98 @@ static void run_user_programs(void) {
         run_one_user_program("endsib", user_endsib_start, user_endsib_end);
         report_await();
     }
+    if (cmdline_has(boot_cmdline, "minikern.swaptest")) {
+        swap_selftest();
+    }
     if (cmdline_has(boot_cmdline, "minikern.init")) {
         run_init_from_disk("/init");
     }
+}
+
+/* Swap, if the operator asked for it: `minikern.swap=<path>[:<swappiness>]`.
+ *
+ * **Off unless asked**, which is the operator's decision and the right
+ * default: a kernel that starts paging without being told is one whose
+ * memory behaviour nobody chose. The path is a file that already exists and
+ * is fully allocated — `dd if=/dev/zero of=/swapfile bs=1M count=64` — and
+ * the second field is how willing the kernel is to use it, 0 to 100.
+ *
+ * It is enabled here, after the filesystem is mounted and before any program
+ * runs, because resolving the file's blocks needs the one and the other must
+ * not be able to run without swap if swap was asked for. */
+static void start_swap_if_asked(void) {
+    size_t len = 0;
+    const char *spec = cmdline_value(boot_cmdline, "minikern.swap", &len);
+    char path[64];
+    size_t n = 0;
+    uint32_t swappiness = 60u; /* Linux's default, and a sane middle */
+    int rc;
+    if (spec == NULL || len == 0) {
+        return;
+    }
+    while (n + 1u < sizeof path && n < len && spec[n] != ':') {
+        path[n] = spec[n];
+        n++;
+    }
+    path[n] = '\0';
+    if (n < len && spec[n] == ':') {
+        swappiness = (uint32_t)cmdline_number_in(spec + n + 1u, len - n - 1u, 60u);
+    }
+    rc = swap_enable(path, swappiness);
+    if (rc != KERR_OK) {
+        /* Said out loud, because a kernel that was asked for swap and
+         * quietly has none will later be blamed for the memory pressure it
+         * could not relieve. */
+        kprintf("swap: cannot use %s (rc %d) — running without swap\n", path, rc);
+    }
+}
+
+/* Does a page survive a round trip through the swap file?
+ *
+ * The one thing worth proving before anything is paged out for real: a
+ * frame written to a slot and read back into a different frame must come
+ * back byte for byte. It uses two frames rather than one on purpose —
+ * reading a page back into the frame it came from would pass even if the
+ * read did nothing at all.
+ *
+ * The pattern is derived from the offset, so a read that lands on the wrong
+ * slot or at the wrong offset within one is caught rather than looking
+ * right. */
+static void swap_selftest(void) {
+    phys_t out = 0, back = 0;
+    uint32_t slot = 0;
+    int rc;
+    if (!swap_enabled()) {
+        kprintf("swap: not enabled, so there is nothing to test\n");
+        return;
+    }
+    if (mem_alloc_pages(1, 1, &out) != KERR_OK || mem_alloc_pages(1, 1, &back) != KERR_OK) {
+        kprintf("swap: no memory for the test\n");
+        return;
+    }
+    for (uint32_t i = 0; i < 4096u; i++) {
+        ((volatile uint8_t *)(uintptr_t)out)[i] = (uint8_t)(i * 7u + 1u);
+        ((volatile uint8_t *)(uintptr_t)back)[i] = 0xff;
+    }
+    rc = swap_out(out, &slot);
+    if (rc != KERR_OK) {
+        kprintf("swap: could not write a page out (rc %d)\n", rc);
+        return;
+    }
+    rc = swap_in(slot, back);
+    if (rc != KERR_OK) {
+        kprintf("swap: could not read slot %u back (rc %d)\n", slot, rc);
+        return;
+    }
+    for (uint32_t i = 0; i < 4096u; i++) {
+        if (((volatile uint8_t *)(uintptr_t)back)[i] != (uint8_t)(i * 7u + 1u)) {
+            kprintf("swap: **slot %u came back wrong at byte %u**\n", slot, i);
+            return;
+        }
+    }
+    kprintf("swap: a page went out to slot %u and came back byte for byte\n", slot);
+    mem_free_pages(out, 1);
+    mem_free_pages(back, 1);
 }
 
 /* True when the operator asked the machine to switch itself off at the end,

@@ -46,6 +46,21 @@ int xfsmount_show_file(const char *path);
  * know who is asking, and this layer does not know about processes. */
 int xfsmount_stat(const char *path, uint32_t *uid, uint32_t *gid, uint32_t *mode);
 
+/* A page's worth, which is what the swap device moves. */
+#define XFSMOUNT_PAGE_BYTES 4096u
+
+/* Where each page of a file lives on the device, as byte offsets.
+ *
+ * It is what makes a swap **file** work on a filesystem this kernel mounts
+ * read-only: a swapfile's blocks are allocated once by whoever created it
+ * and only ever overwritten, which changes no metadata. A file with a hole
+ * or an unwritten extent is refused — there is nowhere to put a page — so a
+ * sparse file cannot be swap, which is also `swapon`'s rule on Linux.
+ *
+ * KERR_NODEV with no filesystem, KERR_INVAL for a file that is too small or
+ * not fully allocated. */
+int xfsmount_map_file(const char *path, uint64_t *offsets, uint32_t max, uint32_t *pages);
+
 int xfsmount_read_file(const char *path, uint32_t limit, uint8_t **out, uint32_t *size);
 
 /* Hashes a file **without holding it in memory**, and reports its size.
