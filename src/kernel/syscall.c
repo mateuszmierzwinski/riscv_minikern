@@ -211,15 +211,51 @@ static const struct refused_map_flag *refused_flag(uint64_t flags) {
     return NULL;
 }
 
+/* Attaches a file to a mapping request.
+ *
+ * **The mapping takes its own reference**, which is what makes `mmap` of a
+ * file independent of the descriptor: a program that maps a file and closes
+ * the descriptor keeps its mapping, and that is not a courtesy — it is the
+ * ordinary way the call is used.
+ *
+ * Two restrictions, both refusals rather than approximations. The offset
+ * must be page aligned, because a mapping starts at a page and there is no
+ * way to honour a byte offset without copying the whole thing. And the
+ * mapping may not reach past the file's last page: Linux answers a touch
+ * there with `SIGBUS`, this kernel has no `SIGBUS` to raise, and a mapping
+ * that quietly handed out zeroes instead would be inventing file contents.
+ */
+static int file_backing(struct uspace_mapping *m, int32_t fd, uint64_t offset) {
+    const uint8_t *bytes = NULL;
+    uint32_t size = 0;
+    uint64_t last;
+    int rc = fdobjects_file_bytes(fd, &bytes, &size);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    if ((offset & (PAGE_SIZE - 1u)) != 0) {
+        return KERR_INVAL;
+    }
+    last = ((uint64_t)size + PAGE_SIZE - 1u) & ~(uint64_t)(PAGE_SIZE - 1u);
+    if (offset > last || m->bytes > last - offset) {
+        return KERR_INVAL;
+    }
+    m->file = file_get(fdobjects_file_of(fd));
+    m->offset = offset;
+    m->huge = false; /* a file is read in 4 KiB pages, so it is mapped in them */
+    return m->file == NULL ? KERR_NODEV : KERR_OK;
+}
+
 static int64_t sys_mmap(struct trapframe *tf) {
     uint64_t flags = sysarg(tf, 3);
     const struct refused_map_flag *no = refused_flag(flags);
-    struct uspace_mapping m;
+    /* **Zeroed, not merely filled in.** Every field it does not set has to
+     * mean "not asked for", and the one that bites is the file: a mapping
+     * request with a stack-garbage file pointer would have the record
+     * believing an anonymous mapping was backed by something. */
+    struct uspace_mapping m = {0};
     virt_t out = 0;
     int rc;
-    if ((flags & MAP_ANONYMOUS) == 0) {
-        return KERR_NODEV; /* nothing is mappable from a file yet */
-    }
     if (no != NULL) {
         if ((complained_flags & no->bit) == 0) {
             complained_flags |= no->bit;
@@ -245,7 +281,16 @@ static int64_t sys_mmap(struct trapframe *tf) {
      * that cannot be had contiguously falls back to 4 KiB pages rather than
      * failing the mapping — `uspace_huge_pages` says how many were real. */
     m.huge = (flags & MAP_HUGETLB) != 0;
-    rc = uspace_map_anon(uspace_current(), &m, &out);
+    if ((flags & MAP_ANONYMOUS) == 0) {
+        rc = file_backing(&m, (int32_t)sysarg(tf, 4), sysarg(tf, 5));
+        if (rc != KERR_OK) {
+            return rc;
+        }
+    }
+    rc = uspace_map(uspace_current(), &m, &out);
+    if (rc != KERR_OK && m.file != NULL) {
+        file_put(m.file); /* the mapping was refused, so its reference is not owed */
+    }
     return rc == KERR_OK ? (int64_t)out : rc;
 }
 

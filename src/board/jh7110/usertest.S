@@ -32,6 +32,7 @@
 #define SYS_GETPID 172
 #define SYS_IOCTL 29
 #define SYS_READ 63
+#define SYS_CLOSE 57
 #define SYS_GETUID 174
 #define SYS_GETEUID 175
 #define SYS_SETUID 146
@@ -1670,3 +1671,165 @@ hp_done:
     ecall
 8:  j       8b
 user_huge_end:
+
+/* Roadmap §2: a mapping backed by a file.
+ *
+ * Six checks, one bit each; **63 is a pass.** It maps `/init` — the only
+ * file this kernel is sure to find, and one whose first four bytes are
+ * known: an ELF magic number, which is a better marker than anything this
+ * program could write because it is *the file's* and not its own.
+ *
+ *   1. `openat` of a regular file succeeds, which it could not before
+ *   2. `read` of it gives the ELF magic
+ *   3. the mapping gives the same four bytes
+ *   4. a page **not yet touched** gives the file's bytes after the
+ *      descriptor is closed — the word at offset 4096, read through the
+ *      descriptor beforehand and compared against the mapping afterwards.
+ *      Re-reading the *first* page would prove nothing: it was faulted in
+ *      before the close, so a kernel that had freed the file's bytes would
+ *      still answer correctly. This is the check that the mapping's own
+ *      reference to the file is real
+ *   5. an unaligned offset is refused rather than rounded
+ *   6. a mapping reaching past the file's last page is refused rather than
+ *      being handed invented zeroes
+ */
+    .globl user_filemap_start
+    .globl user_filemap_end
+user_filemap_start:
+    li      s2, 0
+    addi    sp, sp, -32
+
+    /* openat(AT_FDCWD, "/init", O_RDONLY) */
+    li      a0, -100
+    lla     a1, fm_path
+    li      a2, 0
+    li      a3, 0
+    li      a7, SYS_OPENAT
+    ecall
+    bltz    a0, fm_done
+    mv      s3, a0
+    ori     s2, s2, 1
+
+    /* read(fd, sp, 4) must give the ELF magic. */
+    mv      a0, s3
+    mv      a1, sp
+    li      a2, 4
+    li      a7, SYS_READ
+    ecall
+    li      t0, 4
+    bne     a0, t0, fm_map
+    lw      t1, 0(sp)
+    lla     t2, fm_magic
+    lw      t3, 0(t2)
+    bne     t1, t3, fm_map
+    ori     s2, s2, 2
+
+    /* mmap(NULL, 8192, PROT_READ, MAP_PRIVATE, fd, 0) */
+fm_map:
+    li      a0, 0
+    li      a1, 8192
+    li      a2, 1                /* PROT_READ */
+    li      a3, 0x02             /* MAP_PRIVATE, and no MAP_ANONYMOUS */
+    mv      a4, s3
+    li      a5, 0
+    li      a7, SYS_MMAP
+    ecall
+    bltz    a0, fm_unaligned
+    mv      s4, a0
+    lw      t1, 0(s4)
+    lla     t2, fm_magic
+    lw      t3, 0(t2)
+    bne     t1, t3, fm_closed
+    ori     s2, s2, 4
+
+    /* **The page that proves it.** Closing the descriptor and re-reading
+     * the *first* page proves nothing: that page was faulted in before the
+     * close, so its bytes were already copied and a kernel that had freed
+     * the file would still answer correctly. So the word at offset 4096 is
+     * read through the descriptor first, kept in a register, and then
+     * compared against the same offset reached **through the mapping after
+     * the close** — a page that has to be faulted in from a file the
+     * program can no longer name. If the mapping did not hold its own
+     * reference, that fault reads freed memory.
+     *
+     * Getting there needs the descriptor's offset at exactly 4096: four
+     * bytes have been read already, so 4092 more. */
+fm_closed:
+    li      t0, 4096             /* past `addi`'s reach, so through a register */
+    sub     sp, sp, t0
+    mv      a0, s3
+    mv      a1, sp
+    li      a2, 4092
+    li      a7, SYS_READ
+    ecall
+    li      t0, 4092
+    bne     a0, t0, fm_unaligned
+    mv      a0, s3
+    mv      a1, sp
+    li      a2, 4
+    li      a7, SYS_READ
+    ecall
+    li      t0, 4
+    bne     a0, t0, fm_unaligned
+    lw      s5, 0(sp)            /* the file's word at offset 4096 */
+    li      t0, 4096
+    add     sp, sp, t0
+
+    mv      a0, s3
+    li      a7, SYS_CLOSE
+    ecall
+    li      t0, 4096
+    add     t1, s4, t0
+    lw      t2, 0(t1)
+    bne     t2, s5, fm_unaligned
+    ori     s2, s2, 8
+
+    /* An unaligned offset is refused. The descriptor is closed, so this
+     * also has to be refused for that reason — it is reopened first. */
+fm_unaligned:
+    li      a0, -100
+    lla     a1, fm_path
+    li      a2, 0
+    li      a3, 0
+    li      a7, SYS_OPENAT
+    ecall
+    bltz    a0, fm_done
+    mv      s3, a0
+    li      a0, 0
+    li      a1, 4096
+    li      a2, 1
+    li      a3, 0x02
+    mv      a4, s3
+    li      a5, 100              /* not a multiple of the page size */
+    li      a7, SYS_MMAP
+    ecall
+    bgez    a0, fm_toolong
+    ori     s2, s2, 16
+
+    /* A mapping past the end of the file is refused. */
+fm_toolong:
+    li      a0, 0
+    li      a1, 64
+    slli    a1, a1, 20           /* 64 MiB, far past /init */
+    li      a2, 1
+    li      a3, 0x02
+    mv      a4, s3
+    li      a5, 0
+    li      a7, SYS_MMAP
+    ecall
+    bgez    a0, fm_done
+    ori     s2, s2, 32
+
+fm_done:
+    mv      a0, s2
+    li      a7, SYS_EXIT_GROUP
+    ecall
+fm_path:
+    .asciz  "/init"
+    .balign 4
+fm_magic:
+    .byte   0x7f
+    .ascii  "ELF"
+    .balign 4
+9:  j       9b
+user_filemap_end:

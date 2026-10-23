@@ -35,6 +35,7 @@ static int back_one_page(struct uproc *p, virt_t va, uint32_t prot);
 static int back_for_region(struct uproc *p, const struct vma *r, virt_t va);
 static int drop_pages(struct uproc *p, virt_t at, uint64_t bytes);
 static void record_stack(struct uproc *p);
+static void drop_every_file(struct uproc *p);
 static void published_addition(void);
 
 /* The generic Linux syscall numbers, which is the set RISC-V uses — and the
@@ -206,7 +207,7 @@ int uspace_build(struct uproc *p, const void *program, uint32_t bytes) {
      * here, so the 64 pages the program was running on were addresses
      * `mmap` believed were free: the first mapping an embedded program asked
      * for was placed on **the top eight pages of its own stack**, and
-     * `uspace_map_anon` drops the pages of the range before it records it,
+     * `uspace_map` drops the pages of the range before it records it,
      * so the stack under the running program was handed back to the
      * allocator. It was found by this section's `mremap` test, which is the
      * first embedded program to both use its stack and call `mmap`; before
@@ -289,6 +290,7 @@ void uspace_destroy(struct uproc *p) {
     if (!p->built) {
         return;
     }
+    drop_every_file(p);
     unshare_kernel_mappings(&p->pt);
     pgtable_destroy(&p->pt);
     p->built = false;
@@ -1006,7 +1008,9 @@ int uspace_build_elf_args(struct uproc *p, const uint8_t *image, uint32_t bytes,
     p->shares_pt = false;
     /* A fresh address space has nothing in it. A process slot is reused, so
      * the previous occupant's regions would otherwise still be recorded and
-     * placement would refuse addresses that are free. */
+     * placement would refuse addresses that are free — and a region that
+     * was reading from a file is a reference this process stops holding. */
+    drop_every_file(p);
     p->vmas.n = 0;
     rc = elf_parse(image, bytes, USER_TOP, &img);
     if (rc != KERR_OK) {
@@ -1585,6 +1589,42 @@ static int back_one_megapage(struct uproc *p, virt_t base, uint32_t prot) {
     return KERR_OK;
 }
 
+/* How many pages have been filled from a file at their first touch. */
+static uint64_t file_pages;
+
+uint64_t uspace_file_pages(void) {
+    return file_pages;
+}
+
+/* Fills a freshly backed page from the file behind its region.
+ *
+ * The page is already zero, which is exactly what the bytes past the end of
+ * the file must read as: a mapping's last page is partly file and partly
+ * nothing, and Linux's rule for that nothing is zero rather than a fault.
+ * So this copies what there is and leaves the rest alone.
+ *
+ * It reads through the kernel's own copy of the file rather than the disk,
+ * because that is what `openat` produced — see `fdobjects.c` for why, and
+ * for what it costs. */
+static void fill_from_file(struct uproc *p, const struct vma *r, virt_t page) {
+    const uint8_t *bytes = NULL;
+    uint32_t size = 0;
+    uint64_t at = r->offset + (page - r->start);
+    phys_t phys = 0;
+    uint64_t flags = 0, span = 0;
+    if (fdobjects_file_of_object(r->file, &bytes, &size) != KERR_OK ||
+        !pgtable_lookup(&p->pt, page, &phys, &flags, &span) || at >= size) {
+        return;
+    }
+    {
+        uint64_t take = size - at < PAGE_SIZE ? size - at : PAGE_SIZE;
+        for (uint64_t i = 0; i < take; i++) {
+            ((volatile uint8_t *)(uintptr_t)(phys & ~(phys_t)(PAGE_SIZE - 1u)))[i] = bytes[at + i];
+        }
+    }
+    file_pages++;
+}
+
 /* Backs whatever the region says belongs at `va`: a 2 MiB block for a
  * region that asked for huge pages and has room for a whole one, a 4 KiB
  * page otherwise.
@@ -1595,11 +1635,17 @@ static int back_one_megapage(struct uproc *p, virt_t base, uint32_t prot) {
  * and in the way of the next mapping. */
 static int back_for_region(struct uproc *p, const struct vma *r, virt_t va) {
     virt_t base = va & ~(virt_t)(MEGAPAGE_SIZE - 1u);
-    if ((r->flags & VMA_HUGE) != 0 && base >= r->start && r->end - base >= MEGAPAGE_SIZE &&
-        back_one_megapage(p, base, r->prot) == KERR_OK) {
+    virt_t page = va & ~(virt_t)(PAGE_SIZE - 1u);
+    int rc;
+    if (r->file == NULL && (r->flags & VMA_HUGE) != 0 && base >= r->start &&
+        r->end - base >= MEGAPAGE_SIZE && back_one_megapage(p, base, r->prot) == KERR_OK) {
         return KERR_OK;
     }
-    return back_one_page(p, va & ~(virt_t)(PAGE_SIZE - 1u), r->prot);
+    rc = back_one_page(p, page, r->prot);
+    if (rc == KERR_OK && r->file != NULL) {
+        fill_from_file(p, r, page);
+    }
+    return rc;
 }
 
 /* Live pages destroyed by a mapping nobody insisted on. Always a bug. */
@@ -1721,6 +1767,13 @@ static int give_address_space(struct uproc *child, struct uproc *parent) {
         virt_t end = parent->vmas.v[i].end;
         bool huge = (parent->vmas.v[i].flags & VMA_HUGE) != 0;
         uint32_t prot = parent->vmas.v[i].prot;
+        /* **The child's own reference.** Its region set is a copy of the
+         * parent's, pointers and all, so without this the two processes
+         * would share one reference and whichever let go first would take
+         * the file's bytes out from under the other. */
+        if (parent->vmas.v[i].file != NULL) {
+            (void)file_get((struct file *)parent->vmas.v[i].file);
+        }
         for (; at < end;) {
             int rc = huge ? give_megapage(child, parent, at, prot)
                           : give_page_cow(child, parent, at);
@@ -1965,10 +2018,36 @@ static void clear_the_range(struct uproc *p, bool fixed, virt_t base, uint64_t p
  * `ENOMEM` can cope; one that is given memory somebody else is using
  * cannot. The failure is silent and total — measured, a kernel that kept
  * going here stopped producing any output at all. */
+/* Lets go of the file a region was reading from.
+ *
+ * Passed to `vma_remove` everywhere, because **every** way a region
+ * disappears is a reference the kernel stops holding — and the one place
+ * that forgets is the one that frees a file's bytes while a mapping is
+ * still faulting pages out of them. The core calls it with the region
+ * rather than its range for exactly this reason. */
+static void drop_the_file(void *ctx, const struct vma *v) {
+    (void)ctx;
+    if (v->file != NULL) {
+        file_put((struct file *)v->file);
+    }
+}
+
+/* The same for every region a process still holds, which is what ending or
+ * replacing an address space has to do. */
+static void drop_every_file(struct uproc *p) {
+    for (uint32_t i = 0; i < p->vmas.n; i++) {
+        if (p->vmas.v[i].file != NULL) {
+            file_put((struct file *)p->vmas.v[i].file);
+            p->vmas.v[i].file = NULL;
+        }
+    }
+}
+
 static int record_the_mapping(struct uproc *p, virt_t base, uint64_t pages, uint32_t prot,
-                              uint32_t flags) {
-    if (vma_remove(&p->vmas, base, base + pages * PAGE_SIZE, NULL, NULL) == KERR_OK &&
-        vma_insert(&p->vmas, base, base + pages * PAGE_SIZE, prot, flags) == KERR_OK) {
+                              uint32_t flags, struct file *file, uint64_t offset) {
+    if (vma_remove(&p->vmas, base, base + pages * PAGE_SIZE, drop_the_file, NULL) == KERR_OK &&
+        vma_insert_backed(&p->vmas, base, base + pages * PAGE_SIZE, prot, flags, file, offset) ==
+            KERR_OK) {
         return KERR_OK;
     }
     unrecorded_regions++;
@@ -1976,7 +2055,7 @@ static int record_the_mapping(struct uproc *p, virt_t base, uint64_t pages, uint
     return KERR_NOMEM;
 }
 
-int uspace_map_anon(struct uproc *p, const struct uspace_mapping *m, virt_t *out) {
+int uspace_map(struct uproc *p, const struct uspace_mapping *m, virt_t *out) {
     uint64_t pages = 0;
     virt_t base;
     int rc;
@@ -1994,7 +2073,7 @@ int uspace_map_anon(struct uproc *p, const struct uspace_mapping *m, virt_t *out
         return KERR_NOMEM;
     }
     clear_the_range(p, m->fixed, base, pages);
-    rc = record_the_mapping(p, base, pages, m->prot, m->huge ? VMA_HUGE : 0u);
+    rc = record_the_mapping(p, base, pages, m->prot, m->huge ? VMA_HUGE : 0u, m->file, m->offset);
     if (rc != KERR_OK) {
         return rc;
     }
@@ -2070,16 +2149,23 @@ static int drop_pages(struct uproc *p, virt_t at, uint64_t bytes) {
  * nothing (a partial unmap splits a region, and the split needs a slot), so
  * doing it first means a refusal leaves the mapping intact rather than
  * leaving pages freed under a record that still promises them. */
-/* Whether a range would cut a huge region in half.
+/* Whether a range would cut in half a region that has to stay whole.
  *
- * A 2 MiB page is one entry: there is no such thing as unmapping a quarter
- * of it, and the honest answers are to split it into 4 KiB pages or to
- * refuse. **It refuses**, because splitting is the opposite of what the
- * caller asked for and doing it silently would make `MAP_HUGETLB` a hint
- * again. A huge mapping is unmapped and moved whole. */
-static bool cuts_a_huge_region(struct uproc *p, virt_t at, uint64_t bytes) {
+ * Two kinds, for two reasons that happen to have the same answer. A **huge**
+ * region is one table entry over 2 MiB: there is no such thing as unmapping
+ * a quarter of it, and the alternatives are to split it into 4 KiB pages —
+ * the opposite of what the caller asked for — or to refuse. A
+ * **file-backed** region holds one reference to the file it reads from, and
+ * splitting it would make two regions sharing one reference: the first to
+ * be unmapped would drop it and the other would go on faulting pages out of
+ * freed memory. Splitting one properly means taking another reference at
+ * the split, which the pure record cannot do.
+ *
+ * So both are unmapped and moved whole, and a program that asks for less is
+ * told `EINVAL` rather than given a quiet half-measure. */
+static bool must_be_whole(struct uproc *p, virt_t at, uint64_t bytes) {
     const struct vma *r = vma_find(&p->vmas, at);
-    if (r == NULL || (r->flags & VMA_HUGE) == 0) {
+    if (r == NULL || ((r->flags & VMA_HUGE) == 0 && r->file == NULL)) {
         return false;
     }
     return at != r->start || bytes != r->end - r->start;
@@ -2090,10 +2176,10 @@ int uspace_unmap(struct uproc *p, virt_t at, uint64_t bytes) {
     if ((at & (PAGE_SIZE - 1u)) != 0 || !page_count(bytes, &pages)) {
         return KERR_INVAL;
     }
-    if (cuts_a_huge_region(p, at, pages * PAGE_SIZE)) {
+    if (must_be_whole(p, at, pages * PAGE_SIZE)) {
         return KERR_INVAL;
     }
-    if (vma_remove(&p->vmas, at, at + pages * PAGE_SIZE, NULL, NULL) != KERR_OK) {
+    if (vma_remove(&p->vmas, at, at + pages * PAGE_SIZE, drop_the_file, NULL) != KERR_OK) {
         return KERR_NOMEM;
     }
     return drop_pages(p, at, bytes);
@@ -2231,7 +2317,7 @@ static int move_mapping(struct uproc *p, virt_t at, uint64_t old_bytes, uint64_t
     }
     rc = move_frames(p, at, base, old_bytes / PAGE_SIZE);
     if (rc != KERR_OK) {
-        (void)vma_remove(&p->vmas, base, base + new_bytes, NULL, NULL);
+        (void)vma_remove(&p->vmas, base, base + new_bytes, drop_the_file, NULL);
         /* **The destination was already mapped**, at an address the record
          * said was free. That is not a reason to refuse a move; it is the
          * record and the page tables disagreeing, and the move is the only
@@ -2245,7 +2331,7 @@ static int move_mapping(struct uproc *p, virt_t at, uint64_t old_bytes, uint64_t
         }
         return rc;
     }
-    (void)vma_remove(&p->vmas, at, at + old_bytes, NULL, NULL);
+    (void)vma_remove(&p->vmas, at, at + old_bytes, drop_the_file, NULL);
     published_removal(); /* the old addresses no longer translate anywhere */
     *out = base;
     return KERR_OK;
@@ -2268,10 +2354,12 @@ int uspace_remap(struct uproc *p, virt_t at, uint64_t old_bytes, uint64_t new_by
     if (region == NULL) {
         return KERR_FAULT;
     }
-    if ((region->flags & VMA_HUGE) != 0) {
-        /* Resizing would have to split or extend a 2 MiB page, and moving
-         * would have to re-point one — both are real work and neither is
-         * what this does. Refused rather than half done. */
+    if ((region->flags & VMA_HUGE) != 0 || region->file != NULL) {
+        /* Resizing a huge region would have to split or extend a 2 MiB
+         * page and moving it would have to re-point one; a file-backed
+         * region cannot be resized without deciding what the new part
+         * reads from, and `mremap` is not told. Refused rather than half
+         * done. */
         return KERR_INVAL;
     }
     prot = region->prot; /* read now: the next insert or remove invalidates it */

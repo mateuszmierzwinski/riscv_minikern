@@ -331,9 +331,46 @@ Ordering inside a section is roughly by what unblocks the most.
 - [x] **Copy-on-write.** (L) **Done** for anonymous memory, with `fork`
       above. Not done for `MAP_PRIVATE` file mappings, which need
       file-backed mappings first.
-- [ ] **File-backed mappings.** (M) `mmap` of a file is not supported, so a
-      dynamic loader cannot work and neither can anything that maps a file
-      to read it.
+- [x] **File-backed mappings.** (M) **Done** for `MAP_PRIVATE`, read-only,
+      which is what "maps a file to read it" needs. A region records the
+      file and the offset it starts at, and each page is filled from the
+      file at its first touch — the page is already zero, which is exactly
+      what the bytes past the end of the file have to read as.
+      It needed the dependency this entry named: **`openat` of a regular
+      file**, which did not exist (only `/dev/null`, `/dev/zero` and the
+      console did). A file is read whole into the kernel's heap when it is
+      opened, because `xfsmount` reads a file by name and not a block of
+      one by offset — so there is nothing to be lazy with yet, and the cost
+      is the file's size in kernel memory while the descriptor is open,
+      with a stated 16 MiB limit rather than a discovered one.
+      **That opening is also the permission rule's first caller.** §1 built
+      `access_permitted` and `uspace_may_access` and nothing asked them
+      anything, because there was no file to be denied; the mode now comes
+      from the filesystem's own inode and a file the caller may not read
+      does not open.
+      **The mapping holds its own reference to the file**, which is the
+      whole of why `mmap` does not need the descriptor to stay open — and
+      that reference is let go of wherever a region goes: `munmap`, a fixed
+      `mmap` over it, `execve`, and the end of the process. `fork` takes
+      one per region, because the child's record is a copy of the parent's
+      pointers and sharing one reference would let whichever process
+      finished first take the file's bytes out from under the other.
+      A partial `munmap` of one is **refused**, for the same reason a huge
+      mapping's is: splitting the region would make two of them share one
+      reference, and the first to go would free the file under the second.
+      So is an unaligned offset, and so is a mapping reaching past the
+      file's last page — Linux answers a touch there with `SIGBUS`, this
+      kernel has none to raise, and handing out zeroes instead would be
+      inventing file contents.
+      Verified on the board (`minikern.filemap=1 minikern.disk=sd`): **63**,
+      all six checks, mapping `/init` and comparing against its ELF magic —
+      which is a better marker than anything the test could write, because
+      it is the file's. The check that matters reads the word at offset 4096
+      **through the descriptor**, closes it, and compares against the same
+      offset **through the mapping**: a page that has to be faulted in from
+      a file the program can no longer name. Re-reading the first page would
+      have proved nothing, since it was already backed. The kernel reports
+      `2 pages from a file`, one before the close and one after.
 - [x] **`mremap`.** (S) **Done.** Shrinking unmaps the tail; growing takes
       the pages past the end when they are free and otherwise moves the
       mapping, which needs `MREMAP_MAYMOVE` — a caller that cannot cope with
@@ -469,6 +506,10 @@ Ordering inside a section is roughly by what unblocks the most.
 - [ ] **Device nodes.** (M) No `/dev/null`, `/dev/zero`, `/dev/urandom` as
       *files* — the descriptor layer has the objects, but nothing opens them
       by path.
+      **A regular file does open by path now** (§2's file-backed mappings
+      needed it): `openat` reads it off the filesystem, checks the mode
+      against the caller's identity, and gives a descriptor that `read`
+      works on. What is still missing here is the *synthetic* ones.
 - [ ] **The directory and file syscalls.** (M) Missing: `getdents64`,
       `lseek`, `fstat`/`fstatat`/`statx`, `mkdirat`, `unlinkat`, `renameat`,
       `linkat`, `symlinkat`, `readlinkat`, `truncate`/`ftruncate`, `fsync`,

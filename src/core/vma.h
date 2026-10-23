@@ -26,6 +26,14 @@ struct vma {
     virt_t end;
     uint32_t prot;
     uint32_t flags;
+    /* What a file-backed mapping reads from, and where in it this region
+     * starts. **The core carries them and never looks inside**: the pointer
+     * is the kernel's file object, the kernel owns the reference that keeps
+     * it alive, and nothing here dereferences it — which is what lets this
+     * file stay pure and host-tested while the mapping it describes reaches
+     * a disk. NULL for an anonymous mapping, which is most of them. */
+    void *file;
+    uint64_t offset;
 };
 
 struct vma_set {
@@ -51,16 +59,24 @@ struct vma_set {
  * and do not keep it. */
 const struct vma *vma_find(const struct vma_set *s, virt_t addr);
 
-/* Adds a region. KERR_INVAL when misaligned, empty or overlapping an
- * existing one; KERR_NOMEM when the set is full. */
+/* Adds a region backed by a file: `file` is whatever the kernel wants to
+ * find it by, and `offset` is where in it the region begins. */
+int vma_insert_backed(struct vma_set *s, virt_t start, virt_t end, uint32_t prot, uint32_t flags,
+                      void *file, uint64_t offset);
+
+/* Adds an anonymous region, which is the same thing with nothing behind it.
+ * KERR_INVAL when misaligned, empty or overlapping an existing one;
+ * KERR_NOMEM when the set is full. */
 int vma_insert(struct vma_set *s, virt_t start, virt_t end, uint32_t prot, uint32_t flags);
 
 /* Removes [start, end) from every region it touches, splitting partial
- * ones. Calls gone(ctx, lo, hi) for each sub-range actually removed, so the
- * caller can drop the pages. KERR_NOMEM if a split needs a slot it lacks
- * (nothing is changed then); unmapped holes are not an error. */
+ * ones. Calls gone(ctx, v) for each region actually removed, so the caller
+ * can drop the pages and whatever else the region held — the whole region
+ * is passed rather than its range, because what has to be let go of may be
+ * recorded in it. KERR_NOMEM if a split needs a slot it lacks (nothing is
+ * changed then); unmapped holes are not an error. */
 int vma_remove(struct vma_set *s, virt_t start, virt_t end,
-               void (*gone)(void *ctx, virt_t lo, virt_t hi), void *ctx);
+               void (*gone)(void *ctx, const struct vma *v), void *ctx);
 
 /* Sets prot on [start, end). KERR_NOMEM (Linux's answer) when part of the
  * range is unmapped or a split needs a slot it lacks; nothing changes then. */

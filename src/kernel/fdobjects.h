@@ -45,6 +45,23 @@ int fdobjects_open_epoll(uint32_t flags);
  * handles — it is what a probe for an optional file expects. */
 int fdobjects_open_path(const char *path, uint32_t flags);
 
+/* The bytes behind a descriptor that is a regular file, for a mapping to be
+ * backed from. KERR_BADF for a descriptor that is not open, KERR_NODEV for
+ * one that is not a file — which is what `mmap` answers for a console or a
+ * socket. */
+int fdobjects_file_bytes(int32_t fd, const uint8_t **bytes, uint32_t *size);
+
+/* The file object itself, or NULL when that descriptor is not a regular
+ * file. A mapping holds a reference to it, so that closing the descriptor
+ * does not take the bytes out from under the mapping — which is the whole
+ * of why `mmap` does not need the file to stay open. */
+struct file *fdobjects_file_of(int32_t fd);
+
+/* The bytes behind a file *object*, which is what a mapping holds — it
+ * keeps the file rather than a descriptor number, so that a program closing
+ * the descriptor does not disturb the mapping. */
+int fdobjects_file_of_object(void *object, const uint8_t **bytes, uint32_t *size);
+
 /* A pipe: two descriptors, the read end first, which is the order `pipe2`
  * writes them in. This is how a program started by another reports that it
  * could not start — the only way, in fact, because by then it has no

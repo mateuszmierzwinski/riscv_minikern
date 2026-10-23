@@ -42,8 +42,12 @@ static void close_slot(struct vma_set *s, uint32_t at) {
     s->n--;
 }
 
+/* Two regions that can be one. **A file-backed region is never merged**:
+ * its neighbour reads from a different place in a different file, and a
+ * merged region could only name one of them. */
 static bool mergeable(const struct vma *a, const struct vma *b) {
-    return a->end == b->start && a->prot == b->prot && a->flags == b->flags && a->flags == 0;
+    return a->end == b->start && a->prot == b->prot && a->flags == b->flags && a->flags == 0 &&
+           a->file == NULL && b->file == NULL;
 }
 
 /* Joins each region with an equal neighbour that touches it. */
@@ -58,7 +62,8 @@ static void merge_all(struct vma_set *s) {
     }
 }
 
-int vma_insert(struct vma_set *s, virt_t start, virt_t end, uint32_t prot, uint32_t flags) {
+int vma_insert_backed(struct vma_set *s, virt_t start, virt_t end, uint32_t prot, uint32_t flags,
+                      void *file, uint64_t offset) {
     uint32_t i = first_after(s, start);
     if (!aligned_range(start, end) || (i < s->n && s->v[i].start < end)) {
         return KERR_INVAL;
@@ -67,9 +72,14 @@ int vma_insert(struct vma_set *s, virt_t start, virt_t end, uint32_t prot, uint3
         return KERR_NOMEM;
     }
     open_slot(s, i);
-    s->v[i] = (struct vma){.start = start, .end = end, .prot = prot, .flags = flags};
+    s->v[i] = (struct vma){
+        .start = start, .end = end, .prot = prot, .flags = flags, .file = file, .offset = offset};
     merge_all(s);
     return KERR_OK;
+}
+
+int vma_insert(struct vma_set *s, virt_t start, virt_t end, uint32_t prot, uint32_t flags) {
+    return vma_insert_backed(s, start, end, prot, flags, NULL, 0);
 }
 
 /* Region boundaries cut() must create: one per range end that falls
@@ -81,12 +91,19 @@ static uint32_t splits_needed(const struct vma_set *s, virt_t start, virt_t end)
     return (a != 0 && a->start < start ? 1u : 0u) + (b != 0 && b->start < end ? 1u : 0u);
 }
 
-/* Splits the region at index i at addr (strictly inside it). */
+/* Splits the region at index i at addr (strictly inside it).
+ *
+ * The upper half's `offset` moves with its start, so a file-backed region
+ * cut in two still reads from the right place in the file. (The kernel
+ * refuses to cut one, because the *reference* it holds cannot be split
+ * here — but the arithmetic is right either way, and a value that is right
+ * only because nobody uses it is how the next defect gets in.) */
 static void split_at(struct vma_set *s, uint32_t i, virt_t addr) {
     open_slot(s, i + 1);
     s->v[i + 1] = s->v[i];
     s->v[i].end = addr;
     s->v[i + 1].start = addr;
+    s->v[i + 1].offset += addr - s->v[i].start;
 }
 
 /* Splits regions so that start and end fall on region boundaries. */
@@ -102,7 +119,7 @@ static void cut(struct vma_set *s, virt_t start, virt_t end) {
 }
 
 int vma_remove(struct vma_set *s, virt_t start, virt_t end,
-               void (*gone)(void *ctx, virt_t lo, virt_t hi), void *ctx) {
+               void (*gone)(void *ctx, const struct vma *v), void *ctx) {
     if (!aligned_range(start, end)) {
         return KERR_INVAL;
     }
@@ -112,7 +129,7 @@ int vma_remove(struct vma_set *s, virt_t start, virt_t end,
     cut(s, start, end);
     for (uint32_t i = first_after(s, start); i < s->n && s->v[i].start < end;) {
         if (gone != 0) {
-            gone(ctx, s->v[i].start, s->v[i].end);
+            gone(ctx, &s->v[i]);
         }
         close_slot(s, i);
     }

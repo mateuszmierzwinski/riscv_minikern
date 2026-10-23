@@ -4,10 +4,12 @@
 
 #include "core/console.h"
 #include "core/errno.h"
+#include "core/access.h"
 #include "kernel/mem.h"
 #include "kernel/sched.h"
 #include "kernel/tty.h"
 #include "kernel/uspace.h"
+#include "kernel/xfsmount.h"
 
 /* ── the console ────────────────────────────────────────────────────────── */
 
@@ -196,6 +198,139 @@ static int32_t zero_read(struct file *f, void *buf, uint32_t n) {
 static const struct file_ops null_ops = {.read = null_read, .write = null_write};
 static const struct file_ops zero_ops = {.read = zero_read, .write = null_write};
 
+/* ── a regular file ─────────────────────────────────────────────────────── */
+
+/* A file off the disk, read **whole** into the kernel's heap when it is
+ * opened.
+ *
+ * Not how a real kernel does it, and the reason is the filesystem
+ * underneath: `xfsmount` reads a file by name, not a block of one by
+ * offset, so there is nothing to be lazy with yet. What this buys is the
+ * two things that were missing — a descriptor a program can `read`, and a
+ * mapping that can be backed from a file — and what it costs is the file's
+ * size in kernel memory for as long as the descriptor is open. The limit is
+ * stated rather than discovered: a file larger than it will not open.
+ *
+ * It is read-only. Writing one needs the filesystem's write path, which is
+ * `ROADMAP.md` §3's business. */
+#define DISKFILE_MAX_BYTES (16u * 1024u * 1024u)
+
+struct diskfile {
+    uint8_t *bytes;
+    uint32_t size;
+    uint32_t offset; /* how much of it this descriptor has handed over */
+};
+
+static struct diskfile diskfiles[FD_MAX];
+
+static struct diskfile *diskfile_alloc(void) {
+    for (uint32_t i = 0; i < FD_MAX; i++) {
+        if (diskfiles[i].bytes == NULL) {
+            return &diskfiles[i];
+        }
+    }
+    return NULL;
+}
+
+static int32_t diskfile_read(struct file *f, void *buf, uint32_t n) {
+    struct diskfile *d = f->priv;
+    uint32_t left = d->size - d->offset;
+    uint32_t take = n < left ? n : left;
+    for (uint32_t i = 0; i < take; i++) {
+        ((uint8_t *)buf)[i] = d->bytes[d->offset + i];
+    }
+    d->offset += take;
+    return (int32_t)take;
+}
+
+static void diskfile_release_buffer(struct diskfile *d) {
+    kfree_image(d->bytes);
+    *d = (struct diskfile){0};
+}
+
+static void diskfile_release(struct file *f) {
+    diskfile_release_buffer(f->priv);
+}
+
+static const struct file_ops diskfile_ops = {.read = diskfile_read, .release = diskfile_release};
+
+/* The bytes behind a descriptor, for a mapping to be backed from — and
+ * `KERR_NODEV` for a descriptor that is not a file, which is `mmap`'s
+ * answer for a console or a socket. */
+int fdobjects_file_bytes(int32_t fd, const uint8_t **bytes, uint32_t *size) {
+    struct file *f = fd_get(fd);
+    const struct diskfile *d;
+    if (f == NULL) {
+        return KERR_BADF;
+    }
+    if (f->ops != &diskfile_ops) {
+        return KERR_NODEV;
+    }
+    d = f->priv;
+    *bytes = d->bytes;
+    *size = d->size;
+    return KERR_OK;
+}
+
+struct file *fdobjects_file_of(int32_t fd) {
+    struct file *f = fd_get(fd);
+    return f != NULL && f->ops == &diskfile_ops ? f : NULL;
+}
+
+/* The same question asked of the object rather than a descriptor, which is
+ * what a *mapping* has: it holds the file itself, precisely so that it does
+ * not depend on a descriptor number that the program may have closed. */
+int fdobjects_file_of_object(void *object, const uint8_t **bytes, uint32_t *size) {
+    const struct file *f = object;
+    const struct diskfile *d;
+    if (f == NULL || f->ops != &diskfile_ops) {
+        return KERR_NODEV;
+    }
+    d = f->priv;
+    *bytes = d->bytes;
+    *size = d->size;
+    return KERR_OK;
+}
+
+/* Opens a regular file, if the caller may read it.
+ *
+ * **The permission rule's first caller.** `access_permitted` and
+ * `uspace_may_access` were written with §1's identity model and nothing
+ * asked them anything: there was no file to be denied. Opening one by name
+ * is exactly where the owner/group/other bits mean something, and the mode
+ * comes from the filesystem's own inode rather than from a guess. */
+static int open_regular(const char *path, uint32_t flags) {
+    uint32_t uid = 0, gid = 0, mode = 0;
+    uint8_t *bytes = NULL;
+    uint32_t size = 0;
+    struct diskfile *d;
+    struct file *f;
+    int rc = xfsmount_stat(path, &uid, &gid, &mode);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    if (!uspace_may_access(uid, gid, mode, ACCESS_READ)) {
+        return KERR_ACCES;
+    }
+    if ((flags & 3u) != O_RDONLY) {
+        return KERR_ROFS; /* nothing here can write a file yet */
+    }
+    d = diskfile_alloc();
+    rc = d == NULL ? KERR_NOMEM : xfsmount_read_file(path, DISKFILE_MAX_BYTES, &bytes, &size);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    d->bytes = bytes;
+    d->size = size;
+    d->offset = 0;
+    f = file_new(&diskfile_ops, d, flags);
+    if (f == NULL) {
+        diskfile_release_buffer(d);
+        return KERR_NOMEM;
+    }
+    return fd_install(f);
+}
+
 static bool same_path(const char *a, const char *b) {
     uint32_t i = 0;
     while (a[i] != '\0' && a[i] == b[i]) {
@@ -215,7 +350,9 @@ int fdobjects_open_path(const char *path, uint32_t flags) {
         ops = &console_ops;
     }
     if (ops == NULL) {
-        return KERR_NOENT;
+        /* Not one of the kernel's own objects, so it is a name on the
+         * filesystem — or nothing at all, which the filesystem says. */
+        return open_regular(path, flags);
     }
     f = file_new(ops, NULL, flags);
     return f == NULL ? KERR_NOMEM : fd_install(f);

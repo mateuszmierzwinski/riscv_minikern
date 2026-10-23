@@ -337,14 +337,20 @@ struct uspace_mapping {
     bool noreplace; /* MAP_FIXED_NOREPLACE: this address, and over nothing */
     bool populate;  /* MAP_POPULATE: back the pages now, not on first touch */
     bool huge;      /* MAP_HUGETLB: 2 MiB pages, one table entry each */
+    /* What a file-backed mapping reads from. The mapping takes its own
+     * reference, so closing the descriptor afterwards does not take the
+     * bytes out from under it — which is what `mmap` of a file promises. */
+    struct file *file;
+    uint64_t offset;
 };
 
-/* Maps anonymous zeroed pages into the running process.
+/* Maps pages into the running process: zeroed, or filled from a file at
+ * their first touch when the request names one.
  *
  * Reports the address it chose. KERR_NOMEM when pages or address space run
  * out, KERR_INVAL for a length of zero or an unaligned fixed address, and
  * KERR_EXIST for a `noreplace` mapping whose range is not free. */
-int uspace_map_anon(struct uproc *p, const struct uspace_mapping *m, virt_t *out);
+int uspace_map(struct uproc *p, const struct uspace_mapping *m, virt_t *out);
 
 /* Unmaps a range and frees whatever was backing it. A range that was only
  * reserved unmaps successfully, having nothing to free — which is what a
@@ -467,6 +473,11 @@ uint64_t uspace_populated_pages(void);
  * zero means this kernel restored the wrong registers, and the fault that
  * follows happens later and somewhere else. */
 uint32_t uspace_impossible_frames(void);
+
+/* How many pages have been filled from a file at their first touch. A
+ * file-backed mapping is otherwise indistinguishable from an anonymous one
+ * that a program happened to write the same bytes into. */
+uint64_t uspace_file_pages(void);
 
 /* How many 2 MiB pages have been handed to user space. It is the only way
  * to tell a huge mapping from an ordinary one from outside: the program

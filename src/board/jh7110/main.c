@@ -1000,6 +1000,7 @@ extern const char user_mremap_start[], user_mremap_end[];
 extern const char user_mapflags_start[], user_mapflags_end[];
 extern const char user_endsib_start[], user_endsib_end[];
 extern const char user_huge_start[], user_huge_end[];
+extern const char user_filemap_start[], user_filemap_end[];
 
 /* The three numbers that tell how a mapping's pages were paid for: on first
  * touch, up front because the caller asked, and re-pointed by a move. They
@@ -1007,9 +1008,10 @@ extern const char user_huge_start[], user_huge_end[];
  * measurements rather than claims, so they are printed together. */
 static void report_mapping_counters(void) {
     kprintf("mem: %llu pages backed on demand, %llu populated up front, %llu moved by mremap,"
-            " %llu huge\n",
+            " %llu huge, %llu from a file\n",
             (unsigned long long)uspace_demand_pages(), (unsigned long long)uspace_populated_pages(),
-            (unsigned long long)uspace_moved_pages(), (unsigned long long)uspace_huge_pages());
+            (unsigned long long)uspace_moved_pages(), (unsigned long long)uspace_huge_pages(),
+            (unsigned long long)uspace_file_pages());
 }
 
 /* Whether the kernel had to catch a thread mid-flight on another hart, and
@@ -1278,6 +1280,15 @@ static void run_user_programs(void) {
      * entries below is the half the program cannot see. */
     if (cmdline_has(boot_cmdline, "minikern.huge")) {
         run_one_user_program("huge", user_huge_start, user_huge_end);
+        report_mapping_counters();
+    }
+    /* Roadmap §2: a mapping backed by a file. **63** is a pass, and the
+     * count of pages filled from a file is the half the program cannot see
+     * — a file mapping is otherwise indistinguishable from an anonymous one
+     * somebody wrote the same bytes into. Needs a filesystem with `/init`
+     * on it, so: `minikern.disk=sd`. */
+    if (cmdline_has(boot_cmdline, "minikern.filemap")) {
+        run_one_user_program("filemap", user_filemap_start, user_filemap_end);
         report_mapping_counters();
     }
     if (cmdline_has(boot_cmdline, "minikern.endsib")) {
