@@ -156,6 +156,62 @@ int xfs_alloc_extent(struct xfs *fs, uint32_t agno, uint32_t count, uint32_t wan
  * number of the new chunk. */
 int xfs_inode_chunk_add(struct xfs *fs, uint32_t agno, uint32_t *startino);
 
+/* ── the pieces a directory data block is made of ──────────────────────── */
+
+/* Marks a directory's own inode as changed: its times, and nothing else,
+ * because an edit inside an existing block moves neither its size nor its
+ * block count. */
+int xfs_dir_touch(struct xfs *fs, const struct xfs_inode *dir, uint64_t now_s);
+
+/* An entry's bytes in a data block: inumber, name length, name, the type
+ * byte when the filesystem has them, and the two-byte tag, rounded to
+ * eight. */
+uint32_t xfs_dir_entry_size(const struct xfs *fs, uint32_t namelen);
+
+/* Writes one entry at `at` and returns what it took. The **tag** at its end
+ * is the field a writer forgets, because nothing this kernel reads uses it
+ * and `xfs_repair` does. */
+uint32_t xfs_dir_put_entry(const struct xfs *fs, uint8_t *block, uint32_t at, uint64_t ino,
+                           const char *name, uint32_t namelen, uint8_t ftype);
+
+/* Whether the name at `here` is `name`. Shared because three formats'
+ * removals all compare one. */
+static inline bool xfs_dir_name_here(const uint8_t *here, const char *name, uint32_t namelen) {
+    for (uint32_t i = 0; i < namelen; i++) {
+        if (here[i] != (uint8_t)name[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Marks [at, at+len) free, the way a reader expects to find it. */
+void xfs_dir_put_free(uint8_t *block, uint32_t at, uint32_t len);
+
+/* A free span of at least `need` bytes below `end`, or 0.
+ *
+ * `end` is where the data area stops, which differs by format: a block
+ * directory's data stops where its hash array begins and moves as that
+ * array grows, while a data block of a leaf directory runs to the end of
+ * the block. It uses the part of a span that is still free rather than
+ * requiring all of it to lie below `end`. */
+uint32_t xfs_dir_find_room(const struct xfs *fs, const uint8_t *block, uint32_t end,
+                           uint32_t need);
+
+/* Turns a block-format directory into a leaf-format one, adding `name` as
+ * part of the same step — for the same reason the shortform conversion
+ * does. KERR_NOSPC when even leaf format would not hold it, which is where
+ * node format begins. */
+int xfs_dir_to_leaf(struct xfs *fs, const struct xfs_inode *dir, const char *name,
+                    uint32_t namelen, uint64_t ino, uint8_t ftype, uint64_t now_s);
+
+/* Adds to and removes from a leaf-format directory: the entry goes in a
+ * data block, its hash in the leaf block. */
+int xfs_dir_leaf_add(struct xfs *fs, const struct xfs_inode *dir, const char *name,
+                     uint32_t namelen, uint64_t ino, uint8_t ftype, uint64_t now_s);
+int xfs_dir_leaf_remove(struct xfs *fs, const struct xfs_inode *dir, const char *name,
+                        uint32_t namelen, uint64_t now_s, uint64_t *ino);
+
 /* Adds an entry to a directory of whatever shape, growing it when the
  * shape it has cannot hold one more. What `create`, `link` and `rename` all
  * want, so that none of them has to know about formats. */

@@ -119,12 +119,28 @@ struct xfs {
      * files to need one passes identically if the allocator happened not to
      * need one, so the number is the only thing that says the path ran. */
     uint64_t inode_chunks_added;
+    /* Directories that changed shape, by the shape they reached. Counted
+     * for the third time for the same reason: a directory that grew and one
+     * that never had to look identical from outside, so a test of the
+     * growth passes either way unless it reads these. */
+    uint64_t grew_to_block;
+    uint64_t grew_to_leaf;
     /* Where a directory block that spans several filesystem blocks is
      * gathered. Per filesystem rather than a module static, so that nothing
      * about reading a directory depends on there being one mount or one
      * thread — and unused when a directory block is a single filesystem
      * block, which is the default geometry. */
     uint8_t dirblock[XFS_DIRBLK_MAX];
+    /* The hash pairs of a block directory, while it is being converted to
+     * leaf format: they have to be held somewhere while the block they came
+     * from is rewritten as data, and `dirblock` is that block.
+     *
+     * **Bounded by what a block directory can hold**, which is one pair per
+     * entry and an entry is at least sixteen bytes — so a quarter of the
+     * block, in eight-byte pairs, is the ceiling. Here rather than on a
+     * stack because the frame guard refused it twice, which is the rule
+     * about kernel stacks doing its job. */
+    uint8_t dirpairs[XFS_DIRBLK_MAX / 3u];
 };
 
 /* One inode, parsed, with its inline fork copied out so no cached block

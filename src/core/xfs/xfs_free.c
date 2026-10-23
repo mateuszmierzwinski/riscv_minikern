@@ -307,5 +307,11 @@ int xfs_dir_remove(struct xfs *fs, const struct xfs_inode *dir, const char *name
     if (dir->format == XFS_DINODE_FMT_LOCAL) {
         return xfs_dir_sf_remove(fs, dir, name, namelen, now_s, ino);
     }
+    {
+        struct xfs_extent e;
+        if (xfs_bmap(fs, dir, fs->dir_leaf_block, &e) == KERR_OK) {
+            return xfs_dir_leaf_remove(fs, dir, name, namelen, now_s, ino);
+        }
+    }
     return xfs_dir_block_remove(fs, dir, name, namelen, now_s, ino);
 }

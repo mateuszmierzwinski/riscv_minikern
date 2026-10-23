@@ -922,11 +922,45 @@ sparse inodes, `nrext64`, exchange-range, parent pointers, `bigtime`,
       with three and a half kilobytes free. It uses the part of the span
       that is still free.
 
-- [ ] **Directory growth: block format into leaf.** (M) Past about a
-      hundred and twenty names a block directory is full and the entries
-      have to move into their own blocks with the hashes in a leaf block of
-      their own (`KERR_NOSPC`). Reading both formats already works, as does
-      growing into the first of them.
+- [x] **Directory growth: block format into leaf.** (M) **Done, and both
+      conversions measured on the board.** Past about a hundred and twenty
+      names one block is full, and the entries need blocks of their own with
+      the hashes in a block of their own. That is leaf format — what `mkfs`
+      gives any directory with a few hundred files in it, and the shape this
+      kernel could read and not produce.
+
+      The conversion is mostly a **re-labelling**: the block that was the
+      whole directory becomes data block zero, its magic changing from
+      `XDB3` to `XDD3`, and the space its hash array and tail occupied
+      becomes free. The hashes move to a new block at 32 GiB of logical
+      offset — which is why a leaf directory's *size* counts only its data,
+      and why asking the extent map whether a block exists up there is how
+      the two shapes are told apart. Inferring it from the size would not
+      work: a leaf directory with one data block has the same size as a
+      block directory.
+
+      Adding and removing afterwards put the entry in the data block and its
+      hash in the leaf, and maintain the one structure this reader never
+      consults: the leaf's **`bests`** array, one value per data block
+      giving its largest free span, with a `bestcount` tail. `xfs_repair`
+      and Linux read it and will call a filesystem corrupt if it lies.
+
+      **One data block**, for now. A second means extending the directory's
+      size, allocating at the next logical offset and growing `bests` —
+      `KERR_NOSPC` until then, rather than a block written where the format
+      does not expect one. That is about a hundred and sixty names in leaf
+      format, and the next step up is node format, which this reads.
+
+      The pairs are held in the filesystem rather than on a stack: the frame
+      guard refused a 16 KiB array, which is the second time that rule has
+      caught this work.
+
+      **On the board**: two hundred names added, found and removed, twice
+      over — with `1 grew to block, 1 to leaf` and three inode chunks, so
+      every growth path is known to have run rather than assumed. The
+      second pass adds to a directory that is *already* leaf format, since
+      one is never shrunk back, which is what exercises the add and remove
+      rather than the conversion.
 - [x] **A second inode chunk.** (S–M) **Done, and measured to have run.**
       `take_inode` allocated from the inode b-tree records that existed, so
       when every chunk in a group was full it answered `KERR_NOSPC` — a

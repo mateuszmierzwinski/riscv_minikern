@@ -1318,14 +1318,16 @@ static int read_back(const char *name, const char *want, uint32_t len) {
  */
 /* How many names to add.
  *
- * Past shortform's dozen, so the directory must become a block directory —
- * and past the sixty-odd free inodes a fresh filesystem's first chunk
- * holds, so the inode allocator must make a **second chunk**. Both were
- * gaps this number found: at twenty it stopped at the shortform boundary,
- * and at sixty it stopped at `KERR_NOSPC` from an allocator that would not
- * grow. Asking for more than the fixture was built for is how a test finds
- * the next thing rather than confirming the last one. */
-#define NAMES 60u
+ * Past shortform's dozen, so the directory must become a block directory.
+ * Past the sixty-odd free inodes a fresh filesystem's first chunk holds, so
+ * the inode allocator must make a **second chunk**. And past the hundred
+ * and twenty a single block holds, so the directory must become a **leaf**
+ * directory. Each of those was a gap this number found by being raised:
+ * twenty stopped at shortform, sixty at an allocator that would not grow,
+ * and two hundred at a directory that could not leave one block. Asking
+ * for more than the last run managed is how a test finds the next thing
+ * rather than confirming the last one. */
+#define NAMES 200u
 
 static int grow_a_directory(void) {
     char name[8] = "g00";
@@ -1402,8 +1404,13 @@ static void run_write_selftest(void) {
      * fail.** Sixty names need a second chunk of inodes only if the first
      * one runs out, and a run where it did not would print every step as
      * passing while never touching the allocator's new path. */
-    kprintf("fswrite: %llu inode chunk(s) added\n",
-            (unsigned long long)xfsmount_inode_chunks_added());
+    {
+        uint64_t to_block = 0, to_leaf = 0;
+        xfsmount_growth_counts(&to_block, &to_leaf);
+        kprintf("fswrite: %llu inode chunk(s) added, %llu grew to block, %llu to leaf\n",
+                (unsigned long long)xfsmount_inode_chunks_added(),
+                (unsigned long long)to_block, (unsigned long long)to_leaf);
+    }
     kprintf("fswrite: %s\n", ok ? "every step passed" : "a step FAILED");
 }
 

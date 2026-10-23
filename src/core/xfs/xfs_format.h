@@ -233,6 +233,17 @@
  * an error rather than a loop. */
 #define XFS_DA3_MAX_LEVELS 8u
 
+/* A leaf block's own tail: how many data blocks its `bests` array covers.
+ *
+ * The array sits at the end of the leaf, one 16-bit value per data block
+ * holding that block's largest free span, and it grows **downwards** from
+ * the tail while the hash entries grow upwards from the header. This reader
+ * does not consult it — it walks the data blocks and uses the hashes — but
+ * a writer that leaves it wrong hands `xfs_repair` and Linux a filesystem
+ * they will call corrupt, so it is maintained. */
+#define XFS_DIR2_LEAF_TAIL_SIZE 4u /* u32 bestcount, at the very end */
+#define XFS_DIR2_LEAF_BEST_SIZE 2u /* one u16 per data block */
+
 /* Directory data lives below 32 GiB of logical offset; the hash structures
  * live above it. A listing only has to read what is below. */
 #define XFS_DIR2_LEAF_SPACE_BYTES 0x800000000ull /* 32 GiB */

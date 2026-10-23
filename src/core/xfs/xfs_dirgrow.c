@@ -34,7 +34,7 @@
 /* An entry's bytes in a data block: inumber, name length, the name, the
  * type byte when the filesystem has them, and the two-byte tag, rounded up
  * to eight. */
-static uint32_t data_entry_bytes(const struct xfs *fs, uint32_t namelen) {
+uint32_t xfs_dir_entry_size(const struct xfs *fs, uint32_t namelen) {
     uint32_t n = 8u + 1u + namelen + (fs->ftype ? 1u : 0u) + 2u;
     return (n + XFS_DIR2_DATA_ALIGN - 1u) & ~(XFS_DIR2_DATA_ALIGN - 1u);
 }
@@ -45,9 +45,9 @@ static uint32_t data_entry_bytes(const struct xfs *fs, uint32_t namelen) {
  * reader walking the block backwards finds entry boundaries, and it is the
  * field a writer most easily forgets, because nothing this kernel reads
  * uses it. `xfs_repair` does. */
-static uint32_t put_entry(const struct xfs *fs, uint8_t *block, uint32_t at, uint64_t ino,
-                          const char *name, uint32_t namelen, uint8_t ftype) {
-    uint32_t size = data_entry_bytes(fs, namelen);
+uint32_t xfs_dir_put_entry(const struct xfs *fs, uint8_t *block, uint32_t at, uint64_t ino,
+                           const char *name, uint32_t namelen, uint8_t ftype) {
+    uint32_t size = xfs_dir_entry_size(fs, namelen);
     xfs_put_be64(block + at, ino);
     block[at + 8u] = (uint8_t)namelen;
     for (uint32_t i = 0; i < namelen; i++) {
@@ -61,7 +61,7 @@ static uint32_t put_entry(const struct xfs *fs, uint8_t *block, uint32_t at, uin
 }
 
 /* Marks [at, at+len) as free, the way a reader expects to find it. */
-static void put_free(uint8_t *block, uint32_t at, uint32_t len) {
+void xfs_dir_put_free(uint8_t *block, uint32_t at, uint32_t len) {
     xfs_put_be16(block + at, XFS_DIR2_DATA_FREE_TAG);
     xfs_put_be16(block + at + 2u, (uint16_t)len);
     xfs_put_be16(block + at + len - 2u, (uint16_t)at);
@@ -94,7 +94,7 @@ static void seal_block(struct xfs *fs, uint8_t *block, uint64_t ino, uint32_t us
     uint32_t leaf_at = fs->dirblocksize - XFS_DIR2_BLOCK_TAIL_SIZE -
                        count * XFS_DIR2_LEAF_ENTRY_SIZE;
     if (leaf_at > used) {
-        put_free(block, used, leaf_at - used);
+        xfs_dir_put_free(block, used, leaf_at - used);
         xfs_put_be16(block + 48u, (uint16_t)used);            /* best free: offset */
         xfs_put_be16(block + 50u, (uint16_t)(leaf_at - used)); /* and its length */
     }
@@ -132,7 +132,7 @@ static uint32_t copy_shortform(struct xfs *fs, const uint8_t *sf, uint32_t count
         uint64_t ino = xfs_be32(e + 3u + namelen + 1u);
         uint8_t ftype = e[3u + namelen];
         insert_sorted(ents, nents, xfs_dir_hashname(name, namelen), at / XFS_DIR2_DATA_ALIGN);
-        at += put_entry(fs, fs->dirblock, at, ino, name, namelen, ftype);
+        at += xfs_dir_put_entry(fs, fs->dirblock, at, ino, name, namelen, ftype);
         e += 1u + 2u + namelen + 1u + 4u;
     }
     return at;
@@ -159,7 +159,7 @@ static int take_a_block(struct xfs *fs, const struct xfs_inode *dir, uint64_t *f
  * Its size and block count do not move when an entry is added to a block
  * directory — the block was already there — so this is only the times, and
  * it is separate because every edit to the block needs it. */
-static int touch_directory(struct xfs *fs, const struct xfs_inode *dir, uint64_t now_s) {
+int xfs_dir_touch(struct xfs *fs, const struct xfs_inode *dir, uint64_t now_s) {
     uint64_t block;
     uint32_t boffset;
     struct bbuf *b;
@@ -251,12 +251,12 @@ int xfs_dir_to_block(struct xfs *fs, const struct xfs_inode *dir, const char *na
         fs->dirblock[i] = 0;
     }
     insert_sorted(ents, &nents, xfs_dir_hashname(".", 1u), at / XFS_DIR2_DATA_ALIGN);
-    at += put_entry(fs, fs->dirblock, at, dir->ino, ".", 1u, XFS_DIR3_FT_DIR);
+    at += xfs_dir_put_entry(fs, fs->dirblock, at, dir->ino, ".", 1u, XFS_DIR3_FT_DIR);
     insert_sorted(ents, &nents, xfs_dir_hashname("..", 2u), at / XFS_DIR2_DATA_ALIGN);
-    at += put_entry(fs, fs->dirblock, at, parent, "..", 2u, XFS_DIR3_FT_DIR);
+    at += xfs_dir_put_entry(fs, fs->dirblock, at, parent, "..", 2u, XFS_DIR3_FT_DIR);
     at = copy_shortform(fs, dir->fork, count, at, ents, &nents);
     insert_sorted(ents, &nents, xfs_dir_hashname(name, namelen), at / XFS_DIR2_DATA_ALIGN);
-    at += put_entry(fs, fs->dirblock, at, ino, name, namelen, ftype);
+    at += xfs_dir_put_entry(fs, fs->dirblock, at, ino, name, namelen, ftype);
     if (at + nents * XFS_DIR2_LEAF_ENTRY_SIZE + XFS_DIR2_BLOCK_TAIL_SIZE > fs->dirblocksize) {
         return KERR_NOSPC; /* it would have to become a leaf directory */
     }
@@ -324,16 +324,16 @@ static uint32_t leaf_start(const struct xfs *fs, uint32_t *count) {
  * downwards as entries are added** — so a span is only usable if it still
  * fits once the array has taken its eight more bytes. Forgetting that is
  * how an entry gets written over the first hash pair. */
-static uint32_t find_room(const struct xfs *fs, uint32_t need) {
-    uint32_t count, end = leaf_start(fs, &count) - XFS_DIR2_LEAF_ENTRY_SIZE;
+uint32_t xfs_dir_find_room(const struct xfs *fs, const uint8_t *block, uint32_t end,
+                           uint32_t need) {
     uint32_t at = XFS_DIR3_DATA_HDR_SIZE;
     while (at + 8u <= end) {
         uint32_t len;
-        if (xfs_be16(fs->dirblock + at) != XFS_DIR2_DATA_FREE_TAG) {
-            at += data_entry_bytes(fs, fs->dirblock[at + 8u]);
+        if (xfs_be16(block + at) != XFS_DIR2_DATA_FREE_TAG) {
+            at += xfs_dir_entry_size(fs, block[at + 8u]);
             continue;
         }
-        len = xfs_be16(fs->dirblock + at + 2u);
+        len = xfs_be16(block + at + 2u);
         if (len < XFS_DIR2_DATA_ALIGN) {
             return 0; /* a free span that cannot be true */
         }
@@ -412,12 +412,12 @@ static int flush_block(struct xfs *fs, const struct xfs_inode *dir, uint64_t fsb
     xfs_copy_bytes(b->data, fs->dirblock, fs->blocksize);
     bcache_dirty(b);
     bcache_put(fs->cache, b);
-    return touch_directory(fs, dir, now_s);
+    return xfs_dir_touch(fs, dir, now_s);
 }
 
 int xfs_dir_block_add(struct xfs *fs, const struct xfs_inode *dir, const char *name,
                       uint32_t namelen, uint64_t ino, uint8_t ftype, uint64_t now_s) {
-    uint32_t need = data_entry_bytes(fs, namelen);
+    uint32_t need = xfs_dir_entry_size(fs, namelen);
     uint64_t fsb = 0;
     uint32_t at, len;
     int rc = the_block(fs, dir, &fsb);
@@ -425,7 +425,11 @@ int xfs_dir_block_add(struct xfs *fs, const struct xfs_inode *dir, const char *n
     if (rc != KERR_OK) {
         return rc;
     }
-    at = find_room(fs, need);
+    {
+        uint32_t count;
+        at = xfs_dir_find_room(fs, fs->dirblock,
+                               leaf_start(fs, &count) - XFS_DIR2_LEAF_ENTRY_SIZE, need);
+    }
     if (at == 0) {
         return KERR_NOSPC; /* it would have to become a leaf directory */
     }
@@ -444,11 +448,11 @@ int xfs_dir_block_add(struct xfs *fs, const struct xfs_inode *dir, const char *n
             len = usable - at;
         }
     }
-    (void)put_entry(fs, fs->dirblock, at, ino, name, namelen, ftype);
+    (void)xfs_dir_put_entry(fs, fs->dirblock, at, ino, name, namelen, ftype);
     /* What is left of the span stays free; a remainder too small to hold a
      * free record is left inside the entry's padding instead. */
     if (len - need >= XFS_DIR2_DATA_ALIGN) {
-        put_free(fs->dirblock, at + need, len - need);
+        xfs_dir_put_free(fs->dirblock, at + need, len - need);
     }
     index_insert(fs, xfs_dir_hashname(name, namelen), at / XFS_DIR2_DATA_ALIGN);
     return flush_block(fs, dir, fsb, now_s);
@@ -471,11 +475,11 @@ int xfs_dir_block_remove(struct xfs *fs, const struct xfs_inode *dir, const char
             at += xfs_be16(fs->dirblock + at + 2u);
             continue;
         }
-        size = data_entry_bytes(fs, fs->dirblock[at + 8u]);
+        size = xfs_dir_entry_size(fs, fs->dirblock[at + 8u]);
         if (same_name(fs->dirblock, at, name, namelen)) {
             *ino = xfs_be64(fs->dirblock + at);
             index_remove(fs, at / XFS_DIR2_DATA_ALIGN);
-            put_free(fs->dirblock, at, size);
+            xfs_dir_put_free(fs->dirblock, at, size);
             return flush_block(fs, dir, fsb, now_s);
         }
         at += size;

@@ -159,8 +159,12 @@ CASES = [
       # **And the allocator's growth path was reached.** Sixty names need a
       # second chunk of inodes only if the first runs out; a run where it
       # did not would report every step passing while never touching it.
-      "fswrite: 1 inode chunk(s) added"],
-     180, None, "small"),
+      # **And every growth path was reached.** Two hundred names need a
+      # second inode chunk, a block directory and then a leaf directory; a
+      # run that needed none of them would report every step passing while
+      # never touching the code that makes them.
+      "grew to block, 1 to leaf"],
+     220, None, "small"),
 ]
 
 

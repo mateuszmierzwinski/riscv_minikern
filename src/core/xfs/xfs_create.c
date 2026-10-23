@@ -501,9 +501,33 @@ int xfs_dir_add(struct xfs *fs, const struct xfs_inode *dir, const char *name, u
         if (rc != KERR_NOSPC) {
             return rc;
         }
-        return xfs_dir_to_block(fs, dir, name, namelen, ino, ftype, now_s);
+        rc = xfs_dir_to_block(fs, dir, name, namelen, ino, ftype, now_s);
+        if (rc == KERR_OK) {
+            fs->grew_to_block++;
+        }
+        return rc;
     }
-    return xfs_dir_block_add(fs, dir, name, namelen, ino, ftype, now_s);
+    /* **Which of the two block-backed shapes it is.** A leaf directory has
+     * a block above its data, at 32 GiB of logical offset; a block
+     * directory has only the one. Asking the extent map is the test, rather
+     * than inferring it from the size, because the size of a leaf
+     * directory counts its data alone and so looks like a block
+     * directory's once it has one data block. */
+    {
+        struct xfs_extent e;
+        if (xfs_bmap(fs, dir, fs->dir_leaf_block, &e) == KERR_OK) {
+            return xfs_dir_leaf_add(fs, dir, name, namelen, ino, ftype, now_s);
+        }
+    }
+    rc = xfs_dir_block_add(fs, dir, name, namelen, ino, ftype, now_s);
+    if (rc != KERR_NOSPC) {
+        return rc;
+    }
+    rc = xfs_dir_to_leaf(fs, dir, name, namelen, ino, ftype, now_s);
+    if (rc == KERR_OK) {
+        fs->grew_to_leaf++;
+    }
+    return rc;
 }
 
 /* ── a new chunk of inodes ─────────────────────────────────────────────── */
