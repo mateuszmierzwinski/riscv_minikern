@@ -1336,6 +1336,7 @@ sh_test(
     srcs = ["test/hil_test.sh"],
     data = [
         "test/hil/board.py",
+        "test/hil/image.py",
         "test/hil/suite.py",
     ],
     tags = [

@@ -1221,6 +1221,16 @@ static void run_init_from_disk(const char *path) {
         return;
     }
     status = uspace_run(proc);
+    /* **The alias audit, on a real address space.** Asked here because a
+     * clean answer from it is load-bearing for §0 — it is the reason "two
+     * virtual addresses over one frame" is excluded — and an audit that
+     * examines nothing gives exactly the same clean answer. Run at exit,
+     * where the program's mappings are all still in place and at their most
+     * numerous, it reports how many user pages it looked at, which is what
+     * turns its answer into evidence. */
+    if (cmdline_has(boot_cmdline, "minikern.audit")) {
+        uspace_audit_aliases(proc);
+    }
     kprintf("init: %s exited with %lld after %llu syscalls (%llu stale-translation faults)\n",
             path, (long long)status, (unsigned long long)uspace_syscalls(),
             (unsigned long long)uspace_stale_faults());

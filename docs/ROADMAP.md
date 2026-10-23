@@ -124,14 +124,28 @@ Ordering inside a section is roughly by what unblocks the most.
       to establish, and the honest state is that it is not established.
 
       **Everything the kernel's own bookkeeping could have done wrong has
-      been instrumented, and all of it reads clean**: no frame reachable
-      from two user addresses anywhere in the address space, no page backed
-      twice, no mapping placed on a range the record claims (a `PROT_NONE`
+      been instrumented, and all of it reads clean — on the board**: no
+      frame reachable from two user addresses anywhere in the address space
+      (and the audit says so **among 2,570 user pages**, because an audit
+      that examined nothing gives the same clean answer and was read as
+      proof for most of this hunt), no page backed twice, no mapping placed on a range the record claims (a `PROT_NONE`
       reservation included), no live page replaced by a fixed mapping, the
       one kernel lock exclusive, and 28 user registers preserved across
       hundreds of involuntary preemptions and fifty blocking sleeps. A
       kernel can be internally consistent and still be the problem, but it
-      is not these.
+      is not these. `minikern.mapchurn` adds the same question asked by a
+      raw program rather than a runtime — eight mappings kept and stamped
+      while a ninth is thrown away and replaced, four hundred times — and it
+      exits 0 on the board, so two separate mappings never become one piece
+      of memory and a store to a fresh mapping is never lost.
+
+      The **5 to 7 "stale-translation faults"** a board run reports are not
+      a lead either, which took two measurements to establish: broadcasting
+      TLB additions as well leaves the count where it was (5 against 7), so
+      they are not harts caching a mapping's absence. They are spurious page
+      faults, which the specification allows on a translation that is
+      perfectly valid, and the kernel handles them by noticing the tables
+      disagree with the hardware, fencing locally and retrying.
 
       **The next step is a board one.** The fast reproducer is a Go binary
       and runs only where there is a filesystem to load it from, which is

@@ -24,11 +24,11 @@ A case fails if any of them is missing, and the log of every case is kept
 under the output directory so a failure can be read rather than re-run.
 """
 import argparse
-import hashlib
 import os
-import shutil
 import subprocess
 import sys
+
+import image
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROJECT = os.path.dirname(os.path.dirname(HERE))
@@ -87,30 +87,10 @@ CASES = [
 ]
 
 
-def staged_image():
-    """Builds the board image and makes sure the served file is that image.
-
-    Returns the digest actually in place, so the caller can print what the
-    board is about to run."""
-    subprocess.run(["bazel", "build", BOARD_TARGET], cwd=PROJECT, check=True)
-    built = subprocess.run(["bazel", "cquery", "--output=files", BOARD_TARGET],
-                           cwd=PROJECT, check=True, capture_output=True,
-                           text=True).stdout.split()[0]
-    # **Workspace-relative, not project-relative.** `bazel cquery` prints a
-    # path from the workspace root, and this script lives several
-    # directories below it, so joining it onto the project directory names a
-    # file that does not exist. `bazel info workspace` is the only thing that
-    # knows where the root is.
-    workspace = subprocess.run(["bazel", "info", "workspace"], cwd=PROJECT,
-                               check=True, capture_output=True, text=True).stdout.strip()
-    built = os.path.join(workspace, built)
-    fresh = hashlib.md5(open(built, "rb").read()).hexdigest()
-    served = (hashlib.md5(open(SERVED, "rb").read()).hexdigest()
-              if os.path.exists(SERVED) else None)
-    if fresh != served:
-        shutil.copyfile(built, SERVED)
-        print(f"hil: staged a new image at {SERVED}")
-    return fresh
+# Staging is `image.stage`, called by `board.py` on every boot — the check
+# belongs with the choice of image rather than with one of its callers, which
+# is what let a single manual boot run a stale image after the suite had
+# grown a check of its own.
 
 
 def run_case(name, bootargs, wanted, seconds, out_dir):
@@ -130,7 +110,7 @@ def main():
                     help="run only the cases whose name contains this text")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
-    print(f"hil: image md5 {staged_image()}")
+    print(f"hil: image md5 {image.stage(PROJECT)}")
     failures = 0
     for name, bootargs, wanted, seconds in CASES:
         if args.only and args.only not in name:

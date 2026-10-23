@@ -1688,6 +1688,16 @@ struct alias_audit {
     phys_t base;        /* the physical address frame 0 starts at */
     uint32_t duplicates;
     uint32_t reported;
+    /* **How many user pages were examined**, because without it a clean
+     * answer cannot be told from a vacuous one. If the walk yields no
+     * leaves — a bug in it, a table read that fails, a process whose
+     * mappings are all somewhere this does not look — the audit says "no
+     * frame is mapped twice" and means nothing by it. That answer was
+     * treated as proof for most of the §0 hunt. The question this file
+     * keeps restating applies to instruments too: ask what it would report
+     * if the thing it looks for were there, and if the answer is "the same",
+     * it is not an instrument. */
+    uint32_t examined;
 };
 
 static void count_one_leaf(void *ctx, virt_t va, phys_t pa, uint64_t span, uint64_t flags) {
@@ -1706,6 +1716,7 @@ static void count_one_leaf(void *ctx, virt_t va, phys_t pa, uint64_t span, uint6
         if (frame < a->base || i >= a->frames) {
             continue;
         }
+        a->examined++;
         if (a->seen[i] == 0) {
             a->seen[i] = 1;
             a->first[i] = here;
@@ -1778,10 +1789,12 @@ void uspace_audit_aliases(struct uproc *p) {
     a.base = mem_base_address();
     pgtable_each_leaf(&p->pt, count_one_leaf, &a);
     aliased_frames += a.duplicates;
-    if (a.duplicates == 0) {
-        kprintf("uspace: the alias audit found no frame mapped twice\n");
+    if (a.examined == 0) {
+        kprintf("uspace: **the alias audit examined nothing** — it proves nothing\n");
+    } else if (a.duplicates == 0) {
+        kprintf("uspace: no frame is mapped twice, among %u user pages\n", a.examined);
     } else {
-        kprintf("uspace: **%u frames are mapped twice**\n", a.duplicates);
+        kprintf("uspace: **%u of %u user pages share a frame**\n", a.duplicates, a.examined);
     }
     kfree(a.seen);
     kfree(a.first);

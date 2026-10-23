@@ -34,6 +34,8 @@ import os
 import sys
 import time
 
+import image
+
 try:
     import serial
 except ImportError:  # pragma: no cover - the operator's machine has it
@@ -150,9 +152,16 @@ def main():
                     help="how long to capture after booti (default 60)")
     ap.add_argument("-o", "--out", default="hil.log", help="where to write the log")
     ap.add_argument("-q", "--quiet", action="store_true", help="do not echo the log")
+    ap.add_argument("--no-stage", dest="stage", action="store_false",
+                    help="boot whatever is already served, without building")
     ap.add_argument("-w", "--wait", type=float, default=0.0,
                     help="seconds to wait for another run to release the board")
     args = ap.parse_args()
+    if args.stage:
+        digest = image.stage(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        if digest is None:
+            return 2
+        print(f"hil: image md5 {digest}")
     bootargs = args.bootargs if args.bare else f"{STANDARD_ARGS} {args.bootargs}"
     ok = boot(bootargs, args.seconds, args.out, args.wait)
     if not args.quiet:
