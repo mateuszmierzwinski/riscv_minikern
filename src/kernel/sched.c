@@ -64,7 +64,17 @@ enum thread_state {
     THREAD_RUNNABLE,
     THREAD_RUNNING,
     THREAD_BLOCKED,
-    THREAD_DYING
+    THREAD_DYING,
+    /* **Stopped by a signal, which is not the same as blocked.**
+     *
+     * A blocked thread is waiting for something that will happen — a
+     * deadline, a futex, a child. A stopped one is waiting for `SIGCONT`,
+     * which may never come, and it must not be woken by whatever it was
+     * blocked on either: a process stopped in the middle of a sleep stays
+     * stopped when the sleep expires. Keeping it a separate state is what
+     * makes both of those true without a flag that every wake path has to
+     * remember to check. */
+    THREAD_STOPPED
 };
 
 /* A thread.
@@ -696,6 +706,84 @@ bool sched_set_affinity(uint64_t mask) {
 }
 
 /* The running thread's scheduling class and priority. */
+/* **Stops every thread of a process, and resumes them.**
+ *
+ * `SIGSTOP` and `SIGCONT` are not deliverable to a handler — they act on
+ * the process itself — so they are the scheduler's business rather than the
+ * signal frame's. A thread that is running on another hart is marked and
+ * poked; it stops at its next return to user mode, which is the same place
+ * every other preemption happens.
+ *
+ * The stopped state is remembered across what the thread was doing: a
+ * thread stopped while blocked on a sleep is `THREAD_STOPPED`, and when the
+ * sleep expires it stays stopped, because the wake path moves `BLOCKED` to
+ * `RUNNABLE` and this is neither. That is the whole reason it is a state
+ * and not a flag.
+ *
+ * Returns how many threads it moved, so a caller can tell "stopped a
+ * process" from "there was nothing to stop". */
+uint32_t sched_stop_process(uint32_t pid) {
+    uint32_t moved = 0;
+    for (uint32_t i = 0; i < SCHED_MAX_THREADS; i++) {
+        if (threads[i].proc == NULL || uspace_pid_of(threads[i].proc) != pid) {
+            continue;
+        }
+        if (threads[i].state == THREAD_FREE || threads[i].state == THREAD_DYING ||
+            threads[i].state == THREAD_STOPPED) {
+            continue;
+        }
+        if (threads[i].state == THREAD_RUNNING) {
+            /* On a hart now: marked, and it stops on its way out. */
+            for (uint32_t h = 0; h < SMP_MAX_HARTS; h++) {
+                harts[h].preempt_pending = harts[h].current == i ? true : harts[h].preempt_pending;
+            }
+        }
+        threads[i].state = THREAD_STOPPED;
+        moved++;
+    }
+    if (moved != 0) {
+        poke_idle_harts();
+    }
+    return moved;
+}
+
+bool sched_raise_on_process(uint32_t pid, uint32_t signo) {
+    for (uint32_t i = 0; i < SCHED_MAX_THREADS; i++) {
+        if (threads[i].state == THREAD_FREE || threads[i].state == THREAD_DYING ||
+            threads[i].proc == NULL || uspace_pid_of(threads[i].proc) != pid) {
+            continue;
+        }
+        signal_raise_on(&threads[i].signals, signo, 0, 0);
+        /* A thread that is blocked or stopped has to be made runnable or the
+         * signal waits for an event that a stopped process will not see. */
+        if (threads[i].state == THREAD_BLOCKED || threads[i].state == THREAD_STOPPED) {
+            place_on_runqueue(i);
+            poke_idle_harts();
+        }
+        return true;
+    }
+    return false;
+}
+
+uint32_t sched_continue_process(uint32_t pid) {
+    uint32_t moved = 0;
+    for (uint32_t i = 0; i < SCHED_MAX_THREADS; i++) {
+        if (threads[i].state != THREAD_STOPPED || threads[i].proc == NULL ||
+            uspace_pid_of(threads[i].proc) != pid) {
+            continue;
+        }
+        /* Placed rather than given its old virtual clock: it has been
+         * stopped for an unbounded time, and a thread that far behind would
+         * take the processor until it caught up. */
+        place_on_runqueue(i);
+        moved++;
+    }
+    if (moved != 0) {
+        poke_idle_harts();
+    }
+    return moved;
+}
+
 uint32_t sched_rt_priority(void) {
     const struct thread *t = running_thread();
     return t != NULL ? t->rt_priority : 0u;

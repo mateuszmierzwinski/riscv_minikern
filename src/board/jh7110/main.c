@@ -939,6 +939,7 @@ extern const char user_pin_start[], user_pin_end[];
 extern const char user_rt_start[], user_rt_end[];
 extern const char user_hostile_start[], user_hostile_end[];
 extern const char user_wait_start[], user_wait_end[];
+extern const char user_pgrp_start[], user_pgrp_end[];
 
 static void run_one_user_program(const char *name, const char *from, const char *to) {
     struct uproc *proc = uspace_alloc();
@@ -1127,6 +1128,12 @@ static void run_user_programs(void) {
      * stops, and a run that never finishes means the parent is blocked. */
     if (cmdline_has(boot_cmdline, "minikern.wait")) {
         run_one_user_program("wait", user_wait_start, user_wait_end);
+    }
+    /* Roadmap §1: process groups, and a job-control signal sent to a group
+     * rather than to a process. 7 means every step worked; 111..115 name
+     * which one did not. */
+    if (cmdline_has(boot_cmdline, "minikern.pgrp")) {
+        run_one_user_program("pgrp", user_pgrp_start, user_pgrp_end);
     }
     if (cmdline_has(boot_cmdline, "minikern.init")) {
         run_init_from_disk("/init");

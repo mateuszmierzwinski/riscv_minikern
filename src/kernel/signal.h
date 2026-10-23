@@ -40,6 +40,11 @@
 #define SIGBUS 7
 #define SIGFPE 8
 #define SIGKILL 9
+/* The two that act on the process rather than on a handler: neither can be
+ * caught, blocked or ignored, which is why they are the scheduler's and not
+ * the signal frame's. */
+#define SIGSTOP 19
+#define SIGCONT 18
 #define SIGSEGV 11
 #define SIGPIPE 13
 #define SIGALRM 14

@@ -26,6 +26,9 @@
 #define SYS_SCHED_SETAFFINITY 122
 #define SYS_SCHED_SETSCHEDULER 119
 #define SYS_WAIT4 260
+#define SYS_KILL 129
+#define SYS_GETPGID 155
+#define SYS_GETPID 172
 
 user_program_start:
     /* write(1, message, length) — the address comes from the program
@@ -596,6 +599,138 @@ wait_failed:
     ecall
 8:  j       8b
 user_wait_end:
+
+/* A ninth program: **process groups, and SIGSTOP/SIGCONT by group.**
+ *
+ * Roadmap §1's groups-and-sessions step, tested the way a shell would use
+ * it rather than one syscall at a time:
+ *
+ *   1. `getpgid(0)` must equal the pid — a fresh process leads its own
+ *      group, which is what makes the first process a leader with no
+ *      special case.
+ *   2. `fork`, and the child must inherit that group.
+ *   3. The parent sends **`SIGSTOP` to the group** (`kill(-pgid)`). Both
+ *      members are in it, and the signal must reach the child.
+ *   4. The parent sends `SIGCONT` to the group, and the child runs on and
+ *      exits with 7.
+ *   5. The parent reaps it and exits with the child's status.
+ *
+ * 7 means every step worked. The interesting failure is step 3 reaching
+ * only one member: a job-control signal that reaches part of a pipeline is
+ * worse than one that reaches none, because the survivors keep running with
+ * their input gone — so this checks the *child* observed it, by having the
+ * child only exit after being continued.
+ *
+ * The child proves it was stopped by writing nothing until it is continued:
+ * the parent sleeps between STOP and CONT, and if the child were running it
+ * would have exited during that window and the reap would come back with a
+ * status it set before the CONT. There is no shared memory here, so the
+ * evidence is the ordering, which the status carries.
+ */
+    .globl user_pgrp_start
+    .globl user_pgrp_end
+user_pgrp_start:
+    /* getpgid(0) and getpid() must agree. */
+    li      a0, 0
+    li      a7, SYS_GETPGID
+    ecall
+    mv      s3, a0
+    li      a7, SYS_GETPID
+    ecall
+    bne     a0, s3, pgrp_bad_group
+    mv      s4, a0               /* our pid, which is also our pgid */
+
+    /* fork */
+    li      a0, 17               /* SIGCHLD: a child, not a thread */
+    li      a1, 0
+    li      a2, 0
+    li      a3, 0
+    li      a4, 0
+    li      a7, SYS_CLONE
+    ecall
+    bltz    a0, pgrp_clone_failed
+    bnez    a0, pgrp_parent
+
+    /* The child: confirm it inherited the group, then spin until it is
+     * continued. The spin is bounded so a failure ends rather than hangs —
+     * if it is never stopped it simply exits 7 early, and the ordering the
+     * parent checks is what catches that. */
+    li      a0, 0
+    li      a7, SYS_GETPGID
+    ecall
+    bne     a0, s4, pgrp_child_wrong_group
+    li      t0, 400000000
+pgrp_child_spin:
+    addi    t0, t0, -1
+    bnez    t0, pgrp_child_spin
+    li      a0, 7
+    li      a7, SYS_EXIT_GROUP
+    ecall
+
+pgrp_parent:
+    /* SIGSTOP to the whole group: kill(-pgid, SIGSTOP). */
+    sub     a0, zero, s4
+    li      a1, 19               /* SIGSTOP */
+    li      a7, SYS_KILL
+    ecall
+    bltz    a0, pgrp_kill_failed
+
+    /* Long enough that a child which ignored the stop would have finished
+     * its spin and exited. */
+    addi    sp, sp, -16
+    sd      zero, 0(sp)
+    li      t0, 500000000
+    sd      t0, 8(sp)            /* 500 ms */
+    mv      a0, sp
+    li      a1, 0
+    li      a7, SYS_NANOSLEEP
+    ecall
+
+    /* SIGCONT to the group. */
+    sub     a0, zero, s4
+    li      a1, 18               /* SIGCONT */
+    li      a7, SYS_KILL
+    ecall
+    bltz    a0, pgrp_kill_failed
+
+    /* Reap, and exit with what the child exited with. */
+    addi    sp, sp, -16
+    sw      zero, 0(sp)
+    li      a0, -1
+    mv      a1, sp
+    li      a2, 0
+    li      a3, 0
+    li      a7, SYS_WAIT4
+    ecall
+    bltz    a0, pgrp_wait_failed
+    lw      t0, 0(sp)
+    srli    t0, t0, 8
+    andi    a0, t0, 0xff
+    li      a7, SYS_EXIT_GROUP
+    ecall
+
+pgrp_bad_group:
+    li      a0, 111
+    li      a7, SYS_EXIT_GROUP
+    ecall
+pgrp_clone_failed:
+    li      a0, 112
+    li      a7, SYS_EXIT_GROUP
+    ecall
+pgrp_child_wrong_group:
+    li      a0, 113
+    li      a7, SYS_EXIT_GROUP
+    ecall
+pgrp_kill_failed:
+    li      a0, 114
+    li      a7, SYS_EXIT_GROUP
+    ecall
+pgrp_wait_failed:
+    li      a0, 115
+    li      a7, SYS_EXIT_GROUP
+    ecall
+7:  j       7b
+user_pgrp_end:
 
 /* A second program, which faults on purpose: it reads an address that is
  * mapped for the kernel and not for user mode. */

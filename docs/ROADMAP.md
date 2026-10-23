@@ -61,9 +61,32 @@ Ordering inside a section is roughly by what unblocks the most.
       the third instance of the rule this kernel keeps relearning: the
       address-space record has to include everything in the address space,
       because placement reads it too.
-- [ ] **Process groups and sessions.** (M) `setpgid`, `getpgid`, `setsid`,
-      and the job-control signals (`SIGTSTP`, `SIGCONT`, `SIGTTIN`). Needed
-      before a shell is usable.
+- [x] **Process groups and sessions.** (M) **Done.** `setpgid`, `getpgid`,
+      `setsid`, `getsid`, and `kill` — which did not exist at all before
+      this, only `tgkill` — with the three forms a shell uses: a pid, a
+      group as a negative pid, and 0 for the caller's own group. Group and
+      session are inherited at `fork` and survive `execve`, so a shell can
+      put a job in a group before exec'ing into it, and a fresh process
+      leads its own group and session, which makes the first process a
+      leader with no special case.
+      **`SIGSTOP` and `SIGCONT` came with it**, which `PREEMPTION_MODEL.md`
+      had listed as not built. They act on the process rather than on a
+      handler, so they are the scheduler's: a new `THREAD_STOPPED` state
+      rather than a flag, because a thread stopped during a sleep must stay
+      stopped when the sleep expires, and a state gets that right without
+      every wake path remembering to check.
+      Measured on the board (`minikern.pgrp=1`): a parent confirms it leads
+      its own group, forks, sends `SIGSTOP` to the **group**, sleeps long
+      enough that a child which ignored it would have finished, sends
+      `SIGCONT`, and reaps the child's status. Exit 7 means every step
+      worked — a job-control signal reaching only part of a group is worse
+      than one reaching none, so the child's own observation is what is
+      checked rather than the syscall's return.
+      **Not done:** `SIGTSTP` and `SIGTTIN` need a controlling terminal to
+      be raised *from*, which is the next item; and `kill` raises on the
+      process's first live thread, since there is no process-wide pending
+      set — right for what a shell sends, wrong for a multi-threaded
+      program catching them, and said so in the code.
 - [ ] **A controlling terminal.** (M) Line discipline, canonical mode,
       `TIOCGWINSZ`. Today the console is a write-only sink with a read path
       that is not a terminal.

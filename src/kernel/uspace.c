@@ -902,10 +902,31 @@ int uspace_fork_shared(struct uproc *child, struct uproc *parent) {
     child->built = true;
     child->pid = pid;
     child->parent_pid = parent->pid;
+    child->pgid = parent->pgid;
+    child->sid = parent->sid;
     for (uint32_t i = 0; i < SIG_COUNT; i++) {
         child->actions[i] = parent->actions[i];
     }
     return fd_copy_table(child, parent);
+}
+
+uint32_t uspace_pid_of(const struct uproc *p) {
+    return p == NULL ? 0u : p->pid;
+}
+
+uint32_t uspace_for_each_in_group(uint32_t pgid, void (*fn)(struct uproc *p, uint32_t arg),
+                                  uint32_t arg) {
+    uint32_t n = 0;
+    if (fn == NULL || pgid == 0) {
+        return 0;
+    }
+    for (uint32_t i = 0; i < PROC_MAX; i++) {
+        if (procs[i].used && !procs[i].zombie && procs[i].pgid == pgid) {
+            fn(&procs[i], arg);
+            n++;
+        }
+    }
+    return n;
 }
 
 uint32_t uspace_count_children(uint32_t parent_pid) {
@@ -961,7 +982,14 @@ int uspace_exec(struct uproc *p, const uint8_t *image, uint32_t bytes, const cha
     /* The new address space is built **beside** the old one, so a failure
      * here leaves the process exactly as it was. A program that handles a
      * failing `execve` is entitled to carry on. */
-    *fresh = (struct uproc){.pid = p->pid, .parent_pid = p->parent_pid, .used = true};
+    /* `execve` replaces the image and keeps the identity — pid, parent,
+     * group and session all survive it, which is what lets a shell put a
+     * job in a group *before* exec'ing into it. */
+    *fresh = (struct uproc){.pid = p->pid,
+                            .parent_pid = p->parent_pid,
+                            .pgid = p->pgid,
+                            .sid = p->sid,
+                            .used = true};
     rc = uspace_build_elf_args(fresh, image, bytes, path, argv, argc);
     if (rc != KERR_OK) {
         return rc;
@@ -1077,7 +1105,14 @@ int uspace_copy_out(virt_t to, const void *from, uint32_t n) {
 struct uproc *uspace_alloc(void) {
     for (uint32_t i = 0; i < PROC_MAX; i++) {
         if (!procs[i].used) {
-            procs[i] = (struct uproc){.used = true, .pid = next_pid++};
+            procs[i] = (struct uproc){.used = true, .pid = next_pid};
+            /* **Its own group and session leader**, which is what makes the
+             * first process one without a special case: a group of one is
+             * still a group, and `setpgid`/`setsid` then move it the same
+             * way they move anything else. A fork inherits both. */
+            procs[i].pgid = next_pid;
+            procs[i].sid = next_pid;
+            next_pid++;
             return &procs[i];
         }
     }
@@ -1340,6 +1375,8 @@ int uspace_fork(struct uproc *child, struct uproc *parent) {
     child->mmap_next = parent->mmap_next;
     child->pid = pid;
     child->parent_pid = parent->pid;
+    child->pgid = parent->pgid;
+    child->sid = parent->sid;
     for (uint32_t i = 0; i < SIG_COUNT; i++) {
         child->actions[i] = parent->actions[i];
     }

@@ -359,6 +359,21 @@ bool sched_set_affinity(uint64_t mask);
  * Inherited at `clone`, like nice and affinity. Setting it yields, because
  * a thread that has just raised itself above the one it shares a hart with
  * should be the one running. */
+/* **Stops and resumes every thread of a process.** `SIGSTOP` and `SIGCONT`
+ * act on the process rather than being delivered to a handler, so they are
+ * the scheduler's to implement. A thread running on another hart stops at
+ * its next return to user mode. Returns how many threads moved, so "stopped
+ * a process" can be told from "there was nothing to stop". */
+uint32_t sched_stop_process(uint32_t pid);
+
+/* Raises a signal on a process — meaning on the thread of it that will
+ * notice first. This kernel has no process-wide pending set, so "the
+ * process" is approximated by its first live thread: right for the signals
+ * a shell sends, and not right for a multi-threaded program catching them.
+ * Returns false if the process has no thread to raise it on. */
+bool sched_raise_on_process(uint32_t pid, uint32_t signo);
+uint32_t sched_continue_process(uint32_t pid);
+
 uint32_t sched_rt_priority(void);
 bool sched_rt_is_round_robin(void);
 bool sched_set_rt(uint32_t priority, bool round_robin);

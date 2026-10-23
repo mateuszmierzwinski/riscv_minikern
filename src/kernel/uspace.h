@@ -81,6 +81,13 @@ struct uproc {
     /* ── identity ──────────────────────────────────────────────────────── */
     uint32_t pid;
     uint32_t parent_pid;
+    /* **Process group and session**, both inherited at `fork` and both
+     * defaulting to the process's own pid for the first process — which is
+     * what makes it a group leader and a session leader without a special
+     * case. A signal sent to a negative pid goes to the group, which is how
+     * a shell interrupts a pipeline rather than one of its members. */
+    uint32_t pgid;
+    uint32_t sid;
     bool used;
     bool zombie;        /* finished, and keeping its status for its parent */
     int64_t status;     /* what `wait4` will report */
@@ -177,6 +184,16 @@ void uspace_wait_for_child(struct uproc *parent);
 /* How many live children a process has, so `wait4` can tell "none finished"
  * from "none exist". */
 uint32_t uspace_count_children(uint32_t parent_pid);
+
+/* A process's pid from its handle, for callers that hold one and must not
+ * reach into the struct — the scheduler, which knows about threads and
+ * their processes but has no business reading a process's fields. */
+uint32_t uspace_pid_of(const struct uproc *p);
+
+/* Every process in a group, for a signal sent to one. Calls `fn` with each,
+ * and returns how many it called it for. */
+uint32_t uspace_for_each_in_group(uint32_t pgid, void (*fn)(struct uproc *p, uint32_t arg),
+                                  uint32_t arg);
 
 /* Frees an image read for an `execve`. A thin name over the heap so
  * `sys_proc.c` need not know which allocator it came from. */
