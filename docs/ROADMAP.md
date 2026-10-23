@@ -17,144 +17,166 @@ Ordering inside a section is roughly by what unblocks the most.
 
 ## 0. Known defects
 
-- [ ] **A four-hart race that corrupts user memory.** (M) **Still open**, and
-      measured again rather than remembered. A stock Go binary fails its own
-      concurrency checks: a contended counter ends short, a channel yields
-      values nobody sent, a `WaitGroup` reports its own state as impossible,
-      or a thread faults at an address no program could have produced. Down
-      from one run in three after two fixes (a thread slot freed while still
-      in use; an `mmap` hint that checked only the first page of its range).
-      A minimal four-thread C program using the same primitives — raw
-      `clone`, atomics and a futex mutex — **passes**, so what remains is
-      something a Go runtime does that it does not.
-      **Today's rates**, measured in one session with one binary:
+- [x] **The board harness lives in the tree.** (S) **Done**, and overdue:
+      every piece of hardware work this project has done drove the board
+      with a throwaway script that was never committed, so each session
+      rediscovered the serial ports, the relay commands, the U-Boot sequence
+      and the load address — and staged a stale image more than once because
+      nothing checked. For a kernel whose emulator "agrees with whatever you
+      believed", that is the wrong thing to leave outside version control.
 
-      | Configuration | Runs | Failures |
-      |---|---|---|
-      | Board | 24 | 1 |
-      | Board, `minikern.onetid=1` | 16 | 1 |
-      | QEMU | 60 | 1 |
-      | QEMU, `minikern.onetid=1` | 60 | 1 |
+      `test/hil/board.py` is one boot: cut the power, restore it, catch the
+      autoboot window, `dhcp`, fetch the image over HTTP, set the command
+      line, `booti`, capture. Every step waits for U-Boot's prompt rather
+      than sleeping a guessed interval, which is how the original lost a
+      command inside the previous one's output and presented it as
+      `Bad Linux RISCV Image magic!`. It adds `console=sbi
+      minikern.halt=poweroff` to every boot, because a run that cannot be
+      heard or does not stop is not a test, and the suite's first version
+      forgot both.
 
-      So it is now **about one run in twenty on the board**, against the one
-      in eight this file recorded, and the emulator and the board agree for
-      the first time. What changed in between is this session's work; which
-      part of it is not established, and the table is here so the next
-      measurement has something to be compared against.
-      **One thing it is not**: the thread-id defect fixed in §1. Every
-      thread used to report id 1, so a Go runtime preempted goroutines with
-      `tgkill(pid, 1, SIGURG)` and every preemption signal reached whichever
-      thread was numbered 1. That looked like an excellent candidate — and
-      `minikern.onetid=1` puts it back, which is what the second and fourth
-      rows are. They are indistinguishable from the first and third. The
-      lever stays in the tree because a cause that has been *excluded by
-      measurement* is worth more than one that was never suspected, and
-      because the first small sample (1 in 8 against 0 in 16) pointed the
-      other way: it took 40 more runs to stop believing it.
-      **A reproducer that fails in a second.** `src/userland/racestress`
-      does nothing but the operations that have been seen to fail — a
-      buffered channel, interface values through `fmt`, a mutex and an
-      atomic under contention, and the prime sieve on every hart at once —
-      in a loop, checking every result. It reproduces the corruption in
-      **under a second**, where `go_qemu_test` needed about thirty boots:
-      one failure in thirty is enough to know something is wrong and far too
-      rare to *compare* anything, which is why every knob in this entry used
-      to be an argument rather than a measurement.
-      The thing that made it reproduce was **allocating**. The first version
-      ran four hundred rounds of channels and counters and never failed; the
-      failing program's garbage collector is the heaviest user of this
-      kernel there is, and adding a prime sieve per round — a fresh 60,000
-      element slice, on eight goroutines at once — took it from never to
-      twenty times in twenty.
-      **Ruled out, each with a rate rather than an argument.** Every row is
-      a configuration of the same binary, and the knob that makes it
-      possible to ask stays in the tree:
+      `test/hil/suite.py` is the cases, and `bazel test //…:hil_test` runs
+      them. Two things make it quick enough to use constantly: the kernel
+      runs **every self-test named on its command line in one boot**, so a
+      dozen programs cost one power cycle; and the image is **built, hashed
+      and re-staged before every run**, compared against what the web server
+      will actually hand out. That check earns its place — `bazel cquery`
+      prints an output's path without building it, and staging that way
+      produced a board result for code that was not on the board during the
+      `MADV_DONTNEED` work.
 
-      | Configuration | Reproduced |
-      |---|---|
-      | baseline | 20 of 20 |
-      | `minikern.tlbsafe` — broadcast TLB *additions* too | 10 of 10 |
-      | `GODEBUG=asyncpreemptoff=1` — Go stops preempting | 19 of 20 |
-      | `minikern.nopreempt` — the kernel drops `tgkill`, so **0 signals are delivered** | 8 of 8 |
-      | `minikern.eager` — every mapping backed at `mmap`, no demand faults | 9 of 10 |
-      | `minikern.neverreuse` — **no frame is ever handed out twice** | 10 of 10 |
-      | `minikern.cooperative` — the tick never takes a hart from a thread | 5 of 5 |
-      | `minikern.nomigrate` — a thread stays on one hart | 10 of 10 |
-      | `minikern.isolate=0xe` — every thread confined to **one** hart | 3 of 6 |
-      | `GOMAXPROCS=1` — one goroutine runs at a time | 5 of 6 |
-      | `GODEBUG=gcstoptheworld=2` — no concurrent mark or sweep | 6 of 6 |
-      | `minikern.smp=off` — **one hart** | 2 of 6 |
-      | `minikern.smp=off` **with `GOMAXPROCS=8`** | **6 of 6** |
-      | **`GOGC=off`** — no garbage collection | **0 of 6** |
-      | `GOGC=off`, with every thread on one hart | **0 of 6** |
+      Its first run reported six failures, all of which were **passes**: these
+      self-tests exit with a bitmask of the checks that passed, and the ones
+      that report a child's status exit with whatever the child chose. The
+      expectations now come from each program's own exit paths. A suite that
+      invents regressions is worse than no suite, because the next person
+      debugs working code.
 
-      **It does not need SMP at all, and this entry said for months that it
-      did.** One hart with `GOMAXPROCS=8` reproduces six times in six. The
-      `0 of 20` that founded the four-hart story was **exposure, not
-      immunity**: with one hart Go reads `NumCPU` as 1, runs one `P`,
-      allocates a fraction as much and switches far less, so the rate fell
-      under what twenty runs could see. Forcing the goroutine count back up
-      brings it straight back. That is this file's own lesson about rates
-      arriving a second time, and it cost every conclusion below it: thread
-      migration, cross-hart visibility, TLB shootdown, the kernel lock and
-      `satp` handling were all eliminated the moment one hart was enough.
+- [x] **`MADV_DONTNEED` and `MADV_FREE` were accepted and ignored.** (S)
+      **Fixed, and verified on the board.** A real defect, found while
+      hunting the item below — and *not* established as its cause, which is
+      the next entry's business.
 
-      **What it is**: *the collector frees an object the program is still
-      using.* `GODEBUG=clobberfree=1` fills a span with `0xdeadbeef` as it
-      is freed, and the failing worker's live 60,000-byte sieve then
-      contains **nothing else** — 15,000 bytes each of `de`, `ad`, `be`,
-      `ef` — while that worker reports its sum as 0. The worker also says
-      its sum was *already wrong when it computed it*, so the span is freed
-      **while the loop is still writing to it**. Everything earlier in this
-      entry — a counter ending short, a channel yielding values nobody
-      sent, an impossible `WaitGroup` — is that one fact seen from
-      different angles.
+      Their name says advice and their contract does not. For private memory
+      Linux **guarantees** that the pages are discarded and that the next
+      read of those addresses returns zero. This kernel accepted the call,
+      answered 0 and kept the pages, with a comment in `sys_madvise`
+      explaining that discarding was optional and that "a runtime copes
+      with" either choice. A runtime that has been told its memory is zero
+      does not cope with being handed the last owner's bytes.
 
-      **What it is not**, now by instrument rather than by argument. Each of
-      these is a counter in the tree that reads zero in failing runs, and
-      each closes a hypothesis that looked excellent:
+      `uspace_discard_range` is the fix: the pages go, the addresses stay,
+      and the next touch faults a fresh zero page in the ordinary way. A
+      file-backed range re-reads its file on the next fault, which is what
+      Linux does and what `fill_from_file` already implemented. A range that
+      would split a 2 MiB mapping is **declined rather than rounded**:
+      discarding all of a huge page because a quarter of it was named would
+      throw away memory the program still wants. `MADV_FREE` is honoured the
+      same way — discarding at once is a correct implementation of the lazy
+      form, and the fault it costs on the next touch is what the caller has
+      already decided it can afford.
 
-      | Instrument | What it would have caught |
-      |---|---|
-      | `uspace_audit_aliases` | any frame reachable from two user addresses, over the **whole address space**, asked at the moment the program notices (`madvise` with a private advice) |
-      | `uspace_backed_twice` | two deciders both backing one absent page, each with its own frame |
-      | `uspace_misplaced_mappings` | a mapping placed where the record says something already is — including a `PROT_NONE` reservation, which has no pages and which `replaced_pages` therefore cannot see |
-      | `uspace_fixed_over_live` | a `MAP_FIXED` mapping throwing away live pages, which is legitimate and is evidence when the program thinks the range is free |
-      | `klock_breaches` | the one kernel lock not being exclusive — the assumption every "but the lock prevents that" argument rests on |
-      | `minikern.regs` | a user register lost across a switch: 28 of them, canaried through hundreds of involuntary preemptions **and** fifty blocking `nanosleep`s, with three spinners for company. Exit 0 on four harts and on one |
+      **The test is behavioural and it fails without the fix.**
+      `minikern.dontneed` writes a non-zero word into each of sixteen pages,
+      **proves it is really there**, discards the range, requires every word
+      to read zero, and writes and reads the addresses again to show the
+      mapping survived. On the **board**: exit **0**, and exit **200** with
+      `minikern.keepadvice`, which puts the old behaviour back for exactly
+      this purpose. A test of a guarantee that cannot fail when the
+      guarantee is broken is not a test.
 
-      The slice **header** is intact too — each worker records where `make`
-      put its sieve and the address still matches — so the pointer is
-      sound and the bytes under it are not. And giving the sieve a heap root
-      *before* filling it changes nothing (5 of 5), so the root being missed
-      is **not** the running goroutine's own stack.
+      Its first board run exited **216** — an index the mapping does not
+      have. The zero-checking loop had borrowed its limit from the filling
+      loop, which counts 1..16 because it writes the index plus one, so the
+      check read one page *past* the mapping; the emulator answered that
+      page with zero and the board did not. A loop bound copied from a loop
+      that starts somewhere else is the oldest off-by-one there is, and the
+      board found it the first time it ran.
 
-      **Caught in the act, once.** With `minikern.paranoid` the kernel reads
-      back every page it zeroes, and one page, zeroed and mapped
-      microseconds earlier, already held `0x000000000000ea60` — **60000**,
-      which is the length of the very slice the program was about to
-      allocate. So the frame has a second writer, and the allocator says it
-      was not handed out twice. `pgtable_find_mappings` was added to ask the
-      obvious next question — which other address maps that frame — and has
-      not yet fired at the same time as the dirty page.
-      **What the corruption looks like**, measured rather than inferred: a
-      worker's own sieve, compared against a reference, has about 8,600 of
-      its 60,000 marks wrong, scattered from the first index to the last,
-      with marks both missing and extra. The arithmetic is not wrong; the
-      memory the arithmetic read was. A fresh `make([]bool, n)` must be
-      zero, and a Go runtime does not zero a span it believes came straight
-      from the kernel.
-      **A sharper signature than before**, from the one board failure:
-      `store access fault at sepc 0x4020f3fe, stval 0x40000000` with
-      `sp 0x407b7e30`, reported as a fault *in user code*, after 306,450
-      signals and 3 million syscalls. That pc is inside the kernel's own
-      text and that sp is in the kernel's identity map: the thread was
-      returned to user mode with **kernel registers**, which no program can
-      arrange. `uspace_impossible_frames` now tests exactly that on every
-      return to user mode and reports the frame where it is restored rather
-      than where it faults.
-      `CLAUDE.md` lists everything ruled out and the detectors left in the
-      tree.
+- [ ] **A corruption of user memory that the collector is involved in.** (M)
+      **Still open.** Renamed, because two of the three things its old title
+      said are now known to be wrong: it is not four-hart (one hart
+      reproduces it) and it is not a race in the kernel's own structures
+      (every one of those has been instrumented and reads clean).
+
+      **The fix above did not close it.** The reproducer still failed four
+      times in four with `MADV_DONTNEED` honoured, so the stale-pages defect
+      was a real bug sitting next to this one rather than this one. Saying
+      so plainly matters: the evidence below was read as proof of a cause it
+      does not prove.
+
+      **The sharpest evidence, and what it does and does not establish.** A
+      worker allocates its sieve, then a guard of the same size filled with
+      `0xA5`, checks that the two ranges do not overlap, fills the sieve,
+      and checks the guard. In a failing round the sieve sums **0** — every
+      position already reads `true`, so the outer loop skips everything and
+      writes nothing — and the guard comes back **pure**. The sieve is
+      reading `0xA5`. With `GODEBUG=clobberfree=1` it reads `0xdeadbeef`
+      instead, 15,000 bytes of each byte of it, which is what Go writes over
+      a span as it frees one.
+
+      So a fresh allocation is handed memory that still holds a previous
+      owner's bytes. What that does **not** explain is why Go did not zero
+      it: Go clears a reused span, which is why the first reading of this —
+      "the kernel lied about the memory being zero" — was too quick. Either
+      Go believed this span came straight from the kernel, or the bytes
+      arrived after it was cleared. Which of those it is, is the next thing
+      to establish, and the honest state is that it is not established.
+
+      **Everything the kernel's own bookkeeping could have done wrong has
+      been instrumented, and all of it reads clean**: no frame reachable
+      from two user addresses anywhere in the address space, no page backed
+      twice, no mapping placed on a range the record claims (a `PROT_NONE`
+      reservation included), no live page replaced by a fixed mapping, the
+      one kernel lock exclusive, and 28 user registers preserved across
+      hundreds of involuntary preemptions and fifty blocking sleeps. A
+      kernel can be internally consistent and still be the problem, but it
+      is not these.
+
+      **The next step is a board one.** The fast reproducer is a Go binary
+      and runs only where there is a filesystem to load it from, which is
+      why it has been exercised under the emulator — and the emulator is no
+      longer the arbiter here.
+
+      `minikern.run=<path>` is half of what that needs: any program on the
+      card, named on the command line, instead of `/init` being the only
+      thing the filesystem could start. That made the card a fixed surface —
+      a new test program meant a new card, which only the operator can
+      produce — and a path is all that stood between the two. The other half
+      is the operator putting `racestress` on the card as `/race`, which has
+      been asked for; it is staged at `~/vf2/race` and served beside the
+      kernel image. Then `minikern.run=/race` hunts this on hardware at the
+      rate the emulator hunts it, and the alternative — embedding the binary
+      in the kernel image and adding a loader path for it — stays available
+      if the card turns out to be awkward to keep in step.
+
+      **The one piece of "caught in the act" evidence was an artefact of
+      the instrument, and withdrawing it matters.** With `minikern.paranoid`
+      the kernel read back every page it zeroed, and one page — zeroed and
+      mapped microseconds earlier — already held `0xea60`, which is 60000,
+      the length of the slice the program was about to allocate. That read
+      as a second writer reaching a frame nobody else could have, and it
+      steered the hunt for a long time.
+
+      It is explained, and not by a defect. The check runs *after*
+      `pgtable_map`, and the kernel holds the big lock — but another thread
+      of the same process, in **user mode on another hart**, can touch that
+      address the instant it becomes mapped, because a TLB miss is resolved
+      by the hardware walking the tables and needs no kernel at all. So the
+      frame had an entirely legitimate second writer: the program itself.
+      The check is only meaningful on one hart, which is now said where it
+      is defined. An instrument whose own race is indistinguishable from the
+      bug it hunts is worse than none.
+
+      The instruments built during the hunt all stay: an alias audit over
+      the whole address space, counts of pages backed twice, of mappings
+      placed on a range already taken, of live pages a fixed mapping
+      replaced, of the kernel lock failing to be exclusive, and
+      `minikern.regs` for user registers across both kinds of context
+      switch. Every one of them reads zero, which is the point — they are
+      now the standing answer to a whole class of suspicion that this
+      session had to re-argue from scratch. `CLAUDE.md` §5 records what each
+      one cost to learn.
 - [x] **An embedded program's stack was not in its own address-space
       record.** (S) **Found and fixed** by §2's `mremap` test, which is the
       first embedded program to both use its stack and call `mmap`. The raw

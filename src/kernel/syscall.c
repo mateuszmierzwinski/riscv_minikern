@@ -334,6 +334,22 @@ static int64_t sys_munmap(struct trapframe *tf) {
  *
  * It is a debugging interface and it is only honoured under
  * `minikern.paranoid`, which is also what makes the audit affordable. */
+/* Whether the kernel goes back to keeping the pages a program said it did
+ * not need — the behaviour that caused §0's corruption.
+ *
+ * It stays, as a knob, for one reason: a test of the guarantee is only a
+ * test if it fails when the guarantee is broken, and `minikern.keepadvice`
+ * is how that is shown rather than asserted. `minikern.dontneed` exits 0
+ * with it off and **193** with it on, which is the difference between a
+ * regression test and a line of hopeful assembly. */
+static bool keep_discarded_pages;
+
+void syscall_keep_discarded_pages(bool on) {
+    keep_discarded_pages = on;
+}
+
+#define MADV_DONTNEED 4u
+#define MADV_FREE 8u
 #define MADV_AUDIT 0x4d494eu
 
 static int64_t sys_madvise(struct trapframe *tf) {
@@ -348,6 +364,28 @@ static int64_t sys_madvise(struct trapframe *tf) {
             uspace_audit_aliases(uspace_current());
         }
         return 0;
+    }
+    /* **`MADV_DONTNEED` and `MADV_FREE` are honoured, and have to be.**
+     *
+     * Their name says advice and their contract does not: for private
+     * memory Linux guarantees the pages are gone and that the next read of
+     * those addresses returns zero. A runtime builds on it — Go's allocator
+     * returns memory this way, records the range as zeroed, and **skips
+     * zeroing it** when it hands it out again. Keeping the pages therefore
+     * does not mean "ignoring optional advice", it means telling the
+     * program its memory is zero when it is full of the last owner's bytes,
+     * which is where §0's corruption came from.
+     *
+     * `MADV_FREE` is the lazy form — the kernel may keep the pages until it
+     * needs them, and a write cancels the discard. Discarding at once is a
+     * correct implementation of it and a simpler one; what it costs is a
+     * fault on the next touch, which is exactly what `MADV_DONTNEED` costs
+     * and what the caller has already decided it can afford. */
+    if ((advice == MADV_DONTNEED || advice == MADV_FREE) && !keep_discarded_pages) {
+        if ((at & (PAGE_SIZE - 1u)) != 0) {
+            return KERR_INVAL;
+        }
+        return uspace_discard_range(uspace_current(), at, bytes) == KERR_OK ? 0 : KERR_INVAL;
     }
     if (advice != MADV_PAGEOUT) {
         return 0;

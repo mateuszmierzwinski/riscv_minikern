@@ -2405,3 +2405,120 @@ regs_exit:
     li      a7, SYS_EXIT_GROUP
     ecall
 user_regs_end:
+
+/* Roadmap §0: `MADV_DONTNEED` means the pages are gone and read as zero.
+ *
+ * **The guarantee §0's corruption came from breaking.** Its name says
+ * advice, and for private memory Linux's contract does not: the pages are
+ * discarded and the next read of those addresses returns zero. A runtime
+ * builds on that — Go's allocator returns memory this way, records the
+ * range as zeroed, and skips zeroing it when it hands the range out again.
+ * A kernel that keeps the pages has not declined optional advice; it has
+ * told the program its memory is zero while it still holds the previous
+ * owner's bytes.
+ *
+ * So the test is behavioural and it is the whole point: write a pattern
+ * that is **not** zero, prove it is really there, discard it, and require
+ * zero. Searching the kernel for the constant proves nothing; this proves
+ * what a program would see.
+ *
+ * **0 is a pass**; 190..193 name the step.
+ */
+    .globl user_dontneed_start
+    .globl user_dontneed_end
+user_dontneed_start:
+    /* mmap(NULL, 64 KiB, RW, PRIVATE|ANON) */
+    li      a0, 0
+    li      a1, 65536
+    li      a2, 3
+    li      a3, 0x22
+    li      a4, -1
+    li      a5, 0
+    li      a7, SYS_MMAP
+    ecall
+    bltz    a0, dn_no_memory
+    mv      s3, a0
+
+    /* A word per page, each its own index plus one: non-zero everywhere,
+     * and distinct so that a page swapped for another is caught too. */
+    li      t3, 4096
+    mv      t1, s3
+    li      t2, 1
+    li      t4, 17
+dn_fill:
+    sd      t2, 0(t1)
+    add     t1, t1, t3
+    addi    t2, t2, 1
+    blt     t2, t4, dn_fill
+
+    /* It really is there. Without this the test could pass on a kernel
+     * whose pages were never written at all. */
+    mv      t1, s3
+    li      t2, 1
+dn_verify_written:
+    ld      t5, 0(t1)
+    bne     t5, t2, dn_not_written
+    add     t1, t1, t3
+    addi    t2, t2, 1
+    blt     t2, t4, dn_verify_written
+
+    /* madvise(addr, 64 KiB, MADV_DONTNEED=4) */
+    mv      a0, s3
+    li      a1, 65536
+    li      a2, 4
+    li      a7, SYS_MADVISE
+    ecall
+    bnez    a0, dn_refused
+
+    /* Every word must now be zero — **sixteen of them, not seventeen.**
+     *
+     * The fill loop counts 1..16 because the value it writes is the page's
+     * index plus one, so its limit is 17; this loop counts 0..15 and its
+     * limit is 16. Sharing the 17 read one page *past* the mapping, which
+     * the emulator happened to answer with zero and the board did not —
+     * so the first board run of this test failed at index 16, an index the
+     * mapping does not have. A loop bound copied from a loop that starts
+     * somewhere else is the oldest off-by-one there is. */
+    mv      t1, s3
+    li      t2, 0
+    li      t4, 16
+dn_verify_zero:
+    ld      t5, 0(t1)
+    bnez    t5, dn_not_zero
+    add     t1, t1, t3
+    addi    t2, t2, 1
+    blt     t2, t4, dn_verify_zero
+
+    /* And the addresses still work: writing and reading them again must
+     * succeed, because `MADV_DONTNEED` takes the pages and not the
+     * mapping. */
+    li      t5, 0x1234
+    sd      t5, 0(s3)
+    ld      t6, 0(s3)
+    bne     t5, t6, dn_not_usable
+
+    li      a0, 0
+    j       dn_exit
+dn_no_memory:
+    li      a0, 190
+    j       dn_exit
+dn_not_written:
+    li      a0, 191
+    j       dn_exit
+dn_refused:
+    li      a0, 192
+    j       dn_exit
+dn_not_zero:
+    /* **Which page, not just that one failed.** The first run of this on
+     * real hardware exited 193 where the emulator exits 0, and "a page did
+     * not come back zero" is not enough to act on: the first page and the
+     * sixteenth fail for different reasons. `t2` is the index. */
+    li      a0, 200
+    add     a0, a0, t2
+    j       dn_exit
+dn_not_usable:
+    li      a0, 194
+dn_exit:
+    li      a7, SYS_EXIT_GROUP
+    ecall
+user_dontneed_end:

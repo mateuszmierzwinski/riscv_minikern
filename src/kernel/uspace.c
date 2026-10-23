@@ -1797,6 +1797,18 @@ void uspace_set_paranoid(bool on) {
     paranoid = on;
 }
 
+/* **Only meaningful on one hart**, and the reason is worth stating where it
+ * is defined rather than discovered twice.
+ *
+ * This runs after `pgtable_map`, with the kernel lock held — which keeps
+ * other harts out of the *kernel* and not out of the page. A thread of the
+ * same process in user mode on another hart can touch the address the
+ * instant it becomes mapped, because a TLB miss is resolved by the hardware
+ * walking the tables and needs no kernel at all. So on four harts a
+ * non-zero reading here means "the program got there first", which is
+ * legitimate and is indistinguishable from the corruption this was built to
+ * catch. It reported exactly that once, and the §0 hunt chased it for a
+ * long time. */
 static void check_the_frame_is_clean(phys_t page, virt_t va) {
     const volatile uint64_t *words = (const volatile uint64_t *)(uintptr_t)page;
     if (!paranoid) {
@@ -2615,6 +2627,62 @@ int uspace_unmap(struct uproc *p, virt_t at, uint64_t bytes) {
         return KERR_NOMEM;
     }
     return drop_pages(p, at, bytes);
+}
+
+/* Pages given up because the program said it would not need them. */
+static uint64_t discarded_pages;
+
+uint64_t uspace_discarded_pages(void) {
+    return discarded_pages;
+}
+
+/* Throws away the pages in a range, keeping the addresses.
+ *
+ * **`MADV_DONTNEED` is not advice, whatever its name suggests.** On Linux,
+ * for private memory, it is a guarantee: the pages are gone and the next
+ * read of those addresses returns **zero**. A runtime builds on that. Go's
+ * allocator returns memory to the kernel this way and records that the
+ * range is now zeroed, so when it hands the range out again it **skips
+ * zeroing it** — there is nothing to zero, the kernel promised.
+ *
+ * This kernel accepted the call, answered 0 and kept the pages, with a
+ * comment explaining that discarding was optional. That was the §0
+ * corruption: the runtime handed a fresh allocation memory that still held
+ * the previous owner's bytes, without zeroing it, because this kernel had
+ * said it was zero. A program then read values it never wrote — most
+ * visibly a brand-new `[]bool` that was already `true` everywhere, so a
+ * sieve skipped its whole outer loop and summed nothing.
+ *
+ * The addresses stay mapped as far as the *record* is concerned: the region
+ * is untouched and a later touch faults a fresh zero page in the ordinary
+ * way. Only the pages go. A file-backed range re-reads its file on the next
+ * fault, which is what Linux does and what `fill_from_file` already
+ * implements.
+ *
+ * A range that would split a huge mapping is left alone rather than
+ * rounded: 2 MiB is one entry, and discarding all of it because a quarter
+ * was named would throw away memory the program still wants. Advice may be
+ * declined; a promise about *these* addresses may not be broken. */
+int uspace_discard_range(struct uproc *p, virt_t at, uint64_t bytes) {
+    uint64_t pages = 0;
+    if (p == NULL || !p->built || (at & (PAGE_SIZE - 1u)) != 0 ||
+        !page_count(bytes, &pages)) {
+        return KERR_INVAL;
+    }
+    if (pages == 0) {
+        return KERR_OK;
+    }
+    if (must_be_whole(p, at, pages * PAGE_SIZE)) {
+        return KERR_OK; /* a huge mapping named in part: declined, not rounded */
+    }
+    for (virt_t va = at; va < at + pages * PAGE_SIZE; va += PAGE_SIZE) {
+        phys_t phys = 0;
+        uint64_t flags = 0, size = 0;
+        if (pgtable_lookup(&p->pt, va, &phys, &flags, &size)) {
+            discarded_pages++;
+        }
+    }
+    return drop_pages(p, at, pages * PAGE_SIZE);
 }
 
 /* Sends one of a process's pages out to swap, if it finds one it may.

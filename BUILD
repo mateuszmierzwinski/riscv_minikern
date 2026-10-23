@@ -1316,6 +1316,34 @@ test_suite(
     ],
 )
 
+# The board suite: every self-test this kernel has, on the real VisionFive 2.
+#
+# **`manual`, and for a stronger reason than the QEMU targets.** Those need a
+# host tool; this needs the physical board attached to this machine, powered
+# through the operator's relay on `/dev/ttyACM0`, its console on
+# `/dev/ttyUSB0`, and a web server handing out the image. It is the gate that
+# matters — the emulator agrees with whatever you believed — and it is the one
+# a wildcard build must never reach for.
+#
+# `test/hil/board.py` is one boot; `test/hil/suite.py` is the cases. Python
+# and `pyserial` because the harness talks to two serial ports and waits on
+# prompts, which is not work for the kernel's own toolchain; it is an external
+# instrument in the same category as `sonar-scanner`, and nothing built or
+# tested here depends on it.
+sh_test(
+    name = "hil_test",
+    size = "enormous",
+    srcs = ["test/hil_test.sh"],
+    data = [
+        "test/hil/board.py",
+        "test/hil/suite.py",
+    ],
+    tags = [
+        "external",
+        "manual",
+    ],
+)
+
 test_suite(
     name = "qemu_tests",
     tags = ["manual"],

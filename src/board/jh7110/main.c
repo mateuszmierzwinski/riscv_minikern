@@ -1074,6 +1074,7 @@ extern const char user_filemap_start[], user_filemap_end[];
 extern const char user_tstp_start[], user_tstp_end[];
 extern const char user_swap_start[], user_swap_end[];
 extern const char user_regs_start[], user_regs_end[];
+extern const char user_dontneed_start[], user_dontneed_end[];
 
 /* The three numbers that tell how a mapping's pages were paid for: on first
  * touch, up front because the caller asked, and re-pointed by a move. They
@@ -1086,6 +1087,13 @@ static void report_mapping_counters(void) {
             (unsigned long long)uspace_demand_pages(), (unsigned long long)uspace_populated_pages(),
             (unsigned long long)uspace_moved_pages(), (unsigned long long)uspace_huge_pages(),
             (unsigned long long)uspace_file_pages());
+    /* **Whether the program discards memory at all**, which decides whether
+     * honouring `MADV_DONTNEED` is on its path or beside it. A runtime's
+     * scavenger is the only thing that calls it, and a zero here says a
+     * whole explanation does not apply to this run — which is worth seeing
+     * in every report rather than inferred from its absence. */
+    kprintf("mem: %llu pages given up on advice\n",
+            (unsigned long long)uspace_discarded_pages());
 }
 
 /* Whether the kernel had to catch a thread mid-flight on another hart, and
@@ -1259,6 +1267,9 @@ static void run_user_programs(void) {
         uspace_set_extra_env(env, (uint32_t)envlen);
     }
     syscall_allow_tgkill(!cmdline_has(boot_cmdline, "minikern.nopreempt"));
+    /* `minikern.keepadvice` keeps pages a program said it did not need —
+     * the defect §0 came down to, kept so the test for it can fail. */
+    syscall_keep_discarded_pages(cmdline_has(boot_cmdline, "minikern.keepadvice"));
     /* Puts `gettid`'s old wrong answer back, for measuring what it cost. */
     syscall_one_tid(cmdline_has(boot_cmdline, "minikern.onetid"));
     /* Keeps the kernel heap's pages out of the frame pool — a diagnostic for
@@ -1415,11 +1426,37 @@ static void run_user_programs(void) {
      * **0** is a pass; any other value is the register that came back
      * wrong. Several copies at once, because one thread alone is never
      * preempted in favour of anything interesting. */
+    /* Roadmap §0: the guarantee the corruption came from breaking.
+     * **0** is a pass; 190..194 name the step. */
+    if (cmdline_has(boot_cmdline, "minikern.dontneed")) {
+        run_one_user_program("dontneed", user_dontneed_start, user_dontneed_end);
+    }
     if (cmdline_has(boot_cmdline, "minikern.regs")) {
         run_one_user_program("regs", user_regs_start, user_regs_end);
     }
     if (cmdline_has(boot_cmdline, "minikern.init")) {
         run_init_from_disk("/init");
+    }
+    /* **Any program on the card, named on the command line.**
+     *
+     * `/init` was the only thing that could be run from the filesystem, and
+     * that made the card a fixed surface: a new test program meant a new
+     * card, which only the operator can produce. The hunt in §0 needs its
+     * reproducer on the **board** rather than under the emulator, and a
+     * path is all that stands between the two. */
+    {
+        size_t len = 0;
+        const char *spec = cmdline_value(boot_cmdline, "minikern.run", &len);
+        char path[64];
+        size_t n = 0;
+        while (spec != NULL && n + 1u < sizeof path && n < len) {
+            path[n] = spec[n];
+            n++;
+        }
+        if (spec != NULL && n > 0u) {
+            path[n] = '\0';
+            run_init_from_disk(path);
+        }
     }
 }
 

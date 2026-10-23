@@ -138,6 +138,10 @@ func sumOfPrimesBelow(n int) (int, []bool) {
 	return fillSieve(sieve), sieve
 }
 
+// A root in the data segment, held by nothing on any stack. See the call
+// site: which kind of root keeps the sieve alive is the question.
+var published [16][]bool
+
 // Whether a worker gives its sieve a heap root before filling it. A
 // diagnostic: see the comment at the call site.
 var publishFirst = os.Getenv("PUBLISH_FIRST") != ""
@@ -176,6 +180,19 @@ func inParallel(workers, n int) ([]int, [][]bool) {
 	 * the data moved under a sound pointer. */
 	bases := make([]uintptr, workers)
 	owned := make([]bool, workers)
+	/* **Did `wg.Wait()` actually wait?**
+	 *
+	 * A `WaitGroup` is a futex underneath, and this kernel's futex is its
+	 * own. If a wake arrives that should not have, or an accounting slip
+	 * lets `Wait` return while a worker is still running, then everything
+	 * read afterwards is simply read too early — a sieve caught part way
+	 * through being built, and two passes over it disagreeing because it is
+	 * still being written. That is a precise description of what this
+	 * program has been reporting, and it is not memory corruption at all.
+	 *
+	 * So each worker says so itself, as its last act, and `Wait` is held to
+	 * its promise rather than trusted. */
+	finished := make([]bool, workers)
 	/* **Each worker's own sieve, kept.** The first version of this threw
 	 * them away and, on a wrong sum, computed a *fresh* sieve to compare
 	 * against the reference — which answers a question nobody asked. The
@@ -201,18 +218,84 @@ func inParallel(workers, n int) ([]int, [][]bool) {
 			 * goroutine's own stack. */
 			sieve := make([]bool, n)
 			if publishFirst {
-				sieves[w] = sieve
+				/* **A package-level global, which is a different root from
+				 * anything tried so far.** The first attempt at this stored
+				 * the slice into the shared `sieves`, and that was not the
+				 * experiment it looked like: `sieves` is itself a heap
+				 * object reachable from `inParallel`'s frame — on a
+				 * goroutine's stack. If a goroutine's stack is what the
+				 * collector is failing to scan, storing one more pointer
+				 * into something reachable only through that stack proves
+				 * nothing, which is exactly the result it gave.
+				 *
+				 * A global lives in the data segment and is scanned as a
+				 * root unconditionally, with no stack involved. If that is
+				 * enough to keep the sieve alive, the root being missed is
+				 * a stack. */
+				published[w] = sieve
+			}
+			/* **A guard the same size, allocated in the same breath.**
+			 *
+			 * The stamped slabs are checked every round and have never once
+			 * been wrong — but they are allocated before anything runs in
+			 * parallel and never freed, so they sit in the cold part of the
+			 * heap, nowhere near the churn. That makes them evidence about
+			 * cold memory and nothing else.
+			 *
+			 * This one is allocated beside the sieve, lives exactly as
+			 * long, and holds a byte no sieve ever writes. If it comes back
+			 * wrong, the damage is not something about *this* object being
+			 * freed early; it is that memory in the hot part of the heap is
+			 * being written by somebody else, and the sieve is simply the
+			 * thing that was looking. */
+			guard := make([]byte, n)
+			/* **Two allocations, one address.**
+			 *
+			 * The guard was added to ask whether hot memory gets written by
+			 * somebody else. It answered something sharper: the guard comes
+			 * back *pure* while the sieve beside it sums to zero, and those
+			 * two facts fit together in only one way. A sieve whose every
+			 * position already reads true skips its whole outer loop and so
+			 * writes nothing at all — which is what leaves the guard
+			 * pristine — and every position reads true because the bytes
+			 * under it are `0xA5`. The sieve is reading the guard.
+			 *
+			 * The earlier overlap check compared the eight workers' sieves
+			 * against each other and never compared a worker's own two
+			 * allocations, which is where it is. So this is checked at the
+			 * moment both addresses are known, before either is used. */
+			if a, b := uintptr(unsafe.Pointer(&sieve[0])), uintptr(unsafe.Pointer(&guard[0])); a < b+uintptr(n) && b < a+uintptr(n) {
+				fmt.Printf("stress: **worker %d got one range from two allocations**: sieve %#x, guard %#x, %d bytes each\n",
+					w, a, b, n)
+				os.Exit(7)
+			}
+			for i := range guard {
+				guard[i] = 0xA5
 			}
 			sum := fillSieve(sieve)
+			for i, b := range guard {
+				if b != 0xA5 {
+					fmt.Printf("stress: **the guard beside worker %d's sieve holds %#02x at %d**\n",
+						w, b, i)
+					os.Exit(5)
+				}
+			}
 			bases[w] = uintptr(unsafe.Pointer(&sieve[0]))
 			/* Checked here, by the goroutine that just built it, before it
 			 * is handed anywhere: "already wrong when it was computed" and
 			 * "wrong by the time anyone looked" are different bugs. */
 			owned[w] = sum == wantedSum
 			got[w], sieves[w] = sum, sieve
+			finished[w] = true
 		}(w)
 	}
 	wg.Wait()
+	for w := 0; w < workers; w++ {
+		if !finished[w] {
+			fmt.Printf("stress: **Wait() returned while worker %d was still running**\n", w)
+			os.Exit(6)
+		}
+	}
 	/* **Did two workers get the same memory?**
 	 *
 	 * Every sign points at it: the bytes change between two passes of the

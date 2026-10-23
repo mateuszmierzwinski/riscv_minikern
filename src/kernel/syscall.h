@@ -74,6 +74,10 @@
 #define SYS_BRK 214u
 #define SYS_MUNMAP 215u
 #define SYS_MREMAP 216u
+/* Puts back the pre-fix behaviour of keeping pages a program discarded, so
+ * that the test of the guarantee can be shown to fail without it. */
+void syscall_keep_discarded_pages(bool on);
+
 #define SYS_SWAPON 224u
 #define SYS_SWAPOFF 225u
 #define SYS_CLONE 220u

@@ -451,6 +451,15 @@ uint32_t uspace_fixed_over_live(void);
  * reservation has no pages. */
 uint32_t uspace_misplaced_mappings(void);
 
+/* Throws the pages in a range away, keeping the addresses: what
+ * `MADV_DONTNEED` and `MADV_FREE` mean. The next touch faults a fresh zero
+ * page, which is the guarantee a runtime relies on when it hands the range
+ * out again without zeroing it. */
+int uspace_discard_range(struct uproc *p, virt_t at, uint64_t bytes);
+
+/* Pages given up because a program said it would not need them. */
+uint64_t uspace_discarded_pages(void);
+
 /* Pages that two harts both set out to back, each with its own frame. Any
  * value but zero means one of those frames was live in a hart's TLB while
  * the page table named the other — two copies of one page. */
