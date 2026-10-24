@@ -74,6 +74,7 @@ static void take_geometry(struct xfs *fs, const uint8_t *sb) {
     fs->dirblocks = 1u << sb[XFS_SB_DIRBLKLOG];
     fs->dirblocksize = fs->dirblocks * fs->blocksize;
     fs->dir_leaf_block = XFS_DIR2_LEAF_SPACE_BYTES >> fs->blocklog;
+    fs->dir_free_block = XFS_DIR2_FREE_SPACE_BYTES >> fs->blocklog;
 }
 
 /* The geometry has to be self-consistent before anything is read with it:

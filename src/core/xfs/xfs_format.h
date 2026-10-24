@@ -235,6 +235,8 @@
 #define XFS_DA3_HDR_SIZE   64u /* blkinfo, then count and one more u16, padded */
 #define XFS_DA3_COUNT_OFF  56u /* u16: entries in a leaf, or children in a node */
 #define XFS_DA3_LEVEL_OFF  58u /* u16, node blocks only: 0 is the leaf level */
+#define XFS_DA3_BACK_OFF   4u  /* u32: the previous block at this level */
+#define XFS_DA3_BLKNO_OFF  16u /* u64: this block's own da address, in fs blocks */
 #define XFS_DA3_ENTRY_SIZE 8u  /* {hash, address} or {hash, block} */
 
 /* How many levels of node blocks this will descend before refusing. The
@@ -258,7 +260,7 @@
  * blocks of its own up here, above both the data and the leaf/node blocks.
  * This reader never consults them, walking the data blocks instead, but
  * `xfs_repair` and Linux do. */
-#define XFS_DIR2_FREE_SPACE_BYTES 0xc00000000ull /* 48 GiB: the third space */
+#define XFS_DIR2_FREE_SPACE_BYTES 0x1000000000ull /* 64 GiB: the third space */
 #define XFS_DIR3_FREE_MAGIC 0x58444633u          /* "XDF3" */
 #define XFS_DIR3_FREE_HDR_SIZE 64u               /* blk_hdr, firstdb, nvalid, nused, pad */
 #define XFS_DIR3_FREE_FIRSTDB 48u                /* be32 */

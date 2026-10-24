@@ -517,10 +517,56 @@ int xfs_dir_add(struct xfs *fs, const struct xfs_inode *dir, const char *name, u
      * than inferring it from the size, because the size of a leaf
      * directory counts its data alone and so looks like a block
      * directory's once it has one data block. */
+    /* **Which of the three block-backed shapes it is.** A leaf or node
+     * directory has a block above its data at 32 GiB; a block directory has
+     * only the one. Asking the extent map is the test rather than inferring
+     * it from the size, because a leaf directory's size counts its data
+     * alone and so looks like a block directory's once it has one data
+     * block.
+     *
+     * Leaf and node are then told apart by the magic in that block, not by
+     * anything in the inode: the shape is a property of the index, and the
+     * inode does not record it. */
     {
-        struct xfs_extent e;
-        if (xfs_bmap(fs, dir, fs->dir_leaf_block, &e) == KERR_OK) {
-            return xfs_dir_leaf_add(fs, dir, name, namelen, ino, ftype, now_s);
+        uint16_t shape = xfs_dir_index_shape(fs, dir);
+        if (shape == XFS_DA3_NODE_MAGIC) {
+            return xfs_dir_node_add(fs, dir, name, namelen, ino, ftype, now_s);
+        }
+        if (shape == XFS_DIR3_LEAF1_MAGIC) {
+            rc = xfs_dir_leaf_add(fs, dir, name, namelen, ino, ftype, now_s);
+            if (rc != KERR_NOSPC) {
+                return rc;
+            }
+            /* The hashes have outgrown one block: it becomes a node, and
+             * the entry goes in afterwards rather than as part of the
+             * conversion — the conversion moves no entries, so there is
+             * nothing to add halfway through it. */
+            rc = xfs_dir_to_node(fs, dir, now_s);
+            if (rc == KERR_OK) {
+                fs->grew_to_node++;
+            }
+            if (rc != KERR_OK) {
+                return rc;
+            }
+            /* **The inode is re-read, because `dir` no longer describes it.**
+             * The conversion gave the directory three blocks and three
+             * extents, and `dir` is a snapshot taken before any of that —
+             * so mapping the leaf the node now points at fails on the old
+             * fork, with `KERR_NOENT` for a block that certainly exists.
+             * That is what the first board run said: a *create* answering
+             * "no such file".
+             *
+             * A caller's copy of an inode is only valid until something
+             * changes the inode, which is the same lesson the fork insert
+             * learned one function away. */
+            {
+                struct xfs_inode fresh;
+                rc = xfs_inode_read(fs, dir->ino, &fresh);
+                return rc != KERR_OK
+                           ? rc
+                           : xfs_dir_node_add(fs, &fresh, name, namelen, ino, ftype,
+                                              now_s);
+            }
         }
     }
     rc = xfs_dir_block_add(fs, dir, name, namelen, ino, ftype, now_s);

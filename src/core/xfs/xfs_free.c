@@ -308,8 +308,11 @@ int xfs_dir_remove(struct xfs *fs, const struct xfs_inode *dir, const char *name
         return xfs_dir_sf_remove(fs, dir, name, namelen, now_s, ino);
     }
     {
-        struct xfs_extent e;
-        if (xfs_bmap(fs, dir, fs->dir_leaf_block, &e) == KERR_OK) {
+        uint16_t shape = xfs_dir_index_shape(fs, dir);
+        if (shape == XFS_DA3_NODE_MAGIC) {
+            return xfs_dir_node_remove(fs, dir, name, namelen, now_s, ino);
+        }
+        if (shape == XFS_DIR3_LEAF1_MAGIC) {
             return xfs_dir_leaf_remove(fs, dir, name, namelen, now_s, ino);
         }
     }

@@ -1062,9 +1062,66 @@ sparse inodes, `nrext64`, exchange-range, parent pointers, `bigtime`,
 
       A removal does not give a block back. XFS itself keeps them and reuses
       the space; reclaiming one means removing an extent and a `bests` slot,
-      which is a step of its own. The next shape up is **node** format,
-      which this already reads — reached when the hash array grows into
-      `bests`.
+      which is a step of its own.
+
+- [x] **Directory growth: leaf format into node.** (M) **Done, and every
+      shape measured on the board.** Leaf format keeps every hash in one
+      block, so it ended at about five hundred names however many data
+      blocks it had. Node format puts a **node** block above several
+      `LEAFN` blocks and indexes them by hash, so the ceiling becomes the
+      node's own: five hundred leaves of five hundred hashes.
+
+      Three things move, and the middle one is the surprise:
+
+      - the one `LEAF1` block's hashes split across **two** `LEAFN` blocks,
+        chained by `forw`/`back` so a run of equal hashes can continue into
+        the next;
+      - the block that *was* the leaf becomes the **node root**, and the
+        leaves move to new addresses. The root has to keep its block number
+        because that is where a search starts, so the conversion moves the
+        contents out rather than putting the root somewhere new;
+      - `bests` cannot stay, a `LEAFN` block being all hashes. It moves to a
+        **free block** at 64 GiB of logical offset — a third address space,
+        above the data and the leaves.
+
+      A full leaf then **splits**: the new one takes the upper hashes and
+      goes after the old one in the chain, so the order the chain exists to
+      preserve is preserved. One node level is written; a deeper tree is
+      refused. The *reader* walks any depth, so a filesystem made elsewhere
+      is still read — the limit is on what is written, which is the safer
+      way round.
+
+      **Three bugs, and all three were the same mistake about what a stale
+      copy is worth:**
+
+      - `xfs_dir_fork_insert` took the extent count from the **caller's
+        inode snapshot**. The conversion adds three extents in a row, so
+        the second write put the fork back one extent short and silently
+        dropped the block the first had just added.
+      - The dispatcher chose a shape by **calling an add path and falling
+        back on its error** — but an add writes the entry into a data block
+        *before* it touches the index, so the wrong guess left an entry on
+        disk that the other path then wrote again. `xfs_dir_index_shape`
+        only reads, and is asked first: a probe is how you choose between
+        operations that write.
+      - And twice, a block that had **just been created could not be
+        mapped**, because the inode it was mapped through predated it. On
+        the board that read as a *create* answering `KERR_NOENT` — "no such
+        file" for a file being made. `refresh` is now called wherever the
+        fork changes, and named, because it was written out by hand in two
+        places before it was given a name.
+
+      A fourth was found in the leaf format while reaching this one: a leaf
+      add placed the entry **before** checking the leaf had room for its
+      hash, so a full leaf would have left an entry visible to a walk and
+      invisible to a lookup. It had never been reached, because until node
+      format existed there was nothing after "the leaf is full" — which is
+      the only reason it was not a bug in practice. A step that cannot be
+      undone has to be the last step.
+
+      Also: `struct xfs` carried **85 KB of directory scratch**, which the
+      mount table made expensive. It is shared now, sound only because this
+      kernel takes one big lock around every directory operation.
 
       The pairs are held in the filesystem rather than on a stack: the frame
       guard refused a 16 KiB array, which is the second time that rule has

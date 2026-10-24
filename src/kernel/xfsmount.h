@@ -132,6 +132,10 @@ void xfsmount_root_shape(void);
  * created many files never actually needed one. */
 uint64_t xfsmount_inode_chunks_added(void);
 
+/* Leaves split because they filled: what makes a node directory grow
+ * rather than merely exist. */
+uint64_t xfsmount_leaf_splits(void);
+
 /* Allocations that had to leave the group they asked for. */
 uint64_t xfsmount_alloc_other_group(void);
 
@@ -141,6 +145,7 @@ void xfsmount_single_group(bool on);
 
 /* Directories that changed shape, by the shape reached. A zero in either is
  * the difference between growth that works and growth never reached. */
-void xfsmount_growth_counts(uint64_t *to_block, uint64_t *to_leaf, uint64_t *data_blocks);
+void xfsmount_growth_counts(uint64_t *to_block, uint64_t *to_leaf, uint64_t *to_node,
+                            uint64_t *data_blocks);
 
 #endif

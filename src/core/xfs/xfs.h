@@ -91,6 +91,7 @@ struct xfs {
     uint64_t rootino;
     uint64_t logstart;    /* the internal log's first block, 0 when external */
     uint64_t dir_leaf_block; /* directory data lives below this logical block */
+    uint64_t dir_free_block; /* and the free blocks of a node directory above */
     uint32_t blocksize;
     uint32_t sectsize;
     uint32_t inodesize;
@@ -157,6 +158,11 @@ struct xfs {
      * growth passes either way unless it reads these. */
     uint64_t grew_to_block;
     uint64_t grew_to_leaf;
+    uint64_t grew_to_node;
+    /* Leaves split because they filled, which is the step that makes node
+     * format grow rather than merely exist. The conversion alone makes two
+     * leaves, so a directory that never needed a third never ran it. */
+    uint64_t leaf_splits;
     /* Data blocks added to a directory that had filled the ones it had. */
     uint64_t dir_blocks_added;
     /* Allocations answered by a group other than the one asked for. Zero

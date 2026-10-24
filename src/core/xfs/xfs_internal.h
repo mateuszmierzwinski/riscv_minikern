@@ -266,10 +266,20 @@ int xfs_dir_place_entry(struct xfs *fs, const struct xfs_inode *dir, const char 
 int xfs_dir_take_out(struct xfs *fs, const char *name, uint32_t namelen, uint64_t *ino,
                      uint32_t *at);
 
+/* The magic of a directory's index block: `XFS_DIR3_LEAF1_MAGIC`,
+ * `XFS_DA3_NODE_MAGIC`, or 0 when there is no index block.
+ *
+ * **Asked before dispatching, never discovered by trying.** The add paths
+ * write the entry into a data block before they touch the index, so calling
+ * the wrong one and falling back on its error leaves an entry on disk that
+ * the other path then writes again — a duplicate the first version of this
+ * produced on its first board run. A probe that only reads is the way to
+ * choose between operations that write. */
+uint16_t xfs_dir_index_shape(struct xfs *fs, const struct xfs_inode *dir);
+
 /* Turns a leaf-format directory into a node-format one, adding `name` as
  * part of the same step, and adds to and removes from one afterwards. */
-int xfs_dir_to_node(struct xfs *fs, const struct xfs_inode *dir, const char *name,
-                    uint32_t namelen, uint64_t ino, uint8_t ftype, uint64_t now_s);
+int xfs_dir_to_node(struct xfs *fs, const struct xfs_inode *dir, uint64_t now_s);
 int xfs_dir_node_add(struct xfs *fs, const struct xfs_inode *dir, const char *name,
                      uint32_t namelen, uint64_t ino, uint8_t ftype, uint64_t now_s);
 int xfs_dir_node_remove(struct xfs *fs, const struct xfs_inode *dir, const char *name,

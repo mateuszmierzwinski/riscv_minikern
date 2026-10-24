@@ -167,7 +167,15 @@ CASES = [
       # block directory, a leaf directory, a second data block under it and
       # six chunks of inodes; a run that needed none of them would report
       # every step passing while never touching the code that makes them.
-      "1 to block, 1 to leaf, 1 data block(s)",
+      # Every shape a growing directory passes through, and the splits that
+      # make the last of them grow rather than merely exist. The counts are
+      # pinned because they are behavioural and deterministic — twelve
+      # hundred fixed names hash the same way every run — so a change in
+      # them is a change in what the code did, not in how big it is. The
+      # splits mattered most: seven hundred names reached node format and
+      # split nothing, because the conversion's two leaves hold about a
+      # thousand hashes between them.
+      "1 to block, 1 to leaf, 1 to node, 4 data block(s), 4 leaf split(s)",
       # The allocator left a full group — and its control, in this same
       # run, shows the write being refused without that search.
       "crossed a group after",
@@ -175,7 +183,7 @@ CASES = [
       # rather than being refused — a power cut must not make a disk
       # unreadable.
       "the log is dirty; checked sound, mounting read-only"],
-     360, None, "small"),
+     700, None, "small"),
 
     ("§3: automount puts each volume where its label says",
      "minikern.volumes",

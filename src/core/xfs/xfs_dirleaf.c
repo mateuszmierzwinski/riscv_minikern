@@ -277,22 +277,31 @@ static void empty_data(struct xfs *fs, uint64_t ino) {
 int xfs_dir_fork_insert(struct xfs *fs, const struct xfs_inode *dir, uint64_t logical,
                         uint64_t fsb, bool grows_data, uint64_t now_s) {
     struct xfs_extent e[XFS_DIR_FORK_EXTENTS];
-    uint32_t count = dir->nextents;
-    uint32_t at = 0;
-    uint64_t block;
+    uint32_t count, at = 0;
+    uint64_t block, size, nblocks;
     uint32_t boffset;
     struct bbuf *b;
     uint8_t *di;
     int rc;
-    if (count == 0 || count + 1u > sizeof e / sizeof e[0]) {
-        return KERR_NOSPC; /* a b-tree fork for a directory: not written */
-    }
     xfs_inode_place(fs, dir->ino, &block, &boffset);
     rc = bcache_get(fs->cache, block, &b);
     if (rc != KERR_OK) {
         return rc;
     }
     di = b->data + boffset;
+    /* **The counts come from the inode, not from the caller's copy of it.**
+     * `dir` is a snapshot taken before the operation started, and growing a
+     * directory writes the inode more than once — a leaf-to-node conversion
+     * adds three extents in a row. Using the snapshot's count for the
+     * second of those writes the fork back one extent short, silently
+     * dropping whichever block the first one had just added. */
+    count = xfs_be32(di + XFS_DI_NEXTENTS);
+    size = xfs_be64(di + XFS_DI_SIZE);
+    nblocks = xfs_be64(di + XFS_DI_NBLOCKS);
+    if (count == 0 || count + 1u > sizeof e / sizeof e[0]) {
+        bcache_put(fs->cache, b);
+        return KERR_NOSPC; /* a b-tree fork for a directory: not written */
+    }
     for (uint32_t i = 0; i < count; i++) {
         xfs_extent_unpack(di + XFS_DI_V3_SIZE + i * XFS_EXTENT_BYTES, &e[i]);
         at = e[i].startoff < logical ? i + 1u : at;
@@ -313,8 +322,8 @@ int xfs_dir_fork_insert(struct xfs *fs, const struct xfs_inode *dir, uint64_t lo
         xfs_extent_pack(di + XFS_DI_V3_SIZE + i * XFS_EXTENT_BYTES, &e[i]);
     }
     xfs_put_be32(di + XFS_DI_NEXTENTS, count);
-    xfs_put_be64(di + XFS_DI_SIZE, dir->size + (grows_data ? fs->dirblocksize : 0u));
-    xfs_put_be64(di + XFS_DI_NBLOCKS, dir->nblocks + fs->dirblocks);
+    xfs_put_be64(di + XFS_DI_SIZE, size + (grows_data ? fs->dirblocksize : 0u));
+    xfs_put_be64(di + XFS_DI_NBLOCKS, nblocks + fs->dirblocks);
     xfs_put_be32(di + XFS_DI_MTIME, (uint32_t)now_s);
     xfs_put_be32(di + XFS_DI_CTIME, (uint32_t)now_s);
     xfs_reseal(di, fs->inodesize, XFS_DI_CRC);
@@ -463,11 +472,42 @@ int xfs_dir_place_entry(struct xfs *fs, const struct xfs_inode *dir, const char 
     return xfs_dir_raw_store(fs, fsb);
 }
 
+/* Whether the leaf could take another hash, asked **before** anything is
+ * written.
+ *
+ * `xfs_dir_place_entry` writes the entry into a data block and stores it, so
+ * an add that then found the leaf full would leave an entry on disk with no
+ * hash pointing at it — present to a walk and invisible to a lookup. That
+ * is what this kernel did until the node format gave the "leaf is full"
+ * path somewhere to go: it had never been reached, which is the only reason
+ * it was not a bug in practice. A step that cannot be undone has to be the
+ * *last* step. */
+static int leaf_has_room(struct xfs *fs, const struct xfs_inode *dir) {
+    uint64_t leaf_fsb = 0;
+    uint32_t count, bestcount, blocks = xfs_dir_data_count(fs, dir);
+    int rc = xfs_dir_raw_load(fs, dir, fs->dir_leaf_block, &leaf_fsb);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    if (xfs_be16(fs->dirblock + XFS_DA3_MAGIC_OFF) != XFS_DIR3_LEAF1_MAGIC) {
+        return KERR_NOTSUP;
+    }
+    count = xfs_be16(fs->dirblock + XFS_DA3_COUNT_OFF);
+    bestcount = xfs_be32(fs->dirblock + fs->dirblocksize - XFS_DIR2_LEAF_TAIL_SIZE);
+    bestcount = blocks > bestcount ? blocks : bestcount;
+    /* One more data block than it has, because the entry may need one and
+     * that costs another `bests` slot — the pessimistic answer, since
+     * finding out afterwards is what this function exists to avoid. */
+    return leaf_hash_room(fs, count, bestcount + 1u) != 0 ? KERR_OK : KERR_NOSPC;
+}
+
 int xfs_dir_leaf_add(struct xfs *fs, const struct xfs_inode *dir, const char *name,
                      uint32_t namelen, uint64_t ino, uint8_t ftype, uint64_t now_s) {
     uint32_t which = 0, at = 0, best = 0, blocks = 0;
-    int rc = xfs_dir_place_entry(fs, dir, name, namelen, ino, ftype, now_s, &which, &at, &best,
-                         &blocks);
+    int rc = leaf_has_room(fs, dir);
+    rc = rc != KERR_OK ? rc
+                       : xfs_dir_place_entry(fs, dir, name, namelen, ino, ftype, now_s,
+                                             &which, &at, &best, &blocks);
     rc = rc != KERR_OK ? rc
                        : edit_leaf(fs, dir, xfs_dir_hashname(name, namelen),
                                    xfs_dir_address_of(fs, which, at), true, which, best, blocks);

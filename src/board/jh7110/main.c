@@ -1399,11 +1399,13 @@ static int read_back(const char *name, const char *want, uint32_t len) {
  * and twenty a single block holds, so the directory must become a **leaf**
  * directory. Each of those was a gap this number found by being raised:
  * twenty stopped at shortform, sixty at an allocator that would not grow,
- * two hundred at a directory that could not leave one block, and four
- * hundred at a leaf directory that could not have a second data block.
+ * two hundred at a directory that could not leave one block, four hundred
+ * at a leaf directory that could not have a second data block, and seven
+ * hundred at a leaf whose hashes no longer fit in one block, and twelve
+ * hundred at a node directory whose two leaves were themselves full.
  * Asking for more than the last run managed is how a test finds the next
  * thing rather than confirming the last one. */
-#define NAMES 400u
+#define NAMES 1200u
 
 static int grow_a_directory(void) {
     char name[8] = "g00";
@@ -1575,24 +1577,32 @@ static void run_write_selftest(void) {
                                  xfsmount_inode_of("w3", &two, &links) == KERR_OK ? KERR_IO
                                                                                   : KERR_OK);
     ok = ok && wrote_and_checked("grow past shortform", grow_a_directory());
+    /* **Said out loud, because the alternative is a test that cannot
+     * fail.** Seven hundred names need a second chunk of inodes, a block
+     * directory, a leaf, a second data block under it and then a node only
+     * if each boundary is actually crossed — and a run that crossed none of
+     * them would print every step as passing while never touching the code
+     * that does the growing.
+     *
+     * Printed **here** rather than at the end: the dirty-log step below
+     * mounts the filesystem again, which resets the counters it would
+     * otherwise be read after. The first version did read them after, and
+     * reported five zeroes on a run that had done all five. */
+    {
+        uint64_t to_block = 0, to_leaf = 0, to_node = 0, data_blocks = 0;
+        xfsmount_growth_counts(&to_block, &to_leaf, &to_node, &data_blocks);
+        kprintf("fswrite: %llu inode chunk(s), %llu to block, %llu to leaf, %llu to node, "
+                "%llu data block(s), %llu leaf split(s)\n",
+                (unsigned long long)xfsmount_inode_chunks_added(),
+                (unsigned long long)to_block, (unsigned long long)to_leaf,
+                (unsigned long long)to_node, (unsigned long long)data_blocks,
+                (unsigned long long)xfsmount_leaf_splits());
+    }
     ok = ok && wrote_and_checked("allocate past one group", fill_past_one_group());
     ok = ok && wrote_and_checked("one group alone must refuse", one_group_refuses());
     /* Last, because it leaves the filesystem read-only: anything after it
      * would be testing a mount that refuses writes by design. */
     ok = ok && wrote_and_checked("a dirty log mounts read-only", dirty_then_remount());
-    /* **Said out loud, because the alternative is a test that cannot
-     * fail.** Sixty names need a second chunk of inodes only if the first
-     * one runs out, and a run where it did not would print every step as
-     * passing while never touching the allocator's new path. */
-    {
-        uint64_t to_block = 0, to_leaf = 0, data_blocks = 0;
-        xfsmount_growth_counts(&to_block, &to_leaf, &data_blocks);
-        kprintf("fswrite: %llu inode chunk(s), %llu to block, %llu to leaf, "
-                "%llu data block(s)\n",
-                (unsigned long long)xfsmount_inode_chunks_added(),
-                (unsigned long long)to_block, (unsigned long long)to_leaf,
-                (unsigned long long)data_blocks);
-    }
     kprintf("fswrite: %s\n", ok ? "every step passed" : "a step FAILED");
 }
 
