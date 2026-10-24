@@ -1414,8 +1414,8 @@ sparse inodes, `nrext64`, exchange-range, parent pointers, `bigtime`,
 
 ## 4. Drivers and board hardware
 
-- [~] **The board's Ethernet (DesignWare GMAC).** (L) **The link comes up on
-      the board**; frames still need descriptor rings.
+- [x] **The board's Ethernet (DesignWare GMAC).** (L) **The link comes up
+      and frames go both ways on the board.**
 
       `dwmac: /soc/ethernet@16040000, version 00004152` /
       `address 6c:cf:39:00:b6:89` / `PHY at 0, id 4f51e91b` /
@@ -1441,11 +1441,45 @@ sparse inodes, `nrext64`, exchange-range, parent pointers, `bigtime`,
       rather than invented, so this kernel appears on the network as the
       same machine U-Boot was.
 
-      What remains: the dwmac4 DMA block at 0x1000, four-word descriptors,
-      page-aligned buffers, and `send`/`poll` over them. Nothing there is
-      unknown.
+      **And frames now go both ways**, proved in MAC loopback:
+      `frame of 64 bytes, 6c:cf:39:00:b6:89 -> ff:ff:ff:ff:ff:ff type 0806`
+      and `1 sent, 1 received, 0 dropped`. Eight descriptors each way,
+      2 KiB buffers, store-and-forward both directions.
 
-- [ ] **The board's Ethernet: frames.** (M) The network stack and
+      Three details that are where a dwmac driver silently does nothing:
+      the ring-length registers hold **one less** than the ring (the
+      controller reads it as the last valid index); **writing the tail
+      pointer** is what starts a transfer, so a descriptor published without
+      moving it sits there for ever; and the **ownership bit goes last**,
+      fenced with `fence w, w` as `virtio.c` does, because the controller
+      may act the instant it sees that bit and a descriptor published before
+      its buffer address is one the hardware fills at whatever address was
+      there.
+
+      The DMA software reset had to move **before** the MAC is configured:
+      on this controller it resets the whole MAC, so resetting it where it
+      naturally belongs — with the rings — wiped the speed and duplex the
+      PHY had just negotiated. That fails silently: the link stays up,
+      frames leave at the wrong rate, and none arrive.
+
+      **The first test could not have failed usefully.** It sent a broadcast
+      ARP and waited for anything at all, assuming a real segment is never
+      quiet; when nothing came back, a broken receive ring and a switch port
+      with nobody else on it looked identical — and the DMA status was
+      consistent with both. Loopback removes the network from the question:
+      the frame sent is the frame that must arrive. A test whose outcome
+      depends on what else is plugged in was never a test of this driver.
+
+      Two of this driver's own comments had to be corrected after being
+      written as though measured: that enhanced addressing (`EAME`) was the
+      cause of the receive failure — the buffers came back at
+      `0x4084_6000`, inside 32 bits, so it never was, though it stays
+      because an 8 GiB board *can* return higher memory — and that `dma
+      status` bit 10 was a fatal bus error. Bit 12 is; bit 10 is the early
+      transmit interrupt, so the `0x405` that was read as a fault was
+      `TI | TBU | ETI` and entirely normal.
+
+- [ ] **The board's Ethernet: the stack over it.** (M) The network stack and
       sockets work over virtio-net; on the VisionFive 2 there is no driver,
       so the board has no network. The cable is in the **second** controller
       (`ethernet@16040000`), which is the one that negotiates.

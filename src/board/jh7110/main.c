@@ -931,6 +931,24 @@ static void bring_up_clocks(uint64_t dtb) {
  * known to work together, and every one of those was a separate wrong guess
  * before the probe measured it. Frames need descriptor rings, which is the
  * next step and has nothing left to discover. */
+/* Where received frames go for the bring-up test: it prints the first few
+ * and counts the rest. The frame is valid only during the call, which is
+ * the port's contract, so anything kept would have to be copied — and
+ * nothing here needs to be. */
+static void show_frame(void *self, const uint8_t *frame, uint32_t len) {
+    static uint32_t said;
+    (void)self;
+    if (said < 4u) {
+        said++;
+        kprintf("dwmac: frame of %u bytes, %02x:%02x:%02x:%02x:%02x:%02x -> "
+                "%02x:%02x:%02x:%02x:%02x:%02x type %02x%02x\n",
+                len, frame[6], frame[7], frame[8], frame[9], frame[10], frame[11], frame[0],
+                frame[1], frame[2], frame[3], frame[4], frame[5], frame[12], frame[13]);
+    }
+}
+
+static const struct frame_sink show_sink = {.frame = show_frame, .self = NULL};
+
 static void bring_up_the_ethernet(uint64_t dtb) {
     struct fdt fdt;
     const struct netdev_port *port = NULL;
@@ -940,12 +958,62 @@ static void bring_up_the_ethernet(uint64_t dtb) {
         kprintf("dwmac: no device tree\n");
         return;
     }
+    dwmac_set_sink(&show_sink);
     if (dwmac_init(&fdt, &port) != KERR_OK) {
         kprintf("dwmac: not brought up\n");
         return;
     }
-    if (dwmac_link_up(&mbit, &full)) {
-        kprintf("dwmac: ready at %u Mbit %s duplex\n", mbit, full ? "full" : "half");
+    if (!dwmac_link_up(&mbit, &full)) {
+        return;
+    }
+    kprintf("dwmac: ready at %u Mbit %s duplex\n", mbit, full ? "full" : "half");
+    /* **A frame the switch is obliged to answer.** An ARP request for this
+     * board's own address, broadcast: anything on the segment that has that
+     * address replies, and nothing does, so what comes back is whatever
+     * else is talking — which on any real network is plenty. The point is
+     * not the reply, it is that the receive path delivers *something*: a
+     * link that is up and a ring that never fills means the rings are
+     * wrong, and that is indistinguishable from a quiet network unless
+     * something is sent to stir it. */
+    if (port != NULL) {
+        uint8_t arp[42];
+        uint8_t mac[6];
+        uint64_t sent = 0, got = 0, dropped = 0;
+        dwmac_address(mac);
+        for (uint32_t i = 0; i < sizeof arp; i++) {
+            arp[i] = 0;
+        }
+        for (uint32_t i = 0; i < 6u; i++) {
+            arp[i] = 0xffu;      /* to everybody */
+            arp[6u + i] = mac[i]; /* from this board */
+            arp[22u + i] = mac[i];
+        }
+        arp[12] = 0x08;
+        arp[13] = 0x06; /* ARP */
+        arp[14] = 0x00;
+        arp[15] = 0x01; /* Ethernet */
+        arp[16] = 0x08;
+        arp[17] = 0x00; /* IPv4 */
+        arp[18] = 6u;
+        arp[19] = 4u;
+        arp[21] = 0x01; /* request */
+        /* **In loopback**, so the answer does not depend on who else is on
+         * the wire. The frame the board sends is the frame it must receive,
+         * and `show_frame` prints what came back for comparison. */
+        dwmac_set_loopback(true);
+        if (port->send(port->self, arp, sizeof arp) != KERR_OK) {
+            kprintf("dwmac: the first frame was refused\n");
+        }
+        /* Polled for a while, because nothing interrupts yet. */
+        for (uint32_t i = 0; i < 2000000u; i++) {
+            (void)dwmac_poll();
+        }
+        dwmac_set_loopback(false);
+        dwmac_counters(&sent, &got, &dropped);
+        kprintf("dwmac: %llu sent, %llu received, %llu dropped; dma status %08x, "
+                "last tx desc %08x\n",
+                (unsigned long long)sent, (unsigned long long)got,
+                (unsigned long long)dropped, dwmac_dma_status(), dwmac_last_tx_status());
     }
 }
 

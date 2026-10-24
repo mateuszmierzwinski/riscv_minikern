@@ -38,6 +38,23 @@ uint32_t dwmac_poll(void);
  * read rather than assumed. */
 bool dwmac_link_up(uint32_t *mbit, bool *full_duplex);
 
+/* Frames sent, delivered and dropped. A driver that reports zero received
+ * on a link that is up is a different problem from one that reports
+ * hundreds dropped, and the counters are how the two are told apart. */
+void dwmac_counters(uint64_t *sent, uint64_t *received, uint64_t *dropped);
+
+/* Loops the MAC back on itself: every frame sent arrives on the receive
+ * ring. The only way to test the rings without depending on what else is
+ * on the segment — a quiet switch port and a broken receive ring look
+ * identical from outside. */
+void dwmac_set_loopback(bool on);
+
+/* What the DMA channel reports, and the last transmit descriptor's
+ * write-back. A frame counted as sent but whose descriptor the hardware
+ * never claimed is the signature of a tail pointer that was not written. */
+uint32_t dwmac_dma_status(void);
+uint32_t dwmac_last_tx_status(void);
+
 /* The MAC address the controller was given. */
 void dwmac_address(uint8_t out[6]);
 

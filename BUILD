@@ -873,6 +873,7 @@ cc_library(
         ":console",
         ":core_boot",
         ":drivers_gpio",
+        ":kernel_mem",
     ],
 )
 

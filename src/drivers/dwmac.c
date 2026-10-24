@@ -17,6 +17,7 @@
 #include "core/errno.h"
 #include "core/fdt.h"
 #include "drivers/crg_jh7110.h"
+#include "kernel/mem.h"
 
 /* The dwmac4 registers this driver touches. */
 #define MAC_CONFIG        0x0000u
@@ -32,6 +33,7 @@
 #define MAC_CONFIG_DM    (1u << 13) /* full duplex */
 #define MAC_CONFIG_FES   (1u << 14) /* 100 Mbit when PS is set */
 #define MAC_CONFIG_PS    (1u << 15) /* port select: MII/RMII rather than GMII */
+#define MAC_CONFIG_LM    (1u << 12) /* loopback: the MAC feeds itself */
 
 #define MDIO_BUSY  (1u << 0)
 #define MDIO_READ  (3u << 2)
@@ -51,6 +53,76 @@
 #define PHY_CONTROL_AUTONEG  (1u << 12)
 #define PHY_CONTROL_RESTART  (1u << 9)
 
+/* The DMA and queue registers, which the dwmac4 map puts above 0x1000. */
+#define MTL_OPMODE        0x0c00u
+#define MTL_TXQ0_OPMODE   0x0d00u
+#define MTL_RXQ0_OPMODE   0x0d30u
+#define DMA_BUS_MODE      0x1000u
+#define DMA_SYSBUS_MODE   0x1004u
+#define DMA_CH0_CONTROL   0x1100u
+#define DMA_CH0_TX_CTRL   0x1104u
+#define DMA_CH0_RX_CTRL   0x1108u
+#define DMA_CH0_TXLIST_HI 0x1110u
+#define DMA_CH0_TXLIST    0x1114u
+#define DMA_CH0_RXLIST_HI 0x1118u
+#define DMA_CH0_RXLIST    0x111cu
+#define DMA_CH0_TXTAIL    0x1120u
+#define DMA_CH0_RXTAIL    0x1128u
+#define DMA_CH0_TXRINGLEN 0x112cu
+#define DMA_CH0_RXRINGLEN 0x1130u
+#define DMA_CH0_STATUS    0x1160u
+
+#define DMA_BUS_MODE_SWR  (1u << 0)
+/* `DMA_SYSBUS_MODE`, and the one bit that decides whether a descriptor's
+ * high address word means anything.
+ *
+ * **EAME belongs here, and it was not the bug it was added for.** This
+ * board has 8 GiB of DRAM from `0x4000_0000`, so the page allocator *can*
+ * return a buffer above 4 GiB, and without enhanced addressing the
+ * controller would ignore the high word and write the frame to the low 32
+ * bits instead. That is worth preventing. But it was not what was wrong:
+ * the rings and buffers actually came back at `0x4084_6000` and nearby,
+ * inside 32 bits, which the driver now prints — and printing them is what
+ * refuted the theory in the same run that tested it.
+ *
+ * The status bits were misread too. In this generation **bit 12** is the
+ * fatal bus error; bit 10 is the early transmit interrupt. `0x405` is
+ * `TI | TBU | ETI`: transmit finished, its ring is empty, and nothing is
+ * wrong anywhere.
+ *
+ * `AAL` keeps bursts address-aligned, which the fixed-burst setting below
+ * assumes. */
+#define DMA_SYS_FB   (1u << 0)
+#define DMA_SYS_EAME (1u << 11)
+#define DMA_SYS_AAL  (1u << 12)
+#define DMA_TX_START      (1u << 0)
+#define DMA_RX_START      (1u << 0)
+#define MTL_TXQ_ENABLE    (2u << 2)
+#define MTL_TXQ_STORE_FWD (1u << 1)
+#define MTL_RXQ_STORE_FWD (1u << 5)
+
+/* A descriptor's words, as dwmac4 defines them. The fourth word carries the
+ * ownership bit, which is the entire synchronisation between this driver and
+ * the controller: set means the hardware owns it. */
+#define DESC_OWN   (1u << 31)
+#define DESC_TX_FD (1u << 29) /* first descriptor of a frame */
+#define DESC_TX_LD (1u << 28) /* and last */
+#define DESC_TX_IOC (1u << 31) /* in word 2: interrupt on completion */
+#define DESC_RX_BUF1V (1u << 24)
+#define DESC_RX_IOC   (1u << 30)
+#define DESC_RX_ERROR (1u << 15)
+
+/* Eight descriptors each way and 2 KiB a buffer.
+ *
+ * Eight because a ring must be a power of two for the tail pointer
+ * arithmetic to wrap cleanly, and because this kernel polls: a deeper ring
+ * only helps a driver that can be interrupted while the hardware runs
+ * ahead. 2 KiB holds any Ethernet frame this link will carry and is what
+ * `RBSZ` is set to — a buffer smaller than a frame makes the controller
+ * split it across descriptors, which is a feature nobody here needs. */
+#define RING 8u
+#define BUFFER 2048u
+
 /* The one controller this driver drives, and what it needs to remember.
  *
  * Static rather than allocated because there is one of it: the board has
@@ -61,9 +133,25 @@ static struct {
     uint8_t mac[6];
     uint32_t phy;
     bool present;
+    bool noncoherent;
     uint32_t mbit;
     bool full_duplex;
     const struct frame_sink *sink;
+    /* The rings and their buffers, in memory the controller reads and
+     * writes directly. **Physically contiguous and page-aligned**, which is
+     * why they come from the page allocator rather than the heap: the
+     * controller is given a physical address and walks the ring itself, so
+     * a ring split across pages that the heap happened to place apart would
+     * have it reading whatever lies between them. */
+    volatile uint32_t *txd;
+    volatile uint32_t *rxd;
+    uint8_t *txb;
+    uint8_t *rxb;
+    uint32_t tx_next;
+    uint32_t rx_next;
+    uint64_t sent;
+    uint64_t received;
+    uint64_t dropped;
 } nic;
 
 static uint32_t rd(uint32_t off) {
@@ -261,6 +349,197 @@ void dwmac_set_sink(const struct frame_sink *sink) {
     nic.sink = sink;
 }
 
+/* ── the descriptor rings ────────────────────────────────────────────── */
+
+/* One receive descriptor, handed back to the controller.
+ *
+ * The buffer address goes in first and the ownership bit **last**, because
+ * the controller may act on the descriptor the instant it sees that bit: a
+ * descriptor published before its address was written is one the hardware
+ * fills at whatever address happened to be there. This is the same
+ * publish-last rule the page tables follow, for the same reason. */
+static void rx_publish(uint32_t i) {
+    volatile uint32_t *d = nic.rxd + i * 4u;
+    phys_t buf = (phys_t)(uintptr_t)(nic.rxb + i * BUFFER);
+    d[0] = (uint32_t)buf;
+    d[1] = (uint32_t)(buf >> 32);
+    d[2] = 0;
+    /* **The ownership bit last, and fenced.** The controller may act on a
+     * descriptor the instant it sees that bit, so one published before its
+     * address was written is one the hardware fills at whatever address
+     * happened to be there. `fence w, w` is the idiom `virtio.c` uses for
+     * the same ordering problem against the same kind of reader. */
+    __asm__ volatile("fence w, w" : : : "memory");
+    d[3] = DESC_OWN | DESC_RX_BUF1V | DESC_RX_IOC;
+}
+
+/* The rings, and the DMA engine told where they are.
+ *
+ * `DMA_BUS_MODE_SWR` first: a software reset leaves every DMA register at
+ * its default, which is the only state this driver knows how to build on —
+ * the firmware has been using this controller for its own network and its
+ * settings are not ours to inherit. The reset is self-clearing and is
+ * waited for, because writing the ring addresses into a block that is still
+ * resetting writes them nowhere. */
+static int rings_up(void) {
+    phys_t txd = 0, rxd = 0, txb = 0, rxb = 0;
+    int rc = mem_alloc_pages(1, 1, &txd);
+    rc = rc != KERR_OK ? rc : mem_alloc_pages(1, 1, &rxd);
+    rc = rc != KERR_OK ? rc : mem_alloc_pages((RING * BUFFER + 4095u) / 4096u, 1, &txb);
+    rc = rc != KERR_OK ? rc : mem_alloc_pages((RING * BUFFER + 4095u) / 4096u, 1, &rxb);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    nic.txd = (volatile uint32_t *)(uintptr_t)txd;
+    nic.rxd = (volatile uint32_t *)(uintptr_t)rxd;
+    nic.txb = (uint8_t *)(uintptr_t)txb;
+    nic.rxb = (uint8_t *)(uintptr_t)rxb;
+    for (uint32_t i = 0; i < RING * 4u; i++) {
+        nic.txd[i] = 0;
+        nic.rxd[i] = 0;
+    }
+    for (uint32_t i = 0; i < RING; i++) {
+        rx_publish(i);
+    }
+    nic.tx_next = 0;
+    nic.rx_next = 0;
+    /* Store-and-forward both ways: the controller holds a whole frame
+     * before starting on it, which costs latency and removes the underrun
+     * a threshold mode has to be tuned to avoid. A kernel that polls is in
+     * no position to tune it. */
+    /* Enhanced addressing before the ring addresses are written, because
+     * it is what makes the high word of each of them mean anything. */
+    wr(DMA_SYSBUS_MODE, rd(DMA_SYSBUS_MODE) | DMA_SYS_EAME | DMA_SYS_AAL | DMA_SYS_FB);
+    kprintf("dwmac: rings at %llx/%llx, buffers at %llx/%llx\n", (unsigned long long)txd,
+            (unsigned long long)rxd, (unsigned long long)txb, (unsigned long long)rxb);
+    wr(MTL_TXQ0_OPMODE, MTL_TXQ_ENABLE | MTL_TXQ_STORE_FWD);
+    wr(MTL_RXQ0_OPMODE, MTL_RXQ_STORE_FWD);
+    wr(DMA_CH0_TXLIST_HI, (uint32_t)((uint64_t)txd >> 32));
+    wr(DMA_CH0_TXLIST, (uint32_t)txd);
+    wr(DMA_CH0_RXLIST_HI, (uint32_t)((uint64_t)rxd >> 32));
+    wr(DMA_CH0_RXLIST, (uint32_t)rxd);
+    /* **The length registers hold one less than the ring**, which is the
+     * kind of off-by-one that costs an afternoon: the controller reads it
+     * as "the last valid index". */
+    wr(DMA_CH0_TXRINGLEN, RING - 1u);
+    wr(DMA_CH0_RXRINGLEN, RING - 1u);
+    wr(DMA_CH0_RX_CTRL, (BUFFER << 1) | DMA_RX_START);
+    wr(DMA_CH0_TX_CTRL, rd(DMA_CH0_TX_CTRL) | DMA_TX_START);
+    /* The receive tail points past the last descriptor the hardware may
+     * use; everything up to it is fair game. */
+    wr(DMA_CH0_RXTAIL, (uint32_t)(rxd + RING * 16u));
+    wr(MAC_CONFIG, rd(MAC_CONFIG) | MAC_CONFIG_TE | MAC_CONFIG_RE);
+    return KERR_OK;
+}
+
+static int dwmac_send(void *self, const uint8_t *frame, uint32_t len) {
+    volatile uint32_t *d;
+    uint8_t *buf;
+    (void)self;
+    if (!nic.present || len == 0 || len > BUFFER) {
+        return KERR_INVAL;
+    }
+    d = nic.txd + nic.tx_next * 4u;
+    if ((d[3] & DESC_OWN) != 0) {
+        return KERR_AGAIN; /* the controller still has this one */
+    }
+    buf = nic.txb + nic.tx_next * BUFFER;
+    for (uint32_t i = 0; i < len; i++) {
+        buf[i] = frame[i];
+    }
+    d[0] = (uint32_t)(uintptr_t)buf;
+    d[1] = (uint32_t)((uint64_t)(uintptr_t)buf >> 32);
+    d[2] = DESC_TX_IOC | len;
+    __asm__ volatile("fence w, w" : : : "memory");
+    d[3] = DESC_OWN | DESC_TX_FD | DESC_TX_LD | len;
+    nic.tx_next = (nic.tx_next + 1u) % RING;
+    /* The tail tells the controller how far it may walk. Writing it is what
+     * starts the transfer — a descriptor published without moving the tail
+     * sits there for ever, which is the commonest way a dwmac driver
+     * appears to do nothing at all. */
+    wr(DMA_CH0_TXTAIL, (uint32_t)(uintptr_t)(nic.txd + nic.tx_next * 4u));
+    nic.sent++;
+    return KERR_OK;
+}
+
+static const struct netdev_port dwmac_port = {.send = dwmac_send, .self = NULL};
+
+uint32_t dwmac_poll(void) {
+    uint32_t delivered = 0;
+    if (!nic.present) {
+        return 0;
+    }
+    for (uint32_t n = 0; n < RING; n++) {
+        volatile uint32_t *d = nic.rxd + nic.rx_next * 4u;
+        uint32_t status = d[3];
+        uint32_t len;
+        if ((status & DESC_OWN) != 0) {
+            break; /* the controller has not finished with it */
+        }
+        len = status & 0x7fffu;
+        if ((status & DESC_RX_ERROR) != 0 || len == 0 || len > BUFFER) {
+            nic.dropped++;
+        } else if (nic.sink != NULL) {
+            /* **The frame is valid only during the call**, which is the
+             * port's contract and why the descriptor is handed back
+             * afterwards rather than before: giving it to the controller
+             * first would let the next frame overwrite this one while the
+             * stack was still reading it. */
+            nic.sink->frame(nic.sink->self, nic.rxb + nic.rx_next * BUFFER, len);
+            nic.received++;
+            delivered++;
+        }
+        rx_publish(nic.rx_next);
+        nic.rx_next = (nic.rx_next + 1u) % RING;
+        wr(DMA_CH0_RXTAIL, (uint32_t)(uintptr_t)(nic.rxd + nic.rx_next * 4u));
+    }
+    return delivered;
+}
+
+/* Loops the MAC back on itself, so a frame sent is a frame received.
+ *
+ * **This is how the rings get tested without the network in the way.** The
+ * first attempt sent a broadcast ARP and waited to see anything at all,
+ * on the theory that a real segment is never quiet — and when nothing
+ * came back there was no way to tell a broken receive ring from a switch
+ * port with nobody else on it. The DMA status said transmit had finished
+ * cleanly and receive was running with buffers free, which is consistent
+ * with both.
+ *
+ * In loopback the question has one answer: the frame goes out, comes back
+ * through the receive ring, and the bytes either match or they do not. A
+ * test that depends on what else is plugged in is not a test of this
+ * driver. */
+void dwmac_set_loopback(bool on) {
+    if (!nic.present && nic.regs == NULL) {
+        return;
+    }
+    wr(MAC_CONFIG, on ? (rd(MAC_CONFIG) | MAC_CONFIG_LM)
+                      : (rd(MAC_CONFIG) & ~(uint32_t)MAC_CONFIG_LM));
+}
+
+uint32_t dwmac_dma_status(void) {
+    return nic.present ? rd(DMA_CH0_STATUS) : 0;
+}
+
+/* Whether the controller has finished with the last descriptor posted, and
+ * what it said about it.
+ *
+ * `sent` counting posts rather than completions is honest but not enough: a
+ * descriptor the hardware never looks at leaves the count rising and the
+ * wire silent, which is exactly the failure a tail pointer left unwritten
+ * produces. The ownership bit clearing is the hardware saying it is done. */
+uint32_t dwmac_last_tx_status(void) {
+    uint32_t i = (nic.tx_next + RING - 1u) % RING;
+    return nic.present ? nic.txd[i * 4u + 3u] : 0;
+}
+
+void dwmac_counters(uint64_t *sent, uint64_t *received, uint64_t *dropped) {
+    *sent = nic.sent;
+    *received = nic.received;
+    *dropped = nic.dropped;
+}
+
 /* ── bringing one up ─────────────────────────────────────────────────── */
 
 /* The controller to use, which is **not** simply the first one found.
@@ -309,11 +588,30 @@ static int open_controller(const struct fdt *fdt, const char *path) {
         kprintf("dwmac: %s reads version 0 — mapped but not running\n", path);
         return KERR_IO;
     }
-    return KERR_OK;
+    /* **The reset comes first, before anything is configured.**
+     *
+     * A DMA software reset on this controller resets the whole MAC, not
+     * just the DMA block — so doing it where it naturally belongs, with the
+     * rings, wipes every setting made before it. The first version
+     * configured the speed and duplex the PHY had negotiated and *then*
+     * reset the MAC, which left a gigabit link driven by a MAC back at its
+     * defaults. Nothing complains about that: the link stays up, frames go
+     * out at the wrong rate, and none arrive.
+     *
+     * The firmware has been using this controller for its own network, so
+     * its settings are not ours to inherit either. A reset is the only
+     * state this driver knows how to build on. */
+    wr(DMA_BUS_MODE, rd(DMA_BUS_MODE) | DMA_BUS_MODE_SWR);
+    for (uint32_t i = 0; i < 1000000u; i++) {
+        if ((rd(DMA_BUS_MODE) & DMA_BUS_MODE_SWR) == 0) {
+            return KERR_OK;
+        }
+    }
+    kprintf("dwmac: the DMA block would not come out of reset\n");
+    return KERR_TIMEDOUT;
 }
 
 int dwmac_init(const struct fdt *fdt, const struct netdev_port **port) {
-    (void)port;
     for (uint32_t i = 0; i < sizeof CONTROLLERS / sizeof CONTROLLERS[0]; i++) {
         struct fdt_prop exists;
         int rc;
@@ -342,7 +640,26 @@ int dwmac_init(const struct fdt *fdt, const struct netdev_port **port) {
             continue; /* the other controller may be the one with the cable */
         }
         configure_mac();
+        {
+            struct fdt_prop nc;
+            nic.noncoherent = fdt_get_prop(fdt, CONTROLLERS[i], "dma-noncoherent", &nc) ==
+                              KERR_OK;
+        }
+        /* **Said out loud, because nothing in this tree maintains caches.**
+         * NVMe and virtio do DMA here without any flush or invalidate,
+         * which works because their masters are coherent. If this one is
+         * not, frames will arrive as stale bytes rather than not at all —
+         * so the tree's own answer is printed, and a corrupt frame has a
+         * first suspect instead of a mystery. */
+        kprintf("dwmac: the tree says this controller is %s\n",
+                nic.noncoherent ? "dma-noncoherent — caches are NOT maintained here"
+                                : "cache-coherent");
+        if (rings_up() != KERR_OK) {
+            kprintf("dwmac: the rings would not come up\n");
+            continue;
+        }
         nic.present = true;
+        *port = &dwmac_port;
         kprintf("dwmac: link up at %u Mbit, %s duplex\n", nic.mbit,
                 nic.full_duplex ? "full" : "half");
         return KERR_OK;
@@ -350,6 +667,3 @@ int dwmac_init(const struct fdt *fdt, const struct netdev_port **port) {
     return KERR_NODEV;
 }
 
-uint32_t dwmac_poll(void) {
-    return 0; /* the descriptor rings are the next step */
-}

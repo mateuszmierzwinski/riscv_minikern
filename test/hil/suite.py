@@ -212,7 +212,13 @@ CASES = [
       # has to be configured to match it: a MAC set for gigabit on a
       # hundred-megabit link loses every frame and says nothing.
       "dwmac: PHY at 0, id 4f51e91b",
-      "dwmac: link up at 1000 Mbit, full duplex"],
+      "dwmac: link up at 1000 Mbit, full duplex",
+      # And the rings, proved in loopback rather than against the network:
+      # a quiet switch port and a broken receive ring are indistinguishable
+      # from outside, and the first version of this test could not tell
+      # them apart. The frame sent is the frame that must arrive.
+      "dwmac: frame of 64 bytes, 6c:cf:39:00:b6:89 -> ff:ff:ff:ff:ff:ff type 0806",
+      "dwmac: 1 sent, 1 received, 0 dropped"],
      120, None, False),
 
     ("§2: swap under a watermark, with the clock choosing",
