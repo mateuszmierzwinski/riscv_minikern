@@ -111,6 +111,27 @@ static int take(struct xfs *fs, const uint8_t *di, uint64_t ino, struct xfs_inod
         .forkoff = di[XFS_DI_FORKOFF],
         .fork_len = avail < XFS_FORK_MAX ? avail : XFS_FORK_MAX,
     };
+    /* **An inode whose fork is larger than the cache is refused here**, not
+     * at mount: the filesystem is fine and so is every other inode in it.
+     *
+     * The b-tree case is the one that matters most. Its key and pointer
+     * arrays are laid out according to how many records the root *could*
+     * hold, which is computed from the fork's length — so a truncated
+     * `fork_len` does not merely hide the tail, it moves every pointer. A
+     * silently wrong pointer is worse than a refusal by the whole distance
+     * between a wrong answer and no answer. */
+    if (avail > XFS_FORK_MAX) {
+        bool fits = out->format == XFS_DINODE_FMT_LOCAL
+                        ? out->size <= XFS_FORK_MAX
+                        : (out->format == XFS_DINODE_FMT_EXTENTS
+                               ? (uint64_t)out->nextents * XFS_EXTENT_BYTES <= XFS_FORK_MAX
+                               : false);
+        if (!fits) {
+            kprintf("xfs: inode %u has a %u-byte fork; this reader caches %u\n",
+                    (uint32_t)ino, avail, XFS_FORK_MAX);
+            return KERR_NOTSUP;
+        }
+    }
     if (out->format == XFS_DINODE_FMT_BTREE && out->fork_len <= XFS_BMDR_HDR_BYTES) {
         return KERR_IO; /* a btree root with no room for even one pointer */
     }

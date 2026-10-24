@@ -91,8 +91,32 @@ static int check_geometry(const struct xfs *fs) {
         kprintf("xfs: the superblock's geometry does not add up\n");
         return KERR_INVAL;
     }
-    if (fs->inodesize > XFS_INODE_MAX || (fs->inodesize != 256u && fs->inodesize != 512u)) {
-        kprintf("xfs: %u-byte inodes are not supported (256 or 512)\n", fs->inodesize);
+    /* **Every inode size XFS allows is accepted**: 256, 512, 1024 or 2048.
+     *
+     * The first three of those were refused outright, which made a
+     * filesystem formatted with `-i size=1024` unmountable — and the
+     * refusal was not about the inode size at all, it was about the fork
+     * cache. `struct xfs_inode` carries a copy of the inode's literal area,
+     * and that copy is `XFS_FORK_MAX` bytes: enough for a 512-byte inode.
+     * A 2048-byte one has 1872 bytes of literal area, and an inode struct
+     * big enough to hold it would be two kilobytes — past the kernel's
+     * 1 KiB frame limit for a *single* one on a stack, let alone the three
+     * functions that hold two.
+     *
+     * So the filesystem mounts and every inode whose fork fits the cache
+     * works normally, which is all of them in practice: 336 bytes is a
+     * shortform directory of a dozen names or a file of twenty-one
+     * extents. An inode that genuinely needs more is refused **on its own**
+     * by `xfs_inode_read`, with its number, rather than taking the whole
+     * filesystem down with it.
+     *
+     * That is a partial and is recorded as one. Lifting it means reading
+     * forks on demand instead of caching them — about twenty call sites
+     * across the write path — and that is a refactor of code this board
+     * has proved, not a line to slip in beside a validation check. */
+    if (fs->inodesize < 256u || fs->inodesize > 2048u ||
+        (fs->inodesize & (fs->inodesize - 1u)) != 0) {
+        kprintf("xfs: %u-byte inodes are not a size XFS makes (256..2048)\n", fs->inodesize);
         return KERR_NOTSUP;
     }
     if (fs->sectsize > fs->cache->dev->block_size || (fs->sectsize & (fs->sectsize - 1u)) != 0 ||

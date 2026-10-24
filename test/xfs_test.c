@@ -475,10 +475,31 @@ static void damage_inopblock(void) {
     seal(block(0), 512u, XFS_SB_CRC);
 }
 
+/* A legal inode size that is not this fixture's: 2048, which XFS makes with
+ * `-i size=2048` and which this reader refused outright until it learned
+ * that the refusal was about its own fork cache rather than about the
+ * format. The geometry is kept self-consistent so that the *size* is what
+ * is being tested and not the arithmetic around it. */
 static void damage_inodesize(void) {
     put16(block(0) + XFS_SB_INODESIZE, 2048u);
     put16(block(0) + XFS_SB_INOPBLOCK, 2u);
     block(0)[XFS_SB_INOPBLOG] = 1u;
+    seal(block(0), 512u, XFS_SB_CRC);
+}
+
+/* And one XFS does not make: 4096, above the format's own ceiling of 2048.
+ *
+ * **Its arithmetic is kept consistent deliberately.** The first attempt
+ * used 384, which is not a power of two — and `check_geometry` rejected it
+ * one line earlier, for `inopblock != blocksize / inodesize`, with
+ * `KERR_INVAL`. The test passed nothing: it asserted a refusal that came
+ * from a different check than the one being tested. One inode per 4096-byte
+ * block adds up perfectly, so the only thing left to refuse it is the size
+ * bound itself. */
+static void damage_inodesize_impossible(void) {
+    put16(block(0) + XFS_SB_INODESIZE, 4096u);
+    put16(block(0) + XFS_SB_INOPBLOCK, 1u);
+    block(0)[XFS_SB_INOPBLOG] = 0u;
     seal(block(0), 512u, XFS_SB_CRC);
 }
 
@@ -565,7 +586,17 @@ static void test_a_superblock_that_cannot_be_trusted(void) {
     KTEST_CHECK(mount_with(damage_blocksize) == KERR_INVAL);
     KTEST_CHECK(mount_with(damage_blocklog) == KERR_INVAL);
     KTEST_CHECK(mount_with(damage_inopblock) == KERR_INVAL);
-    KTEST_CHECK(mount_with(damage_inodesize) == KERR_NOTSUP);
+    /* **A legal inode size mounts**, whatever this reader caches.
+     *
+     * This line used to expect `KERR_NOTSUP`, protecting a refusal of every
+     * 1024- and 2048-byte-inode filesystem — and the refusal was never
+     * about the format: it was about `struct xfs_inode` carrying a copy of
+     * the literal area, which cannot grow past the kernel's frame limit.
+     * That is a limit on this reader, so it belongs on the inodes that
+     * exceed it rather than on the whole filesystem. A size XFS cannot have
+     * is still refused, which is the line below. */
+    KTEST_CHECK(mount_with(damage_inodesize) == KERR_OK);
+    KTEST_CHECK(mount_with(damage_inodesize_impossible) == KERR_NOTSUP);
     KTEST_CHECK(mount_with(damage_sectsize) == KERR_NOTSUP);
     KTEST_CHECK(mount_with(damage_dblocks) == KERR_INVAL);
     KTEST_CHECK(mount_with(damage_agcount) == KERR_INVAL);
