@@ -240,9 +240,13 @@ int xfs_log_check(struct xfs *fs) {
         return rc;
     }
     if (!unmount) {
-        kprintf("xfs: the log is dirty (newest record at %u is not an unmount): refusing to mount\n",
+        /* **Reported, not refused.** The caller decides what a dirty log
+         * means: it checks the filesystem and mounts it read-only if the
+         * check is sound, because metadata that is behind the log is a
+         * reason not to write and not a reason to be unreadable. */
+        kprintf("xfs: the log is dirty (newest record at %u is not an unmount)\n",
                 (uint32_t)newest);
-        return KERR_NOTSUP;
+        return KERR_DIRTY;
     }
     return KERR_OK;
 }

@@ -39,5 +39,9 @@
 #define KERR_PROTO   (-71)  /* a peer broke its own protocol */
 #define KERR_NOTSUP  (-95)  /* EOPNOTSUPP: understood, and refused */
 #define KERR_TIMEDOUT (-110)
+/* A filesystem's log holds work that was never committed to its metadata.
+ * Not an error on its own — it says the filesystem is readable and must not
+ * be written — so it is distinct from a refusal. */
+#define KERR_DIRTY   (-117) /* EUCLEAN: the structure is not clean */
 
 #endif

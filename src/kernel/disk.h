@@ -36,6 +36,14 @@ void disk_use_ram(phys_t at, uint64_t bytes);
 int disk_attach(const struct fdt *fdt);
 
 /* The cache, for a filesystem to read through. NULL when there is no disk. */
+/* Every filesystem candidate the disk offers — each partition, or the whole
+ * disk when it has no table — as a device of filesystem-sized blocks.
+ *
+ * Separate from `disk_cache`, which is the one the kernel boots from.
+ * Automount walks these to find out what is actually on the machine. */
+uint32_t disk_volume_count(void);
+const struct blockdev *disk_volume(uint32_t i);
+
 struct bcache *disk_cache(void);
 
 /* The device itself, for anything that wants whole sectors. */

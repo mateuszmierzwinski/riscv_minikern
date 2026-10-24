@@ -859,6 +859,22 @@ cc_library(
     ],
 )
 
+# The mount table: which filesystem is mounted where, and automount by the
+# filesystem's label. ROOT becomes /, anything else a volume under /volumes.
+cc_library(
+    name = "kernel_volumes",
+    srcs = ["src/kernel/volumes.c"],
+    hdrs = ["src/kernel/volumes.h"],
+    strip_include_prefix = "src",
+    target_compatible_with = ["//platforms:riscv64"],
+    deps = [
+        ":console",
+        ":kernel_disk",
+        ":kernel_mem",
+        ":xfs",
+    ],
+)
+
 # The filesystem on the disk: the carried-over XFS over the live cache.
 cc_library(
     name = "kernel_xfs",
@@ -871,6 +887,7 @@ cc_library(
         ":crypto_hash",
         ":kernel_disk",
         ":kernel_mem",
+        ":kernel_volumes",
         ":xfs",
     ],
 )
@@ -980,6 +997,7 @@ cc_library(
         ":kernel_swap",
         ":kernel_uspace",
         ":virtio_net",
+        ":kernel_volumes",
         ":kernel_xfs",
     ],
     alwayslink = True,

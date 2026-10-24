@@ -195,6 +195,28 @@ static void take_uuid(struct xfs *fs, const uint8_t *sb) {
     fs->ftype = (in & XFS_FEAT_IN_FTYPE) != 0;
 }
 
+/* Copies the filesystem's label out of the superblock.
+ *
+ * Twelve bytes, and **not NUL-terminated when all twelve are used** — so it
+ * is copied into a thirteenth byte of its own rather than pointed at, which
+ * is the difference between a label and a label followed by whatever the
+ * superblock keeps at offset 120. */
+static void take_label(struct xfs *fs, const uint8_t *sb) {
+    uint32_t n = 0;
+    while (n < XFS_SB_LABEL_MAX && sb[XFS_SB_FNAME + n] != '\0') {
+        fs->label[n] = (char)sb[XFS_SB_FNAME + n];
+        n++;
+    }
+    fs->label[n] = '\0';
+}
+
+/* The one copy of the directory scratch, handed to every mount.
+ *
+ * See `struct xfs`: it is live only inside a directory operation, and this
+ * kernel holds one lock around all of them. */
+static uint8_t dir_scratch[XFS_DIRBLK_MAX];
+static uint8_t pair_scratch[XFS_DIRPAIRS_BYTES];
+
 /* Reads block 0 and takes everything the geometry needs from it. The block
  * stays pinned for as long as the superblock is being read out of it. */
 static int mount_from_super(struct xfs *fs, const uint8_t *sb) {
@@ -204,6 +226,7 @@ static int mount_from_super(struct xfs *fs, const uint8_t *sb) {
     }
     take_geometry(fs, sb);
     take_uuid(fs, sb);
+    take_label(fs, sb);
     rc = check_geometry(fs);
     if (rc != KERR_OK) {
         return rc;
@@ -223,17 +246,42 @@ int xfs_mount(struct xfs *fs, struct bcache *cache) {
     if (rc != KERR_OK) {
         return rc;
     }
+    fs->dirblock = dir_scratch;
+    fs->dirpairs = pair_scratch;
     rc = mount_from_super(fs, b->data);
     bcache_put(cache, b);
     if (rc != KERR_OK) {
         return rc;
     }
+    /* **A dirty log is checked, not refused.** A filesystem whose log holds
+     * uncommitted work has metadata that is behind the log, which is a
+     * reason not to *write* to it and not in itself a reason to refuse it:
+     * the data and the metadata that were already committed are intact, and
+     * a machine that cannot read its own disk after a power cut is worse
+     * than one that reads it carefully. So the structures this reader walks
+     * are checked first, and the mount is read-only if they are sound.
+     *
+     * This is what Linux's `norecovery` does, and the rule it follows is
+     * the one `MADV_DONTNEED` taught this project: a promise about what the
+     * caller will observe is the specification. A reader may observe a
+     * filesystem as of its last commit; nobody may write over a log that
+     * says something newer happened. */
     rc = xfs_log_check(fs);
-    if (rc != KERR_OK) {
+    if (rc == KERR_DIRTY) {
+        fs->log_was_dirty = true;
+        fs->write_refused = true;
+        rc = xfs_check(fs);
+        if (rc != KERR_OK) {
+            kprintf("xfs: the log is dirty and the check found faults: refusing to mount\n");
+            return rc;
+        }
+        kprintf("xfs: the log is dirty; checked sound, mounting read-only\n");
+    } else if (rc != KERR_OK) {
         return rc;
     }
     fs->mounted = true;
-    kprintf("xfs: %u blocks of %u bytes, %u groups, %u-byte inodes, root %u\n", (uint32_t)fs->dblocks,
-            fs->blocksize, fs->agcount, fs->inodesize, (uint32_t)fs->rootino);
+    kprintf("xfs: %u blocks of %u bytes, %u groups, %u-byte inodes, root %u, label \"%s\"\n",
+            (uint32_t)fs->dblocks, fs->blocksize, fs->agcount, fs->inodesize,
+            (uint32_t)fs->rootino, fs->label);
     return KERR_OK;
 }

@@ -170,8 +170,22 @@ CASES = [
       "1 to block, 1 to leaf, 1 data block(s)",
       # The allocator left a full group — and its control, in this same
       # run, shows the write being refused without that search.
-      "crossed a group after"],
+      "crossed a group after",
+      # A filesystem the kernel left dirty mounts read-only after a check,
+      # rather than being refused — a power cut must not make a disk
+      # unreadable.
+      "the log is dirty; checked sound, mounting read-only"],
      360, None, "small"),
+
+    ("§3: automount puts each volume where its label says",
+     "minikern.volumes",
+     ["volumes: \"ROOT\" mounted at /",
+      "volumes: \"DATA\" mounted at /volumes/DATA",
+      # The policy held *and* each volume's own file was reachable only
+      # through its own mount point. A kernel that mounted both at / would
+      # satisfy a test that merely counted mounts.
+      "volumes: every volume where its label says"],
+     240, None, "twovol"),
 ]
 
 
@@ -205,6 +219,8 @@ def run_case(name, bootargs, wanted, seconds, out_dir, program=None, needs_image
         at = os.path.join(out_dir, "fx")
         if needs_image == "small":
             img = fixtures.small_directory(at)
+        elif needs_image == "twovol":
+            img = fixtures.two_labelled_volumes(at)
         else:
             size = None if needs_image is True else needs_image
             img = fixtures.big_directory(at, FIXTURE_ENTRIES, size)

@@ -93,6 +93,59 @@ def small_directory(at):
     return img
 
 
+# Two filesystems on one disk, labelled so that automount has a decision to
+# make. The sizes are forced by `mkfs.xfs` refusing anything under 300 MB.
+VOLUME_MB = 320
+VOLUME_FIRST_SECTOR = 2048  # 1 MiB in, which is where a partitioner starts
+
+
+def two_labelled_volumes(at):
+    """A partitioned image with a ROOT volume and a DATA volume.
+
+    **This is the fixture the mount policy needs and nothing else provides.**
+    A single filesystem cannot show the difference between "mounted at /
+    because it is labelled ROOT" and "mounted at / because it is the only
+    thing there" — and the second is what the kernel used to do. So there
+    are two, labelled, and the DATA one carries a file that can only be
+    reached through `/volumes/DATA`.
+
+    Built without root: `mkfs.xfs` writes each filesystem into its own
+    file, `sfdisk` writes a partition table into a third, and the two are
+    copied in at their sector offsets. `losetup` would be the ordinary way
+    and needs privileges this account does not have.
+    """
+    os.makedirs(at, exist_ok=True)
+    data = payload(at)
+    parts = []
+    for label in ("ROOT", "DATA"):
+        proto = os.path.join(at, f"proto{label}")
+        with open(proto, "w") as f:
+            f.write(f"dummy\n0 0\nd--755 0 0\non{label} ---644 0 0 {data}\n$\n")
+        one = os.path.join(at, f"vol{label}.img")
+        with open(one, "wb") as f:
+            f.truncate(VOLUME_MB * 1024 * 1024)
+        subprocess.run(MKFS + ["-L", label, "-n", "ftype=1", "-p", proto, one], check=True)
+        parts.append(one)
+    img = os.path.join(at, "twovol.img")
+    sectors = VOLUME_MB * 1024 * 1024 // 512
+    with open(img, "wb") as f:
+        f.truncate((VOLUME_FIRST_SECTOR + 2 * sectors + VOLUME_FIRST_SECTOR) * 512)
+    script = (f"label: gpt\n"
+              f"start={VOLUME_FIRST_SECTOR}, size={sectors}, name=ROOT\n"
+              f"start={VOLUME_FIRST_SECTOR + sectors}, size={sectors}, name=DATA\n")
+    subprocess.run(["sfdisk", "--quiet", img], input=script, text=True, check=True)
+    with open(img, "r+b") as out:
+        for i, one in enumerate(parts):
+            out.seek((VOLUME_FIRST_SECTOR + i * sectors) * 512)
+            with open(one, "rb") as src:
+                while True:
+                    chunk = src.read(1 << 20)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+    return img
+
+
 def main():
     at = sys.argv[1] if len(sys.argv) > 1 else "/tmp/minikern-fixtures"
     entries = int(sys.argv[2]) if len(sys.argv) > 2 else 3000

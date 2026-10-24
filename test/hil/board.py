@@ -49,6 +49,11 @@ RELAY = os.environ.get("MINIKERN_RELAY", "/dev/ttyACM0")
 IMAGE_URL = os.environ.get("MINIKERN_IMAGE_URL", "http://192.168.86.119:8780/minikern.bin")
 LOAD_AT = "0x82000000"
 
+# How much room the kernel is given at `LOAD_AT`. It is a few megabytes of
+# ELF; this is generous so that a fixture placed just above it still fails
+# the overlap check rather than failing to boot.
+KERNEL_ROOM = 64 * 1024 * 1024
+
 # Where a program fetched alongside the kernel is put.
 #
 # **This is what lets a new test program reach the board without a new SD
@@ -77,7 +82,12 @@ PROGRAM_AT = 0x50000000
 # mid-decompression and the kernel reported a corrupt log — a defect in the
 # harness wearing the filesystem's clothes. The ranges are checked against
 # each other now, as well as moved apart.
-IMAGE_GZ_AT = 0x80000000
+# Raised from `0x8000_0000` once a fixture needed two 320 MB filesystems on
+# one disk: 642 MB at `0x6000_0000` reaches past it, and the overlap check
+# refused the run rather than producing another corrupt-log mystery. The
+# board has 8 GiB at `0x4000_0000`, so 4 GiB in is clear of any image a
+# fixture can reasonably be.
+IMAGE_GZ_AT = 0x100000000
 
 # How much smaller the archive has to be to be worth sending instead of the
 # image. A filesystem holding random data compresses to nothing, so the
@@ -93,7 +103,9 @@ COMPRESS_IF_UNDER = 0.5
 # in the XFS reader could be described and not exercised, because producing a
 # filesystem with the awkward shape means writing a card. `mkfs.xfs` on this
 # host makes any shape wanted; the board mounts it from DRAM.
-IMAGE_AT = 0x60000000
+# Above the kernel at `0x8200_0000` rather than below it, so that a large
+# fixture grows away from it instead of into it.
+IMAGE_AT = 0x90000000
 
 # **There is one board, so there is one lock.** Two runs at once give
 # `device reports readiness to read but returned no data`, which reads like
@@ -302,7 +314,15 @@ def main():
     if args.image:
         fs = offer_filesystem_image(args.image)
         bootargs += f" minikern.diskat={IMAGE_AT:#x}:{fs[1]:#x} minikern.disk=ram"
-        spans = [("the image", IMAGE_AT, fs[1])]
+        # **The kernel is one of the things loaded**, and leaving it out of
+        # this list cost a board run: a 642 MB image at `0x6000_0000` runs
+        # through `0x8200_0000`, so U-Boot decompressed the filesystem over
+        # the kernel it was about to boot and answered `Bad Linux RISCV
+        # Image magic!`. The archive collision this check was written for
+        # was caught; the kernel's own address was not in it. A range check
+        # that does not check every range is the same defect twice.
+        spans = [("the image", IMAGE_AT, fs[1]),
+                 ("the kernel", int(LOAD_AT, 16), KERNEL_ROOM)]
         if program is not None:
             spans.append(("the program", PROGRAM_AT, program[1]))
         if fs[2] is not None:

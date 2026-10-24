@@ -62,6 +62,16 @@ bool xfs_uuid_ok(const struct xfs *fs, const uint8_t *uuid);
 int xfs_meta_block(struct xfs *fs, uint64_t fsb, uint32_t magic, uint32_t magic2, uint32_t crc_off,
                    uint32_t uuid_off, struct bbuf **out);
 
+/* Checks the structures this reader walks, without writing anything
+ * (xfs_check.c): both headers of every group, their four b-tree roots, the
+ * counts each group states about itself, and the root inode.
+ *
+ * `KERR_OK` when the filesystem is sound enough to read, `KERR_DIRTY` with
+ * a count and the first fault when it is not. Bounded by the group count,
+ * not the filesystem's size — walking every inode is what `xfs_repair`
+ * does and would make boot time a function of how full the disk is. */
+int xfs_check(struct xfs *fs);
+
 /* The clean-log check (xfs_log.c): KERR_OK when the log's newest record is
  * an unmount record, KERR_NOTSUP when it is anything else. */
 int xfs_log_check(struct xfs *fs);
@@ -210,6 +220,60 @@ void xfs_dir_put_free(uint8_t *block, uint32_t at, uint32_t len);
  * requiring all of it to lie below `end`. */
 uint32_t xfs_dir_find_room(const struct xfs *fs, const uint8_t *block, uint32_t end,
                            uint32_t need);
+
+/* ── pieces shared by the leaf and node shapes ────────────────────────── */
+
+/* Reads one of the directory's blocks into `fs->dirblock` and reports the
+ * filesystem block it came from; writes it back.
+ *
+ * There is **one** buffer, so a step that needs two blocks at once has to
+ * write one before reading the other — which is why the conversions read
+ * the way they do rather than the way they would be described. */
+int xfs_dir_raw_load(struct xfs *fs, const struct xfs_inode *dir, uint64_t logical,
+                     uint64_t *fsb);
+int xfs_dir_raw_store(struct xfs *fs, uint64_t fsb);
+
+/* A fresh block for the directory, from any group that has one. */
+int xfs_dir_take_block(struct xfs *fs, uint64_t near, uint64_t *fsb);
+
+/* Adds an extent to the directory's fork in sorted order, merging where it
+ * can; `grows_data` also moves the directory's size, which only a data
+ * block does. */
+int xfs_dir_fork_insert(struct xfs *fs, const struct xfs_inode *dir, uint64_t logical,
+                        uint64_t fsb, bool grows_data, uint64_t now_s);
+
+/* The largest free span in the data block held in the buffer: what the
+ * `bests` array records. */
+uint32_t xfs_dir_largest_free(const struct xfs *fs, const uint8_t *block);
+
+/* Inserts into a sorted array of `{hash, address}` pairs held as bytes. */
+void xfs_dir_pairs_insert(uint8_t *pairs, uint32_t *count, uint32_t hash, uint32_t address);
+
+/* How many data blocks the directory has, and the address a leaf entry
+ * carries for an entry at `at` in data block `which` — a byte offset within
+ * the directory's data, divided by eight. */
+uint32_t xfs_dir_data_count(const struct xfs *fs, const struct xfs_inode *dir);
+uint32_t xfs_dir_address_of(const struct xfs *fs, uint32_t which, uint32_t at);
+
+/* Puts an entry in a data block that has room, growing the directory by a
+ * block when none has; reports which block took it, where, that block's
+ * largest remaining free span, and how many data blocks there now are. */
+int xfs_dir_place_entry(struct xfs *fs, const struct xfs_inode *dir, const char *name,
+                        uint32_t namelen, uint64_t ino, uint8_t ftype, uint64_t now_s,
+                        uint32_t *which, uint32_t *at, uint32_t *best, uint32_t *blocks);
+
+/* Finds a name in the data block held in the buffer and frees its entry. */
+int xfs_dir_take_out(struct xfs *fs, const char *name, uint32_t namelen, uint64_t *ino,
+                     uint32_t *at);
+
+/* Turns a leaf-format directory into a node-format one, adding `name` as
+ * part of the same step, and adds to and removes from one afterwards. */
+int xfs_dir_to_node(struct xfs *fs, const struct xfs_inode *dir, const char *name,
+                    uint32_t namelen, uint64_t ino, uint8_t ftype, uint64_t now_s);
+int xfs_dir_node_add(struct xfs *fs, const struct xfs_inode *dir, const char *name,
+                     uint32_t namelen, uint64_t ino, uint8_t ftype, uint64_t now_s);
+int xfs_dir_node_remove(struct xfs *fs, const struct xfs_inode *dir, const char *name,
+                        uint32_t namelen, uint64_t now_s, uint64_t *ino);
 
 /* Turns a block-format directory into a leaf-format one, adding `name` as
  * part of the same step — for the same reason the shortform conversion

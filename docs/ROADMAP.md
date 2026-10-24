@@ -830,6 +830,100 @@ sparse inodes, `nrext64`, exchange-range, parent pointers, `bigtime`,
       and the board case requires `0 walked`. On hardware, both geometries:
       `2 hashed, 0 walked`, with the payload checksum exact.
 
+- [x] **A dirty filesystem is checked before it is mounted, not refused.**
+      (M) **Done, and proved with a log this kernel dirtied itself.** A
+      filesystem whose log held uncommitted work was refused outright, which
+      made a power cut as damaging as a broken disk: the machine could not
+      read its own root filesystem.
+
+      It is now **checked and mounted read-only**, which is what Linux's
+      `norecovery` does. The two facts underneath are worth separating,
+      because a kernel that got either wrong would look fine:
+
+      - such a filesystem **is readable** — everything committed before the
+        cut is intact, and refusing it protects nothing;
+      - it **must not be written** — its metadata is behind a log saying
+        something newer happened, so a write would build on a state the log
+        has already superseded.
+
+      `xfs_check` is the pass: both headers of every group, the four b-tree
+      roots they name, the counts each group states about itself, and the
+      root inode. It **writes nothing** — a repair that guessed would be the
+      most dangerous code in the tree, because on a filesystem whose log
+      says something newer happened, a fix is a guess overwriting a fact.
+      It is bounded by the group count rather than the filesystem's size;
+      walking every inode is what `xfs_repair` does and would make boot time
+      a function of how full the disk is.
+
+      Two things it got wrong first, both instructive. It **returned the
+      first device error instead of counting it**, so a filesystem with
+      forty bad groups reported as one — a checker exists to count, and a
+      structure it cannot read is a fault like any other. And it addressed a
+      group's headers as `block + sector` when a **sector is an offset
+      inside the group's first block**: it reported twenty faults on a
+      filesystem `mkfs.xfs` had just made. That is the useful kind of wrong,
+      because a checker that cries corruption on a good disk would have had
+      its verdict ignored on a bad one.
+
+      **On the board**: the kernel logs a transaction and omits the unmount
+      record — what a machine losing power mid-write actually leaves — then
+      mounts again from the disk with the cache dropped. The log reads
+      dirty, the check reports four groups sound, the mount is read-only,
+      a write is refused, and the file written before the cut reads back. A
+      hand-patched log would have proved the parser; a log this kernel wrote
+      and failed to close proves the path a real machine takes.
+
+- [x] **Automount: a volume is mounted where its label says.** (M)
+      **Done, and proved with two labelled filesystems on one disk.** This
+      kernel mounted exactly one filesystem — whatever the first partition
+      held — and every path lookup went to it regardless of what the path
+      said. There was no mount table, so `/volumes/DATA/x` and `/x` reached
+      the same filesystem.
+
+      The policy is the **label**: `ROOT` is the root filesystem and is
+      mounted at `/`; anything else is mounted at `/volumes/<label>`. That
+      is the operator's instruction, and it is the right rule for a reason
+      worth recording: the alternative — mounting whatever the firmware
+      booted from at `/` — makes the root filesystem a property of the
+      **boot order** rather than of the disk, so fitting a second drive can
+      silently change which filesystem is the system.
+
+      `/volumes` is a **virtual directory**, synthesised from the table. A
+      directory that exists because the kernel says so needs no block, no
+      inode and no space, and cannot disagree with what is actually mounted.
+
+      Resolution takes the **longest matching prefix**, at a path boundary —
+      so `/volumes/DATA` is not matched by a volume at `/volumes/DAT`, and
+      `/`, which matches everything, is the weakest match rather than the
+      first. The first version sorted the table instead and had to copy a
+      `struct volume` to swap two entries: three kilobytes on the stack,
+      which the frame guard refused, and a block cache moved out from under
+      whatever held a buffer in it.
+
+      `struct xfs` carried **85 KB of directory scratch**, which made a
+      mount table the largest thing in the kernel. It is now shared, which
+      is sound only because this kernel takes one big lock around every
+      directory operation — said in the struct, because splitting that lock
+      would have to split this with it.
+
+      **On the board**, with a GPT image carrying a `ROOT` volume and a
+      `DATA` volume: both mount, `ROOT` at `/` and `DATA` at
+      `/volumes/DATA`, `/volumes` lists both, and each volume's own file is
+      read **through its own mount point** — including the negative, that
+      `DATA`'s file is *not* reachable at `/onDATA`. Without that last
+      check the test would pass on a kernel that ignored mount points
+      entirely, which is precisely the kernel this replaced.
+
+      The harness cost two fixes, both the same shape as a defect already in
+      this list. The compressed image was staged at `0x8000_0000` and a
+      642 MB fixture reaches past it; and then the image at `0x6000_0000`
+      ran through `0x8200_0000`, **where the kernel itself is loaded** — so
+      U-Boot decompressed the filesystem over the kernel it was about to
+      boot and said `Bad Linux RISCV Image magic!`. The overlap check this
+      project added after the first collision did not have the kernel's own
+      address in it. A range check that does not check every range is the
+      same defect twice.
+
 - [ ] **Log replay.** (M) A dirty log is refused rather than replayed, so an
       unclean shutdown needs `xfs_repair` on another machine. Deliberate for
       now — guessing at a log is how data is lost — but it is a gap.

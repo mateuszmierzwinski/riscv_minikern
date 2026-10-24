@@ -36,6 +36,22 @@ static struct blockdev device;
 static struct bcache cache;
 static bool present;
 
+/* **Every candidate the disk offers**, not just the one the kernel boots
+ * from. `adopt_partition_or_whole` picks the first partition because that
+ * is where an operator puts the root filesystem; automount has to try them
+ * all, because a second partition with a label is a volume the machine
+ * should mount somewhere.
+ *
+ * The wrapping structures live here rather than in the caller because each
+ * presented device *points at* its partition wrapper and its scaler — a
+ * device built on a caller's stack is a device whose innards are freed
+ * while the mount is still reading through them. */
+static struct partdev vol_part[PARTITION_MAX];
+static struct blockscale vol_scale[PARTITION_MAX];
+static struct blockdev vol_over[PARTITION_MAX];
+static struct blockdev vol_dev[PARTITION_MAX];
+static uint32_t vol_count;
+
 /* Which adapter is in use, so the boot log names the device rather than
  * merely its size. */
 static const char *attached_kind = "";
@@ -118,6 +134,40 @@ static int attach_any(const struct fdt *fdt) {
     return KERR_NOENT;
 }
 
+/* Presents each partition (or the whole disk) as a block device of
+ * filesystem-sized blocks, ready to mount.
+ *
+ * A partition whose sector size cannot present a filesystem block is
+ * skipped rather than refused: one unusable partition on a disk must not
+ * stop the others being mounted, which is the difference between automount
+ * and the single-device path above. */
+static void present_volumes(uint32_t found) {
+    vol_count = 0;
+    for (uint32_t i = 0; i < found && i < PARTITION_MAX; i++) {
+        if (partition_wrap(&raw, &parts[i], &vol_part[vol_count], &vol_over[vol_count]) !=
+            KERR_OK) {
+            continue;
+        }
+        if (blockscale_wrap(&vol_over[vol_count], FILESYSTEM_BLOCK, &vol_scale[vol_count],
+                            &vol_dev[vol_count]) != KERR_OK) {
+            continue;
+        }
+        vol_count++;
+    }
+    if (found == 0 &&
+        blockscale_wrap(&raw, FILESYSTEM_BLOCK, &vol_scale[0], &vol_dev[0]) == KERR_OK) {
+        vol_count = 1; /* a whole-disk filesystem, which is what a card is */
+    }
+}
+
+uint32_t disk_volume_count(void) {
+    return vol_count;
+}
+
+const struct blockdev *disk_volume(uint32_t i) {
+    return i < vol_count ? &vol_dev[i] : NULL;
+}
+
 /* Picks what the filesystem is read from: the first partition if the disk has
  * a table, the whole disk if it does not.
  *
@@ -128,6 +178,7 @@ static int attach_any(const struct fdt *fdt) {
  * which fails at the superblock rather than at a plausible offset. */
 static int adopt_partition_or_whole(void) {
     uint32_t found = partition_scan(&raw, parts, PARTITION_MAX);
+    present_volumes(found);
     if (found == 0) {
         whole = raw;
         return KERR_OK;

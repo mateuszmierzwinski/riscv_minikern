@@ -29,6 +29,21 @@ int xfsmount_attach(void);
 /* True once a filesystem is mounted. */
 bool xfsmount_present(void);
 
+/* Mounts the filesystem again from the disk, dropping the block cache
+ * first so that it is read as a fresh boot would read it. */
+int xfsmount_remount(void);
+
+/* Leaves the next logged transaction without its unmount record, so that
+ * the filesystem is left as a power cut would leave it. */
+void xfsmount_leave_log_dirty(bool on);
+
+/* Whether the mounted filesystem's log held uncommitted work, which is why
+ * it is read-only. */
+bool xfsmount_log_was_dirty(void);
+
+/* The filesystem's label, which is what decides where it is mounted. */
+const char *xfsmount_label(void);
+
 /* Walks the root directory and prints what is there, with sizes: the
  * cheapest proof that a filesystem has really been read rather than merely
  * opened. Returns how many entries it saw, or a negative error. */

@@ -615,15 +615,46 @@ static void damage_log_no_record(void) {
     }
 }
 
-static void test_a_dirty_log_is_refused(void) {
-    KTEST_CHECK(mount_with(damage_log_not_unmount) == KERR_NOTSUP);
-    KTEST_CHECK(mount_with(damage_log_wrong_client) == KERR_NOTSUP);
-    KTEST_CHECK(mount_with(damage_log_many_ops) == KERR_NOTSUP);
-    KTEST_CHECK(mount_with(damage_log_newer_record) == KERR_NOTSUP);
+/* A dirty log sends the mount through the check instead of refusing it.
+ *
+ * This test used to assert `KERR_NOTSUP` for each of these — it protected
+ * the old behaviour of refusing any unclean filesystem, which made a power
+ * cut as damaging as a broken disk. The behaviour deliberately changed: an
+ * unclean filesystem is checked, and mounted **read-only** if it is sound.
+ *
+ * What this fixture can show is the first half. It is a synthetic
+ * filesystem with a superblock, a log and inodes and **no group headers at
+ * all**, so the check correctly finds it unsound — which is why `KERR_DIRTY`
+ * is the right answer here and not a weaker version of `KERR_OK`. The
+ * read-only mount of a *sound* unclean filesystem needs a filesystem
+ * `mkfs.xfs` made, so it is proved on the board, where this project's rule
+ * says such things are proved anyway.
+ *
+ * The distinction being asserted is `KERR_DIRTY` against `KERR_NOTSUP`:
+ * the mount reached the checker rather than stopping at the log. */
+static void test_a_dirty_log_is_checked(void) {
+    void (*dirty[])(void) = {damage_log_not_unmount, damage_log_wrong_client,
+                             damage_log_many_ops, damage_log_newer_record};
+    for (uint32_t i = 0; i < sizeof dirty / sizeof dirty[0]; i++) {
+        KTEST_CHECK(mount_with(dirty[i]) == KERR_DIRTY);
+    }
+    /* An external log and an unreadable one are refusals of a different
+     * kind: the first is a device this kernel was not given, the second is
+     * not a statement about cleanliness at all. Neither reaches the check. */
     KTEST_CHECK(mount_with(damage_log_external) == KERR_NOTSUP);
     KTEST_CHECK(mount_with(damage_log_no_record) == KERR_NOTSUP);
-    /* A log that was never written has nothing to replay. */
+    /* A log that was never written has nothing to replay, so it is clean
+     * and the check never runs — which is what lets this fixture, with no
+     * group headers in it, mount at all. */
     KTEST_CHECK(mount_with(damage_log_empty) == KERR_OK);
+    KTEST_CHECK(!fs.log_was_dirty);
+    KTEST_CHECK(reads_outside == 0);
+}
+
+/* The check reads a group header that is not there and says so, rather than
+ * reading past the end of the filesystem to find one. */
+static void test_the_check_stays_inside_the_filesystem(void) {
+    KTEST_CHECK(mount_with(damage_log_not_unmount) == KERR_DIRTY);
     KTEST_CHECK(reads_outside == 0);
 }
 
@@ -1087,7 +1118,8 @@ int main(void) {
     KTEST_RUN(test_holes_and_unwritten_read_as_zeroes);
     KTEST_RUN(test_read_only_features_mount_but_forbid_writing);
     KTEST_RUN(test_a_superblock_that_cannot_be_trusted);
-    KTEST_RUN(test_a_dirty_log_is_refused);
+    KTEST_RUN(test_a_dirty_log_is_checked);
+    KTEST_RUN(test_the_check_stays_inside_the_filesystem);
     KTEST_RUN(test_an_inode_that_cannot_be_trusted);
     KTEST_RUN(test_inode_formats_we_refuse);
     KTEST_RUN(test_an_inode_that_claims_too_much);

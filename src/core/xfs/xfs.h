@@ -75,6 +75,16 @@
 #define XFS_NAME_MAX   255u
 
 /* One mounted filesystem: its geometry, taken from the superblock. */
+/* The label, terminated. Twelve bytes on disk plus the NUL this adds; the
+ * on-disk offset is `XFS_SB_FNAME`, which belongs to the format header
+ * rather than here. */
+#define XFS_LABEL_BYTES 13u
+
+/* The hash pairs of a block directory under conversion: one pair per entry,
+ * and an entry is at least sixteen bytes, so a third of the block is past
+ * the ceiling. */
+#define XFS_DIRPAIRS_BYTES (XFS_DIRBLK_MAX / 3u)
+
 struct xfs {
     struct bcache *cache;
     uint64_t dblocks;     /* blocks in the filesystem */
@@ -94,6 +104,28 @@ struct xfs {
     uint8_t inopblog;
     uint8_t agblklog;
     uint8_t uuid[16];     /* what metadata blocks must carry */
+    /* The filesystem's label (`sb_fname`), NUL-terminated here.
+     *
+     * On disk it is twelve bytes and **not terminated when all twelve are
+     * used**, so it is copied rather than pointed at. It is what decides
+     * where a volume is mounted: `ROOT` is the root filesystem and anything
+     * else is a volume under `/volumes`. */
+    char label[XFS_LABEL_BYTES];
+    /* The log held uncommitted work when this was mounted, so the newest
+     * transactions are not in the metadata. The filesystem is readable and
+     * **must not be written**: replaying the log is what would make it
+     * writable, and until then a write would build on a state the log says
+     * is already superseded. */
+    bool log_was_dirty;
+    /* Leaves the next logged transaction **without** its unmount record,
+     * which is what a power cut does — the transaction is in the log and
+     * nothing says the filesystem was put down.
+     *
+     * Here so that a test can produce a genuinely dirty log on a filesystem
+     * `mkfs.xfs` made, rather than one hand-damaged by a fixture script. A
+     * hand-damaged log proves the parser; a log this kernel wrote and then
+     * failed to close proves the path a real machine takes. */
+    bool skip_unmount_record;
     bool ftype;           /* directory entries carry a type byte */
     bool mounted;
     /* The filesystem uses read-only-compatible features this reader does not
@@ -141,7 +173,18 @@ struct xfs {
      * about reading a directory depends on there being one mount or one
      * thread — and unused when a directory block is a single filesystem
      * block, which is the default geometry. */
-    uint8_t dirblock[XFS_DIRBLK_MAX];
+    /* **Scratch, shared between mounts, not owned by one.** A directory
+     * block being parsed or built, and the hash pairs of a block directory
+     * mid-conversion.
+     *
+     * Pointers rather than arrays because `struct xfs` is now one entry in
+     * a mount table, and eighty-five kilobytes of scratch per mount would
+     * make the table the largest thing in the kernel. They are only live
+     * *inside* one directory operation, and this kernel takes one big lock
+     * around everything — so one buffer serves every mount. If that lock
+     * is ever split, this is one of the things that has to be split with
+     * it, which is why it is said here rather than left to be discovered. */
+    uint8_t *dirblock;
     /* The hash pairs of a block directory, while it is being converted to
      * leaf format: they have to be held somewhere while the block they came
      * from is rewritten as data, and `dirblock` is that block.
@@ -151,7 +194,7 @@ struct xfs {
      * block, in eight-byte pairs, is the ceiling. Here rather than on a
      * stack because the frame guard refused it twice, which is the rule
      * about kernel stacks doing its job. */
-    uint8_t dirpairs[XFS_DIRBLK_MAX / 3u];
+    uint8_t *dirpairs;
 };
 
 /* One inode, parsed, with its inline fork copied out so no cached block

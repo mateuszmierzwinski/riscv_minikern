@@ -53,7 +53,7 @@
 #include "kernel/syscall.h"
 #include "kernel/uspace.h"
 #include "kernel/probe.h"
-#include "kernel/xfsmount.h"
+#include "kernel/volumes.h"
 #include "lib/sha256.h"
 #include "kernel/probe.h"
 #include "kernel/xfsmount.h"
@@ -441,9 +441,84 @@ static void run_disk_benchmark(void) {
             per_read);
 }
 
+/* Lists the virtual `/volumes` directory: what is mounted, and where.
+ *
+ * It is synthesised from the mount table rather than read from a disk —
+ * there is no filesystem behind `/volumes`, which is the point of it. A
+ * directory that exists because the kernel says so needs no block,
+ * no inode and no space, and cannot be inconsistent with what is
+ * actually mounted. */
+static void list_the_volumes(void) {
+    uint32_t n = volumes_count();
+    kprintf("volumes: %u mounted\n", n);
+    for (uint32_t i = 0; i < n; i++) {
+        kprintf("volumes:   %s -> %s%s\n", volumes_at(i),
+                volumes_label(i)[0] != '\0' ? volumes_label(i) : "(no label)",
+                volumes_readonly(i) ? " (read-only)" : "");
+    }
+}
+
+/* Mounts everything the disk offers, each where its label says.
+ *
+ * **Before the single-filesystem path below**, because that one is the
+ * fallback: a kernel told which device to use (`minikern.disk=`) or handed a
+ * RAM disk by a test still mounts it by hand. Automount is what a machine
+ * does when nobody told it anything. */
+static void automount_the_disk(void) {
+    if (volumes_automount() == 0) {
+        return;
+    }
+    list_the_volumes();
+}
+
+/* Whether two NUL-terminated strings are the same. The kernel has no libc
+ * and this is the only place in this file that needs one. */
+static bool same_text(const char *a, const char *b) {
+    uint32_t i = 0;
+    while (a[i] != '\0' && a[i] == b[i]) {
+        i++;
+    }
+    return a[i] == b[i];
+}
+
+/* Checks automount put each volume where its label says.
+ *
+ * **The decision, not the mounting.** That both filesystems mount is the
+ * easy half and the old kernel managed it for one; what this asserts is
+ * that the one labelled `ROOT` became `/` and the one labelled `DATA`
+ * became `/volumes/DATA` — and, crucially, that a file on DATA is reachable
+ * *only* through that path. A kernel that mounted both at `/` would pass a
+ * test that merely counted mounts.
+ *
+ * `minikern.volumes` runs it. */
+static void run_volumes_selftest(void) {
+    bool ok = volumes_count() == 2u;
+    const char *root = NULL, *data = NULL;
+    for (uint32_t i = 0; i < volumes_count(); i++) {
+        root = same_text(volumes_label(i), "ROOT") ? volumes_at(i) : root;
+        data = same_text(volumes_label(i), "DATA") ? volumes_at(i) : data;
+    }
+    kprintf("volumes: ROOT at %s, DATA at %s\n", root != NULL ? root : "(absent)",
+            data != NULL ? data : "(absent)");
+    ok = ok && root != NULL && same_text(root, "/");
+    ok = ok && data != NULL && same_text(data, "/volumes/DATA");
+    /* Each volume's own file, through its own path. The names differ per
+     * volume, so reading one through the other's mount point cannot
+     * accidentally succeed. */
+    ok = ok && xfsmount_show_file("/onROOT") == KERR_OK;
+    ok = ok && xfsmount_show_file("/volumes/DATA/onDATA") == KERR_OK;
+    /* And the negative: DATA's file is not in the root filesystem. A test
+     * without this would pass on a kernel that ignored mount points and
+     * answered every path from one filesystem. */
+    ok = ok && xfsmount_show_file("/onDATA") != KERR_OK;
+    kprintf("volumes: %s\n", ok ? "every volume where its label says" : "FAILED");
+}
+
 static void bring_up_filesystem(void) {
-    int rc = xfsmount_attach();
+    int rc;
     int32_t entries;
+    automount_the_disk();
+    rc = xfsmount_attach();
     if (rc == KERR_NODEV) {
         return; /* no disk: already said so */
     }
@@ -1426,6 +1501,46 @@ static int one_group_refuses(void) {
     return rc == KERR_NOSPC ? KERR_OK : (rc == KERR_OK ? KERR_IO : rc);
 }
 
+/* A filesystem left as a power cut leaves it, then mounted again.
+ *
+ * **The kernel dirties its own log** rather than a fixture script patching
+ * a byte: it logs a transaction and omits the unmount record, which is
+ * exactly what a machine losing power mid-write produces. A hand-damaged
+ * log proves the parser; a log this kernel wrote and failed to close proves
+ * the path a real machine takes.
+ *
+ * Three things are then asserted, and the second is the one that matters.
+ * The filesystem **mounts** — a power cut must not make a disk unreadable.
+ * It is **read-only** — its metadata is behind a log saying something newer
+ * happened, so a write would build on a superseded state. And a **read
+ * still works**, which is what the whole arrangement is for. */
+static int dirty_then_remount(void) {
+    static const char text[] = "written before the power went";
+    int rc = xfsmount_create("d1", 0100644u);
+    rc = rc != KERR_OK ? rc : xfsmount_write("d1", 0, text, sizeof text - 1u);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    xfsmount_leave_log_dirty(true);
+    rc = xfsmount_create("d2", 0100644u);
+    xfsmount_leave_log_dirty(false);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    rc = xfsmount_remount();
+    if (rc != KERR_OK) {
+        kprintf("fswrite: a dirty filesystem would not mount (rc %d)\n", rc);
+        return rc;
+    }
+    if (!xfsmount_log_was_dirty()) {
+        return KERR_IO; /* the log closed cleanly: the test proved nothing */
+    }
+    if (xfsmount_writable()) {
+        return KERR_IO; /* readable is right; writable is the bug */
+    }
+    return read_back("d1", text, sizeof text - 1u);
+}
+
 static void run_write_selftest(void) {
     static const char text[] = "a file this kernel wrote";
     const uint32_t len = (uint32_t)(sizeof text - 1u);
@@ -1462,6 +1577,9 @@ static void run_write_selftest(void) {
     ok = ok && wrote_and_checked("grow past shortform", grow_a_directory());
     ok = ok && wrote_and_checked("allocate past one group", fill_past_one_group());
     ok = ok && wrote_and_checked("one group alone must refuse", one_group_refuses());
+    /* Last, because it leaves the filesystem read-only: anything after it
+     * would be testing a mount that refuses writes by design. */
+    ok = ok && wrote_and_checked("a dirty log mounts read-only", dirty_then_remount());
     /* **Said out loud, because the alternative is a test that cannot
      * fail.** Sixty names need a second chunk of inodes only if the first
      * one runs out, and a run where it did not would print every step as
@@ -1816,6 +1934,10 @@ static void run_user_programs(void) {
     /* Roadmap §3: the write path, on a filesystem in memory. */
     if (cmdline_has(boot_cmdline, "minikern.fswrite")) {
         run_write_selftest();
+    }
+    /* Automount's decision: a labelled volume where its label says. */
+    if (cmdline_has(boot_cmdline, "minikern.volumes")) {
+        run_volumes_selftest();
     }
     /* `minikern.cat=<path>` — lookup and extent reading, in one answer. */
     {

@@ -29,6 +29,7 @@
 #define XFS_SB_SECTSIZE    102u /* u16 */
 #define XFS_SB_INODESIZE   104u /* u16 */
 #define XFS_SB_INOPBLOCK   106u /* u16: inodes per block */
+#define XFS_SB_FNAME       108u /* 12 bytes: the filesystem label */
 #define XFS_SB_BLOCKLOG    120u /* u8 */
 #define XFS_SB_SECTLOG     121u /* u8 */
 #define XFS_SB_INODELOG    122u /* u8 */
@@ -36,6 +37,7 @@
 #define XFS_SB_AGBLKLOG    124u /* u8 */
 #define XFS_SB_INPROGRESS  126u /* u8: mkfs had not finished */
 #define XFS_SB_DIRBLKLOG   192u /* u8: directory blocks are 1 << this, in fs blocks */
+#define XFS_SB_LABEL_MAX 12u /* `sb_fname` is not NUL-terminated when full */
 #define XFS_SB_FEAT_COMPAT     208u /* u32 */
 #define XFS_SB_FEAT_RO_COMPAT  212u /* u32 */
 #define XFS_SB_FEAT_INCOMPAT   216u /* u32 */
@@ -248,6 +250,21 @@
  * does not consult it — it walks the data blocks and uses the hashes — but
  * a writer that leaves it wrong hands `xfs_repair` and Linux a filesystem
  * they will call corrupt, so it is maintained. */
+/* A node-format directory's third address space: the **free** blocks, at
+ * 64 GiB of logical offset.
+ *
+ * Leaf format keeps its `bests` array inside its one leaf block. Node
+ * format cannot — a `LEAFN` block is all hashes — so the array moves into
+ * blocks of its own up here, above both the data and the leaf/node blocks.
+ * This reader never consults them, walking the data blocks instead, but
+ * `xfs_repair` and Linux do. */
+#define XFS_DIR2_FREE_SPACE_BYTES 0xc00000000ull /* 48 GiB: the third space */
+#define XFS_DIR3_FREE_MAGIC 0x58444633u          /* "XDF3" */
+#define XFS_DIR3_FREE_HDR_SIZE 64u               /* blk_hdr, firstdb, nvalid, nused, pad */
+#define XFS_DIR3_FREE_FIRSTDB 48u                /* be32 */
+#define XFS_DIR3_FREE_NVALID 52u                 /* be32 */
+#define XFS_DIR3_FREE_NUSED 56u                  /* be32 */
+
 #define XFS_DIR2_LEAF_TAIL_SIZE 4u /* u32 bestcount, at the very end */
 #define XFS_DIR2_LEAF_BEST_SIZE 2u /* one u16 per data block */
 

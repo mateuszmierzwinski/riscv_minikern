@@ -358,6 +358,11 @@ int xfs_log_inodes(struct xfs *fs, const struct xfs_log_inode_item *items, uint3
     seal(sectors);
     rc = flush_record(fs, 0, sectors);
     /* The unmount record goes immediately after this one: one basic block
-     * for the header and one for each sector of operations. */
+     * for the header and one for each sector of operations — unless a test
+     * has asked for it to be left off, which is the shape a power cut
+     * leaves behind. */
+    if (fs->skip_unmount_record) {
+        return rc;
+    }
     return rc != KERR_OK ? rc : write_unmount(fs, 1u + sectors);
 }

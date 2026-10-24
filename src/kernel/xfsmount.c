@@ -11,6 +11,7 @@
 #include "arch/riscv/timer.h"
 #include "kernel/disk.h"
 #include "kernel/mem.h"
+#include "kernel/volumes.h"
 
 static struct xfs fs;
 static bool mounted;
@@ -27,6 +28,42 @@ int xfsmount_attach(void) {
     }
     mounted = true;
     return KERR_OK;
+}
+
+int xfsmount_remount(void) {
+    struct bcache *cache = disk_cache();
+    int rc;
+    if (cache == NULL) {
+        return KERR_NODEV;
+    }
+    /* **The cache is dropped first.** A re-mount that read the superblock
+     * out of the cache would be reading what this kernel last wrote rather
+     * than what is on the disk, and the whole point of re-mounting in a
+     * test is to see the filesystem as a fresh boot would. */
+    rc = bcache_flush(cache);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    bcache_invalidate(cache);
+    mounted = false;
+    for (uint32_t i = 0; i < sizeof fs; i++) {
+        ((uint8_t *)&fs)[i] = 0;
+    }
+    rc = xfs_mount(&fs, cache);
+    mounted = rc == KERR_OK;
+    return rc;
+}
+
+void xfsmount_leave_log_dirty(bool on) {
+    fs.skip_unmount_record = on;
+}
+
+bool xfsmount_log_was_dirty(void) {
+    return fs.log_was_dirty;
+}
+
+const char *xfsmount_label(void) {
+    return fs.label;
 }
 
 bool xfsmount_present(void) {
@@ -107,15 +144,35 @@ int xfsmount_hash_file(const char *path, uint8_t digest[32], uint64_t *size) {
     return rc;
 }
 
+/* Which filesystem answers for a path, and the path within it.
+ *
+ * **The mount table first, and this single mount only as a fallback.** The
+ * table is what makes a path mean something — `/volumes/DATA/x` has to
+ * reach the DATA volume — and the fallback is what keeps every caller
+ * written before the table existed working: a kernel that mounted one
+ * filesystem by hand (`minikern.disk=`, the self-tests) still resolves
+ * through it. Dropping the fallback would be tidier and would break the
+ * board tests, which mount a RAM disk directly. */
+static struct xfs *owner_of(const char *path, const char **within) {
+    struct xfs *v = volumes_resolve(path, within);
+    if (v != NULL) {
+        return v;
+    }
+    *within = path;
+    return mounted ? &fs : NULL;
+}
+
 int xfsmount_show_file(const char *path) {
     struct xfs_inode ip;
     char *buf;
     uint32_t got = 0;
+    const char *within = path;
+    struct xfs *vol = owner_of(path, &within);
     int rc;
-    if (!mounted) {
+    if (vol == NULL) {
         return KERR_NODEV;
     }
-    rc = xfs_path_lookup(&fs, path, &ip);
+    rc = xfs_path_lookup(vol, within, &ip);
     if (rc != KERR_OK) {
         return rc;
     }
@@ -123,7 +180,7 @@ int xfsmount_show_file(const char *path) {
     if (buf == NULL) {
         return KERR_NOMEM;
     }
-    rc = xfs_file_read(&fs, &ip, 0, buf, 511u, &got);
+    rc = xfs_file_read(vol, &ip, 0, buf, 511u, &got);
     if (rc == KERR_OK) {
         /* One line of it: a file's first bytes prove the data path, and the
          * whole file would prove the same thing less legibly. */
@@ -224,11 +281,13 @@ int xfsmount_read_file(const char *path, uint32_t limit, uint8_t **out, uint32_t
     struct xfs_inode ip;
     uint8_t *buf;
     uint32_t got = 0, at = 0;
+    const char *within = path;
+    struct xfs *vol = owner_of(path, &within);
     int rc;
-    if (!mounted) {
+    if (vol == NULL) {
         return KERR_NODEV;
     }
-    rc = xfs_path_lookup(&fs, path, &ip);
+    rc = xfs_path_lookup(vol, within, &ip);
     if (rc != KERR_OK) {
         return rc;
     }
@@ -243,7 +302,7 @@ int xfsmount_read_file(const char *path, uint32_t limit, uint8_t **out, uint32_t
      * boundary, and a loop that assumes one call is enough works until the
      * first file that is not contiguous. */
     while (at < ip.size) {
-        rc = xfs_file_read(&fs, &ip, at, buf + at, (uint32_t)ip.size - at, &got);
+        rc = xfs_file_read(vol, &ip, at, buf + at, (uint32_t)ip.size - at, &got);
         if (rc != KERR_OK || got == 0) {
             kfree(buf);
             return rc != KERR_OK ? rc : KERR_IO;
