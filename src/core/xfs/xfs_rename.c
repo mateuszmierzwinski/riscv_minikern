@@ -42,7 +42,7 @@ int xfs_inode_adjust_nlink(struct xfs *fs, uint64_t ino, int32_t delta) {
         return KERR_IO; /* a count that cannot move is a corrupt inode */
     }
     xfs_put_be32(di + XFS_DI_NLINK, (uint32_t)((int64_t)was + delta));
-    xfs_reseal(di, fs->inodesize, XFS_DI_CRC);
+    xfs_reseal(fs, di, fs->inodesize, XFS_DI_CRC);
     bcache_dirty(b);
     bcache_put(fs->cache, b);
     return KERR_OK;

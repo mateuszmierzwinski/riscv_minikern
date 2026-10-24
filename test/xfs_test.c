@@ -87,8 +87,29 @@ static void put64(uint8_t *p, uint64_t v) {
 
 /* The little-endian checksum field, computed with the field zeroed — the
  * same rule the reader verifies by. */
+/* **Which on-disk format the fixture builds.** The v4 layout is the same
+ * filesystem with shorter headers and no checksums, so the builder needs
+ * three things to be able to produce it: the inode core's size, the magic
+ * for each kind of block, and whether to seal anything at all. Everything
+ * else about the fixture is identical, which is the point — if v4 needed a
+ * separate builder it would be testing a separate reader. */
+static bool fx_v4;
+
+/* The inode core's size, so the literal area starts in the right place. */
+static uint32_t fx_core(void) {
+    return fx_v4 ? XFS_DI_V2_SIZE : XFS_DI_V3_SIZE;
+}
+
+/* A directory data block's header size. */
+static uint32_t fx_dir_hdr(void) {
+    return fx_v4 ? XFS_DIR2_DATA_HDR_SIZE : XFS_DIR3_DATA_HDR_SIZE;
+}
+
 static void seal(uint8_t *buf, uint32_t len, uint32_t crc_off) {
     uint32_t crc;
+    if (fx_v4) {
+        return; /* there is no checksum field in a v4 structure */
+    }
     memset(buf + crc_off, 0, 4);
     crc = ~crc32c_update(CRC32C_SEED, buf, len);
     buf[crc_off] = (uint8_t)crc;
@@ -120,7 +141,8 @@ static void build_super(void) {
     put32(sb + XFS_SB_AGBLOCKS, BLOCKS);
     put32(sb + XFS_SB_AGCOUNT, 1u);
     put32(sb + XFS_SB_LOGBLOCKS, LOG_BLOCKS);
-    put16(sb + XFS_SB_VERSIONNUM, 0xb000u | XFS_SB_VERSION_5);
+    put16(sb + XFS_SB_VERSIONNUM,
+          (uint16_t)(0xb000u | (fx_v4 ? XFS_SB_VERSION_4 : XFS_SB_VERSION_5)));
     put16(sb + XFS_SB_SECTSIZE, 512u);
     put16(sb + XFS_SB_INODESIZE, ISIZE);
     put16(sb + XFS_SB_INOPBLOCK, BS / ISIZE);
@@ -129,8 +151,10 @@ static void build_super(void) {
     sb[XFS_SB_INODELOG] = 9u;
     sb[XFS_SB_INOPBLOG] = 3u;
     sb[XFS_SB_AGBLKLOG] = 6u;
-    put32(sb + XFS_SB_FEAT_RO_COMPAT, XFS_FEAT_RO_FINOBT);
-    put32(sb + XFS_SB_FEAT_INCOMPAT, XFS_FEAT_IN_FTYPE);
+    /* The feature words are v5's: a v4 superblock has none of them, and
+     * claiming one would describe a filesystem that cannot exist. */
+    put32(sb + XFS_SB_FEAT_RO_COMPAT, fx_v4 ? 0 : XFS_FEAT_RO_FINOBT);
+    put32(sb + XFS_SB_FEAT_INCOMPAT, fx_v4 ? 0 : XFS_FEAT_IN_FTYPE);
     seal(sb, 512u, XFS_SB_CRC);
 }
 
@@ -155,19 +179,23 @@ static uint8_t *build_inode(uint64_t ino, uint32_t mode, uint8_t format, uint64_
     memset(di, 0, ISIZE);
     put16(di + XFS_DI_MAGIC, XFS_DINODE_MAGIC);
     put16(di + XFS_DI_MODE, (uint16_t)mode);
-    di[XFS_DI_VERSION] = XFS_DI_VERSION_3;
+    di[XFS_DI_VERSION] = fx_v4 ? XFS_DI_VERSION_2 : XFS_DI_VERSION_3;
     di[XFS_DI_FORMAT] = format;
     put32(di + XFS_DI_NLINK, 1u);
     put64(di + XFS_DI_SIZE, size);
-    put64(di + XFS_DI_INO, ino);
-    memcpy(di + XFS_DI_UUID, TEST_UUID, 16);
+    if (!fx_v4) {
+        /* On a v4 inode these offsets are inside the literal area, so
+         * writing them would put an inode number into the file's fork. */
+        put64(di + XFS_DI_INO, ino);
+        memcpy(di + XFS_DI_UUID, TEST_UUID, 16);
+    }
     return di;
 }
 
 /* An extent record in an inode's inline fork. */
 static void set_extent(uint8_t *di, uint32_t index, uint64_t startoff, uint64_t startblock,
                        uint32_t count, bool unwritten) {
-    uint8_t *p = di + XFS_DI_V3_SIZE + index * XFS_EXTENT_BYTES;
+    uint8_t *p = di + fx_core() + index * XFS_EXTENT_BYTES;
     uint64_t hi = ((uint64_t)(unwritten ? 1u : 0u) << 63) | (startoff << 9) | (startblock >> 43);
     uint64_t lo = ((startblock & (((uint64_t)1 << 43) - 1u)) << 21) | count;
     put64(p, hi);
@@ -176,13 +204,24 @@ static void set_extent(uint8_t *di, uint32_t index, uint64_t startoff, uint64_t 
 }
 
 /* One directory entry written into a block at *at. */
+/* One directory entry written into a block at *at.
+ *
+ * **The file-type byte is a feature, not part of the format.** `ftype`
+ * arrived with v5 and an entry without it is one byte shorter, so a fixture
+ * that always wrote the byte would build a directory the v4 reader cannot
+ * walk — which is exactly what it did, and the listing failed on the second
+ * entry rather than the first, because the drift only accumulates past the
+ * alignment padding. */
 static void put_dirent(uint8_t *blk, uint32_t *at, uint64_t ino, const char *name, uint8_t type) {
     uint32_t name_len = (uint32_t)strlen(name);
-    uint32_t len = (8u + 1u + name_len + 1u + 2u + 7u) & ~7u;
+    uint32_t ftype = fx_v4 ? 0u : 1u;
+    uint32_t len = (8u + 1u + name_len + ftype + 2u + 7u) & ~7u;
     put64(blk + *at, ino);
     blk[*at + 8u] = (uint8_t)name_len;
     memcpy(blk + *at + 9u, name, name_len);
-    blk[*at + 9u + name_len] = type;
+    if (!fx_v4) {
+        blk[*at + 9u + name_len] = type;
+    }
     put16(blk + *at + len - 2u, (uint16_t)*at);
     *at += len;
 }
@@ -190,17 +229,19 @@ static void put_dirent(uint8_t *blk, uint32_t *at, uint64_t ino, const char *nam
 /* The root directory as one data block: ".", "..", a file and a directory. */
 static void build_dir(uint64_t owner, uint32_t fsb, uint32_t magic) {
     uint8_t *blk = block(fsb);
-    uint32_t at = XFS_DIR3_DATA_HDR_SIZE;
+    uint32_t at = fx_dir_hdr();
     memset(blk, 0, BS);
     put32(blk + XFS_DIR3_HDR_MAGIC, magic);
-    put64(blk + XFS_DIR3_HDR_BLKNO, (uint64_t)fsb * (BS / 512u));
-    memcpy(blk + XFS_DIR3_HDR_UUID, TEST_UUID, 16);
-    put64(blk + XFS_DIR3_HDR_OWNER, owner);
+    if (!fx_v4) {
+        put64(blk + XFS_DIR3_HDR_BLKNO, (uint64_t)fsb * (BS / 512u));
+        memcpy(blk + XFS_DIR3_HDR_UUID, TEST_UUID, 16);
+        put64(blk + XFS_DIR3_HDR_OWNER, owner);
+    }
     put_dirent(blk, &at, owner, ".", XFS_DIR3_FT_DIR);
     put_dirent(blk, &at, owner, "..", XFS_DIR3_FT_DIR);
     put_dirent(blk, &at, FILE_INO, "file.txt", XFS_DIR3_FT_REG);
     put_dirent(blk, &at, SUB_INO, "sub", XFS_DIR3_FT_DIR);
-    if (magic == XFS_DIR3_BLOCK_MAGIC) {
+    if (magic == XFS_DIR3_BLOCK_MAGIC || magic == XFS_DIR2_BLOCK_MAGIC) {
         /* A single-block directory keeps four hash entries and a tail at
          * the end of the same block, and the entries stop before them —
          * which is the accounting the reader has to get right. */
@@ -230,7 +271,7 @@ static void build_fs(void) {
     di = build_inode(ROOT_INO, 0040755u, XFS_DINODE_FMT_EXTENTS, BS);
     set_extent(di, 0, 0, DIR_FSB, 1u, false);
     seal(di, ISIZE, XFS_DI_CRC);
-    build_dir(ROOT_INO, DIR_FSB, XFS_DIR3_BLOCK_MAGIC);
+    build_dir(ROOT_INO, DIR_FSB, fx_v4 ? XFS_DIR2_BLOCK_MAGIC : XFS_DIR3_BLOCK_MAGIC);
 
     di = build_inode(FILE_INO, 0100644u, XFS_DINODE_FMT_EXTENTS, 10u);
     set_extent(di, 0, 0, FILE_FSB, 1u, false);
@@ -240,7 +281,7 @@ static void build_fs(void) {
     /* A shortform directory: count, i8count, parent, then one entry. */
     di = build_inode(SUB_INO, 0040755u, XFS_DINODE_FMT_LOCAL, 0);
     {
-        uint8_t *sf = di + XFS_DI_V3_SIZE;
+        uint8_t *sf = di + fx_core();
         uint32_t at = XFS_DIR_SF_PARENT + 4u;
         sf[XFS_DIR_SF_COUNT] = 1u;
         sf[XFS_DIR_SF_I8COUNT] = 0u;
@@ -248,9 +289,17 @@ static void build_fs(void) {
         sf[at] = 5u; /* namelen */
         put16(sf + at + 1u, 0x30u);
         memcpy(sf + at + 3u, "inner", 5u);
-        sf[at + 8u] = XFS_DIR3_FT_REG;
-        put32(sf + at + 9u, (uint32_t)FILE_INO);
-        put64(di + XFS_DI_SIZE, at + 13u);
+        /* The file-type byte is the `ftype` feature's, which is v5's here:
+         * without it the inode number follows the name directly, and a
+         * shortform entry is one byte shorter. */
+        if (fx_v4) {
+            put32(sf + at + 8u, (uint32_t)FILE_INO);
+            put64(di + XFS_DI_SIZE, at + 12u);
+        } else {
+            sf[at + 8u] = XFS_DIR3_FT_REG;
+            put32(sf + at + 9u, (uint32_t)FILE_INO);
+            put64(di + XFS_DI_SIZE, at + 13u);
+        }
     }
     seal(di, ISIZE, XFS_DI_CRC);
 }
@@ -406,8 +455,15 @@ static void damage_magic(void) {
     seal(block(0), 512u, XFS_SB_CRC);
 }
 
+/* A version this reader does not know.
+ *
+ * **It used to say 4**, which was a genuine refusal when only v5 was read
+ * and is now a supported format — so the fixture had quietly become a
+ * filesystem that mounts, and the assertion was testing the opposite of
+ * what it said. Version 3 is a real historical number that no longer
+ * occurs, which is what "unsupported" should mean here. */
 static void damage_version(void) {
-    put16(block(0) + XFS_SB_VERSIONNUM, 0xb004u);
+    put16(block(0) + XFS_SB_VERSIONNUM, 0xb003u);
     seal(block(0), 512u, XFS_SB_CRC);
 }
 
@@ -555,6 +611,82 @@ static void test_read_only_features_mount_but_forbid_writing(void) {
      * feature's doing and not a mount that is read-only anyway. */
     KTEST_CHECK(mount_with(damage_nothing) == KERR_OK);
     KTEST_CHECK(xfs_writable(&fs));
+}
+
+/* **A v4 filesystem, read as a first-class one.**
+ *
+ * The same fixture built with shorter headers, no checksums and the older
+ * magics — which is exactly the claim being tested, because if v4 needed a
+ * separate builder it would be exercising a separate reader rather than the
+ * same one taking its sizes from the superblock.
+ *
+ * The v5 assertions are repeated verbatim on purpose. A v4 filesystem is
+ * not a degraded mode: listing a directory, resolving a path, reading a
+ * file and walking a shortform directory all have to give the same answers,
+ * and the only way to show that is to ask the same questions. */
+static void test_a_v4_filesystem_is_read(void) {
+    struct xfs_inode ip;
+    struct seen saw = {0};
+    char buf[32];
+    uint32_t got = 0;
+    fx_v4 = true;
+    mount_fresh();
+    KTEST_CHECK(!fs.v5);
+    KTEST_CHECK(fs.dinode_size == XFS_DI_V2_SIZE);
+    KTEST_CHECK(fs.dir_data_hdr == XFS_DIR2_DATA_HDR_SIZE);
+
+    /* The root directory lists, which needs the v4 magic accepted and the
+     * 16-byte header used: a 64-byte one would start reading entries 48
+     * bytes in, inside the first name. */
+    KTEST_CHECK(xfs_inode_read(&fs, ROOT_INO, &ip) == KERR_OK);
+    KTEST_CHECK(xfs_dir_list(&fs, &ip, count_entry, &saw) == KERR_OK);
+    KTEST_CHECK(saw.count == 4u);
+
+    /* A file's contents come back, so the extent fork was found at 100 and
+     * not at 176 — where a v2 inode holds the middle of its own fork. */
+    KTEST_CHECK(xfs_path_lookup(&fs, "/file.txt", &ip) == KERR_OK);
+    KTEST_CHECK(xfs_file_read(&fs, &ip, 0, buf, sizeof buf, &got) == KERR_OK);
+    KTEST_CHECK(got == 10u);
+    KTEST_CHECK(memcmp(buf, "0123456789", 10) == 0);
+
+    /* And a shortform directory, whose entries are a byte shorter without
+     * the file-type byte that v5's ftype feature adds. */
+    KTEST_CHECK(xfs_path_lookup(&fs, "/sub/inner", &ip) == KERR_OK);
+    KTEST_CHECK(ip.ino == FILE_INO);
+    KTEST_CHECK(reads_outside == 0);
+
+    /* **Writing to a v4 file**, which is the half that could corrupt
+     * rather than merely fail.
+     *
+     * Recording a file's new size reseals the inode, and on v4 the
+     * checksum's offset — 100 — is the literal area's *first byte*, which
+     * is where the extent fork lives. So a reseal that was not suppressed
+     * would overwrite the fork of the very inode it was updating, and the
+     * file would read back as empty. The assertion that catches it is
+     * reading the file again afterwards: a corrupted fork cannot be
+     * noticed by looking at the write's return code, which succeeds. */
+    KTEST_CHECK(xfs_path_lookup(&fs, "/file.txt", &ip) == KERR_OK);
+    KTEST_CHECK(xfs_file_write(&fs, &ip, 0, "V4WRITE123", 10u, &got) == KERR_OK);
+    KTEST_CHECK(got == 10u);
+    bcache_invalidate(&cache);
+    KTEST_CHECK(xfs_path_lookup(&fs, "/file.txt", &ip) == KERR_OK);
+    KTEST_CHECK(ip.nextents == 1u); /* the fork survived the reseal */
+    memset(buf, 0, sizeof buf);
+    KTEST_CHECK(xfs_file_read(&fs, &ip, 0, buf, sizeof buf, &got) == KERR_OK);
+    KTEST_CHECK(got == 10u);
+    KTEST_CHECK(memcmp(buf, "V4WRITE123", 10) == 0);
+    /* And nothing was written where a v5 checksum would have gone. */
+    KTEST_CHECK(inode_at(FILE_INO)[XFS_DI_CRC] == 0 ||
+                inode_at(FILE_INO)[XFS_DI_CRC] == inode_at(FILE_INO)[fx_core()]);
+
+    /* A v5 magic on a filesystem that says v4 is a corrupt block, not a
+     * format to switch to: accepting it would read a 64-byte header as a
+     * 16-byte one. */
+    put32(block(DIR_FSB) + XFS_DIR3_HDR_MAGIC, XFS_DIR3_BLOCK_MAGIC);
+    bcache_invalidate(&cache);
+    KTEST_CHECK(xfs_inode_read(&fs, ROOT_INO, &ip) == KERR_OK);
+    KTEST_CHECK(xfs_dir_list(&fs, &ip, count_entry, &saw) != KERR_OK);
+    fx_v4 = false;
 }
 
 static void test_a_superblock_that_cannot_be_trusted(void) {
@@ -1046,6 +1178,84 @@ static void test_quotas_are_read(void) {
     bcache_invalidate(&cache);
     KTEST_CHECK(xfs_mount(&fs, &cache) == KERR_OK);
     KTEST_CHECK(xfs_quota_get(&fs, XFS_DQTYPE_USER, 7u, &dq) == KERR_IO);
+    KTEST_CHECK(reads_outside == 0);
+}
+
+/* Quotas that refuse, and quotas that only count.
+ *
+ * **The distinction is the test.** Enforcement and accounting are separate
+ * flags, and a charge must update the count either way while refusing only
+ * when enforcement is on — so a filesystem that merely accounts has to let
+ * a write past its limit through, with the usage recorded. Collapsing the
+ * two would either refuse on an accounting-only filesystem or never refuse
+ * at all, and both read as "quotas work".
+ *
+ * A hard limit of **zero means no limit**, which is the format's
+ * convention and the reverse of how the number looks. That is asserted
+ * directly, because reading it as "nothing allowed" would refuse every
+ * write on a filesystem that has quotas enabled and no limits set — which
+ * is what `mkfs.xfs -m uquota` produces. */
+static void test_quotas_are_enforced(void) {
+    struct xfs_dquot dq;
+    mount_fresh();
+    /* A hard limit of 4 blocks and 2 inodes for id 7, enforcement on. */
+    build_a_quota_file(7u, 4u, 3u);
+    put64(block(QUOTA_FSB) + 7u * XFS_DQUOT_BYTES + XFS_DQ_INO_HARD, 2u);
+    put64(block(QUOTA_FSB) + 7u * XFS_DQUOT_BYTES + XFS_DQ_ICOUNT, 1u);
+    seal(block(QUOTA_FSB) + 7u * XFS_DQUOT_BYTES, XFS_DQUOT_BYTES, XFS_DQ_CRC_OFF);
+    bcache_invalidate(&cache);
+    KTEST_CHECK(xfs_mount(&fs, &cache) == KERR_OK);
+
+    /* One more block fits: 3 used against a hard limit of 4. */
+    KTEST_CHECK(xfs_quota_charge(&fs, XFS_DQTYPE_USER, 7u, 1, 0) == KERR_OK);
+    KTEST_CHECK(xfs_quota_get(&fs, XFS_DQTYPE_USER, 7u, &dq) == KERR_OK);
+    KTEST_CHECK(dq.blocks_used == 4u);
+    /* The next does not, and **nothing is charged for a refusal**. */
+    KTEST_CHECK(xfs_quota_charge(&fs, XFS_DQTYPE_USER, 7u, 1, 0) == KERR_DQUOT);
+    KTEST_CHECK(xfs_quota_get(&fs, XFS_DQTYPE_USER, 7u, &dq) == KERR_OK);
+    KTEST_CHECK(dq.blocks_used == 4u);
+    /* Inodes are their own limit, counted separately from blocks. */
+    KTEST_CHECK(xfs_quota_charge(&fs, XFS_DQTYPE_USER, 7u, 0, 1) == KERR_OK);
+    KTEST_CHECK(xfs_quota_charge(&fs, XFS_DQTYPE_USER, 7u, 0, 1) == KERR_DQUOT);
+    /* Giving space back is never refused, and brings the owner under. */
+    KTEST_CHECK(xfs_quota_charge(&fs, XFS_DQTYPE_USER, 7u, -2, 0) == KERR_OK);
+    KTEST_CHECK(xfs_quota_charge(&fs, XFS_DQTYPE_USER, 7u, 1, 0) == KERR_OK);
+    /* A refund larger than the count clamps at zero rather than wrapping:
+     * a count that went negative would read as enormous and lock the owner
+     * out of a filesystem they have nothing on. */
+    KTEST_CHECK(xfs_quota_charge(&fs, XFS_DQTYPE_USER, 7u, -1000, 0) == KERR_OK);
+    KTEST_CHECK(xfs_quota_get(&fs, XFS_DQTYPE_USER, 7u, &dq) == KERR_OK);
+    KTEST_CHECK(dq.blocks_used == 0);
+
+    /* **Accounting without enforcement counts and does not refuse.** */
+    mount_fresh();
+    build_a_quota_file(7u, 4u, 4u);
+    put16(block(0) + XFS_SB_QFLAGS, XFS_UQUOTA_ACCT); /* no ENFD */
+    seal(block(0), 512u, XFS_SB_CRC);
+    bcache_invalidate(&cache);
+    KTEST_CHECK(xfs_mount(&fs, &cache) == KERR_OK);
+    KTEST_CHECK(xfs_quota_accounted(&fs, XFS_DQTYPE_USER));
+    KTEST_CHECK(!xfs_quota_enforced(&fs, XFS_DQTYPE_USER));
+    KTEST_CHECK(xfs_quota_charge(&fs, XFS_DQTYPE_USER, 7u, 100, 0) == KERR_OK);
+    KTEST_CHECK(xfs_quota_get(&fs, XFS_DQTYPE_USER, 7u, &dq) == KERR_OK);
+    KTEST_CHECK(dq.blocks_used == 104u); /* counted, well past the limit */
+
+    /* **A hard limit of zero is no limit**, not a ban. */
+    mount_fresh();
+    build_a_quota_file(7u, 0u, 0u);
+    bcache_invalidate(&cache);
+    KTEST_CHECK(xfs_mount(&fs, &cache) == KERR_OK);
+    KTEST_CHECK(xfs_quota_enforced(&fs, XFS_DQTYPE_USER));
+    KTEST_CHECK(xfs_quota_charge(&fs, XFS_DQTYPE_USER, 7u, 1000000, 0) == KERR_OK);
+
+    /* An id with no record has no allowance to exceed, and charging it is
+     * not an error — most ids on a real quota file are holes. */
+    KTEST_CHECK(xfs_quota_charge(&fs, XFS_DQTYPE_USER, 6u, 1000000, 0) == KERR_OK);
+    /* And a filesystem with no quotas at all pays nothing and refuses
+     * nothing: the common case must not become a failure. */
+    mount_fresh();
+    KTEST_CHECK(xfs_mount(&fs, &cache) == KERR_OK);
+    KTEST_CHECK(xfs_quota_charge_ids(&fs, 0, 0, 1000000, 1000) == KERR_OK);
     KTEST_CHECK(reads_outside == 0);
 }
 
@@ -1638,10 +1848,12 @@ int main(void) {
     KTEST_RUN(test_a_directory_is_not_a_file);
     KTEST_RUN(test_holes_and_unwritten_read_as_zeroes);
     KTEST_RUN(test_read_only_features_mount_but_forbid_writing);
+    KTEST_RUN(test_a_v4_filesystem_is_read);
     KTEST_RUN(test_a_superblock_that_cannot_be_trusted);
     KTEST_RUN(test_a_realtime_file_is_read_from_its_own_device);
     KTEST_RUN(test_the_realtime_bitmap_allocates);
     KTEST_RUN(test_quotas_are_read);
+    KTEST_RUN(test_quotas_are_enforced);
     KTEST_RUN(test_an_external_log_is_read_from_its_own_device);
     KTEST_RUN(test_a_dirty_log_is_checked);
     KTEST_RUN(test_the_check_stays_inside_the_filesystem);

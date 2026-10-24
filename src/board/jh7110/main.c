@@ -1312,6 +1312,7 @@ extern const char user_wait_start[], user_wait_end[];
 extern const char user_pgrp_start[], user_pgrp_end[];
 extern const char user_term_start[], user_term_end[];
 extern const char user_uid_start[], user_uid_end[];
+extern const char user_privsep_start[], user_privsep_end[];
 extern const char user_rlimit_start[], user_rlimit_end[];
 extern const char user_mremap_start[], user_mremap_end[];
 extern const char user_mapflags_start[], user_mapflags_end[];
@@ -1597,7 +1598,16 @@ static int fill_past_one_group(void) {
         static uint8_t got[sizeof chunk];
         rc = xfsmount_read_at("gg", at - sizeof chunk, got, sizeof got);
         for (uint32_t i = 0; rc == KERR_OK && i < sizeof got; i++) {
-            rc = got[i] == chunk[i] ? rc : KERR_IO;
+            if (got[i] != chunk[i]) {
+                /* **Where, and what instead.** A bare `KERR_IO` here says
+                 * only that a cross-group file read back wrong, and the two
+                 * ways that happens — a missing extent, which reads as
+                 * zeroes, and a misaddressed one, which reads as another
+                 * file — want different investigations. */
+                kprintf("fswrite: gg differs at %llu+%u: 0x%x not 0x%x\n",
+                        (unsigned long long)(at - sizeof chunk), i, got[i], chunk[i]);
+                rc = KERR_IO;
+            }
         }
     }
     return rc;
@@ -1966,7 +1976,14 @@ static void cat_a_file(const char *path) {
     uint64_t sum = 0;
     int rc = xfsmount_read_file(path, INIT_MAX_BYTES, &bytes, &size);
     if (rc != KERR_OK) {
-        kprintf("cat: %s cannot be read (rc %d)\n", path, rc);
+        /* **The counters on the failure path too.** Which lookup path ran
+         * is the first question a failure raises — the hash index and the
+         * walk fail for different reasons — and printing them only on
+         * success is how a failure becomes a mystery. */
+        uint64_t hashed = 0, walked = 0;
+        xfsmount_lookup_counts(&hashed, &walked);
+        kprintf("cat: %s cannot be read (rc %d, %llu hashed, %llu walked)\n", path, rc,
+                (unsigned long long)hashed, (unsigned long long)walked);
         return;
     }
     for (uint32_t i = 0; i < size; i++) {
@@ -2272,6 +2289,11 @@ static void run_user_programs(void) {
     /* Roadmap §1: a resource limit that bites. 0 means it was read
      * honestly, lowered, enforced at the fifth descriptor, and could not be
      * raised again after dropping privilege. */
+    /* Capabilities and `seccomp`: 0 means every step held, 151..160 name
+     * the one that did not. */
+    if (cmdline_has(boot_cmdline, "minikern.privsep")) {
+        run_one_user_program("privsep", user_privsep_start, user_privsep_end);
+    }
     if (cmdline_has(boot_cmdline, "minikern.rlimit")) {
         run_one_user_program("rlimit", user_rlimit_start, user_rlimit_end);
     }

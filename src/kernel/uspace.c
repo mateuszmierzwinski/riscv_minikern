@@ -324,6 +324,10 @@ static void release_every_slot(struct uproc *p) {
 }
 
 void uspace_destroy(struct uproc *p) {
+    /* **Before the `built` test**, because a process can hold filters
+     * without having an address space: `uspace_fork` allocates them first,
+     * and a failure after that point would leak every one of them. */
+    seccomp_release(p);
     if (!p->built) {
         return;
     }
@@ -1200,6 +1204,18 @@ void kfree_image(void *image) {
 
 int uspace_fork_shared(struct uproc *child, struct uproc *parent) {
     uint32_t pid = child->pid;
+    /* **The one step here that can fail, done before anything changes.**
+     * A child needs its own copies of its parent's filters — a struct
+     * assignment would give them one allocation with two owners — and a
+     * child that failed to inherit them must not run, because an
+     * unconfined child of a sandboxed parent is the escape this feature
+     * exists to prevent. Doing it first means the failure costs nothing to
+     * undo: nothing has been set up, and in particular `built` is still
+     * false, so no caller will try to tear down a page table this child
+     * shares with its parent. */
+    if (!seccomp_inherit(child, parent)) {
+        return KERR_NOMEM;
+    }
     /* Everything of the parent's except its identity and its threads. The
      * page tables are **shared, not copied**: that is what `vfork` is, and
      * it is why the parent must then be suspended. */
@@ -1219,6 +1235,10 @@ int uspace_fork_shared(struct uproc *child, struct uproc *parent) {
     child->gid = parent->gid;
     child->euid = parent->euid;
     child->egid = parent->egid;
+    /* Capabilities and the syscall filter both cross `fork` unchanged: a
+     * child that lost its parent's confinement would be an escape, and one
+     * that lost its capabilities could not do the work it was forked for. */
+    child->caps = parent->caps;
     child->rlim_nofile_soft = parent->rlim_nofile_soft;
     child->rlim_nofile_hard = parent->rlim_nofile_hard;
     child->rlim_nproc_soft = parent->rlim_nproc_soft;
@@ -1255,6 +1275,11 @@ uint32_t uspace_count_by_uid(uint32_t uid) {
     return n;
 }
 
+bool uspace_capable(uint32_t cap) {
+    struct uproc *p = uspace_current();
+    return p == NULL ? true : cap_in(p->caps.effective, cap);
+}
+
 uint32_t uspace_euid(void) {
     const struct uproc *p = uspace_current();
     return p == NULL ? 0u : p->euid;
@@ -1268,7 +1293,19 @@ uint32_t uspace_egid(void) {
 bool uspace_may_access(uint32_t file_uid, uint32_t file_gid, uint32_t mode, uint32_t want) {
     /* The rule itself is pure and host-tested in `core/access.c`; what this
      * layer knows is who is asking. */
-    return access_permitted(uspace_euid(), uspace_egid(), file_uid, file_gid, mode, want);
+    /* **A capability, not a uid.** `CAP_DAC_OVERRIDE` is what overrides
+     * the mode bits, and `CAP_DAC_READ_SEARCH` overrides them for reading
+     * alone — which is the narrower privilege a backup program wants and
+     * could never have while the exemption was spelled "uid == 0". Root
+     * holds both by default, so nothing that worked before stops; a root
+     * process that has dropped them is now refused, which is the point. */
+    if (uspace_capable(CAP_DAC_OVERRIDE)) {
+        return true;
+    }
+    if ((want & ~(uint32_t)ACCESS_READ) == 0u && uspace_capable(CAP_DAC_READ_SEARCH)) {
+        return true;
+    }
+    return access_permitted_strict(uspace_euid(), uspace_egid(), file_uid, file_gid, mode, want);
 }
 
 /* Whether this process has claimed this signal for itself. */
@@ -1401,6 +1438,16 @@ int uspace_exec(struct uproc *p, const uint8_t *image, uint32_t bytes, const cha
     p->mmap_next = fresh->mmap_next;
     p->built = true;
     p->shares_pt = false;
+    /* **The capabilities are transformed here, on the process itself.**
+     * What a program may do is a property of the program being run, not of
+     * the process that asked for it, so this is the moment it changes — and
+     * it has to be `p`, because the scratch above is thrown away and a
+     * transformation applied there would simply be lost.
+     *
+     * The `seccomp` filters are *not* touched: they stay on `p` throughout,
+     * which is what "survives execve" means. A sandbox a program could
+     * escape by executing something else would not be one. */
+    cap_after_exec(&p->caps, p->euid, seccomp_no_new_privs(p));
     fd_close_on_exec();
     signal_reset();
     /* The old tables are freed only if they were this process's. A `vfork`
@@ -1548,6 +1595,11 @@ struct uproc *uspace_alloc(void) {
     for (uint32_t i = 0; i < PROC_MAX; i++) {
         if (!procs[i].used) {
             procs[i] = (struct uproc){.used = true, .pid = next_pid};
+            /* **The sets come from the uid, once, here.** A process whose
+             * capabilities were left zero would be a root process that
+             * could do nothing, and the first one has to be able to read
+             * its own filesystem for the machine to boot at all. */
+            cap_sets_init(&procs[i].caps, procs[i].uid);
             /* **Its own group and session leader**, which is what makes the
              * first process one without a special case: a group of one is
              * still a group, and `setpgid`/`setsid` then move it the same
@@ -2343,6 +2395,12 @@ int uspace_fork(struct uproc *child, struct uproc *parent) {
     struct pt_mem mem = {.alloc = proc_alloc, .free = proc_free, .to_virt = proc_to_virt};
     uint32_t pid = child->pid;
     int rc;
+    /* The filters first, for the reason given in `uspace_fork_shared`: it
+     * is the step that can fail, and failing before anything is built
+     * leaves nothing to undo. */
+    if (!seccomp_inherit(child, parent)) {
+        return KERR_NOMEM;
+    }
     child->pt = (struct pgtable){0};
     rc = pgtable_create(&child->pt, &mem);
     if (rc != KERR_OK) {
@@ -2363,6 +2421,10 @@ int uspace_fork(struct uproc *child, struct uproc *parent) {
     child->gid = parent->gid;
     child->euid = parent->euid;
     child->egid = parent->egid;
+    /* Capabilities and the syscall filter both cross `fork` unchanged: a
+     * child that lost its parent's confinement would be an escape, and one
+     * that lost its capabilities could not do the work it was forked for. */
+    child->caps = parent->caps;
     child->rlim_nofile_soft = parent->rlim_nofile_soft;
     child->rlim_nofile_hard = parent->rlim_nofile_hard;
     child->rlim_nproc_soft = parent->rlim_nproc_soft;

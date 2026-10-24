@@ -441,7 +441,13 @@ int xfsmount_write(const char *name, uint64_t off, const void *buf, uint32_t len
     }
     rc = xfs_file_write(&fs, &ip, off, buf, len, &put);
     if (rc == KERR_OK && put != len) {
-        return KERR_IO; /* a short write with no reason is not a success */
+        /* **Say how short.** "A short write with no reason" was the whole
+         * of this message, and a reader who meets it learns only that the
+         * numbers disagreed — not which way, which is the first thing that
+         * narrows it. */
+        kprintf("xfs: short write to %s: %u of %u byte(s) at %llu\n", name, put, len,
+                (unsigned long long)off);
+        return KERR_IO;
     }
     return rc != KERR_OK ? rc : xfs_flush(&fs);
 }

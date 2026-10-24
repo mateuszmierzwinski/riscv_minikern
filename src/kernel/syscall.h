@@ -69,6 +69,9 @@
 #define SYS_UNAME 160u
 #define SYS_GETRUSAGE 165u
 #define SYS_PRCTL 167u
+#define SYS_CAPGET 90u
+#define SYS_CAPSET 91u
+#define SYS_SECCOMP 277u
 #define SYS_GETPID 172u
 #define SYS_GETTID 178u
 #define SYS_BRK 214u
@@ -131,6 +134,10 @@ extern const struct syscall_entry sys_socket_table[];
 
 /* The process domain's table, in `sys_proc.c`: `clone`, `execve`, `wait4`. */
 extern const struct syscall_entry sys_proc_table[];
+
+/* `capget`, `capset`, `prctl` and `seccomp` — the calls whose purpose is to
+ * reduce what a process may do (`kernel/sys_priv.c`). */
+extern const struct syscall_entry sys_priv_table[];
 
 /* A cloned thread, which the process domain's `clone` calls for the
  * `CLONE_THREAD` case. */

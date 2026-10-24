@@ -77,7 +77,7 @@ int xfs_dir_sf_remove(struct xfs *fs, const struct xfs_inode *dir, const char *n
         return rc;
     }
     di = b->data + boffset;
-    sf = di + XFS_DI_V3_SIZE;
+    sf = di + fs->dinode_size;
     count = sf[XFS_DIR_SF_COUNT_OFF];
     used = sf_used(sf, count);
     e = sf[XFS_DIR_SF_I8COUNT_OFF] != 0 ? NULL : sf_find(sf, count, name, namelen, ino);
@@ -93,7 +93,7 @@ int xfs_dir_sf_remove(struct xfs *fs, const struct xfs_inode *dir, const char *n
     xfs_put_be64(di + XFS_DI_SIZE, used - gap);
     xfs_put_be32(di + XFS_DI_MTIME, (uint32_t)now_s);
     xfs_put_be32(di + XFS_DI_CTIME, (uint32_t)now_s);
-    xfs_reseal(di, fs->inodesize, XFS_DI_CRC);
+    xfs_reseal(fs, di, fs->inodesize, XFS_DI_CRC);
     bcache_dirty(b);
     bcache_put(fs->cache, b);
     return KERR_OK;
@@ -113,7 +113,8 @@ static void give_to_record(uint8_t *rec, uint32_t bit) {
  * the record never goes away — and refusing otherwise is better than
  * inserting a btree record badly. */
 static int release_inode(struct xfs *fs, uint32_t agno, uint64_t ino) {
-    struct bbuf *agib, *inob, *finob;
+    struct bbuf *agib, *inob;
+    struct bbuf *finob = NULL; /* absent on v4 */
     uint8_t *agi, *rec, *frec;
     /* The records are keyed by the **group-relative** inode number, not the
      * whole one: the group is in the high bits of an inode number and must
@@ -125,36 +126,49 @@ static int release_inode(struct xfs *fs, uint32_t agno, uint64_t ino) {
     if (rc != KERR_OK) {
         return rc;
     }
-    rc = xfs_tree_get(fs, agno, xfs_be32(agi + XFS_AGI_ROOT), XFS_INOBT_MAGIC, &inob);
+    rc = xfs_tree_get(fs, agno, xfs_be32(agi + XFS_AGI_ROOT), xfs_magic_for(fs, XFS_BLK_INOBT), &inob);
     if (rc != KERR_OK) {
         bcache_put(fs->cache, agib);
         return rc;
     }
-    rc = xfs_tree_get(fs, agno, xfs_be32(agi + XFS_AGI_FREE_ROOT), XFS_FINOBT_MAGIC, &finob);
-    if (rc != KERR_OK) {
-        bcache_put(fs->cache, inob);
-        bcache_put(fs->cache, agib);
-        return rc;
+    /* The free-inode tree only where there is one: on v4 `agi_free_root`
+     * is past the end of the AGI as v4 defined it. */
+    if (fs->has_finobt) {
+        rc = xfs_tree_get(fs, agno, xfs_be32(agi + XFS_AGI_FREE_ROOT),
+                          xfs_magic_for(fs, XFS_BLK_FINOBT), &finob);
+        if (rc != KERR_OK) {
+            bcache_put(fs->cache, inob);
+            bcache_put(fs->cache, agib);
+            return rc;
+        }
     }
-    rec = xfs_tree_record_for(inob, (uint32_t)agino);
-    frec = rec == NULL ? NULL : xfs_tree_record_for(finob, (uint32_t)agino);
-    if (rec == NULL || frec == NULL) {
-        bcache_put(fs->cache, finob);
+    rec = xfs_tree_record_for(fs, inob, (uint32_t)agino);
+    frec = rec == NULL || finob == NULL ? NULL : xfs_tree_record_for(fs, finob, (uint32_t)agino);
+    /* **A missing record and an absent tree are different.** Without the
+     * tree there is no record to want; with the tree and no record the
+     * inode is not where the index says it should be, which is a refusal
+     * rather than something to work around. */
+    if (rec == NULL || (finob != NULL && frec == NULL)) {
+        if (finob != NULL) {
+            bcache_put(fs->cache, finob);
+        }
         bcache_put(fs->cache, inob);
         bcache_put(fs->cache, agib);
         return rec == NULL ? KERR_IO : KERR_NOTSUP;
     }
     bit = (uint32_t)agino - xfs_be32(rec + XFS_INOBT_REC_STARTINO);
     give_to_record(rec, bit);
-    give_to_record(frec, bit);
     xfs_put_be32(agi + XFS_AGI_FREECOUNT, xfs_be32(agi + XFS_AGI_FREECOUNT) + 1u);
-    xfs_reseal(inob->data, fs->blocksize, XFS_BTREE_CRC);
-    xfs_reseal(finob->data, fs->blocksize, XFS_BTREE_CRC);
-    xfs_reseal(agi, fs->sectsize, XFS_AGI_CRC);
+    xfs_reseal(fs, inob->data, fs->blocksize, XFS_BTREE_CRC);
+    xfs_reseal(fs, agi, fs->sectsize, XFS_AGI_CRC);
     bcache_dirty(inob);
-    bcache_dirty(finob);
     bcache_dirty(agib);
-    bcache_put(fs->cache, finob);
+    if (finob != NULL) {
+        give_to_record(frec, bit);
+        xfs_reseal(fs, finob->data, fs->blocksize, XFS_BTREE_CRC);
+        bcache_dirty(finob);
+        bcache_put(fs->cache, finob);
+    }
     bcache_put(fs->cache, inob);
     bcache_put(fs->cache, agib);
     return KERR_OK;
@@ -184,14 +198,21 @@ static int clear_inode(struct xfs *fs, uint64_t ino) {
         di[i] = 0;
     }
     xfs_put_be16(di + XFS_DI_MAGIC, XFS_DINODE_MAGIC);
-    di[XFS_DI_VERSION] = XFS_DI_VERSION_3;
+    di[XFS_DI_VERSION] = fs->v5 ? XFS_DI_VERSION_3 : XFS_DI_VERSION_2;
     xfs_put_be32(di + XFS_DI_GEN, gen);
     xfs_put_be32(di + XFS_DI_NEXT_UNLINKED, XFS_NULL_AGINO);
-    xfs_put_be64(di + XFS_DI_INO, ino);
-    for (uint32_t i = 0; i < 16; i++) {
-        di[XFS_DI_UUID + i] = fs->uuid[i];
+    /* The last two fields a v3 core has and a v2 one does not. On v4 both
+     * offsets are inside the literal area, so writing them puts an inode
+     * number and a UUID into the fork of an inode that has just been
+     * cleared — harmless to this reader, and exactly the sort of thing
+     * `xfs_repair` reports as corruption. */
+    if (fs->v5) {
+        xfs_put_be64(di + XFS_DI_INO, ino);
+        for (uint32_t i = 0; i < 16; i++) {
+            di[XFS_DI_UUID + i] = fs->uuid[i];
+        }
     }
-    xfs_reseal(di, fs->inodesize, XFS_DI_CRC);
+    xfs_reseal(fs, di, fs->inodesize, XFS_DI_CRC);
     bcache_dirty(b);
     bcache_put(fs->cache, b);
     return KERR_OK;
@@ -289,6 +310,14 @@ int xfs_unlink(struct xfs *fs, const struct xfs_inode *dir, const char *name, ui
     rc = rc != KERR_OK ? rc : xfs_dir_remove(fs, dir, name, namelen, now_s, &ino);
     rc = rc != KERR_OK ? rc : release_inode(fs, xfs_fsb_ag(fs, ino >> fs->inopblog), ino);
     rc = rc != KERR_OK ? rc : xfs_count_inodes_free(fs, 1);
+    /* **The refund, after the file is actually gone.** Charging is done
+     * before taking so that a refusal costs nothing; giving back is done
+     * after releasing so that a failure part way through does not credit an
+     * owner for a file they still have. The blocks go back too: the inode's
+     * own count is what they were charged as. */
+    if (rc == KERR_OK) {
+        (void)xfs_quota_charge_all(fs, &ip, -(int64_t)ip.nblocks, -1);
+    }
     rc = rc != KERR_OK ? rc : clear_inode(fs, ino);
     return rc != KERR_OK ? rc : log_unlink(fs, dir->ino);
 }
@@ -309,10 +338,10 @@ int xfs_dir_remove(struct xfs *fs, const struct xfs_inode *dir, const char *name
     }
     {
         uint16_t shape = xfs_dir_index_shape(fs, dir);
-        if (shape == XFS_DA3_NODE_MAGIC) {
+        if (shape == xfs_magic_for(fs, XFS_BLK_DA_NODE)) {
             return xfs_dir_node_remove(fs, dir, name, namelen, now_s, ino);
         }
-        if (shape == XFS_DIR3_LEAF1_MAGIC) {
+        if (shape == xfs_magic_for(fs, XFS_BLK_DIR_LEAF1)) {
             return xfs_dir_leaf_remove(fs, dir, name, namelen, now_s, ino);
         }
     }

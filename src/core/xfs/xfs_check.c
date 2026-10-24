@@ -63,7 +63,7 @@ static void fault(struct report *r, const char *what, uint32_t where) {
 static void header_ok(struct xfs *fs, uint32_t agno, const uint8_t *at, uint32_t magic,
                       uint32_t crc_off, uint32_t uuid_off, struct report *r,
                       const char *name) {
-    if (xfs_be32(at) != magic || !xfs_crc_ok(at, fs->sectsize, crc_off) ||
+    if (xfs_be32(at) != magic || !xfs_crc_ok(fs, at, fs->sectsize, crc_off) ||
         !xfs_uuid_ok(fs, at + uuid_off)) {
         fault(r, name, agno);
     }
@@ -130,13 +130,18 @@ static void check_group(struct xfs *fs, uint32_t agno, struct report *r) {
     header_ok(fs, agno, agi, XFS_AGI_MAGIC, XFS_AGI_CRC, XFS_AGI_UUID, r,
               "group inode header");
     if (r->faults == before) {
-        tree_root_ok(fs, agno, xfs_be32(agf + XFS_AGF_ROOTS), XFS_BNOBT_MAGIC, r,
+        tree_root_ok(fs, agno, xfs_be32(agf + XFS_AGF_ROOTS), xfs_magic_for(fs, XFS_BLK_BNOBT), r,
                      "free space by block");
-        tree_root_ok(fs, agno, xfs_be32(agf + XFS_AGF_ROOTS + 4u), XFS_CNTBT_MAGIC, r,
+        tree_root_ok(fs, agno, xfs_be32(agf + XFS_AGF_ROOTS + 4u), xfs_magic_for(fs, XFS_BLK_CNTBT), r,
                      "free space by count");
-        tree_root_ok(fs, agno, xfs_be32(agi + XFS_AGI_ROOT), XFS_INOBT_MAGIC, r, "inodes");
-        tree_root_ok(fs, agno, xfs_be32(agi + XFS_AGI_FREE_ROOT), XFS_FINOBT_MAGIC, r,
-                     "free inodes");
+        tree_root_ok(fs, agno, xfs_be32(agi + XFS_AGI_ROOT), xfs_magic_for(fs, XFS_BLK_INOBT), r, "inodes");
+        /* No free-inode tree on v4, and `agi_free_root` is past the end of
+         * the AGI as v4 defined it — so checking it would read whatever
+         * follows in the sector and count a fault that does not exist. */
+        if (fs->has_finobt) {
+            tree_root_ok(fs, agno, xfs_be32(agi + XFS_AGI_FREE_ROOT),
+                         xfs_magic_for(fs, XFS_BLK_FINOBT), r, "free inodes");
+        }
         counts_possible(fs, agno, agf, agi, r);
     }
     bcache_put(fs->cache, b);

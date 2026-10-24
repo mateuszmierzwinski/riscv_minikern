@@ -151,8 +151,8 @@ static int apply_inode(struct xfs *fs, const uint8_t *ilf, const uint8_t *core,
     }
     /* **Converted, not copied.** See `xfs_log_dinode_to_disk`: the logged
      * core is in the host's byte order and the inode is big-endian. */
-    xfs_log_dinode_to_disk(b->data + boffset, core);
-    xfs_reseal(b->data + boffset, fs->inodesize, XFS_DI_CRC);
+    xfs_log_dinode_to_disk(b->data + boffset, core, fs->dinode_size);
+    xfs_reseal(fs, b->data + boffset, fs->inodesize, XFS_DI_CRC);
     bcache_dirty(b);
     bcache_put(fs->cache, b);
     return KERR_OK;

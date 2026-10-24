@@ -1,5 +1,6 @@
 #include <stddef.h>
 
+#include "core/console.h"
 #include "core/errno.h"
 #include "core/xfs/xfs_internal.h"
 
@@ -47,7 +48,15 @@ static int list_shortform(struct xfs *fs, const struct xfs_inode *dir, xfs_diren
         uint32_t name_len = at < dir->size ? p[at] : 0u;
         uint32_t need = 1u + 2u + name_len + (fs->ftype ? 1u : 0u) + inolen;
         if (name_len == 0 || at + need > dir->size) {
-            return KERR_IO; /* the entries run past what the inode holds */
+            /* **The numbers, not just the refusal.** Every way this goes
+             * wrong — a writer using the wrong entry size, a size field
+             * that was not updated, an `i8count` disagreement — produces
+             * this one branch, and they want different fixes. */
+            kprintf("xfs: inode %u's shortform entry %u of %u runs past its size: "
+                    "at %u + %u > %u (namelen %u, ftype %u, inolen %u)\n",
+                    (uint32_t)dir->ino, i, count, at, need, (uint32_t)dir->size, name_len,
+                    fs->ftype ? 1u : 0u, inolen);
+            return KERR_IO;
         }
         e.name = (const char *)p + at + 3u;
         e.name_len = name_len;
@@ -71,12 +80,12 @@ static uint32_t data_end(const struct xfs *fs, const uint8_t *block) {
      * worked for as long as `-n size=` was refused at mount: a tail read at
      * the wrong offset is a count of leaf entries taken from the middle of
      * somebody's filename. */
-    if (xfs_be32(block + XFS_DIR3_HDR_MAGIC) != XFS_DIR3_BLOCK_MAGIC) {
+    if (xfs_be32(block + XFS_DIR3_HDR_MAGIC) != xfs_magic_for(fs, XFS_BLK_DIR_BLOCK)) {
         return size;
     }
     count = xfs_be32(block + size - XFS_DIR2_BLOCK_TAIL_SIZE);
-    if (count > (size - XFS_DIR3_DATA_HDR_SIZE) / XFS_DIR2_LEAF_ENTRY_SIZE) {
-        return XFS_DIR3_DATA_HDR_SIZE; /* a tail that cannot be true: read nothing */
+    if (count > (size - fs->dir_data_hdr) / XFS_DIR2_LEAF_ENTRY_SIZE) {
+        return fs->dir_data_hdr; /* a tail that cannot be true: read nothing */
     }
     return size - XFS_DIR2_BLOCK_TAIL_SIZE - count * XFS_DIR2_LEAF_ENTRY_SIZE;
 }
@@ -84,7 +93,7 @@ static uint32_t data_end(const struct xfs *fs, const uint8_t *block) {
 /* Walks the entries of one directory block. */
 static int list_block(struct xfs *fs, const uint8_t *block, xfs_dirent_fn fn, void *self) {
     uint32_t end = data_end(fs, block);
-    uint32_t at = XFS_DIR3_DATA_HDR_SIZE;
+    uint32_t at = fs->dir_data_hdr;
     while (at + 8u <= end) {
         struct xfs_dirent e;
         uint32_t name_len, len;
@@ -191,8 +200,17 @@ static int raw_dir_block(struct xfs *fs, const struct xfs_inode *dir, uint64_t f
  * block — which is exactly what it did. */
 static int verified(const struct xfs *fs, const uint8_t *at, uint64_t ino, uint32_t crc_off,
                     uint32_t uuid_off, uint32_t owner_off) {
-    if (!xfs_crc_ok(at, fs->dirblocksize, crc_off) || !xfs_uuid_ok(fs, at + uuid_off)) {
+    if (!xfs_crc_ok(fs, at, fs->dirblocksize, crc_off) || !xfs_uuid_ok(fs, at + uuid_off)) {
         return KERR_IO;
+    }
+    /* **The owner is the third of v5's self-describing fields**, with the
+     * checksum and the UUID — all three arrived together and none of them
+     * exists on v4, where offset 24 is inside the best-free array. The
+     * first two are skipped inside their own helpers; this one is here,
+     * which is why it was the one still comparing garbage against an inode
+     * number and rejecting every directory block of a sound filesystem. */
+    if (!fs->v5) {
+        return KERR_OK;
     }
     return xfs_be64(at + owner_off) == ino ? KERR_OK : KERR_IO;
 }
@@ -205,7 +223,7 @@ int xfs_dir_data_get(struct xfs *fs, const struct xfs_inode *dir, uint64_t first
         return rc;
     }
     magic = xfs_be32(out->at + XFS_DIR3_HDR_MAGIC);
-    rc = magic == XFS_DIR3_BLOCK_MAGIC || magic == XFS_DIR3_DATA_MAGIC
+    rc = magic == xfs_magic_for(fs, XFS_BLK_DIR_BLOCK) || magic == xfs_magic_for(fs, XFS_BLK_DIR_DATA)
              ? verified(fs, out->at, dir->ino, XFS_DIR3_HDR_CRC, XFS_DIR3_HDR_UUID,
                         XFS_DIR3_HDR_OWNER)
              : KERR_IO;
@@ -223,8 +241,8 @@ int xfs_dir_index_get(struct xfs *fs, const struct xfs_inode *dir, uint64_t firs
         return rc;
     }
     magic = xfs_be16(out->at + XFS_DA3_MAGIC_OFF);
-    rc = magic == XFS_DIR3_LEAF1_MAGIC || magic == XFS_DIR3_LEAFN_MAGIC ||
-                 magic == XFS_DA3_NODE_MAGIC
+    rc = magic == xfs_magic_for(fs, XFS_BLK_DIR_LEAF1) || magic == xfs_magic_for(fs, XFS_BLK_DIR_LEAFN) ||
+                 magic == xfs_magic_for(fs, XFS_BLK_DA_NODE)
              ? verified(fs, out->at, dir->ino, XFS_DA3_CRC_OFF, XFS_DA3_UUID_OFF,
                         XFS_DA3_OWNER_OFF)
              : KERR_IO;

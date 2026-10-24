@@ -50,7 +50,66 @@ bool xfs_fsb_valid(const struct xfs *fs, uint64_t fsb, uint64_t count);
 
 /* Verifies the CRC32C stored little-endian at crc_off within len bytes,
  * with the field itself counted as zero (which is how it was computed). */
-bool xfs_crc_ok(const uint8_t *buf, uint32_t len, uint32_t crc_off);
+/* Whether a structure's checksum matches — **and always true on v4**,
+ * which has no checksum to match. The filesystem is a parameter precisely
+ * so that every call site had to be visited when v4 arrived: on a v4
+ * filesystem the bytes at `crc_off` are not a checksum but whatever the
+ * shorter structure put there, and checking them would reject every block
+ * of a perfectly good filesystem. */
+bool xfs_crc_ok(const struct xfs *fs, const uint8_t *buf, uint32_t len, uint32_t crc_off);
+
+/* The kinds of metadata block whose magic **changed between v4 and v5**.
+ *
+ * AGI, AGF and the superblock are absent on purpose: their magics did not
+ * change, so asking per version would imply a difference that is not there.
+ */
+enum xfs_blk {
+    XFS_BLK_DIR_BLOCK,
+    XFS_BLK_DIR_DATA,
+    XFS_BLK_DIR_FREE,
+    XFS_BLK_DIR_LEAF1,
+    XFS_BLK_DIR_LEAFN,
+    XFS_BLK_DA_NODE,
+    XFS_BLK_ATTR_LEAF,
+    XFS_BLK_BNOBT,
+    XFS_BLK_CNTBT,
+    XFS_BLK_INOBT,
+    XFS_BLK_FINOBT,
+    XFS_BLK_BMBT,
+    XFS_BLK_KINDS
+};
+
+/* The magic a block of this kind carries **on this filesystem**.
+ *
+ * One function for both directions, because reading ("is this the kind I
+ * expect?") and writing ("stamp a new one") ask the same question and must
+ * never answer it differently — a writer that stamped a v5 magic onto a v4
+ * filesystem would produce a block its own reader then rejected. */
+uint32_t xfs_magic_for(const struct xfs *fs, enum xfs_blk kind);
+
+/* **How many bytes of this inode its data fork may use**: the literal area,
+ * cut short by the attribute fork when there is one.
+ *
+ * Exported because the directory writer needs the same answer as the inode
+ * reader, and had its own: it bounded the extents it would write by the
+ * size of a local array instead, which is larger than a small inode's
+ * literal area. With 256-byte inodes — the `mkfs.xfs` default, and what
+ * every v4 image here has — that let a growing directory write a tenth
+ * extent into room for nine, and the inode then read back as corrupt. */
+uint32_t xfs_fork_bytes(const struct xfs *fs, const uint8_t *di);
+
+/* Stamps the **self-describing fields v5 adds** to a metadata block — its
+ * own address, the filesystem's UUID and the structure that owns it — and
+ * does nothing at all on v4.
+ *
+ * One helper rather than a condition at each of the six places that write
+ * them, because the failure mode is silent: on v4 those offsets are not
+ * spare, they are the block's own data (offset 24 of a directory block is
+ * inside the best-free array), so an unguarded write corrupts the block it
+ * is trying to describe. Passing `0` for an offset skips that one field,
+ * for the blocks that have only some of them. */
+void xfs_stamp_owner(const struct xfs *fs, uint8_t *at, uint32_t blkno_off, uint32_t uuid_off,
+                     uint32_t owner_off, uint64_t blkno, uint64_t owner);
 
 /* The filesystem's UUID at uuid, or not. */
 bool xfs_uuid_ok(const struct xfs *fs, const uint8_t *uuid);
@@ -99,7 +158,10 @@ int xfs_log_replay(struct xfs *fs);
  * A logged inode keeps each field's offset but writes it in the host's byte
  * order, so replay cannot simply copy the bytes in. Only the fields the log
  * carries are written; the caller reseals. */
-void xfs_log_dinode_to_disk(uint8_t *di, const uint8_t *logged);
+/* `core` is the inode core's size — `fs->dinode_size`. It bounds the field
+ * table, whose last entries describe fields only a v3 core has and which on
+ * a v2 inode are the file's own fork. */
+void xfs_log_dinode_to_disk(uint8_t *di, const uint8_t *logged, uint32_t core);
 
 /* Writes an unmount record, which is what makes a log clean. */
 int xfs_log_mark_clean(struct xfs *fs);
@@ -127,7 +189,11 @@ struct xfs_log_inode_item {
 uint64_t xfs_group_block(const struct xfs *fs, uint32_t agno);
 
 /* Recomputes a self-describing structure's checksum over len bytes. */
-void xfs_reseal(uint8_t *at, uint32_t len, uint32_t crc_off);
+/* Recomputes a structure's checksum after changing it — **and does nothing
+ * on v4**. That is not an optimisation: a v4 inode core is 100 bytes, so
+ * `XFS_DI_CRC` at offset 100 is inside the literal area, and writing a
+ * checksum there would overwrite the fork. */
+void xfs_reseal(const struct xfs *fs, uint8_t *at, uint32_t len, uint32_t crc_off);
 
 /* The group's inode header, with its magic, checksum and UUID checked. */
 int xfs_agi_get(struct xfs *fs, uint32_t agno, struct bbuf **out, uint8_t **agi);
@@ -138,7 +204,7 @@ int xfs_tree_get(struct xfs *fs, uint32_t agno, uint32_t block, uint32_t magic, 
 
 /* The inode-btree record whose chunk holds this group-relative inode, or
  * NULL. Found by range: a chunk does not begin at a multiple of its size. */
-uint8_t *xfs_tree_record_for(const struct bbuf *b, uint32_t agino);
+uint8_t *xfs_tree_record_for(const struct xfs *fs, const struct bbuf *b, uint32_t agino);
 
 /* The superblock's free-inode counter, moved by delta. */
 int xfs_count_inodes_free(struct xfs *fs, int32_t delta);

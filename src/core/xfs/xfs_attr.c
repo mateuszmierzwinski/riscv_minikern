@@ -112,7 +112,7 @@ static uint32_t sf_find(const uint8_t *fork, uint32_t len, const char *want,
  * two inodes went over the kernel's frame limit the moment it did. */
 static int load_afork(struct xfs *fs, const struct xfs_inode *ip, uint8_t *fork,
                       uint32_t *len) {
-    uint32_t area = fs->inodesize - XFS_DI_V3_SIZE;
+    uint32_t area = fs->inodesize - fs->dinode_size;
     uint32_t at = (uint32_t)ip->forkoff * 8u;
     uint64_t block;
     uint32_t boffset;
@@ -131,7 +131,7 @@ static int load_afork(struct xfs *fs, const struct xfs_inode *ip, uint8_t *fork,
     if (rc != KERR_OK) {
         return rc;
     }
-    xfs_copy_bytes(fork, b->data + boffset + XFS_DI_V3_SIZE + at, *len);
+    xfs_copy_bytes(fork, b->data + boffset + fs->dinode_size + at, *len);
     bcache_put(fs->cache, b);
     return KERR_OK;
 }
@@ -140,7 +140,11 @@ static int load_afork(struct xfs *fs, const struct xfs_inode *ip, uint8_t *fork,
 
 int xfs_attr_get(struct xfs *fs, const struct xfs_inode *ip, const char *name,
                  uint32_t namelen, uint8_t *out, uint32_t room, uint32_t *valuelen) {
-    uint8_t fork[XFS_AFORK_MAX];
+    /* Static for the reason every outsized buffer here is (`CLAUDE.md`
+     * §10): one core is in the kernel at a time and no attribute operation
+     * sleeps or recurses. Each function keeps its own, so two that are live
+     * at once cannot alias — which a single shared scratch would allow. */
+    static uint8_t fork[XFS_AFORK_MAX];
     const char *bare = NULL;
     uint32_t barelen = 0, len = 0, at;
     uint8_t flags = 0;
@@ -171,7 +175,11 @@ int xfs_attr_get(struct xfs *fs, const struct xfs_inode *ip, const char *name,
 }
 
 int xfs_attr_list(struct xfs *fs, const struct xfs_inode *ip, xfs_attr_fn fn, void *self) {
-    uint8_t fork[XFS_AFORK_MAX];
+    /* Static for the reason every outsized buffer here is (`CLAUDE.md`
+     * §10): one core is in the kernel at a time and no attribute operation
+     * sleeps or recurses. Each function keeps its own, so two that are live
+     * at once cannot alias — which a single shared scratch would allow. */
+    static uint8_t fork[XFS_AFORK_MAX];
     uint32_t count, len = 0, at = SF_HDR;
     int rc;
     if (ip->forkoff == 0) {
@@ -277,7 +285,7 @@ static int data_fork_bytes(const struct xfs_inode *ip, uint32_t *need) {
  * moving it would mean moving the attributes too. */
 static int choose_forkoff(const struct xfs *fs, const struct xfs_inode *ip,
                           uint32_t *forkoff, uint32_t *room) {
-    uint32_t area = fs->inodesize - XFS_DI_V3_SIZE;
+    uint32_t area = fs->inodesize - fs->dinode_size;
     uint32_t need = 0;
     uint32_t half = (area / 2u) / 8u;
     int rc = data_fork_bytes(ip, &need);
@@ -318,13 +326,13 @@ static int store_fork(struct xfs *fs, const struct xfs_inode *ip, const uint8_t 
     }
     di = b->data + boffset;
     for (uint32_t i = 0; i < len; i++) {
-        di[XFS_DI_V3_SIZE + forkoff * 8u + i] = fork[i];
+        di[fs->dinode_size + forkoff * 8u + i] = fork[i];
     }
     di[XFS_DI_FORKOFF] = (uint8_t)forkoff;
     di[XFS_DI_AFORMAT] = XFS_DINODE_FMT_LOCAL;
     xfs_put_be32(di + XFS_DI_MTIME, (uint32_t)now_s);
     xfs_put_be32(di + XFS_DI_CTIME, (uint32_t)now_s);
-    xfs_reseal(di, fs->inodesize, XFS_DI_CRC);
+    xfs_reseal(fs, di, fs->inodesize, XFS_DI_CRC);
     bcache_dirty(b);
     bcache_put(fs->cache, b);
     return KERR_OK;
@@ -333,12 +341,29 @@ static int store_fork(struct xfs *fs, const struct xfs_inode *ip, const uint8_t 
 int xfs_attr_set(struct xfs *fs, const struct xfs_inode *ip, const char *name,
                  uint32_t namelen, const uint8_t *value, uint32_t valuelen,
                  uint64_t now_s) {
-    uint8_t fork[XFS_AFORK_MAX];
+    /* **Static, like every other buffer here that outgrew the stack**
+     * (`CLAUDE.md` §10): one core is inside the kernel at a time and
+     * nothing in an attribute write sleeps, and this function neither
+     * recurses nor is called from anything that holds it.
+     *
+     * It became necessary when `XFS_FORK_MAX` grew from 336 to 412 to make
+     * room for a v4 inode's larger literal area: the frame reached 1056
+     * bytes and the guard refused it. That is the fifth time the frame
+     * guard has caught a buffer here, and each time the answer was the
+     * same one. */
+    static uint8_t fork[XFS_AFORK_MAX];
     const char *bare = NULL;
     uint32_t barelen = 0, forkoff = 0, room = 0, used, at, entry;
     uint8_t flags = 0;
     bool found = false;
     int rc;
+    /* **`attr2` is required to change an attribute fork.** Without it the
+     * fork's offset inside the inode was fixed when `mkfs` ran and nothing
+     * may move it — and any change to the fork's size has to. Reading is
+     * unaffected, so this refuses the write rather than the filesystem. */
+    if (fs->attr_fixed_fork) {
+        return KERR_ROFS;
+    }
     if (!xfs_writable(fs)) {
         return KERR_ROFS;
     }
@@ -431,12 +456,23 @@ int xfs_attr_set(struct xfs *fs, const struct xfs_inode *ip, const char *name,
 
 int xfs_attr_remove(struct xfs *fs, const struct xfs_inode *ip, const char *name,
                     uint32_t namelen, uint64_t now_s) {
-    uint8_t fork[XFS_AFORK_MAX];
+    /* Static for the reason every outsized buffer here is (`CLAUDE.md`
+     * §10): one core is in the kernel at a time and no attribute operation
+     * sleeps or recurses. Each function keeps its own, so two that are live
+     * at once cannot alias — which a single shared scratch would allow. */
+    static uint8_t fork[XFS_AFORK_MAX];
     const char *bare = NULL;
     uint32_t barelen = 0, used, at, size, len = 0;
     uint8_t flags = 0;
     bool found = false;
     int rc;
+    /* **`attr2` is required to change an attribute fork.** Without it the
+     * fork's offset inside the inode was fixed when `mkfs` ran and nothing
+     * may move it — and any change to the fork's size has to. Reading is
+     * unaffected, so this refuses the write rather than the filesystem. */
+    if (fs->attr_fixed_fork) {
+        return KERR_ROFS;
+    }
     if (!xfs_writable(fs)) {
         return KERR_ROFS;
     }
@@ -457,7 +493,7 @@ int xfs_attr_remove(struct xfs *fs, const struct xfs_inode *ip, const char *name
         if (!leaf_take_out(fs, bare, barelen, flags)) {
             return KERR_NOENT;
         }
-        xfs_reseal(fs->dirblock, fs->blocksize, XFS_DA3_CRC_OFF);
+        xfs_reseal(fs, fs->dirblock, fs->blocksize, XFS_DA3_CRC_OFF);
         return xfs_attr_leaf_store(fs, fsb);
     }
     if (ip->aformat != XFS_DINODE_FMT_LOCAL) {
@@ -496,7 +532,11 @@ int xfs_attr_remove(struct xfs *fs, const struct xfs_inode *ip, const char *name
  * attribute fork is refused. */
 int xfs_attr_bmap(struct xfs *fs, const struct xfs_inode *ip, uint64_t logical,
                   struct xfs_extent *out) {
-    uint8_t fork[XFS_AFORK_MAX];
+    /* Static for the reason every outsized buffer here is (`CLAUDE.md`
+     * §10): one core is in the kernel at a time and no attribute operation
+     * sleeps or recurses. Each function keeps its own, so two that are live
+     * at once cannot alias — which a single shared scratch would allow. */
+    static uint8_t fork[XFS_AFORK_MAX];
     uint32_t len = 0, n;
     int rc;
     if (ip->aformat != XFS_DINODE_FMT_EXTENTS &&
@@ -559,10 +599,10 @@ static int leaf_load(struct xfs *fs, const struct xfs_inode *ip, uint8_t **at,
     }
     xfs_copy_bytes(fs->dirblock, b->data, fs->blocksize);
     bcache_put(fs->cache, b);
-    if (xfs_be16(fs->dirblock + XFS_DA3_MAGIC_OFF) != XFS_ATTR_LEAF_MAGIC) {
+    if (xfs_be16(fs->dirblock + XFS_DA3_MAGIC_OFF) != xfs_magic_for(fs, XFS_BLK_ATTR_LEAF)) {
         return KERR_IO;
     }
-    if (!xfs_crc_ok(fs->dirblock, fs->blocksize, XFS_DA3_CRC_OFF) ||
+    if (!xfs_crc_ok(fs, fs->dirblock, fs->blocksize, XFS_DA3_CRC_OFF) ||
         !xfs_uuid_ok(fs, fs->dirblock + XFS_DA3_UUID_OFF)) {
         return KERR_IO;
     }
@@ -579,7 +619,7 @@ static int leaf_load(struct xfs *fs, const struct xfs_inode *ip, uint8_t **at,
 static int leaf_entry(const struct xfs *fs, const uint8_t *leaf, uint32_t i,
                       const uint8_t **name, uint32_t *namelen, uint32_t *valuelen,
                       uint32_t *value_at, uint8_t *flags) {
-    uint32_t e = ATTR_LEAF_HDR + i * ATTR_LEAF_ENTRY;
+    uint32_t e = fs->attr_hdr + i * ATTR_LEAF_ENTRY;
     uint32_t idx;
     if (e + ATTR_LEAF_ENTRY > fs->blocksize) {
         return KERR_IO;
@@ -618,7 +658,7 @@ int xfs_attr_leaf_get(struct xfs *fs, const struct xfs_inode *ip, const char *na
     if (rc != KERR_OK) {
         return rc;
     }
-    count = xfs_be16(leaf + ATTR_LEAF_COUNT);
+    count = xfs_be16(leaf + fs->attr_base);
     for (uint32_t i = 0; i < count; i++) {
         const uint8_t *at = NULL;
         uint32_t len = 0, vlen = 0, value_at = 0;
@@ -636,7 +676,7 @@ int xfs_attr_leaf_get(struct xfs *fs, const struct xfs_inode *ip, const char *na
             /* The value is in blocks of its own: the entry carries where,
              * and the blocks carry the value with a header each. */
             return rmt_read(fs, ip, xfs_be32(leaf + xfs_be16(
-                                        leaf + ATTR_LEAF_HDR + i * ATTR_LEAF_ENTRY +
+                                        leaf + fs->attr_hdr + i * ATTR_LEAF_ENTRY +
                                         ATTR_LEAF_NAMEIDX) +
                                     ATTR_REMOTE_VALUEBLK),
                             vlen, out, room);
@@ -661,7 +701,7 @@ int xfs_attr_leaf_list(struct xfs *fs, const struct xfs_inode *ip, xfs_attr_fn f
     if (rc != KERR_OK) {
         return rc;
     }
-    count = xfs_be16(leaf + ATTR_LEAF_COUNT);
+    count = xfs_be16(leaf + fs->attr_base);
     for (uint32_t i = 0; i < count; i++) {
         const uint8_t *at = NULL;
         uint32_t len = 0, vlen = 0, value_at = 0;
@@ -706,7 +746,7 @@ static int xfs_attr_leaf_store(struct xfs *fs, uint64_t fsb) {
  * much of it is live. */
 static bool leaf_take_out(struct xfs *fs, const char *name, uint32_t namelen,
                           uint8_t flags) {
-    uint32_t count = xfs_be16(fs->dirblock + ATTR_LEAF_COUNT);
+    uint32_t count = xfs_be16(fs->dirblock + fs->attr_base);
     for (uint32_t i = 0; i < count; i++) {
         const uint8_t *at = NULL;
         uint32_t len = 0, vlen = 0, value_at = 0;
@@ -718,18 +758,18 @@ static bool leaf_take_out(struct xfs *fs, const char *name, uint32_t namelen,
             continue;
         }
         for (uint32_t k = i; k + 1u < count; k++) {
-            xfs_copy_bytes(fs->dirblock + ATTR_LEAF_HDR + k * ATTR_LEAF_ENTRY,
-                           fs->dirblock + ATTR_LEAF_HDR + (k + 1u) * ATTR_LEAF_ENTRY,
+            xfs_copy_bytes(fs->dirblock + fs->attr_hdr + k * ATTR_LEAF_ENTRY,
+                           fs->dirblock + fs->attr_hdr + (k + 1u) * ATTR_LEAF_ENTRY,
                            ATTR_LEAF_ENTRY);
         }
-        xfs_put_be16(fs->dirblock + ATTR_LEAF_COUNT, (uint16_t)(count - 1u));
+        xfs_put_be16(fs->dirblock + fs->attr_base, (uint16_t)(count - 1u));
         {
-            uint32_t used = xfs_be16(fs->dirblock + ATTR_LEAF_USEDBYTES);
+            uint32_t used = xfs_be16(fs->dirblock + (fs->attr_base + 2u));
             uint32_t size = ATTR_LOCAL_SIZE(len, vlen);
-            xfs_put_be16(fs->dirblock + ATTR_LEAF_USEDBYTES,
+            xfs_put_be16(fs->dirblock + (fs->attr_base + 2u),
                          (uint16_t)(used > size ? used - size : 0u));
         }
-        fs->dirblock[ATTR_LEAF_HOLES] = 1u;
+        fs->dirblock[(fs->attr_base + 6u)] = 1u;
         return true;
     }
     return false;
@@ -767,7 +807,7 @@ static int store_attr_extent(struct xfs *fs, const struct xfs_inode *ip, uint64_
      * room. A format change that does not clear its fork is a fork that
      * reads as whatever it used to be. */
     {
-        uint32_t at = XFS_DI_V3_SIZE + (uint32_t)ip->forkoff * 8u;
+        uint32_t at = fs->dinode_size + (uint32_t)ip->forkoff * 8u;
         for (uint32_t i = at; i < fs->inodesize; i++) {
             di[i] = 0;
         }
@@ -777,7 +817,7 @@ static int store_attr_extent(struct xfs *fs, const struct xfs_inode *ip, uint64_
     xfs_put_be64(di + XFS_DI_NBLOCKS, ip->nblocks + 1u);
     xfs_put_be32(di + XFS_DI_MTIME, (uint32_t)now_s);
     xfs_put_be32(di + XFS_DI_CTIME, (uint32_t)now_s);
-    xfs_reseal(di, fs->inodesize, XFS_DI_CRC);
+    xfs_reseal(fs, di, fs->inodesize, XFS_DI_CRC);
     bcache_dirty(b);
     bcache_put(fs->cache, b);
     return KERR_OK;
@@ -794,16 +834,13 @@ static void empty_attr_leaf(struct xfs *fs, uint64_t ino, uint64_t blkno) {
     for (uint32_t i = 0; i < fs->blocksize; i++) {
         fs->dirblock[i] = 0;
     }
-    xfs_put_be16(fs->dirblock + XFS_DA3_MAGIC_OFF, XFS_ATTR_LEAF_MAGIC);
-    xfs_put_be64(fs->dirblock + XFS_DA3_BLKNO_OFF, blkno);
-    xfs_put_be64(fs->dirblock + XFS_DA3_OWNER_OFF, ino);
-    for (uint32_t i = 0; i < 16; i++) {
-        fs->dirblock[XFS_DA3_UUID_OFF + i] = fs->uuid[i];
-    }
-    xfs_put_be16(fs->dirblock + ATTR_LEAF_FIRSTUSED, (uint16_t)fs->blocksize);
-    xfs_put_be16(fs->dirblock + ATTR_LEAF_FREEMAP, ATTR_LEAF_HDR);
-    xfs_put_be16(fs->dirblock + ATTR_LEAF_FREEMAP + 2u,
-                 (uint16_t)(fs->blocksize - ATTR_LEAF_HDR));
+    xfs_put_be16(fs->dirblock + XFS_DA3_MAGIC_OFF, xfs_magic_for(fs, XFS_BLK_ATTR_LEAF));
+    xfs_stamp_owner(fs, fs->dirblock, XFS_DA3_BLKNO_OFF, XFS_DA3_UUID_OFF, XFS_DA3_OWNER_OFF,
+                    blkno, ino);
+    xfs_put_be16(fs->dirblock + (fs->attr_base + 4u), (uint16_t)fs->blocksize);
+    xfs_put_be16(fs->dirblock + (fs->attr_base + 8u), fs->attr_hdr);
+    xfs_put_be16(fs->dirblock + (fs->attr_base + 8u) + 2u,
+                 (uint16_t)(fs->blocksize - fs->attr_hdr));
 }
 
 /* Puts one attribute into the leaf held in the buffer.
@@ -819,32 +856,32 @@ static void empty_attr_leaf(struct xfs *fs, uint64_t ino, uint64_t blkno) {
  * of you (Rule 11, Single derivation). */
 static int leaf_put(struct xfs *fs, const char *name, uint32_t namelen,
                     const uint8_t *value, uint32_t valuelen, uint8_t flags) {
-    uint32_t count = xfs_be16(fs->dirblock + ATTR_LEAF_COUNT);
-    uint32_t firstused = xfs_be16(fs->dirblock + ATTR_LEAF_FIRSTUSED);
-    uint32_t used = xfs_be16(fs->dirblock + ATTR_LEAF_USEDBYTES);
+    uint32_t count = xfs_be16(fs->dirblock + fs->attr_base);
+    uint32_t firstused = xfs_be16(fs->dirblock + (fs->attr_base + 4u));
+    uint32_t used = xfs_be16(fs->dirblock + (fs->attr_base + 2u));
     uint32_t size = ATTR_LOCAL_SIZE(namelen, valuelen);
     uint32_t hash = xfs_dir_hashname(name, namelen);
-    uint32_t entries_end = ATTR_LEAF_HDR + (count + 1u) * ATTR_LEAF_ENTRY;
+    uint32_t entries_end = fs->attr_hdr + (count + 1u) * ATTR_LEAF_ENTRY;
     uint32_t at = count, pair;
     if (firstused < size || entries_end > firstused - size) {
         return KERR_NOSPC; /* the array and the pairs would meet */
     }
     pair = firstused - size;
     for (uint32_t i = 0; i < count; i++) {
-        if (xfs_be32(fs->dirblock + ATTR_LEAF_HDR + i * ATTR_LEAF_ENTRY) > hash) {
+        if (xfs_be32(fs->dirblock + fs->attr_hdr + i * ATTR_LEAF_ENTRY) > hash) {
             at = i;
             break;
         }
     }
     for (uint32_t i = count; i > at; i--) {
-        xfs_copy_bytes(fs->dirblock + ATTR_LEAF_HDR + i * ATTR_LEAF_ENTRY,
-                       fs->dirblock + ATTR_LEAF_HDR + (i - 1u) * ATTR_LEAF_ENTRY,
+        xfs_copy_bytes(fs->dirblock + fs->attr_hdr + i * ATTR_LEAF_ENTRY,
+                       fs->dirblock + fs->attr_hdr + (i - 1u) * ATTR_LEAF_ENTRY,
                        ATTR_LEAF_ENTRY);
     }
-    xfs_put_be32(fs->dirblock + ATTR_LEAF_HDR + at * ATTR_LEAF_ENTRY, hash);
-    xfs_put_be16(fs->dirblock + ATTR_LEAF_HDR + at * ATTR_LEAF_ENTRY + ATTR_LEAF_NAMEIDX,
+    xfs_put_be32(fs->dirblock + fs->attr_hdr + at * ATTR_LEAF_ENTRY, hash);
+    xfs_put_be16(fs->dirblock + fs->attr_hdr + at * ATTR_LEAF_ENTRY + ATTR_LEAF_NAMEIDX,
                  (uint16_t)pair);
-    fs->dirblock[ATTR_LEAF_HDR + at * ATTR_LEAF_ENTRY + ATTR_LEAF_FLAGS] =
+    fs->dirblock[fs->attr_hdr + at * ATTR_LEAF_ENTRY + ATTR_LEAF_FLAGS] =
         (uint8_t)(flags | XFS_ATTR_LOCAL);
     xfs_put_be16(fs->dirblock + pair + ATTR_LOCAL_VALUELEN, (uint16_t)valuelen);
     fs->dirblock[pair + ATTR_LOCAL_NAMELEN] = (uint8_t)namelen;
@@ -854,18 +891,22 @@ static int leaf_put(struct xfs *fs, const char *name, uint32_t namelen,
     for (uint32_t i = 0; i < valuelen; i++) {
         fs->dirblock[pair + ATTR_LOCAL_NAMEVAL + namelen + i] = value[i];
     }
-    xfs_put_be16(fs->dirblock + ATTR_LEAF_COUNT, (uint16_t)(count + 1u));
-    xfs_put_be16(fs->dirblock + ATTR_LEAF_FIRSTUSED, (uint16_t)pair);
-    xfs_put_be16(fs->dirblock + ATTR_LEAF_USEDBYTES, (uint16_t)(used + size));
-    xfs_put_be16(fs->dirblock + ATTR_LEAF_FREEMAP, (uint16_t)entries_end);
-    xfs_put_be16(fs->dirblock + ATTR_LEAF_FREEMAP + 2u, (uint16_t)(pair - entries_end));
+    xfs_put_be16(fs->dirblock + fs->attr_base, (uint16_t)(count + 1u));
+    xfs_put_be16(fs->dirblock + (fs->attr_base + 4u), (uint16_t)pair);
+    xfs_put_be16(fs->dirblock + (fs->attr_base + 2u), (uint16_t)(used + size));
+    xfs_put_be16(fs->dirblock + (fs->attr_base + 8u), (uint16_t)entries_end);
+    xfs_put_be16(fs->dirblock + (fs->attr_base + 8u) + 2u, (uint16_t)(pair - entries_end));
     return KERR_OK;
 }
 
 int xfs_attr_to_leaf(struct xfs *fs, const struct xfs_inode *ip, const char *name,
                      uint32_t namelen, const uint8_t *value, uint32_t valuelen,
                      uint8_t flags, uint64_t now_s) {
-    uint8_t fork[XFS_AFORK_MAX];
+    /* Static for the reason every outsized buffer here is (`CLAUDE.md`
+     * §10): one core is in the kernel at a time and no attribute operation
+     * sleeps or recurses. Each function keeps its own, so two that are live
+     * at once cannot alias — which a single shared scratch would allow. */
+    static uint8_t fork[XFS_AFORK_MAX];
     uint32_t len = 0, count, at = SF_HDR, agno;
     uint32_t agbno = 0;
     uint64_t fsb;
@@ -904,7 +945,7 @@ int xfs_attr_to_leaf(struct xfs *fs, const struct xfs_inode *ip, const char *nam
     if (rc != KERR_OK) {
         return rc;
     }
-    xfs_reseal(fs->dirblock, fs->blocksize, XFS_DA3_CRC_OFF);
+    xfs_reseal(fs, fs->dirblock, fs->blocksize, XFS_DA3_CRC_OFF);
     rc = xfs_attr_leaf_store(fs, fsb);
     return rc != KERR_OK ? rc : store_attr_extent(fs, ip, fsb, now_s);
 }
@@ -928,7 +969,7 @@ int xfs_attr_leaf_set(struct xfs *fs, const struct xfs_inode *ip, const char *na
     if (rc != KERR_OK) {
         return rc; /* the block is unchanged on disk: nothing was stored */
     }
-    xfs_reseal(fs->dirblock, fs->blocksize, XFS_DA3_CRC_OFF);
+    xfs_reseal(fs, fs->dirblock, fs->blocksize, XFS_DA3_CRC_OFF);
     rc = xfs_attr_leaf_store(fs, fsb);
     (void)now_s;
     return rc;
@@ -940,7 +981,11 @@ int xfs_attr_leaf_set(struct xfs *fs, const struct xfs_inode *ip, const char *na
  * zero and remote values follow it, and asking the fork is the only answer
  * that stays right when a value is removed and another added. */
 static int attr_fork_end(struct xfs *fs, const struct xfs_inode *ip, uint32_t *next) {
-    uint8_t fork[XFS_AFORK_MAX];
+    /* Static for the reason every outsized buffer here is (`CLAUDE.md`
+     * §10): one core is in the kernel at a time and no attribute operation
+     * sleeps or recurses. Each function keeps its own, so two that are live
+     * at once cannot alias — which a single shared scratch would allow. */
+    static uint8_t fork[XFS_AFORK_MAX];
     uint32_t len = 0, n;
     int rc = load_afork(fs, ip, fork, &len);
     if (rc != KERR_OK) {
@@ -982,8 +1027,8 @@ static int attr_fork_append(struct xfs *fs, const struct xfs_inode *ip, uint32_t
         return rc;
     }
     di = b->data + boffset;
-    room = fs->inodesize - XFS_DI_V3_SIZE - (uint32_t)di[XFS_DI_FORKOFF] * 8u;
-    fork = di + XFS_DI_V3_SIZE + (uint32_t)di[XFS_DI_FORKOFF] * 8u;
+    room = fs->inodesize - fs->dinode_size - (uint32_t)di[XFS_DI_FORKOFF] * 8u;
+    fork = di + fs->dinode_size + (uint32_t)di[XFS_DI_FORKOFF] * 8u;
     while (at + XFS_EXTENT_BYTES <= room) {
         struct xfs_extent have;
         xfs_extent_unpack(fork + at, &have);
@@ -1000,7 +1045,7 @@ static int attr_fork_append(struct xfs *fs, const struct xfs_inode *ip, uint32_t
     xfs_put_be64(di + XFS_DI_NBLOCKS, xfs_be64(di + XFS_DI_NBLOCKS) + blocks);
     xfs_put_be32(di + XFS_DI_MTIME, (uint32_t)now_s);
     xfs_put_be32(di + XFS_DI_CTIME, (uint32_t)now_s);
-    xfs_reseal(di, fs->inodesize, XFS_DI_CRC);
+    xfs_reseal(fs, di, fs->inodesize, XFS_DI_CRC);
     bcache_dirty(b);
     bcache_put(fs->cache, b);
     return KERR_OK;
@@ -1008,9 +1053,20 @@ static int attr_fork_append(struct xfs *fs, const struct xfs_inode *ip, uint32_t
 
 /* ── remote values ────────────────────────────────────────────────────── */
 
-/* How many value bytes one remote block carries. */
+/* How many value bytes one remote block carries.
+ *
+ * **On v4 the whole block is value.** A v4 remote attribute has no header
+ * of any kind — the value's bytes begin at the block's first byte, where v5
+ * puts 60 bytes of `XARM`. This is the one place in the format where v4 and
+ * v5 differ by more than a header size and a checksum, and getting it wrong
+ * is not a rejected block but a value that is silently short by 60 bytes
+ * per block and offset by 60 at every boundary. */
+static uint32_t rmt_hdr(const struct xfs *fs) {
+    return fs->v5 ? ATTR_RMT_HDR : 0u;
+}
+
 static uint32_t rmt_payload(const struct xfs *fs) {
-    return fs->blocksize - ATTR_RMT_HDR;
+    return fs->blocksize - rmt_hdr(fs);
 }
 
 /* Reads a value that lives in blocks of its own.
@@ -1043,13 +1099,20 @@ static int rmt_read(struct xfs *fs, const struct xfs_inode *ip, uint32_t valuebl
             return rc;
         }
         h = b->data;
-        if (xfs_be32(h) != XFS_ATTR3_RMT_MAGIC || !xfs_crc_ok(h, fs->blocksize, ATTR_RMT_CRC) ||
-            !xfs_uuid_ok(fs, h + ATTR_RMT_UUID) || xfs_be32(h + ATTR_RMT_OFFSET) != at ||
-            xfs_be32(h + ATTR_RMT_BYTES) != want) {
+        /* A v4 block has no header to check: there is nothing in it that
+         * says which part of the value it holds, so its place in the fork
+         * is the only thing that does. The checks below are exactly what v5
+         * added, and skipping them on v4 is not laxity — there is nothing
+         * there to read. */
+        if (fs->v5 && (xfs_be32(h) != XFS_ATTR3_RMT_MAGIC ||
+                       !xfs_crc_ok(fs, h, fs->blocksize, ATTR_RMT_CRC) ||
+                       !xfs_uuid_ok(fs, h + ATTR_RMT_UUID) ||
+                       xfs_be32(h + ATTR_RMT_OFFSET) != at ||
+                       xfs_be32(h + ATTR_RMT_BYTES) != want)) {
             bcache_put(fs->cache, b);
             return KERR_IO;
         }
-        xfs_copy_bytes(out + at, h + ATTR_RMT_HDR, want);
+        xfs_copy_bytes(out + at, h + rmt_hdr(fs), want);
         bcache_put(fs->cache, b);
         at += want;
     }
@@ -1085,16 +1148,18 @@ static int rmt_write(struct xfs *fs, const struct xfs_inode *ip, const uint8_t *
         for (uint32_t k = 0; k < fs->blocksize; k++) {
             b->data[k] = 0;
         }
-        xfs_put_be32(b->data, XFS_ATTR3_RMT_MAGIC);
-        for (uint32_t k = 0; k < 16; k++) {
-            b->data[ATTR_RMT_UUID + k] = fs->uuid[k];
+        if (fs->v5) {
+            xfs_put_be32(b->data, XFS_ATTR3_RMT_MAGIC);
+            for (uint32_t k = 0; k < 16; k++) {
+                b->data[ATTR_RMT_UUID + k] = fs->uuid[k];
+            }
+            xfs_put_be64(b->data + ATTR_RMT_OWNER, ip->ino);
+            xfs_put_be64(b->data + ATTR_RMT_BLKNO, (uint64_t)at_block + i);
+            xfs_put_be32(b->data + ATTR_RMT_OFFSET, done);
+            xfs_put_be32(b->data + ATTR_RMT_BYTES, want);
         }
-        xfs_put_be64(b->data + ATTR_RMT_OWNER, ip->ino);
-        xfs_put_be64(b->data + ATTR_RMT_BLKNO, (uint64_t)at_block + i);
-        xfs_put_be32(b->data + ATTR_RMT_OFFSET, done);
-        xfs_put_be32(b->data + ATTR_RMT_BYTES, want);
-        xfs_copy_bytes(b->data + ATTR_RMT_HDR, value + done, want);
-        xfs_reseal(b->data, fs->blocksize, ATTR_RMT_CRC);
+        xfs_copy_bytes(b->data + rmt_hdr(fs), value + done, want);
+        xfs_reseal(fs, b->data, fs->blocksize, ATTR_RMT_CRC);
         bcache_dirty(b);
         bcache_put(fs->cache, b);
         done += want;
@@ -1105,12 +1170,12 @@ static int rmt_write(struct xfs *fs, const struct xfs_inode *ip, const uint8_t *
 /* Puts a remote entry — name, and where the value is — into the leaf. */
 static int leaf_put_remote(struct xfs *fs, const char *name, uint32_t namelen,
                            uint32_t valueblk, uint32_t valuelen, uint8_t flags) {
-    uint32_t count = xfs_be16(fs->dirblock + ATTR_LEAF_COUNT);
-    uint32_t firstused = xfs_be16(fs->dirblock + ATTR_LEAF_FIRSTUSED);
-    uint32_t used = xfs_be16(fs->dirblock + ATTR_LEAF_USEDBYTES);
+    uint32_t count = xfs_be16(fs->dirblock + fs->attr_base);
+    uint32_t firstused = xfs_be16(fs->dirblock + (fs->attr_base + 4u));
+    uint32_t used = xfs_be16(fs->dirblock + (fs->attr_base + 2u));
     uint32_t size = ATTR_REMOTE_SIZE(namelen);
     uint32_t hash = xfs_dir_hashname(name, namelen);
-    uint32_t entries_end = ATTR_LEAF_HDR + (count + 1u) * ATTR_LEAF_ENTRY;
+    uint32_t entries_end = fs->attr_hdr + (count + 1u) * ATTR_LEAF_ENTRY;
     uint32_t at = count, pair;
     uint8_t *e;
     if (firstused < size || entries_end > firstused - size) {
@@ -1118,17 +1183,17 @@ static int leaf_put_remote(struct xfs *fs, const char *name, uint32_t namelen,
     }
     pair = firstused - size;
     for (uint32_t i = 0; i < count; i++) {
-        if (xfs_be32(fs->dirblock + ATTR_LEAF_HDR + i * ATTR_LEAF_ENTRY) > hash) {
+        if (xfs_be32(fs->dirblock + fs->attr_hdr + i * ATTR_LEAF_ENTRY) > hash) {
             at = i;
             break;
         }
     }
     for (uint32_t i = count; i > at; i--) {
-        xfs_copy_bytes(fs->dirblock + ATTR_LEAF_HDR + i * ATTR_LEAF_ENTRY,
-                       fs->dirblock + ATTR_LEAF_HDR + (i - 1u) * ATTR_LEAF_ENTRY,
+        xfs_copy_bytes(fs->dirblock + fs->attr_hdr + i * ATTR_LEAF_ENTRY,
+                       fs->dirblock + fs->attr_hdr + (i - 1u) * ATTR_LEAF_ENTRY,
                        ATTR_LEAF_ENTRY);
     }
-    e = fs->dirblock + ATTR_LEAF_HDR + at * ATTR_LEAF_ENTRY;
+    e = fs->dirblock + fs->attr_hdr + at * ATTR_LEAF_ENTRY;
     xfs_put_be32(e, hash);
     xfs_put_be16(e + ATTR_LEAF_NAMEIDX, (uint16_t)pair);
     /* **No `XFS_ATTR_LOCAL`**, which is the one bit that tells a reader to
@@ -1141,11 +1206,11 @@ static int leaf_put_remote(struct xfs *fs, const char *name, uint32_t namelen,
     for (uint32_t i = 0; i < namelen; i++) {
         fs->dirblock[pair + ATTR_REMOTE_NAME + i] = (uint8_t)name[i];
     }
-    xfs_put_be16(fs->dirblock + ATTR_LEAF_COUNT, (uint16_t)(count + 1u));
-    xfs_put_be16(fs->dirblock + ATTR_LEAF_FIRSTUSED, (uint16_t)pair);
-    xfs_put_be16(fs->dirblock + ATTR_LEAF_USEDBYTES, (uint16_t)(used + size));
-    xfs_put_be16(fs->dirblock + ATTR_LEAF_FREEMAP, (uint16_t)entries_end);
-    xfs_put_be16(fs->dirblock + ATTR_LEAF_FREEMAP + 2u, (uint16_t)(pair - entries_end));
+    xfs_put_be16(fs->dirblock + fs->attr_base, (uint16_t)(count + 1u));
+    xfs_put_be16(fs->dirblock + (fs->attr_base + 4u), (uint16_t)pair);
+    xfs_put_be16(fs->dirblock + (fs->attr_base + 2u), (uint16_t)(used + size));
+    xfs_put_be16(fs->dirblock + (fs->attr_base + 8u), (uint16_t)entries_end);
+    xfs_put_be16(fs->dirblock + (fs->attr_base + 8u) + 2u, (uint16_t)(pair - entries_end));
     return KERR_OK;
 }
 
@@ -1204,6 +1269,6 @@ static int attr_set_remote(struct xfs *fs, const struct xfs_inode *ip, const cha
         kprintf("xfs: attr remote: the leaf has no room for the entry: rc %d\n", rc);
         return rc; /* the leaf is unchanged on disk */
     }
-    xfs_reseal(fs->dirblock, fs->blocksize, XFS_DA3_CRC_OFF);
+    xfs_reseal(fs, fs->dirblock, fs->blocksize, XFS_DA3_CRC_OFF);
     return xfs_attr_leaf_store(fs, leaf_fsb);
 }

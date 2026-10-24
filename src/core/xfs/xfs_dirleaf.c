@@ -32,7 +32,7 @@ static uint32_t bests_at(const struct xfs *fs, uint32_t n) {
 
 /* The largest free span in a data block, which is what `bests` records. */
 uint32_t xfs_dir_largest_free(const struct xfs *fs, const uint8_t *block) {
-    uint32_t at = XFS_DIR3_DATA_HDR_SIZE;
+    uint32_t at = fs->dir_data_hdr;
     uint32_t best = 0;
     while (at + 8u <= fs->dirblocksize) {
         uint32_t len;
@@ -122,16 +122,13 @@ static void build_leaf(struct xfs *fs, uint64_t ino, const uint8_t *pairs, uint3
     for (uint32_t i = 0; i < fs->dirblocksize; i++) {
         fs->dirblock[i] = 0;
     }
-    xfs_put_be16(fs->dirblock + XFS_DA3_MAGIC_OFF, XFS_DIR3_LEAF1_MAGIC);
-    xfs_put_be16(fs->dirblock + XFS_DA3_COUNT_OFF, (uint16_t)count);
-    xfs_put_be64(fs->dirblock + XFS_DA3_OWNER_OFF, ino);
-    for (uint32_t i = 0; i < 16; i++) {
-        fs->dirblock[XFS_DA3_UUID_OFF + i] = fs->uuid[i];
-    }
-    xfs_copy_bytes(fs->dirblock + XFS_DA3_HDR_SIZE, pairs, count * XFS_DA3_ENTRY_SIZE);
+    xfs_put_be16(fs->dirblock + XFS_DA3_MAGIC_OFF, xfs_magic_for(fs, XFS_BLK_DIR_LEAF1));
+    xfs_put_be16(fs->dirblock + fs->da_count, (uint16_t)count);
+    xfs_stamp_owner(fs, fs->dirblock, 0, XFS_DA3_UUID_OFF, XFS_DA3_OWNER_OFF, 0, ino);
+    xfs_copy_bytes(fs->dirblock + fs->da_hdr, pairs, count * XFS_DA3_ENTRY_SIZE);
     xfs_put_be16(fs->dirblock + bests_at(fs, 1u), (uint16_t)best);
     xfs_put_be32(fs->dirblock + fs->dirblocksize - XFS_DIR2_LEAF_TAIL_SIZE, 1u);
-    xfs_reseal(fs->dirblock, fs->dirblocksize, XFS_DA3_CRC_OFF);
+    xfs_reseal(fs, fs->dirblock, fs->dirblocksize, XFS_DA3_CRC_OFF);
 }
 
 /* Whether another pair fits between the hashes and the `bests` array.
@@ -141,7 +138,7 @@ static void build_leaf(struct xfs *fs, uint64_t ino, const uint8_t *pairs, uint3
  * format begins. */
 static uint32_t leaf_hash_room(const struct xfs *fs, uint32_t count, uint32_t bestcount) {
     uint32_t end = bests_at(fs, bestcount);
-    uint32_t used = XFS_DA3_HDR_SIZE + (count + 1u) * XFS_DA3_ENTRY_SIZE;
+    uint32_t used = fs->da_hdr + (count + 1u) * XFS_DA3_ENTRY_SIZE;
     return used <= end ? end - used + 1u : 0u;
 }
 
@@ -184,10 +181,10 @@ static int edit_leaf(struct xfs *fs, const struct xfs_inode *dir, uint32_t hash,
     if (rc != KERR_OK) {
         return rc;
     }
-    if (xfs_be16(fs->dirblock + XFS_DA3_MAGIC_OFF) != XFS_DIR3_LEAF1_MAGIC) {
+    if (xfs_be16(fs->dirblock + XFS_DA3_MAGIC_OFF) != xfs_magic_for(fs, XFS_BLK_DIR_LEAF1)) {
         return KERR_NOTSUP; /* node format: its own entry in the roadmap */
     }
-    count = xfs_be16(fs->dirblock + XFS_DA3_COUNT_OFF);
+    count = xfs_be16(fs->dirblock + fs->da_count);
     bestcount = xfs_be32(fs->dirblock + fs->dirblocksize - XFS_DIR2_LEAF_TAIL_SIZE);
     if (leaf_hash_room(fs, count, blocks > bestcount ? blocks : bestcount) == 0) {
         return KERR_NOSPC;
@@ -197,26 +194,26 @@ static int edit_leaf(struct xfs *fs, const struct xfs_inode *dir, uint32_t hash,
         bestcount = blocks;
     }
     if (address != 0 && add) {
-        xfs_dir_pairs_insert(fs->dirblock + XFS_DA3_HDR_SIZE, &count, hash, address);
+        xfs_dir_pairs_insert(fs->dirblock + fs->da_hdr, &count, hash, address);
     } else if (address != 0) {
         at = count;
         for (uint32_t i = 0; i < count; i++) {
-            at = xfs_be32(fs->dirblock + XFS_DA3_HDR_SIZE + i * XFS_DA3_ENTRY_SIZE + 4u) ==
+            at = xfs_be32(fs->dirblock + fs->da_hdr + i * XFS_DA3_ENTRY_SIZE + 4u) ==
                          address
                      ? i
                      : at;
         }
         for (uint32_t i = at; i + 1u < count; i++) {
-            xfs_copy_bytes(fs->dirblock + XFS_DA3_HDR_SIZE + i * XFS_DA3_ENTRY_SIZE,
-                           fs->dirblock + XFS_DA3_HDR_SIZE + (i + 1u) * XFS_DA3_ENTRY_SIZE,
+            xfs_copy_bytes(fs->dirblock + fs->da_hdr + i * XFS_DA3_ENTRY_SIZE,
+                           fs->dirblock + fs->da_hdr + (i + 1u) * XFS_DA3_ENTRY_SIZE,
                            XFS_DA3_ENTRY_SIZE);
         }
         count -= at < count ? 1u : 0u;
     }
-    xfs_put_be16(fs->dirblock + XFS_DA3_COUNT_OFF, (uint16_t)count);
+    xfs_put_be16(fs->dirblock + fs->da_count, (uint16_t)count);
     xfs_put_be16(fs->dirblock + bests_at(fs, bestcount) + which * XFS_DIR2_LEAF_BEST_SIZE,
                  (uint16_t)best);
-    xfs_reseal(fs->dirblock, fs->dirblocksize, XFS_DA3_CRC_OFF);
+    xfs_reseal(fs, fs->dirblock, fs->dirblocksize, XFS_DA3_CRC_OFF);
     return xfs_dir_raw_store(fs, leaf_fsb);
 }
 
@@ -246,15 +243,15 @@ static void empty_data(struct xfs *fs, uint64_t ino) {
     for (uint32_t i = 0; i < fs->dirblocksize; i++) {
         fs->dirblock[i] = 0;
     }
-    xfs_put_be32(fs->dirblock + XFS_DIR3_HDR_MAGIC, XFS_DIR3_DATA_MAGIC);
+    xfs_put_be32(fs->dirblock + XFS_DIR3_HDR_MAGIC, xfs_magic_for(fs, XFS_BLK_DIR_DATA));
     xfs_put_be64(fs->dirblock + 40u, ino);
     for (uint32_t i = 0; i < 16; i++) {
         fs->dirblock[24u + i] = fs->uuid[i];
     }
-    xfs_dir_put_free(fs->dirblock, XFS_DIR3_DATA_HDR_SIZE,
-                     fs->dirblocksize - XFS_DIR3_DATA_HDR_SIZE);
-    xfs_put_be16(fs->dirblock + 48u, XFS_DIR3_DATA_HDR_SIZE);
-    xfs_put_be16(fs->dirblock + 50u, (uint16_t)(fs->dirblocksize - XFS_DIR3_DATA_HDR_SIZE));
+    xfs_dir_put_free(fs->dirblock, fs->dir_data_hdr,
+                     fs->dirblocksize - fs->dir_data_hdr);
+    xfs_put_be16(fs->dirblock + 48u, fs->dir_data_hdr);
+    xfs_put_be16(fs->dirblock + 50u, (uint16_t)(fs->dirblocksize - fs->dir_data_hdr));
 }
 
 /* Adds an extent to the directory's fork, keeping it sorted and merging
@@ -298,12 +295,19 @@ int xfs_dir_fork_insert(struct xfs *fs, const struct xfs_inode *dir, uint64_t lo
     count = xfs_be32(di + XFS_DI_NEXTENTS);
     size = xfs_be64(di + XFS_DI_SIZE);
     nblocks = xfs_be64(di + XFS_DI_NBLOCKS);
-    if (count == 0 || count + 1u > sizeof e / sizeof e[0]) {
+    /* **Two limits, and the inode's is the one that was missing.** The
+     * array bounds what this function can hold; `xfs_fork_bytes` bounds
+     * what the *inode* can hold, and on a 256-byte inode that is nine
+     * extents against an array of XFS_DIR_FORK_EXTENTS. Without it a growing directory wrote
+     * a tenth extent past its literal area and the inode read back as
+     * claiming more extents than it had room for. */
+    if (count == 0 || count + 1u > sizeof e / sizeof e[0] ||
+        (count + 1u) * XFS_EXTENT_BYTES > xfs_fork_bytes(fs, di)) {
         bcache_put(fs->cache, b);
         return KERR_NOSPC; /* a b-tree fork for a directory: not written */
     }
     for (uint32_t i = 0; i < count; i++) {
-        xfs_extent_unpack(di + XFS_DI_V3_SIZE + i * XFS_EXTENT_BYTES, &e[i]);
+        xfs_extent_unpack(di + fs->dinode_size + i * XFS_EXTENT_BYTES, &e[i]);
         at = e[i].startoff < logical ? i + 1u : at;
     }
     if (at > 0 && e[at - 1u].startoff + e[at - 1u].blockcount == logical &&
@@ -319,14 +323,14 @@ int xfs_dir_fork_insert(struct xfs *fs, const struct xfs_inode *dir, uint64_t lo
         count++;
     }
     for (uint32_t i = 0; i < count; i++) {
-        xfs_extent_pack(di + XFS_DI_V3_SIZE + i * XFS_EXTENT_BYTES, &e[i]);
+        xfs_extent_pack(di + fs->dinode_size + i * XFS_EXTENT_BYTES, &e[i]);
     }
     xfs_put_be32(di + XFS_DI_NEXTENTS, count);
     xfs_put_be64(di + XFS_DI_SIZE, size + (grows_data ? fs->dirblocksize : 0u));
     xfs_put_be64(di + XFS_DI_NBLOCKS, nblocks + fs->dirblocks);
     xfs_put_be32(di + XFS_DI_MTIME, (uint32_t)now_s);
     xfs_put_be32(di + XFS_DI_CTIME, (uint32_t)now_s);
-    xfs_reseal(di, fs->inodesize, XFS_DI_CRC);
+    xfs_reseal(fs, di, fs->inodesize, XFS_DI_CRC);
     bcache_dirty(b);
     bcache_put(fs->cache, b);
     return KERR_OK;
@@ -355,12 +359,16 @@ static int add_leaf_extent(struct xfs *fs, const struct xfs_inode *dir, uint64_t
         return rc;
     }
     di = b->data + boffset;
-    xfs_extent_pack(di + XFS_DI_V3_SIZE + XFS_EXTENT_BYTES, &e);
+    if (2u * XFS_EXTENT_BYTES > xfs_fork_bytes(fs, di)) {
+        bcache_put(fs->cache, b);
+        return KERR_NOSPC; /* two extents would not fit inside this inode */
+    }
+    xfs_extent_pack(di + fs->dinode_size + XFS_EXTENT_BYTES, &e);
     xfs_put_be32(di + XFS_DI_NEXTENTS, 2u);
     xfs_put_be64(di + XFS_DI_NBLOCKS, 2u);
     xfs_put_be32(di + XFS_DI_MTIME, (uint32_t)now_s);
     xfs_put_be32(di + XFS_DI_CTIME, (uint32_t)now_s);
-    xfs_reseal(di, fs->inodesize, XFS_DI_CRC);
+    xfs_reseal(fs, di, fs->inodesize, XFS_DI_CRC);
     bcache_dirty(b);
     bcache_put(fs->cache, b);
     return KERR_OK;
@@ -375,7 +383,7 @@ int xfs_dir_to_leaf(struct xfs *fs, const struct xfs_inode *dir, const char *nam
     if (rc != KERR_OK) {
         return rc;
     }
-    if (xfs_be32(fs->dirblock + XFS_DIR3_HDR_MAGIC) != XFS_DIR3_BLOCK_MAGIC) {
+    if (xfs_be32(fs->dirblock + XFS_DIR3_HDR_MAGIC) != xfs_magic_for(fs, XFS_BLK_DIR_BLOCK)) {
         return KERR_NOTSUP;
     }
     count = xfs_be32(fs->dirblock + fs->dirblocksize - XFS_DIR2_BLOCK_TAIL_SIZE);
@@ -386,7 +394,7 @@ int xfs_dir_to_leaf(struct xfs *fs, const struct xfs_inode *dir, const char *nam
     xfs_copy_bytes(pairs, fs->dirblock + old_end, count * XFS_DA3_ENTRY_SIZE);
     /* **The hashes and the tail become free space**, and the block becomes
      * pure data: it now reaches the end of itself. */
-    xfs_put_be32(fs->dirblock + XFS_DIR3_HDR_MAGIC, XFS_DIR3_DATA_MAGIC);
+    xfs_put_be32(fs->dirblock + XFS_DIR3_HDR_MAGIC, xfs_magic_for(fs, XFS_BLK_DIR_DATA));
     xfs_dir_put_free(fs->dirblock, old_end, fs->dirblocksize - old_end);
     at = xfs_dir_find_room(fs, fs->dirblock, fs->dirblocksize,
                            xfs_dir_entry_size(fs, namelen));
@@ -406,7 +414,7 @@ int xfs_dir_to_leaf(struct xfs *fs, const struct xfs_inode *dir, const char *nam
     xfs_put_be16(fs->dirblock + 48u, 0);
     xfs_put_be16(fs->dirblock + 50u, 0);
     best = xfs_dir_largest_free(fs, fs->dirblock);
-    xfs_reseal(fs->dirblock, fs->dirblocksize, XFS_DIR3_HDR_CRC);
+    xfs_reseal(fs, fs->dirblock, fs->dirblocksize, XFS_DIR3_HDR_CRC);
     rc = xfs_dir_raw_store(fs, data_fsb);
     rc = rc != KERR_OK ? rc : xfs_dir_take_block(fs, data_fsb, &leaf_fsb);
     if (rc != KERR_OK) {
@@ -449,7 +457,7 @@ int xfs_dir_place_entry(struct xfs *fs, const struct xfs_inode *dir, const char 
             return rc;
         }
         empty_data(fs, dir->ino);
-        xfs_reseal(fs->dirblock, fs->dirblocksize, XFS_DIR3_HDR_CRC);
+        xfs_reseal(fs, fs->dirblock, fs->dirblocksize, XFS_DIR3_HDR_CRC);
         rc = xfs_dir_raw_store(fs, fsb);
         rc = rc != KERR_OK ? rc
                            : xfs_dir_fork_insert(fs, dir, (uint64_t)have * fs->dirblocks,
@@ -458,7 +466,7 @@ int xfs_dir_place_entry(struct xfs *fs, const struct xfs_inode *dir, const char 
             return rc;
         }
         *blocks = have + 1u;
-        *at = XFS_DIR3_DATA_HDR_SIZE;
+        *at = fs->dir_data_hdr;
         fs->dir_blocks_added++;
     }
     len = xfs_be16(fs->dirblock + *at + 2u);
@@ -468,7 +476,7 @@ int xfs_dir_place_entry(struct xfs *fs, const struct xfs_inode *dir, const char 
         xfs_dir_put_free(fs->dirblock, *at + need, len - need);
     }
     *best = xfs_dir_largest_free(fs, fs->dirblock);
-    xfs_reseal(fs->dirblock, fs->dirblocksize, XFS_DIR3_HDR_CRC);
+    xfs_reseal(fs, fs->dirblock, fs->dirblocksize, XFS_DIR3_HDR_CRC);
     return xfs_dir_raw_store(fs, fsb);
 }
 
@@ -489,10 +497,10 @@ static int leaf_has_room(struct xfs *fs, const struct xfs_inode *dir) {
     if (rc != KERR_OK) {
         return rc;
     }
-    if (xfs_be16(fs->dirblock + XFS_DA3_MAGIC_OFF) != XFS_DIR3_LEAF1_MAGIC) {
+    if (xfs_be16(fs->dirblock + XFS_DA3_MAGIC_OFF) != xfs_magic_for(fs, XFS_BLK_DIR_LEAF1)) {
         return KERR_NOTSUP;
     }
-    count = xfs_be16(fs->dirblock + XFS_DA3_COUNT_OFF);
+    count = xfs_be16(fs->dirblock + fs->da_count);
     bestcount = xfs_be32(fs->dirblock + fs->dirblocksize - XFS_DIR2_LEAF_TAIL_SIZE);
     bestcount = blocks > bestcount ? blocks : bestcount;
     /* One more data block than it has, because the entry may need one and
@@ -517,7 +525,7 @@ int xfs_dir_leaf_add(struct xfs *fs, const struct xfs_inode *dir, const char *na
 /* Finds a name in one data block and frees its entry. */
 int xfs_dir_take_out(struct xfs *fs, const char *name, uint32_t namelen, uint64_t *ino,
                     uint32_t *at) {
-    uint32_t cursor = XFS_DIR3_DATA_HDR_SIZE;
+    uint32_t cursor = fs->dir_data_hdr;
     while (cursor + 8u <= fs->dirblocksize) {
         uint32_t size;
         if (xfs_be16(fs->dirblock + cursor) == XFS_DIR2_DATA_FREE_TAG) {
@@ -563,7 +571,7 @@ int xfs_dir_leaf_remove(struct xfs *fs, const struct xfs_inode *dir, const char 
      * and a `bests` slot, which is a step of its own. */
     {
         uint32_t best = xfs_dir_largest_free(fs, fs->dirblock);
-        xfs_reseal(fs->dirblock, fs->dirblocksize, XFS_DIR3_HDR_CRC);
+        xfs_reseal(fs, fs->dirblock, fs->dirblocksize, XFS_DIR3_HDR_CRC);
         rc = xfs_dir_raw_store(fs, fsb);
         rc = rc != KERR_OK ? rc
                            : edit_leaf(fs, dir, 0, xfs_dir_address_of(fs, which, at), false, which,

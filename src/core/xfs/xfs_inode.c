@@ -65,9 +65,9 @@ void xfs_inode_place(const struct xfs *fs, uint64_t ino, uint64_t *device_block,
 
 /* The inline fork's extent: it ends where the attribute fork begins, or at
  * the end of the inode when there is no attribute fork. */
-static uint32_t fork_bytes(const struct xfs *fs, const uint8_t *di) {
+uint32_t xfs_fork_bytes(const struct xfs *fs, const uint8_t *di) {
     uint32_t forkoff = di[XFS_DI_FORKOFF];
-    uint32_t area = fs->inodesize - XFS_DI_V3_SIZE;
+    uint32_t area = fs->inodesize - fs->dinode_size;
     return forkoff == 0 ? area : forkoff * 8u;
 }
 
@@ -76,12 +76,36 @@ static uint32_t fork_bytes(const struct xfs *fs, const uint8_t *di) {
  * and its checksum and UUID tie it to this filesystem. */
 static int verify(struct xfs *fs, const uint8_t *di, uint64_t ino) {
     if (xfs_be16(di + XFS_DI_MAGIC) != XFS_DINODE_MAGIC) {
+        kprintf("xfs: inode %u has magic %04x, not an inode\n", (uint32_t)ino,
+                xfs_be16(di + XFS_DI_MAGIC));
         return KERR_IO;
     }
-    if (di[XFS_DI_VERSION] != XFS_DI_VERSION_3 || xfs_be64(di + XFS_DI_INO) != ino) {
-        return KERR_IO;
-    }
-    if (!xfs_crc_ok(di, fs->inodesize, XFS_DI_CRC) || !xfs_uuid_ok(fs, di + XFS_DI_UUID)) {
+    /* **A v4 inode does not know its own number.** `di_ino`, `di_uuid` and
+     * the checksum all arrived with the v3 core, and on a v4 inode their
+     * offsets fall inside the *literal area* — offset 100 is the fork's
+     * first byte. Reading them would compare fork data against an inode
+     * number, and every inode of a sound v4 filesystem would be rejected.
+     *
+     * So on v4 the version is the check: 1 and 2 are both real layouts
+     * that differ only in whether `di_nlink` or the older `di_onlink`
+     * carries the link count, and this reader uses `di_nlink`, which v1
+     * leaves at zero. Accepting v1 would read every file as having no
+     * links. */
+    if (fs->v5) {
+        if (di[XFS_DI_VERSION] != XFS_DI_VERSION_3 || xfs_be64(di + XFS_DI_INO) != ino) {
+            kprintf("xfs: inode %u is version %u and calls itself %u\n", (uint32_t)ino,
+                    di[XFS_DI_VERSION], (uint32_t)xfs_be64(di + XFS_DI_INO));
+            return KERR_IO;
+        }
+        if (!xfs_crc_ok(fs, di, fs->inodesize, XFS_DI_CRC) ||
+            !xfs_uuid_ok(fs, di + XFS_DI_UUID)) {
+            kprintf("xfs: inode %u has a bad %s\n", (uint32_t)ino,
+                    xfs_crc_ok(fs, di, fs->inodesize, XFS_DI_CRC) ? "uuid" : "checksum");
+            return KERR_IO;
+        }
+    } else if (di[XFS_DI_VERSION] != XFS_DI_VERSION_2) {
+        kprintf("xfs: inode %u is version %u; this reader needs v2 on a v4 filesystem\n",
+                (uint32_t)ino, di[XFS_DI_VERSION]);
         return KERR_IO;
     }
     return KERR_OK;
@@ -89,12 +113,22 @@ static int verify(struct xfs *fs, const uint8_t *di, uint64_t ino) {
 
 /* Copies the core fields and the inline fork out of a verified inode. */
 static int take(struct xfs *fs, const uint8_t *di, uint64_t ino, struct xfs_inode *out) {
-    uint32_t avail = fork_bytes(fs, di);
-    /* **The inode says, not the superblock.** The superblock's `NREXT64`
-     * permits the layout; each inode's `di_flags2` says whether it actually
-     * uses it, so a filesystem that gained the feature later still has
-     * inodes in the old shape and both must read correctly. */
-    bool big = (xfs_be64(di + XFS_DI_FLAGS2) & XFS_DIFLAG2_NREXT64) != 0;
+    uint32_t avail = xfs_fork_bytes(fs, di);
+    /* **The inode says, not the superblock — but only where the inode has
+     * somewhere to say it.** The superblock's `NREXT64` permits the layout;
+     * each inode's `di_flags2` says whether it actually uses it, so a
+     * filesystem that gained the feature later still has inodes in the old
+     * shape and both must read correctly.
+     *
+     * `di_flags2` is at offset 120, which exists only in the v3 core. On a
+     * **v4 inode that offset is inside the literal area** — the file's own
+     * fork — so reading it there asks the file's data whether the inode
+     * uses a 64-bit extent count. For most inodes those bytes answer no and
+     * nothing is noticed; for one whose extents happen to set the bit, the
+     * count is then read from `di_big_nextents`, also in the fork, and came
+     * back as **zero for a 79 MB file** — every block of it a hole. The
+     * feature is v5's, so on v4 the answer is no without asking. */
+    bool big = fs->v5 && (xfs_be64(di + XFS_DI_FLAGS2) & XFS_DIFLAG2_NREXT64) != 0;
     *out = (struct xfs_inode){
         .ino = ino,
         .size = xfs_be64(di + XFS_DI_SIZE),
@@ -134,17 +168,20 @@ static int take(struct xfs *fs, const uint8_t *di, uint64_t ino, struct xfs_inod
         }
     }
     if (out->format == XFS_DINODE_FMT_BTREE && out->fork_len <= XFS_BMDR_HDR_BYTES) {
-        return KERR_IO; /* a btree root with no room for even one pointer */
+        kprintf("xfs: inode %u has a btree fork of only %u bytes\n", (uint32_t)ino, out->fork_len);
+        return KERR_IO;
     }
     if (out->format == XFS_DINODE_FMT_LOCAL && out->size > out->fork_len) {
-        return KERR_IO; /* says it holds more than fits inside it */
+        kprintf("xfs: inode %u says it holds %u bytes inside itself\n", (uint32_t)ino, (uint32_t)out->size);
+        return KERR_IO;
     }
     if (out->format == XFS_DINODE_FMT_EXTENTS &&
         (uint64_t)out->nextents * XFS_EXTENT_BYTES > out->fork_len) {
-        return KERR_IO; /* more extents than the inode has room for */
+        kprintf("xfs: inode %u claims %u extents, more than its fork holds\n", (uint32_t)ino, (uint32_t)out->nextents);
+        return KERR_IO;
     }
     for (uint32_t i = 0; i < out->fork_len; i++) {
-        out->fork[i] = di[XFS_DI_V3_SIZE + i];
+        out->fork[i] = di[fs->dinode_size + i];
     }
     return KERR_OK;
 }

@@ -54,6 +54,10 @@
 #define SIGTTIN 21
 #define SIGTTOU 22
 #define SIGSEGV 11
+/* **The signal a refused syscall raises.** `seccomp`'s `TRAP` action
+ * delivers it, which is what lets a runtime handle a call the filter
+ * refuses rather than merely dying of it. */
+#define SIGSYS 31
 #define SIGPIPE 13
 #define SIGALRM 14
 #define SIGTERM 15

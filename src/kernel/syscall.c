@@ -1193,7 +1193,7 @@ static int64_t rlimit_set(struct uproc *me, uint64_t which, const struct user_rl
         uint64_t current_hard = *hard == 0 ? ceiling : *hard;
         /* Raising the hard limit is root's alone. Lowering is anybody's,
          * and is one-way for the same reason dropping a uid is. */
-        if (in->hard > current_hard && uspace_euid() != 0) {
+        if (in->hard > current_hard && !uspace_capable(CAP_SYS_RESOURCE)) {
             return KERR_PERM;
         }
     }
@@ -1329,7 +1329,6 @@ static const struct syscall_entry table[] = {
     {SYS_EPOLL_CTL, "epoll_ctl", sys_epoll_ctl},
     {SYS_EPOLL_PWAIT, "epoll_pwait", sys_epoll_pwait},
     {SYS_EVENTFD2, "eventfd2", sys_eventfd2},
-    {SYS_PRCTL, "prctl", sys_ok},
     {SYS_FCNTL, "fcntl", sys_fcntl},
     {SYS_READ, "read", sys_read},
     {SYS_CLOSE, "close", sys_close},
@@ -1374,6 +1373,11 @@ static const struct syscall_entry *entry_of(uint64_t nr) {
             return d;
         }
     }
+    for (const struct syscall_entry *d = sys_priv_table; d->call != NULL; d++) {
+        if (d->nr == nr) {
+            return d;
+        }
+    }
     return NULL;
 }
 
@@ -1403,6 +1407,21 @@ bool syscall_dispatch(struct trapframe *tf) {
                 (unsigned long long)sched_current_tid(), name_of(nr), (unsigned long long)nr,
                 (unsigned long long)sysarg(tf, 0), (unsigned long long)sysarg(tf, 1),
                 (unsigned long long)sysarg(tf, 2));
+    }
+    /* **The filter, before the call and before the table lookup.**
+     *
+     * Before the call for the obvious reason. Before the *lookup* for a
+     * less obvious one: a filter must be able to deny a syscall this kernel
+     * has never heard of, because a sandbox is written against Linux's
+     * numbering and the calls it most wants to refuse are the ones a small
+     * kernel has not implemented. Checking after the lookup would let every
+     * unimplemented number past the filter — and "unimplemented today" is
+     * not a promise about tomorrow. */
+    {
+        uint32_t action = seccomp_action(tf, nr);
+        if (action != SECCOMP_RET_ALLOW && seccomp_apply(tf, nr, action)) {
+            return true;
+        }
     }
     {
         const struct syscall_entry *e = entry_of(nr);

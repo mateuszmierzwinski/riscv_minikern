@@ -186,6 +186,66 @@ def swap_volume(at):
 EXTLOG_MB = 80
 
 
+def v4_filesystem(at):
+    """A **real v4 filesystem**, the pre-checksum on-disk format.
+
+    Built by `mkfs.xfs -m crc=0`, which still works here and prints a
+    deprecation warning — so this is the genuine older layout rather than a
+    v5 image with its version number altered, which is the only way to test
+    the shorter headers and absent checksums for real.
+
+    The feature flags live inside `versionnum` on v4 rather than in separate
+    words, and this image comes out as `0xb4a4`: v2 directories, v2 inodes,
+    aligned allocation, a v2 log and extent flags. `-n ftype=1` is left off
+    because the file-type byte is a v5-era feature and a v4 entry is one
+    byte shorter without it.
+    """
+    os.makedirs(at, exist_ok=True)
+    data = payload(at)
+    proto = os.path.join(at, "protov4")
+    with open(proto, "w") as f:
+        f.write(f"dummy\n0 0\nd--755 0 0\nseed ---644 0 0 {data}\n$\n")
+    img = os.path.join(at, "v4.img")
+    with open(img, "wb") as f:
+        f.truncate(320 * 1024 * 1024)
+    subprocess.run(
+        ["mkfs.xfs", "-q", "-f", "-m", "crc=0", "-b", "size=4096", "-p", proto, img],
+        check=True,
+    )
+    return img
+
+
+def v4_filesystem_big_inodes(at):
+    """The same v4 format, with **512-byte inodes like the v5 fixture**.
+
+    This exists so that the write case compares the *format* and nothing
+    else. `mkfs.xfs` defaults to 256-byte inodes, which leaves a v4 inode a
+    156-byte literal area — nine extents — against the 336 bytes a
+    512-byte inode gives. A directory growing past nine extents needs a
+    b-tree data fork, which this writer refuses by design, so the default
+    image stops early for a reason that has nothing to do with v4.
+
+    The default-size image is still used by the read case, and is what
+    found the bug this bound now prevents: the directory writer limited the
+    extents it would write by the size of a local array rather than by what
+    the inode holds, which overflows on **any** small inode, v5 included.
+    """
+    os.makedirs(at, exist_ok=True)
+    data = payload(at)
+    proto = os.path.join(at, "protov4big")
+    with open(proto, "w") as f:
+        f.write(f"dummy\n0 0\nd--755 0 0\nseed ---644 0 0 {data}\n$\n")
+    img = os.path.join(at, "v4big.img")
+    with open(img, "wb") as f:
+        f.truncate(320 * 1024 * 1024)
+    subprocess.run(
+        ["mkfs.xfs", "-q", "-f", "-m", "crc=0", "-i", "size=512", "-b", "size=4096",
+         "-p", proto, img],
+        check=True,
+    )
+    return img
+
+
 def external_log_volume(at):
     """A filesystem whose log is on a **separate device**, and that device.
 

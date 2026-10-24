@@ -39,6 +39,33 @@
 #define XFS_SB_DIRBLKLOG   192u /* u8: directory blocks are 1 << this, in fs blocks */
 #define XFS_SB_LABEL_MAX 12u /* `sb_fname` is not NUL-terminated when full */
 #define XFS_SB_FEAT_COMPAT     208u /* u32 */
+/* **v4's second feature word**, and the two rules that come with it.
+ *
+ * It is only meaningful when `MOREBITS` is set in `versionnum`: on an older
+ * filesystem these four bytes are not a feature word at all, so reading
+ * them unconditionally invents features.
+ *
+ * `bad_features2` is a duplicate of it, and not redundancy — a long-standing
+ * alignment bug in Linux wrote the field at the wrong offset on some
+ * platforms, so both copies exist and `xfs_repair` reconciles them. A
+ * reader takes `features2`; the duplicate is here to explain why the next
+ * four bytes repeat it rather than looking like corruption. */
+#define XFS_SB_FEATURES2       200u /* u32, valid only with MOREBITS */
+#define XFS_SB_BAD_FEATURES2   204u /* u32, the same value at the buggy offset */
+#define XFS_SB_V4_MOREBITS     0x8000u
+
+#define XFS_SB_V2_LAZYSBCOUNT  0x00000004u
+#define XFS_SB_V2_ATTR2        0x00000008u
+#define XFS_SB_V2_PROJID32     0x00000080u
+/* **The file-type byte, on v4.** `mkfs.xfs` has enabled it by default for
+ * years, including for v4, so a v4 filesystem made today has it — and a
+ * reader that looked only at v5's incompat word would decide it did not.
+ * The cost is not cosmetic: without the byte a shortform entry is one byte
+ * shorter, so the *inode number* is read from the wrong place while the
+ * name still reads correctly. A directory listing then looks perfect and
+ * every lookup in it returns a wrong inode. */
+#define XFS_SB_V2_FTYPE        0x00000200u
+
 #define XFS_SB_FEAT_RO_COMPAT  212u /* u32 */
 #define XFS_SB_FEAT_INCOMPAT   216u /* u32 */
 #define XFS_SB_FEAT_LOG_INCOMPAT 220u /* u32 */
@@ -48,6 +75,61 @@
 
 #define XFS_SB_VERSION_MASK 0x000fu
 #define XFS_SB_VERSION_5    5u
+#define XFS_SB_VERSION_4    4u
+
+/* **On v4 the feature flags live in `versionnum` itself**, not in the three
+ * separate feature words v5 added. Two of them decide whether this reader
+ * can be trusted with the filesystem at all:
+ *
+ * `DIRV2` says the directories are the format this reader knows. A v4
+ * filesystem *without* it has **v1 directories**, which are a different
+ * structure entirely — not a shorter header but a different design — so
+ * reading one as v2 would misparse every directory in it. Every v4
+ * filesystem made since 1997 sets it, which is exactly why a reader that
+ * never checked would work on every image anyone tried and fail on the one
+ * that mattered.
+ *
+ * `SHARED` marks a filesystem mounted read-only by several hosts at once.
+ * Writing to one is not a format question but a correctness one: another
+ * host holds cached metadata that this one's writes would invalidate. */
+#define XFS_SB_V4_DIRV2  0x2000u
+#define XFS_SB_V4_SHARED 0x0200u
+
+/* **The v4 format is the same filesystem with shorter headers and no
+ * checksums.** Every structure that gained a `xfs_da3_blkinfo` or a
+ * `xfs_dir3_blk_hdr` in v5 had a shorter header before it, and a different
+ * magic to tell them apart — so supporting v4 is not a second reader, it is
+ * the same reader with the header size and the accepted magic taken from
+ * the filesystem rather than from a constant.
+ *
+ * Two differences are **not** just a size**. A v4 inode core is 100 bytes,
+ * so `XFS_DI_CRC` at 100 lands *inside the literal area*: checksumming
+ * there reads fork data, and resealing there would overwrite it. And a v4
+ * remote attribute value has no header at all — the value's bytes start at
+ * the block's first byte, where v5 puts 56 bytes of `XARM`. */
+#define XFS_DI_VERSION_2 2u /* the v4 core: 100 bytes, no checksum, no di_ino */
+#define XFS_DI_V2_SIZE 100u /* the v2 core; the literal area follows */
+
+/* The v4 counterparts of the v5 magics, paired with them in
+ * `xfs_magic_ok`. The directory and attribute ones differ in more than a
+ * digit because v5 renumbered rather than extended them. */
+#define XFS_DIR2_BLOCK_MAGIC 0x58443242u /* "XD2B" */
+#define XFS_DIR2_DATA_MAGIC  0x58443244u /* "XD2D" */
+#define XFS_DIR2_FREE_MAGIC  0x58443246u /* "XD2F" */
+#define XFS_DIR2_LEAF1_MAGIC 0xd2f1u
+#define XFS_DIR2_LEAFN_MAGIC 0xd2ffu
+#define XFS_DA_NODE_MAGIC    0xfebeu
+#define XFS_ATTR_LEAF_V4_MAGIC 0xfbeeu
+#define XFS_BNOBT_V4_MAGIC   0x41425442u /* "ABTB" */
+#define XFS_CNTBT_V4_MAGIC   0x41425443u /* "ABTC" */
+#define XFS_INOBT_V4_MAGIC   0x49414254u /* "IABT" */
+#define XFS_FINOBT_V4_MAGIC  0x46494254u /* "FIBT" */
+#define XFS_BMBT_V4_MAGIC    0x424d4150u /* "BMAP" */
+
+/* The v4 header sizes, each the v5 one minus the block header it lacks. */
+#define XFS_DIR2_DATA_HDR_SIZE 16u /* magic and three best-free pairs */
+#define XFS_DA_HDR_SIZE        16u /* the 12-byte blkinfo, count and level */
+#define XFS_DIR2_FREE_HDR_SIZE 16u /* magic, firstdb, nvalid, nused */
 
 /* Features. A reader must refuse anything it does not understand here,
  * which is what keeps it from misreading a filesystem into rubbish. */
@@ -162,6 +244,8 @@
 #define XFS_ATTR_LEAF_MAGIC 0x3beeu
 #define ATTR_LEAF_COUNT     56u /* be16 */
 #define ATTR_LEAF_HDR       80u /* blkinfo, count, usedbytes, firstused, holes, freemap */
+#define ATTR_LEAF_V4_BASE   12u /* v4: the blkinfo is 12 bytes, not 56 */
+#define ATTR_LEAF_V4_HDR    32u /* and the header is not padded */
 #define ATTR_LEAF_ENTRY     8u  /* hashval be32, nameidx be16, flags u8, pad u8 */
 #define ATTR_LEAF_NAMEIDX   4u  /* be16, within an entry */
 #define ATTR_LEAF_FLAGS     6u  /* u8, within an entry */
@@ -308,6 +392,8 @@
 #define XFS_DA3_LEVEL_OFF  58u /* u16, node blocks only: 0 is the leaf level */
 #define XFS_DA3_BACK_OFF   4u  /* u32: the previous block at this level */
 #define XFS_DA3_BLKNO_OFF  16u /* u64: this block's own da address, in fs blocks */
+#define XFS_DA_COUNT_OFF   12u /* v4: straight after the 12-byte blkinfo */
+#define XFS_DA_LEVEL_OFF   14u
 #define XFS_DA3_ENTRY_SIZE 8u  /* {hash, address} or {hash, block} */
 
 /* How many levels of node blocks this will descend before refusing. The
@@ -465,7 +551,8 @@
 #define XFS_BTREE_NUMRECS 6u  /* u16 */
 #define XFS_BTREE_UUID    32u /* 16 bytes */
 #define XFS_BTREE_CRC     52u /* u32, little-endian */
-#define XFS_BTREE_RECORDS 56u /* where the records start */
+#define XFS_BTREE_RECORDS 56u    /* where the records start on v5 */
+#define XFS_BTREE_V4_RECORDS 16u /* magic, level, numrecs and two siblings */
 
 /* One record of either tree, with sparse inodes off: the first inode of a
  * chunk, how many of its 64 are free, and which. A set bit is free. */

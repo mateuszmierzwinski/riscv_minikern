@@ -55,9 +55,16 @@
 #include "core/bcache.h"
 
 /* The largest inode this reader accepts, and so the largest inline fork it
- * ever copies. 512 is what mkfs.xfs makes by default. */
+ * ever copies. 512 is what mkfs.xfs makes by default.
+ *
+ * **The subtraction is the v4 core, not the v5 one.** A v5 inode core is
+ * 176 bytes and a v4 core is 100, so the *same* 512-byte inode presents a
+ * 412-byte literal area on v4 against 336 on v5 — the older format leaves
+ * more room, not less. This was `- 176u`, so every 512-byte v4 inode was
+ * refused with "has a 412-byte fork; this reader caches 336", which is a
+ * reader built for one format telling the truth about the wrong one. */
 #define XFS_INODE_MAX  512u
-#define XFS_FORK_MAX   (XFS_INODE_MAX - 176u)
+#define XFS_FORK_MAX   (XFS_INODE_MAX - 100u)
 
 /* The largest directory block this reader will mount.
  *
@@ -122,6 +129,13 @@ struct xfs {
     uint64_t gquotino;
     uint64_t pquotino;
     uint16_t qflags;
+    /* **Charging a quota writes the quota file**, and writing a file
+     * charges a quota. Today that cannot recurse, because a charge only
+     * ever rewrites a record that already exists inside the file and so
+     * never asks the allocator for a block — but that is a property of the
+     * current code, not of the design, and the day a quota file has to grow
+     * it would recurse until the stack ran out. This says no instead. */
+    bool charging_quota;
     /* The **realtime subvolume**: a second device holding file data only,
      * with no metadata of its own. A file marked realtime has its extents
      * on it, and they look exactly like any other extents — so a reader
@@ -138,6 +152,41 @@ struct xfs {
     uint64_t rbmino;
     uint64_t rsumino;
     uint32_t rextsize;
+    /* **Which on-disk format this is**, and the sizes that follow from it.
+     *
+     * A v4 filesystem is the same filesystem with shorter headers and no
+     * checksums, so these are the handful of numbers the whole difference
+     * reduces to. They are fields rather than macros because every reader
+     * already has the filesystem in hand, and a macro cannot ask. */
+    bool v5;
+    uint32_t dinode_size;     /* the inode core: 176 on v5, 100 on v4 */
+    uint32_t dir_data_hdr;    /* a directory data block's header */
+    uint32_t da_hdr;          /* a hash-tree node or leaf block's */
+    uint32_t dir_free_hdr;    /* a directory free block's */
+    uint32_t btree_hdr;       /* a short-form b-tree block's: 56 or 16 */
+    /* Where a hash-tree block's count and level sit: **immediately after
+     * the blkinfo**, which is 56 bytes on v5 and 12 on v4. Not derivable
+     * from `da_hdr`, because the v5 header pads to 64 and the v4 one does
+     * not — so they are their own numbers rather than an arithmetic trap. */
+    uint32_t da_count;
+    uint32_t da_level;
+    /* An attribute leaf's header. Every field in it sits at a fixed offset
+     * from the end of the blkinfo, so one base carries them all: `count`
+     * there, `usedbytes` +2, `firstused` +4, `holes` +6, the free map +8.
+     * Only the header's total length needs its own number, because v5 pads
+     * it to a multiple of eight and v4 does not. */
+    uint32_t attr_base;
+    uint32_t attr_hdr;
+    /* This filesystem predates `attr2`, so the attribute fork's offset
+     * inside an inode was fixed by `mkfs` and may not move. Reading is
+     * unaffected; growing an attribute fork is refused. */
+    bool attr_fixed_fork;
+    /* **This filesystem has a free-inode b-tree.** It is a v5 feature, and
+     * on v4 `agi_free_root` is not merely zero — it is *past the end of the
+     * AGI as v4 defined it* (the structure stops at 296; the field is at
+     * 328), so reading it returns whatever follows in the sector. Every
+     * path that touches the tree has to ask first. */
+    bool has_finobt;
     uint64_t dir_leaf_block; /* directory data lives below this logical block */
     uint64_t dir_free_block; /* and the free blocks of a node directory above */
     uint32_t blocksize;
@@ -416,6 +465,35 @@ bool xfs_quota_enforced(const struct xfs *fs, uint8_t type);
  * is every freshly formatted quota filesystem), and `KERR_NOENT` for an id
  * with no record — a quota file is sparse and most ids are holes. */
 int xfs_quota_get(struct xfs *fs, uint8_t type, uint32_t id, struct xfs_dquot *out);
+
+/* Charges an owner for blocks and inodes, or refuses with `KERR_DQUOT`.
+ *
+ * **Enforcement and accounting are separate.** A filesystem that only
+ * accounts still has its counts updated; only one that enforces refuses.
+ * A negative amount gives space back and can never be refused.
+ *
+ * The counts are written straight to the quota file, the same way this
+ * writer already updates `agf_freeblks` and the inode b-trees — so a crash
+ * between the allocation and the charge leaves the count stale, exactly as
+ * it leaves the group's free-block count stale, and `xfs_repair`
+ * recalculates both. That is the existing bargain of this write path, not a
+ * new one quotas introduce.
+ *
+ * Only the **hard** limit refuses. A soft limit begins a grace period,
+ * which needs a clock this kernel does not keep, so it is read and reported
+ * but never acted on. A hard limit of zero means *no* limit, which is the
+ * format's convention and the reverse of how the number reads. */
+int xfs_quota_charge(struct xfs *fs, uint8_t type, uint32_t id, int64_t blocks, int64_t inodes);
+
+/* The same, for every kind the filesystem counts. All three or none: a
+ * refusal from the third gives back what the first two were charged.
+ *
+ * `_ids` is the general one and `_all` the facade that reads the ids off an
+ * inode — creation has no inode yet, which is why both exist. */
+int xfs_quota_charge_ids(struct xfs *fs, uint32_t uid, uint32_t gid, int64_t blocks,
+                         int64_t inodes);
+int xfs_quota_charge_all(struct xfs *fs, const struct xfs_inode *ip, int64_t blocks,
+                         int64_t inodes);
 
 /* Says what the filesystem asks for, at mount. */
 void xfs_quota_report(const struct xfs *fs);

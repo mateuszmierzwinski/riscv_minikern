@@ -66,7 +66,7 @@ static int name_at(struct xfs *fs, const struct xfs_inode *dir, uint32_t address
     uint32_t within = (uint32_t)(byte % fs->dirblocksize);
     struct xfs_dirblock b;
     int rc;
-    if (within + 9u + len > fs->dirblocksize || within < XFS_DIR3_DATA_HDR_SIZE) {
+    if (within + 9u + len > fs->dirblocksize || within < fs->dir_data_hdr) {
         return KERR_IO;
     }
     rc = xfs_dir_data_get(fs, dir, first, &b);
@@ -114,11 +114,11 @@ static uint32_t first_at_or_above(const uint8_t *entries, uint32_t count, uint32
 static int search_leaf(struct xfs *fs, const struct xfs_inode *dir, const uint8_t *leaf,
                        uint32_t hash, const char *name, uint32_t len, uint64_t *ino,
                        uint64_t *next) {
-    uint32_t count = xfs_be16(leaf + XFS_DA3_COUNT_OFF);
-    const uint8_t *entries = leaf + XFS_DA3_HDR_SIZE;
+    uint32_t count = xfs_be16(leaf + fs->da_count);
+    const uint8_t *entries = leaf + fs->da_hdr;
     uint32_t at;
     *next = 0;
-    if (XFS_DA3_HDR_SIZE + (uint64_t)count * XFS_DA3_ENTRY_SIZE > fs->dirblocksize) {
+    if (fs->da_hdr + (uint64_t)count * XFS_DA3_ENTRY_SIZE > fs->dirblocksize) {
         return KERR_IO;
     }
     at = first_at_or_above(entries, count, hash);
@@ -157,20 +157,20 @@ static int find_leaf(struct xfs *fs, const struct xfs_inode *dir, uint32_t hash,
             return rc;
         }
         magic = xfs_be16(b.at + XFS_DA3_MAGIC_OFF);
-        count = xfs_be16(b.at + XFS_DA3_COUNT_OFF);
-        if (magic != XFS_DA3_NODE_MAGIC) {
+        count = xfs_be16(b.at + fs->da_count);
+        if (magic != xfs_magic_for(fs, XFS_BLK_DA_NODE)) {
             xfs_dir_block_put(fs, &b);
             *block = at;
             return KERR_OK; /* a leaf: this is the one */
         }
-        pick = first_at_or_above(b.at + XFS_DA3_HDR_SIZE, count, hash);
-        if (count == 0 || XFS_DA3_HDR_SIZE + (uint64_t)count * XFS_DA3_ENTRY_SIZE >
+        pick = first_at_or_above(b.at + fs->da_hdr, count, hash);
+        if (count == 0 || fs->da_hdr + (uint64_t)count * XFS_DA3_ENTRY_SIZE >
                               fs->dirblocksize) {
             xfs_dir_block_put(fs, &b);
             return KERR_IO;
         }
         pick = pick < count ? pick : count - 1u;
-        at = xfs_be32(b.at + XFS_DA3_HDR_SIZE + pick * XFS_DA3_ENTRY_SIZE + 4u);
+        at = xfs_be32(b.at + fs->da_hdr + pick * XFS_DA3_ENTRY_SIZE + 4u);
         xfs_dir_block_put(fs, &b);
     }
     return KERR_IO; /* deeper than any real tree */

@@ -215,7 +215,7 @@ static int64_t sys_clone(struct trapframe *tf) {
      *
      * `EAGAIN` rather than `EPERM`: the caller is being told to try later,
      * which is what the error means and what a runtime retries on. */
-    if (uspace_euid() != 0) {
+    if (!uspace_capable(CAP_SYS_RESOURCE)) {
         struct uproc *me = uspace_current();
         uint64_t limit = uspace_rlimit_nproc();
         if (me != NULL && uspace_count_by_uid(me->uid) >= limit) {
@@ -305,11 +305,26 @@ static int64_t sys_setuid(struct trapframe *tf) {
     if (me == NULL) {
         return KERR_SRCH;
     }
-    if (me->euid != 0) {
+    if (!uspace_capable(CAP_SETUID)) {
         return KERR_PERM;
     }
     me->uid = want;
     me->euid = want;
+    /* **Becoming somebody else drops the capabilities.** Changing the uid
+     * away from root and keeping a full effective set would make `setuid`
+     * a way to look unprivileged while staying privileged, which is the
+     * opposite of what every caller uses it for. Linux's rule is the same:
+     * when the effective uid leaves zero, the permitted set is cleared.
+     *
+     * Becoming root does *not* grant them back — a process that has
+     * dropped `CAP_SYS_ADMIN` must not regain it by passing through
+     * `setuid(0)`. Capabilities are only ever raised by `execve`, which is
+     * where a new program's rights are decided. */
+    if (want != ACCESS_ROOT) {
+        me->caps.permitted = 0;
+        me->caps.effective = 0;
+        me->caps.ambient = 0;
+    }
     return 0;
 }
 
@@ -319,7 +334,12 @@ static int64_t sys_setgid(struct trapframe *tf) {
     if (me == NULL) {
         return KERR_SRCH;
     }
-    if (me->euid != 0) {
+    /* `CAP_SETGID`, not `CAP_SETUID`. They are separate capabilities
+     * precisely so that a program may be trusted with one and not the
+     * other, and a bulk substitution gave this one the wrong name — which
+     * would have let a process holding only `CAP_SETUID` change its group
+     * as well, quietly widening a privilege that was granted narrowly. */
+    if (!uspace_capable(CAP_SETGID)) {
         return KERR_PERM;
     }
     me->gid = want;
@@ -475,7 +495,7 @@ static int64_t sys_swapon(struct trapframe *tf) {
     if (rc != KERR_OK) {
         return rc;
     }
-    if (uspace_euid() != ACCESS_ROOT) {
+    if (!uspace_capable(CAP_SYS_ADMIN)) {
         return KERR_PERM;
     }
     return swap_enable(path, swappiness == 0u ? 60u : swappiness);
@@ -487,7 +507,7 @@ static int64_t sys_swapoff(struct trapframe *tf) {
     if (rc != KERR_OK) {
         return rc;
     }
-    if (uspace_euid() != ACCESS_ROOT) {
+    if (!uspace_capable(CAP_SYS_ADMIN)) {
         return KERR_PERM;
     }
     /* The path is checked for readability and then ignored: this kernel has

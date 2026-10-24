@@ -133,6 +133,25 @@ CASES = [
       # when the hash index is never reached.
       " hashed, 0 walked)"],
      150, None, True),
+    # **A real v4 filesystem**, built by `mkfs.xfs -m crc=0` rather than by
+    # altering a v5 image's version number — which is the only way the
+    # shorter headers and the absent checksums get exercised rather than
+    # asserted. The whole v4 difference is a handful of sizes and magics
+    # taken from the superblock, so what this proves is that the *same*
+    # reader handles both; a separate v4 path would pass this and mean
+    # nothing.
+    #
+    # The payload checksum is what makes it a test rather than a mount: a
+    # reader that found the extent fork at 176 instead of 100 would be
+    # reading the middle of a v2 inode's own fork, and would either fail or
+    # return the wrong blocks. Only the checksum tells those apart.
+    ("v4: the pre-checksum format, read on the board",
+     "minikern.cat=/seed",
+     # "xfs: v4" is the assertion that matters: it says which reader ran.
+     ["xfs: v4,",
+      f"cat: /seed is {fixtures.PAYLOAD_BYTES} bytes, "
+      f"checksum {fixtures.PAYLOAD_CHECKSUM}"],
+     150, None, "v4"),
     # **§3: a directory block of two filesystem blocks** (`-n size=8192`),
     # which was refused at mount. Entries do not straddle a directory block
     # but they do straddle the filesystem blocks inside one, and the
@@ -204,6 +223,59 @@ CASES = [
       "the log was replayed; the filesystem is clean",
       "the log could not be replayed; mounting read-only"],
      700, None, "small"),
+
+    # **The whole write path on a real v4 filesystem.** The same instrument
+    # as the case above, pointed at an image `mkfs.xfs -m crc=0` made — so
+    # create, write, link, rename, unlink, attributes and log replay all run
+    # against the older layout rather than against an assertion that they
+    # would.
+    #
+    # This is where v4 writing is actually dangerous rather than merely
+    # absent. Three things in that path write at offsets a v4 inode does not
+    # have: resealing puts a checksum at 100, which is the literal area's
+    # first byte; `di_ino` and `di_uuid` at 152 and 160 are inside the fork;
+    # and log replay's field table runs to 152 and copies a UUID at 160. Any
+    # of them corrupts the file it is updating and none of them fails, so
+    # only reading the file back afterwards can tell.
+    #
+    # The image has 512-byte inodes, like the v5 case, so that this
+    # compares the *format* and nothing else: `mkfs.xfs` defaults to 256,
+    # which leaves a v4 inode nine extents of literal area and makes a
+    # growing directory need a b-tree fork — refused by design, and nothing
+    # to do with v4. The default-size image is what the read case uses, and
+    # it is what found the fork-capacity bug this now bounds.
+    #
+    # The growth counts the v5 case pins are deliberately left out: without
+    # the file-type byte a directory entry is a byte shorter, so the same
+    # names reach the same shapes after a different number of splits. Those
+    # numbers are behavioural for a given format, not across two.
+    ("v4: the write path on the pre-checksum format",
+     "minikern.fswrite",
+     ["xfs: v4,",
+      "fswrite: every step passed",
+      "fswrite: attributes set, listed, survived a mount, removed",
+      "fswrite: a 3000-byte value went to its own blocks and came back",
+      "the log was replayed; the filesystem is clean"],
+     700, None, "v4big"),
+
+    # **Capabilities and `seccomp`, consulted rather than merely kept.**
+    #
+    # The rules are host-tested — `caps_test` covers every refusal the
+    # policy makes and `bpf_test` every program the verifier rejects — so
+    # what this adds is that the kernel asks them. A capability model whose
+    # bits are maintained perfectly and never consulted is privilege
+    # separation on paper, which is a failure this project has shipped
+    # twice in other guises.
+    #
+    # The step that carries the claim is a `swapon` refused with EPERM from
+    # a process that is **still uid 0**, having dropped CAP_SYS_ADMIN from
+    # its bounding set. Its control is the same call made while the
+    # capability is held, failing for a different reason — without that,
+    # the refusal would prove nothing, because every `swapon` here fails.
+    ("§1: capabilities and a seccomp filter",
+     "minikern.privsep",
+     ["uspace: privsep exited with 0"],
+     120, None),
 
     ("§4: the board's own Ethernet negotiates a link",
      "minikern.gmacup",
@@ -283,6 +355,10 @@ def run_case(name, bootargs, wanted, seconds, out_dir, program=None, needs_image
             img = fixtures.two_labelled_volumes(at)
         elif needs_image == "swap":
             img = fixtures.swap_volume(at)
+        elif needs_image == "v4":
+            img = fixtures.v4_filesystem(at)
+        elif needs_image == "v4big":
+            img = fixtures.v4_filesystem_big_inodes(at)
         else:
             size = None if needs_image is True else needs_image
             img = fixtures.big_directory(at, FIXTURE_ENTRIES, size)

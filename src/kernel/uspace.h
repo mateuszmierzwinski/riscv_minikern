@@ -28,9 +28,11 @@
 
 #include "arch/riscv/pgtable.h"
 #include "arch/riscv/trap.h"
+#include "core/caps.h"
 #include "core/types.h"
 #include "core/vma.h"
 #include "kernel/file.h"
+#include "kernel/seccomp.h"
 #include "kernel/signal.h"
 
 /* Where a user program and its stack live. Low addresses, well inside the
@@ -113,6 +115,14 @@ struct uproc {
     uint64_t rlim_nofile_hard;
     uint64_t rlim_nproc_soft;
     uint64_t rlim_nproc_hard;
+    /* **What this process may do, one bit per privileged operation.** The
+     * uid above says who it is; this says what that lets it do, and the
+     * checks consult only this — so root is a process whose set happens to
+     * be full rather than a special case in every caller. */
+    struct cap_sets caps;
+    /* The syscall filter it has installed on itself, if any. One-way: see
+     * `kernel/seccomp.h`. */
+    struct seccomp_state seccomp;
     bool used;
     bool zombie;        /* finished, and keeping its status for its parent */
     int64_t status;     /* what `wait4` will report */
@@ -224,6 +234,20 @@ uint32_t uspace_pgid_of(const struct uproc *p);
 
 /* The caller's effective identity, for a permission check. */
 uint32_t uspace_euid(void);
+
+/* **Whether the current process holds a capability.**
+ *
+ * This is what a privileged syscall asks, in place of `uspace_euid() != 0`.
+ * The two are not equivalent and the difference is the point: root's
+ * effective set is full, so every check root used to pass it still passes,
+ * but a process that has dropped `CAP_SYS_ADMIN` now fails the ones that
+ * need it *while still being uid 0*. Keeping the uid test as a second path
+ * would give two answers that can disagree, and the disagreeing one would
+ * be the one nobody tested.
+ *
+ * True when there is no current process, because then the caller is the
+ * kernel's own start-up and there is nobody to deny. */
+bool uspace_capable(uint32_t cap);
 
 /* The calling process's soft limit on open descriptors, for the descriptor
  * table to enforce. `RLIM_INFINITY` when there is no process — the kernel's

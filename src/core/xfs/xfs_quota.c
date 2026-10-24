@@ -124,7 +124,7 @@ int xfs_quota_get(struct xfs *fs, uint8_t type, uint32_t id, struct xfs_dquot *o
     /* The checksum and the UUID, as every other v5 structure gets: a quota
      * record is metadata and a torn one would otherwise read as a limit
      * nobody set. */
-    if (!xfs_crc_ok(record, XFS_DQUOT_BYTES, XFS_DQ_CRC_OFF) ||
+    if (!xfs_crc_ok(fs, record, XFS_DQUOT_BYTES, XFS_DQ_CRC_OFF) ||
         !xfs_uuid_ok(fs, record + XFS_DQ_UUID_OFF)) {
         return KERR_IO;
     }
@@ -142,6 +142,122 @@ int xfs_quota_get(struct xfs *fs, uint8_t type, uint32_t id, struct xfs_dquot *o
         .rt_blocks_used = xfs_be64(record + XFS_DQ_RTBCOUNT),
     };
     return KERR_OK;
+}
+
+/* Reads one record for updating, and says where it is so it can be written
+ * back. `KERR_NOENT` when the id has no record, which is not an error: an
+ * owner nobody set a limit for has no allowance to exceed. */
+static int dquot_for_update(struct xfs *fs, uint8_t type, uint32_t id, struct xfs_inode *qip,
+                            uint8_t *record, uint64_t *at) {
+    uint32_t got = 0;
+    uint64_t ino = quota_inode(fs, type);
+    int rc;
+    *at = (uint64_t)id * XFS_DQUOT_BYTES;
+    if (!xfs_quota_accounted(fs, type) || ino == 0) {
+        return KERR_NOENT;
+    }
+    rc = xfs_inode_read(fs, ino, qip);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    if (*at + XFS_DQUOT_BYTES > qip->size) {
+        return KERR_NOENT;
+    }
+    rc = xfs_file_read(fs, qip, *at, record, XFS_DQUOT_BYTES, &got);
+    if (rc != KERR_OK || got != XFS_DQUOT_BYTES) {
+        return rc != KERR_OK ? rc : KERR_IO;
+    }
+    return record_is(record, type, id) == KERR_OK ? KERR_OK : KERR_NOENT;
+}
+
+/* Whether taking `want` more would pass a limit.
+ *
+ * **A hard limit of zero means no limit**, which is the format's
+ * convention and the opposite of what the number looks like: reading it as
+ * "nothing allowed" would refuse every write on a filesystem that merely
+ * counts. Only the *hard* limit refuses; the soft limit starts a grace
+ * period, which needs a clock this does not keep, so it is counted and
+ * reported rather than enforced. */
+static bool over_limit(uint64_t used, uint64_t want, uint64_t hard) {
+    return hard != 0 && used + want > hard;
+}
+
+int xfs_quota_charge(struct xfs *fs, uint8_t type, uint32_t id, int64_t blocks, int64_t inodes) {
+    uint8_t record[XFS_DQUOT_BYTES];
+    struct xfs_inode qip;
+    uint64_t at = 0, bcount, icount;
+    uint32_t put = 0;
+    int rc;
+    /* **The quota file's own writes are not charged.** This rewrites a
+     * record in place, so it asks the allocator for nothing and cannot
+     * recurse today; the guard is here because "cannot recurse" is a fact
+     * about the current code and the failure if it changed would be a
+     * stack overflow rather than a wrong answer. */
+    if (fs->charging_quota) {
+        return KERR_OK;
+    }
+    fs->charging_quota = true;
+    rc = dquot_for_update(fs, type, id, &qip, record, &at);
+    if (rc != KERR_OK) {
+        fs->charging_quota = false;
+        /* Nothing counts this owner, so there is nothing to enforce: not
+         * an error, and most ids on a real quota file are holes. */
+        return rc == KERR_NOENT ? KERR_OK : rc;
+    }
+    bcount = xfs_be64(record + XFS_DQ_BCOUNT);
+    icount = xfs_be64(record + XFS_DQ_ICOUNT);
+    /* **Checked only when enforcement is on, and only upwards.** A
+     * filesystem that accounts without enforcing must still count, so the
+     * refusal and the update are separate decisions; and giving space back
+     * can never exceed a limit. */
+    if (xfs_quota_enforced(fs, type)) {
+        if ((blocks > 0 &&
+             over_limit(bcount, (uint64_t)blocks, xfs_be64(record + XFS_DQ_BLK_HARD))) ||
+            (inodes > 0 &&
+             over_limit(icount, (uint64_t)inodes, xfs_be64(record + XFS_DQ_INO_HARD)))) {
+            fs->charging_quota = false;
+            return KERR_DQUOT;
+        }
+    }
+    /* Clamped at zero: a count that went negative would read as enormous
+     * and lock the owner out of a filesystem they have nothing on. */
+    bcount = blocks < 0 && (uint64_t)(-blocks) > bcount ? 0 : (uint64_t)((int64_t)bcount + blocks);
+    icount = inodes < 0 && (uint64_t)(-inodes) > icount ? 0 : (uint64_t)((int64_t)icount + inodes);
+    xfs_put_be64(record + XFS_DQ_BCOUNT, bcount);
+    xfs_put_be64(record + XFS_DQ_ICOUNT, icount);
+    xfs_reseal(fs, record, XFS_DQUOT_BYTES, XFS_DQ_CRC_OFF);
+    rc = xfs_file_write(fs, &qip, at, record, XFS_DQUOT_BYTES, &put);
+    fs->charging_quota = false;
+    return rc != KERR_OK ? rc : (put == XFS_DQUOT_BYTES ? KERR_OK : KERR_IO);
+}
+
+int xfs_quota_charge_ids(struct xfs *fs, uint32_t uid, uint32_t gid, int64_t blocks,
+                         int64_t inodes) {
+    static const uint8_t KINDS[] = {XFS_DQTYPE_USER, XFS_DQTYPE_GROUP, XFS_DQTYPE_PROJ};
+    if (fs->qflags == 0) {
+        return KERR_OK; /* no quotas at all: the common case, and free */
+    }
+    for (uint32_t i = 0; i < sizeof KINDS / sizeof KINDS[0]; i++) {
+        uint32_t id = KINDS[i] == XFS_DQTYPE_GROUP ? gid : uid;
+        int rc = xfs_quota_charge(fs, KINDS[i], id, blocks, inodes);
+        if (rc != KERR_OK) {
+            /* **Give back what was already charged.** Three kinds are
+             * charged in turn and the third may refuse; leaving the first
+             * two charged would make an owner's usage drift upwards every
+             * time a write was refused. */
+            for (uint32_t j = 0; j < i; j++) {
+                uint32_t back = KINDS[j] == XFS_DQTYPE_GROUP ? gid : uid;
+                (void)xfs_quota_charge(fs, KINDS[j], back, -blocks, -inodes);
+            }
+            return rc;
+        }
+    }
+    return KERR_OK;
+}
+
+int xfs_quota_charge_all(struct xfs *fs, const struct xfs_inode *ip, int64_t blocks,
+                         int64_t inodes) {
+    return xfs_quota_charge_ids(fs, ip->uid, ip->gid, blocks, inodes);
 }
 
 void xfs_quota_report(const struct xfs *fs) {

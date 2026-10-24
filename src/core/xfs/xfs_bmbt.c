@@ -95,8 +95,8 @@ static int check_node(const struct xfs *fs, const struct bbuf *b, uint32_t below
      * b-tree block is as untrustworthy as a directory block, and the
      * consequence of believing a bad one is worse: it is a pointer to
      * follow, not a record to report. */
-    if (xfs_be32(b->data) != XFS_BMBT_CRC_MAGIC ||
-        !xfs_crc_ok(b->data, fs->blocksize, XFS_BMBT_CRC_OFF) ||
+    if (xfs_be32(b->data) != xfs_magic_for(fs, XFS_BLK_BMBT) ||
+        !xfs_crc_ok(fs, b->data, fs->blocksize, XFS_BMBT_CRC_OFF) ||
         !xfs_uuid_ok(fs, b->data + XFS_BMBT_UUID_OFF)) {
         return KERR_IO;
     }

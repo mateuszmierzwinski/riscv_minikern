@@ -26,10 +26,11 @@
 #define ACCESS_WRITE 2u
 #define ACCESS_EXEC 1u
 
-/* The uid that every check passes. Not a shortcut: uid 0 is *defined* as
- * the identity the checks do not apply to, and a kernel that enforced them
- * against it would have no way to administer anything — including fixing a
- * mode that denies everybody. */
+/* The uid that owns a fresh filesystem and whose processes start with a
+ * full capability set. **It is no longer the thing the checks exempt**:
+ * that is now `CAP_DAC_OVERRIDE`, which root holds by default and may drop.
+ * The name is kept because "uid 0" appears in on-disk inodes and in the
+ * `uproc` table, and calling it something else there would be worse. */
 #define ACCESS_ROOT 0u
 
 /* Whether an identity may do `want` to a file with these owners and mode.
@@ -39,5 +40,19 @@
  * rather than being half-granted. */
 bool access_permitted(uint32_t euid, uint32_t egid, uint32_t file_uid, uint32_t file_gid,
                       uint32_t mode, uint32_t want);
+
+/* The same rule **without the root exemption**.
+ *
+ * This is the one the kernel uses, because the exemption belongs to a
+ * capability rather than to a uid: a root process that has dropped
+ * `CAP_DAC_OVERRIDE` must be refused by the mode bits like anybody else,
+ * and a non-root process that holds it must pass. A function that exempted
+ * uid 0 on its own could not express either.
+ *
+ * `access_permitted` keeps the exemption and stays the function to reach
+ * for outside a process context — a check made on behalf of the kernel
+ * itself, where there is no capability set to consult. */
+bool access_permitted_strict(uint32_t euid, uint32_t egid, uint32_t file_uid, uint32_t file_gid,
+                             uint32_t mode, uint32_t want);
 
 #endif

@@ -1,7 +1,7 @@
 #include <stddef.h>
 
+#include "core/console.h"
 #include "core/errno.h"
-#include "lib/crc32c.h"
 #include "core/xfs/xfs_internal.h"
 
 /* Reading a file's bytes.
@@ -140,12 +140,6 @@ static void put_be64(uint8_t *p, uint64_t v) {
     }
 }
 
-static void put_le32(uint8_t *p, uint32_t v) {
-    for (uint32_t i = 0; i < 4; i++) {
-        p[i] = (uint8_t)(v >> (8u * i));
-    }
-}
-
 static int write_chunk(struct xfs *fs, const struct xfs_inode *ip, uint64_t at, const uint8_t *in,
                        uint32_t within, uint32_t chunk) {
     struct xfs_extent e;
@@ -203,7 +197,8 @@ static uint64_t allocated_bytes(const struct xfs *fs, const struct xfs_inode *ip
  * last extent when it is the block that follows it, and as a new extent
  * otherwise. The inode's own copy of the fork is updated too, because the
  * loop above reads it back to decide where the next block should go. */
-static int extend_fork(struct xfs_inode *ip, uint8_t *di, const struct xfs_extent *last, uint64_t fsb) {
+static int extend_fork(const struct xfs *fs, struct xfs_inode *ip, uint8_t *di,
+                       const struct xfs_extent *last, uint64_t fsb) {
     struct xfs_extent e;
     uint32_t at = ip->nextents;
     if (ip->nextents > 0 && last->startblock + last->blockcount == fsb) {
@@ -221,7 +216,7 @@ static int extend_fork(struct xfs_inode *ip, uint8_t *di, const struct xfs_exten
         ip->nextents++;
     }
     xfs_extent_pack(ip->fork + at * XFS_EXTENT_BYTES, &e);
-    xfs_extent_pack(di + XFS_DI_V3_SIZE + at * XFS_EXTENT_BYTES, &e);
+    xfs_extent_pack(di + fs->dinode_size + at * XFS_EXTENT_BYTES, &e);
     ip->nblocks++;
     return KERR_OK;
 }
@@ -266,7 +261,7 @@ static int grow_realtime(struct xfs *fs, struct xfs_inode *ip, uint8_t *di,
     if (rc != KERR_OK) {
         return rc;
     }
-    rc = extend_fork(ip, di, last, extent * fs->rextsize);
+    rc = extend_fork(fs, ip, di, last, extent * fs->rextsize);
     if (rc != KERR_OK) {
         /* The extent was taken but the fork would not hold it: give it
          * back, or the bitmap says used and no inode refers to it — a leak
@@ -297,15 +292,28 @@ static int grow_file(struct xfs *fs, struct xfs_inode *ip, uint64_t end) {
             agno = xfs_fsb_ag(fs, last.startblock);
             want = (uint32_t)((last.startblock + last.blockcount) & mask);
         }
+        /* **The quota is asked before the block is taken.** Charging
+         * afterwards would mean an owner over their limit still consumed
+         * the space, and giving it back needs the allocator's free path —
+         * which is more work than not allocating. A filesystem with no
+         * quotas pays one comparison for this. */
+        rc = xfs_quota_charge_all(fs, ip, 1, 0);
+        if (rc != KERR_OK) {
+            break;
+        }
         if (ip->realtime) {
             rc = grow_realtime(fs, ip, di, &last);
+            if (rc != KERR_OK) {
+                (void)xfs_quota_charge_all(fs, ip, -1, 0);
+            }
             continue;
         }
         rc = xfs_alloc_somewhere(fs, &agno, 1u, want, &got);
         if (rc != KERR_OK) {
+            (void)xfs_quota_charge_all(fs, ip, -1, 0);
             break;
         }
-        rc = extend_fork(ip, di, &last, ((uint64_t)agno << fs->agblklog) | got);
+        rc = extend_fork(fs, ip, di, &last, ((uint64_t)agno << fs->agblklog) | got);
     }
     if (rc == KERR_OK) {
         xfs_put_be64(di + XFS_DI_NBLOCKS, ip->nblocks);
@@ -319,7 +327,7 @@ static int grow_file(struct xfs *fs, struct xfs_inode *ip, uint64_t end) {
         } else {
             xfs_put_be32(di + XFS_DI_NEXTENTS, ip->nextents);
         }
-        xfs_reseal(di, fs->inodesize, XFS_DI_CRC);
+        xfs_reseal(fs, di, fs->inodesize, XFS_DI_CRC);
         bcache_dirty(b);
     }
     bcache_put(fs->cache, b);
@@ -395,8 +403,15 @@ static int record_new_size(struct xfs *fs, const struct xfs_inode *ip, uint64_t 
     }
     di = b->data + boffset;
     put_be64(di + XFS_DI_SIZE, size);
-    put_le32(di + XFS_DI_CRC, 0);
-    put_le32(di + XFS_DI_CRC, crc32c(di, fs->inodesize));
+    /* **`xfs_reseal`, not a hand-rolled checksum.** These two lines used to
+     * compute the sum here, which is the same operation written twice — and
+     * when v4 arrived only the shared one learned that a v4 inode has no
+     * checksum. `XFS_DI_CRC` is offset 100, which on a v4 inode is the
+     * *first four bytes of the literal area*: the first extent record's
+     * first word. So this wrote a checksum over the extent of every file it
+     * had just grown, `nextents` still said one, and the file read back as
+     * zeroes — a write that reported success and lost the data. */
+    xfs_reseal(fs, di, fs->inodesize, XFS_DI_CRC);
     struct xfs_log_inode_item item = {.ino = ip->ino, .chunk_block = block, .boffset = boffset, .core = di};
     rc = xfs_log_inodes(fs, &item, 1);
     if (rc == KERR_OK) {

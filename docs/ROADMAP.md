@@ -1577,8 +1577,42 @@ sparse inodes, `nrext64`, exchange-range, parent pointers, `bigtime`,
 
 ## 6. Security
 
-- [ ] **Any privilege separation at all.** (L) Everything runs with full
-      rights. No uid/gid checks, no capabilities, no `seccomp`.
+- [x] **Capabilities and `seccomp`.** (M) **Done, board-proven.** 41
+      capabilities with permitted/effective/inheritable/bounding/ambient
+      sets, `capget`/`capset` on the version-3 ABI, `PR_CAPBSET_READ` and
+      `PR_CAPBSET_DROP`; every `uspace_euid() != 0` gate is now a named
+      capability, and the mode-bit exemption is `CAP_DAC_OVERRIDE` (with
+      `CAP_DAC_READ_SEARCH` for reads alone) rather than uid 0. `seccomp`
+      has strict mode and **filter mode with a real classic-BPF
+      interpreter**, verified once at install so the syscall path needs no
+      bounds checks; filters stack, the most restrictive answer wins, they
+      survive `fork` as deep copies and `execve` unchanged, and an
+      unprivileged process needs `no_new_privs` first. The filter is
+      consulted **before** the syscall table, so it can deny a number this
+      kernel has not implemented — a sandbox is written against Linux's
+      numbering, and "unimplemented today" is not a promise about tomorrow.
+      Board: `minikern.privsep` exits 0, the decisive step being a `swapon`
+      refused with EPERM from a process still uid 0.
+
+      What is left of the original entry, and deliberately: there are no
+      **file capabilities**, because nothing stores them — so
+      `cap_after_exec` reduces to its two honest halves (root gets the
+      bounding set, anybody else gets the ambient set) rather than
+      consulting a number that is always zero. `KILL_THREAD` ends the
+      process like `KILL_PROCESS`, and `USER_NOTIF`/`TRACE` are reported
+      unavailable rather than silently ignored.
+
+Superseded text, kept because the entry denied what already existed:
+      The rest of privilege separation
+      exists and this entry used to deny it: `struct uproc` carries real and
+      effective uid and gid, `setuid`/`setgid` are root-only, the privileged
+      calls are gated on `uspace_euid()`, and `access_permitted` applies the
+      owner/group/other bits — enforced where a file is opened by name. What
+      is genuinely missing is a **capability** model, so that "may do this
+      one privileged thing" is expressible without being root, and
+      **`seccomp`**, so a process can narrow its own syscall surface.
+      `SECCOMP_SET_MODE_STRICT` is small; `MODE_FILTER` needs a classic-BPF
+      interpreter over `struct seccomp_data`, which is the bulk of it.
 - [ ] **ASLR.** (M) The stack, the heap and `mmap` are all at fixed
       addresses. `AT_RANDOM` is filled from the entropy pool, but nothing is
       actually randomised.

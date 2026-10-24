@@ -39,12 +39,12 @@ static uint64_t leaf_n(const struct xfs *fs, uint32_t which) {
 /* How many hash pairs a `LEAFN` block can hold. No `bests` and no tail —
  * that is what moving them to the free block bought. */
 static uint32_t leafn_capacity(const struct xfs *fs) {
-    return (fs->dirblocksize - XFS_DA3_HDR_SIZE) / XFS_DA3_ENTRY_SIZE;
+    return (fs->dirblocksize - fs->da_hdr) / XFS_DA3_ENTRY_SIZE;
 }
 
 /* How many children the node root can name. */
 static uint32_t node_capacity(const struct xfs *fs) {
-    return (fs->dirblocksize - XFS_DA3_HDR_SIZE) / XFS_DA3_ENTRY_SIZE;
+    return (fs->dirblocksize - fs->da_hdr) / XFS_DA3_ENTRY_SIZE;
 }
 
 /* Writes a `da3` header into the buffer: the shape every index block of a
@@ -57,12 +57,9 @@ static void da3_header(struct xfs *fs, uint16_t magic, uint64_t ino, uint64_t bl
     xfs_put_be32(fs->dirblock + XFS_DA3_FORW_OFF, (uint32_t)forw);
     xfs_put_be32(fs->dirblock + XFS_DA3_BACK_OFF, (uint32_t)back);
     xfs_put_be16(fs->dirblock + XFS_DA3_MAGIC_OFF, magic);
-    xfs_put_be16(fs->dirblock + XFS_DA3_COUNT_OFF, (uint16_t)count);
-    xfs_put_be64(fs->dirblock + XFS_DA3_BLKNO_OFF, blkno);
-    xfs_put_be64(fs->dirblock + XFS_DA3_OWNER_OFF, ino);
-    for (uint32_t i = 0; i < 16; i++) {
-        fs->dirblock[XFS_DA3_UUID_OFF + i] = fs->uuid[i];
-    }
+    xfs_put_be16(fs->dirblock + fs->da_count, (uint16_t)count);
+    xfs_stamp_owner(fs, fs->dirblock, XFS_DA3_BLKNO_OFF, XFS_DA3_UUID_OFF, XFS_DA3_OWNER_OFF,
+                    blkno, ino);
 }
 
 /* The highest hash in a run of pairs, which is what a node entry carries
@@ -83,7 +80,7 @@ static void build_free(struct xfs *fs, uint64_t ino, const uint8_t *bests, uint3
     for (uint32_t i = 0; i < fs->dirblocksize; i++) {
         fs->dirblock[i] = 0;
     }
-    xfs_put_be32(fs->dirblock, XFS_DIR3_FREE_MAGIC);
+    xfs_put_be32(fs->dirblock, xfs_magic_for(fs, XFS_BLK_DIR_FREE));
     for (uint32_t i = 0; i < 16; i++) {
         fs->dirblock[24u + i] = fs->uuid[i];
     }
@@ -92,12 +89,12 @@ static void build_free(struct xfs *fs, uint64_t ino, const uint8_t *bests, uint3
     xfs_put_be32(fs->dirblock + XFS_DIR3_FREE_NVALID, n);
     for (uint32_t i = 0; i < n; i++) {
         uint16_t best = (uint16_t)xfs_be16(bests + i * XFS_DIR2_LEAF_BEST_SIZE);
-        xfs_put_be16(fs->dirblock + XFS_DIR3_FREE_HDR_SIZE + i * XFS_DIR2_LEAF_BEST_SIZE,
+        xfs_put_be16(fs->dirblock + fs->dir_free_hdr + i * XFS_DIR2_LEAF_BEST_SIZE,
                      best);
         used += best != 0 ? 1u : 0u;
     }
     xfs_put_be32(fs->dirblock + XFS_DIR3_FREE_NUSED, used);
-    xfs_reseal(fs->dirblock, fs->dirblocksize, 4u);
+    xfs_reseal(fs, fs->dirblock, fs->dirblocksize, 4u);
 }
 
 /* Records one data block's largest free span in the free block.
@@ -108,19 +105,19 @@ static void build_free(struct xfs *fs, uint64_t ino, const uint8_t *bests, uint3
 static int free_set(struct xfs *fs, const struct xfs_inode *dir, uint32_t which,
                     uint32_t best, uint32_t blocks) {
     uint64_t fsb = 0;
-    uint32_t at = XFS_DIR3_FREE_HDR_SIZE + which * XFS_DIR2_LEAF_BEST_SIZE;
+    uint32_t at = fs->dir_free_hdr + which * XFS_DIR2_LEAF_BEST_SIZE;
     int rc = xfs_dir_raw_load(fs, dir, fs->dir_free_block, &fsb);
     if (rc != KERR_OK) {
         return rc;
     }
-    if (xfs_be32(fs->dirblock) != XFS_DIR3_FREE_MAGIC || at + 2u > fs->dirblocksize) {
+    if (xfs_be32(fs->dirblock) != xfs_magic_for(fs, XFS_BLK_DIR_FREE) || at + 2u > fs->dirblocksize) {
         return KERR_IO;
     }
     xfs_put_be16(fs->dirblock + at, (uint16_t)best);
     if (xfs_be32(fs->dirblock + XFS_DIR3_FREE_NVALID) < blocks) {
         xfs_put_be32(fs->dirblock + XFS_DIR3_FREE_NVALID, blocks);
     }
-    xfs_reseal(fs->dirblock, fs->dirblocksize, 4u);
+    xfs_reseal(fs, fs->dirblock, fs->dirblocksize, 4u);
     return xfs_dir_raw_store(fs, fsb);
 }
 
@@ -157,9 +154,9 @@ static int free_block_from_leaf(struct xfs *fs, const struct xfs_inode *dir, uin
 static int write_leafn(struct xfs *fs, const struct xfs_inode *dir, uint32_t which,
                        const uint8_t *pairs, uint32_t count, uint64_t forw, uint64_t back,
                        uint64_t fsb) {
-    da3_header(fs, XFS_DIR3_LEAFN_MAGIC, dir->ino, leaf_n(fs, which), count, forw, back);
-    xfs_copy_bytes(fs->dirblock + XFS_DA3_HDR_SIZE, pairs, count * XFS_DA3_ENTRY_SIZE);
-    xfs_reseal(fs->dirblock, fs->dirblocksize, XFS_DA3_CRC_OFF);
+    da3_header(fs, xfs_magic_for(fs, XFS_BLK_DIR_LEAFN), dir->ino, leaf_n(fs, which), count, forw, back);
+    xfs_copy_bytes(fs->dirblock + fs->da_hdr, pairs, count * XFS_DA3_ENTRY_SIZE);
+    xfs_reseal(fs, fs->dirblock, fs->dirblocksize, XFS_DA3_CRC_OFF);
     return xfs_dir_raw_store(fs, fsb);
 }
 
@@ -171,14 +168,14 @@ static int write_leafn(struct xfs *fs, const struct xfs_inode *dir, uint32_t whi
  * that had moved. */
 static int write_root(struct xfs *fs, const struct xfs_inode *dir, const uint8_t *pairs,
                       uint32_t half, uint32_t count, uint64_t root_fsb) {
-    uint8_t *e = fs->dirblock + XFS_DA3_HDR_SIZE;
-    da3_header(fs, XFS_DA3_NODE_MAGIC, dir->ino, fs->dir_leaf_block, 2u, 0, 0);
-    xfs_put_be16(fs->dirblock + XFS_DA3_LEVEL_OFF, 1u);
+    uint8_t *e = fs->dirblock + fs->da_hdr;
+    da3_header(fs, xfs_magic_for(fs, XFS_BLK_DA_NODE), dir->ino, fs->dir_leaf_block, 2u, 0, 0);
+    xfs_put_be16(fs->dirblock + fs->da_level, 1u);
     xfs_put_be32(e, top_hash(pairs, half));
     xfs_put_be32(e + 4u, (uint32_t)leaf_n(fs, 0));
     xfs_put_be32(e + XFS_DA3_ENTRY_SIZE, top_hash(pairs, count));
     xfs_put_be32(e + XFS_DA3_ENTRY_SIZE + 4u, (uint32_t)leaf_n(fs, 1));
-    xfs_reseal(fs->dirblock, fs->dirblocksize, XFS_DA3_CRC_OFF);
+    xfs_reseal(fs, fs->dirblock, fs->dirblocksize, XFS_DA3_CRC_OFF);
     return xfs_dir_raw_store(fs, root_fsb);
 }
 
@@ -190,10 +187,10 @@ int xfs_dir_to_node(struct xfs *fs, const struct xfs_inode *dir, uint64_t now_s)
     if (rc != KERR_OK) {
         return rc;
     }
-    if (xfs_be16(fs->dirblock + XFS_DA3_MAGIC_OFF) != XFS_DIR3_LEAF1_MAGIC) {
+    if (xfs_be16(fs->dirblock + XFS_DA3_MAGIC_OFF) != xfs_magic_for(fs, XFS_BLK_DIR_LEAF1)) {
         return KERR_NOTSUP; /* already a node, or not an index at all */
     }
-    count = xfs_be16(fs->dirblock + XFS_DA3_COUNT_OFF);
+    count = xfs_be16(fs->dirblock + fs->da_count);
     if (count * XFS_DA3_ENTRY_SIZE > XFS_DIRPAIRS_BYTES) {
         return KERR_NOSPC;
     }
@@ -207,7 +204,7 @@ int xfs_dir_to_node(struct xfs *fs, const struct xfs_inode *dir, uint64_t now_s)
     if (rc != KERR_OK) {
         return rc;
     }
-    xfs_copy_bytes(pairs, fs->dirblock + XFS_DA3_HDR_SIZE, count * XFS_DA3_ENTRY_SIZE);
+    xfs_copy_bytes(pairs, fs->dirblock + fs->da_hdr, count * XFS_DA3_ENTRY_SIZE);
     half = count / 2u;
     /* Chained forward, so that a run of equal hashes split across the
      * boundary is followed through `forw` — which the reader already does. */
@@ -249,25 +246,25 @@ static int child_for(struct xfs *fs, const struct xfs_inode *dir, uint32_t hash,
     if (rc != KERR_OK) {
         return rc;
     }
-    if (xfs_be16(fs->dirblock + XFS_DA3_MAGIC_OFF) != XFS_DA3_NODE_MAGIC) {
+    if (xfs_be16(fs->dirblock + XFS_DA3_MAGIC_OFF) != xfs_magic_for(fs, XFS_BLK_DA_NODE)) {
         return KERR_NOTSUP;
     }
-    if (xfs_be16(fs->dirblock + XFS_DA3_LEVEL_OFF) != 1u) {
+    if (xfs_be16(fs->dirblock + fs->da_level) != 1u) {
         return KERR_NOTSUP; /* deeper than one level: read, not written */
     }
-    count = xfs_be16(fs->dirblock + XFS_DA3_COUNT_OFF);
-    if (count == 0 || XFS_DA3_HDR_SIZE + count * XFS_DA3_ENTRY_SIZE > fs->dirblocksize) {
+    count = xfs_be16(fs->dirblock + fs->da_count);
+    if (count == 0 || fs->da_hdr + count * XFS_DA3_ENTRY_SIZE > fs->dirblocksize) {
         return KERR_IO;
     }
     *children = count;
     *index = count - 1u; /* past every child's top hash: the last one takes it */
     for (uint32_t i = 0; i < count; i++) {
-        if (xfs_be32(fs->dirblock + XFS_DA3_HDR_SIZE + i * XFS_DA3_ENTRY_SIZE) >= hash) {
+        if (xfs_be32(fs->dirblock + fs->da_hdr + i * XFS_DA3_ENTRY_SIZE) >= hash) {
             *index = i;
             break;
         }
     }
-    *child = xfs_be32(fs->dirblock + XFS_DA3_HDR_SIZE + *index * XFS_DA3_ENTRY_SIZE + 4u);
+    *child = xfs_be32(fs->dirblock + fs->da_hdr + *index * XFS_DA3_ENTRY_SIZE + 4u);
     return KERR_OK;
 }
 
@@ -286,28 +283,28 @@ static int node_set(struct xfs *fs, const struct xfs_inode *dir, uint32_t index,
     if (rc != KERR_OK) {
         return rc;
     }
-    count = xfs_be16(fs->dirblock + XFS_DA3_COUNT_OFF);
+    count = xfs_be16(fs->dirblock + fs->da_count);
     if (insert) {
         if (count + 1u > node_capacity(fs)) {
             return KERR_NOSPC; /* a second level: read, not written */
         }
         for (uint32_t i = count; i > index; i--) {
-            xfs_copy_bytes(fs->dirblock + XFS_DA3_HDR_SIZE + i * XFS_DA3_ENTRY_SIZE,
-                           fs->dirblock + XFS_DA3_HDR_SIZE + (i - 1u) * XFS_DA3_ENTRY_SIZE,
+            xfs_copy_bytes(fs->dirblock + fs->da_hdr + i * XFS_DA3_ENTRY_SIZE,
+                           fs->dirblock + fs->da_hdr + (i - 1u) * XFS_DA3_ENTRY_SIZE,
                            XFS_DA3_ENTRY_SIZE);
         }
         count++;
-        xfs_put_be16(fs->dirblock + XFS_DA3_COUNT_OFF, (uint16_t)count);
+        xfs_put_be16(fs->dirblock + fs->da_count, (uint16_t)count);
     }
     if (index >= count) {
         return KERR_IO;
     }
-    e = fs->dirblock + XFS_DA3_HDR_SIZE + index * XFS_DA3_ENTRY_SIZE;
+    e = fs->dirblock + fs->da_hdr + index * XFS_DA3_ENTRY_SIZE;
     xfs_put_be32(e, hash);
     if (child != 0) {
         xfs_put_be32(e + 4u, (uint32_t)child);
     }
-    xfs_reseal(fs->dirblock, fs->dirblocksize, XFS_DA3_CRC_OFF);
+    xfs_reseal(fs, fs->dirblock, fs->dirblocksize, XFS_DA3_CRC_OFF);
     return xfs_dir_raw_store(fs, root_fsb);
 }
 
@@ -332,29 +329,29 @@ static int split_leaf(struct xfs *fs, struct xfs_inode *dir, uint32_t index,
     if (rc != KERR_OK) {
         return rc;
     }
-    count = xfs_be16(fs->dirblock + XFS_DA3_COUNT_OFF);
+    count = xfs_be16(fs->dirblock + fs->da_count);
     forw = xfs_be32(fs->dirblock + XFS_DA3_FORW_OFF);
     if (count * XFS_DA3_ENTRY_SIZE > XFS_DIRPAIRS_BYTES) {
         return KERR_NOSPC;
     }
-    xfs_copy_bytes(pairs, fs->dirblock + XFS_DA3_HDR_SIZE, count * XFS_DA3_ENTRY_SIZE);
+    xfs_copy_bytes(pairs, fs->dirblock + fs->da_hdr, count * XFS_DA3_ENTRY_SIZE);
     half = count / 2u;
     rc = xfs_dir_take_block(fs, dir->ino >> fs->inopblog, &new_fsb);
     if (rc != KERR_OK) {
         return rc;
     }
     /* The old leaf keeps the lower half and points at the new one. */
-    xfs_put_be16(fs->dirblock + XFS_DA3_COUNT_OFF, (uint16_t)half);
+    xfs_put_be16(fs->dirblock + fs->da_count, (uint16_t)half);
     xfs_put_be32(fs->dirblock + XFS_DA3_FORW_OFF, (uint32_t)at);
-    xfs_reseal(fs->dirblock, fs->dirblocksize, XFS_DA3_CRC_OFF);
+    xfs_reseal(fs, fs->dirblock, fs->dirblocksize, XFS_DA3_CRC_OFF);
     rc = xfs_dir_raw_store(fs, old_fsb);
     if (rc != KERR_OK) {
         return rc;
     }
-    da3_header(fs, XFS_DIR3_LEAFN_MAGIC, dir->ino, at, count - half, forw, child);
-    xfs_copy_bytes(fs->dirblock + XFS_DA3_HDR_SIZE, pairs + half * XFS_DA3_ENTRY_SIZE,
+    da3_header(fs, xfs_magic_for(fs, XFS_BLK_DIR_LEAFN), dir->ino, at, count - half, forw, child);
+    xfs_copy_bytes(fs->dirblock + fs->da_hdr, pairs + half * XFS_DA3_ENTRY_SIZE,
                    (count - half) * XFS_DA3_ENTRY_SIZE);
-    xfs_reseal(fs->dirblock, fs->dirblocksize, XFS_DA3_CRC_OFF);
+    xfs_reseal(fs, fs->dirblock, fs->dirblocksize, XFS_DA3_CRC_OFF);
     rc = xfs_dir_raw_store(fs, new_fsb);
     rc = rc != KERR_OK ? rc : xfs_dir_fork_insert(fs, dir, at, new_fsb, false, now_s);
     /* The old child's top hash has fallen to the halfway pair, and the new
@@ -391,7 +388,7 @@ static int leaf_insert(struct xfs *fs, struct xfs_inode *dir, uint32_t hash,
     if (rc != KERR_OK) {
         return rc;
     }
-    if (xfs_be16(fs->dirblock + XFS_DA3_COUNT_OFF) >= leafn_capacity(fs)) {
+    if (xfs_be16(fs->dirblock + fs->da_count) >= leafn_capacity(fs)) {
         rc = split_leaf(fs, dir, index, child, children, now_s);
         fs->leaf_splits += rc == KERR_OK ? 1u : 0u;
         /* The split gave the directory a block, so the fork has moved on
@@ -404,15 +401,15 @@ static int leaf_insert(struct xfs *fs, struct xfs_inode *dir, uint32_t hash,
             return rc;
         }
     }
-    count = xfs_be16(fs->dirblock + XFS_DA3_COUNT_OFF);
-    xfs_dir_pairs_insert(fs->dirblock + XFS_DA3_HDR_SIZE, &count, hash, address);
-    xfs_put_be16(fs->dirblock + XFS_DA3_COUNT_OFF, (uint16_t)count);
-    xfs_reseal(fs->dirblock, fs->dirblocksize, XFS_DA3_CRC_OFF);
+    count = xfs_be16(fs->dirblock + fs->da_count);
+    xfs_dir_pairs_insert(fs->dirblock + fs->da_hdr, &count, hash, address);
+    xfs_put_be16(fs->dirblock + fs->da_count, (uint16_t)count);
+    xfs_reseal(fs, fs->dirblock, fs->dirblocksize, XFS_DA3_CRC_OFF);
     rc = xfs_dir_raw_store(fs, leaf_fsb);
     /* If it went in at the end, this leaf's top hash has moved and the root
      * must say so — otherwise a later search for that name stops at the
      * child before this one and reports the name missing. */
-    if (rc == KERR_OK && hash >= top_hash(fs->dirblock + XFS_DA3_HDR_SIZE, count)) {
+    if (rc == KERR_OK && hash >= top_hash(fs->dirblock + fs->da_hdr, count)) {
         rc = node_set(fs, dir, index, hash, 0, false);
     }
     return rc;
@@ -452,10 +449,10 @@ static int leaf_remove(struct xfs *fs, const struct xfs_inode *dir, uint32_t has
         if (rc != KERR_OK) {
             return rc;
         }
-        count = xfs_be16(fs->dirblock + XFS_DA3_COUNT_OFF);
+        count = xfs_be16(fs->dirblock + fs->da_count);
         found = count;
         for (uint32_t i = 0; i < count; i++) {
-            found = xfs_be32(fs->dirblock + XFS_DA3_HDR_SIZE + i * XFS_DA3_ENTRY_SIZE +
+            found = xfs_be32(fs->dirblock + fs->da_hdr + i * XFS_DA3_ENTRY_SIZE +
                              4u) == address
                         ? i
                         : found;
@@ -469,12 +466,12 @@ static int leaf_remove(struct xfs *fs, const struct xfs_inode *dir, uint32_t has
             continue;
         }
         for (uint32_t i = found; i + 1u < count; i++) {
-            xfs_copy_bytes(fs->dirblock + XFS_DA3_HDR_SIZE + i * XFS_DA3_ENTRY_SIZE,
-                           fs->dirblock + XFS_DA3_HDR_SIZE + (i + 1u) * XFS_DA3_ENTRY_SIZE,
+            xfs_copy_bytes(fs->dirblock + fs->da_hdr + i * XFS_DA3_ENTRY_SIZE,
+                           fs->dirblock + fs->da_hdr + (i + 1u) * XFS_DA3_ENTRY_SIZE,
                            XFS_DA3_ENTRY_SIZE);
         }
-        xfs_put_be16(fs->dirblock + XFS_DA3_COUNT_OFF, (uint16_t)(count - 1u));
-        xfs_reseal(fs->dirblock, fs->dirblocksize, XFS_DA3_CRC_OFF);
+        xfs_put_be16(fs->dirblock + fs->da_count, (uint16_t)(count - 1u));
+        xfs_reseal(fs, fs->dirblock, fs->dirblocksize, XFS_DA3_CRC_OFF);
         return xfs_dir_raw_store(fs, leaf_fsb);
     }
     return rc == KERR_OK ? KERR_IO : rc;
@@ -501,7 +498,7 @@ int xfs_dir_node_remove(struct xfs *fs, const struct xfs_inode *dir, const char 
     }
     {
         uint32_t best = xfs_dir_largest_free(fs, fs->dirblock);
-        xfs_reseal(fs->dirblock, fs->dirblocksize, XFS_DIR3_HDR_CRC);
+        xfs_reseal(fs, fs->dirblock, fs->dirblocksize, XFS_DIR3_HDR_CRC);
         rc = xfs_dir_raw_store(fs, fsb);
         rc = rc != KERR_OK ? rc
                            : leaf_remove(fs, dir, xfs_dir_hashname(name, namelen),

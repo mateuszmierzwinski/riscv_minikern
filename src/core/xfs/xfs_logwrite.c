@@ -123,15 +123,33 @@ static const struct {
 /* Turns an on-disk inode core into the form the log carries: the same
  * fields in the same places, each one reversed, and the UUID copied as the
  * bytes it is. */
-static void log_dinode_from_disk(uint8_t *out, const uint8_t *di) {
-    zero(out, XFS_LOG_DINODE_SIZE);
+/* **The table runs past a v4 inode's core**, so `core` bounds it.
+ *
+ * `CORE_FIELDS` describes the v3 core: its last seven entries, from offset
+ * 104 to 152, and the UUID at 160, are fields v5 added. On a v2 inode the
+ * core ends at 100 and every one of those offsets is inside the *literal
+ * area* — the file's own fork. Reading them into the log is merely wrong;
+ * writing them back on replay would overwrite the fork of each inode being
+ * recovered, which is the same shape as the bug that made the first version
+ * of replay corrupt every inode it touched while reporting success. */
+static void copy_core_fields(uint8_t *to, const uint8_t *from, uint32_t core) {
     for (uint32_t f = 0; f < sizeof CORE_FIELDS / sizeof CORE_FIELDS[0]; f++) {
         uint32_t off = CORE_FIELDS[f].off, len = CORE_FIELDS[f].len;
+        if (off + len > core) {
+            continue; /* a field this inode's core does not have */
+        }
         for (uint32_t i = 0; i < len; i++) {
-            out[off + i] = di[off + len - 1u - i];
+            to[off + i] = from[off + len - 1u - i];
         }
     }
-    copy(out + XFS_DI_UUID, di + XFS_DI_UUID, 16);
+    if (XFS_DI_UUID + 16u <= core) {
+        copy(to + XFS_DI_UUID, from + XFS_DI_UUID, 16);
+    }
+}
+
+static void log_dinode_from_disk(uint8_t *out, const uint8_t *di, uint32_t core) {
+    zero(out, XFS_LOG_DINODE_SIZE);
+    copy_core_fields(out, di, core);
 }
 
 /* The inverse, for replay: a logged inode core back into an on-disk one.
@@ -149,14 +167,8 @@ static void log_dinode_from_disk(uint8_t *out, const uint8_t *di) {
  * 176-byte copy would also zero `di_next_unlinked`, which the log does not
  * carry and the unlinked list needs. Everything outside the table is left
  * as the inode already has it, and the caller reseals. */
-void xfs_log_dinode_to_disk(uint8_t *di, const uint8_t *logged) {
-    for (uint32_t f = 0; f < sizeof CORE_FIELDS / sizeof CORE_FIELDS[0]; f++) {
-        uint32_t off = CORE_FIELDS[f].off, len = CORE_FIELDS[f].len;
-        for (uint32_t i = 0; i < len; i++) {
-            di[off + i] = logged[off + len - 1u - i];
-        }
-    }
-    copy(di + XFS_DI_UUID, logged + XFS_DI_UUID, 16);
+void xfs_log_dinode_to_disk(uint8_t *di, const uint8_t *logged, uint32_t core) {
+    copy_core_fields(di, logged, core);
 }
 
 /* A record under construction: the header sector, then the operation
@@ -334,7 +346,7 @@ static int put_inode_item(const struct xfs *fs, const struct xfs_log_inode_item 
     put_le32(ilf + ILF_LEN, fs->blocksize / XLOG_SECTOR);
     put_le32(ilf + ILF_BOFFSET, item->boffset);
     rc = put_op(XFS_LOG_TID, 0, ilf, sizeof ilf);
-    log_dinode_from_disk(logged, item->core);
+    log_dinode_from_disk(logged, item->core, fs->dinode_size);
     return rc != KERR_OK ? rc : put_op(XFS_LOG_TID, 0, logged, XFS_LOG_DINODE_SIZE);
 }
 

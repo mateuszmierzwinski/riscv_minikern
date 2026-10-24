@@ -13,9 +13,12 @@ bool xfs_fsb_valid(const struct xfs *fs, uint64_t fsb, uint64_t count) {
            count <= fs->dblocks - block;
 }
 
-bool xfs_crc_ok(const uint8_t *buf, uint32_t len, uint32_t crc_off) {
+bool xfs_crc_ok(const struct xfs *fs, const uint8_t *buf, uint32_t len, uint32_t crc_off) {
     static const uint8_t zeros[4] = {0, 0, 0, 0};
     uint32_t crc;
+    if (!fs->v5) {
+        return true; /* there is no checksum here to disagree with */
+    }
     if (crc_off + 4u > len) {
         return false;
     }
@@ -26,6 +29,13 @@ bool xfs_crc_ok(const uint8_t *buf, uint32_t len, uint32_t crc_off) {
 }
 
 bool xfs_uuid_ok(const struct xfs *fs, const uint8_t *uuid) {
+    if (!fs->v5) {
+        /* **A v4 metadata block has no UUID**, for the same reason it has
+         * no checksum: both arrived with v5. The bytes at `uuid_off` are
+         * whatever the shorter structure put there — comparing them would
+         * reject every block of a sound filesystem. */
+        return true;
+    }
     for (uint32_t i = 0; i < 16u; i++) {
         if (uuid[i] != fs->uuid[i]) {
             return false;
@@ -47,8 +57,18 @@ int xfs_meta_block(struct xfs *fs, uint64_t fsb, uint32_t magic, uint32_t magic2
         return rc;
     }
     found = xfs_be32(b->data);
-    if ((found != magic && (magic2 == 0 || found != magic2)) || !xfs_crc_ok(b->data, fs->blocksize, crc_off) ||
+    if ((found != magic && (magic2 == 0 || found != magic2)) ||
+        !xfs_crc_ok(fs, b->data, fs->blocksize, crc_off) ||
         !xfs_uuid_ok(fs, b->data + uuid_off)) {
+        /* **Which of the three failed, and what was actually there.** A
+         * bare `KERR_IO` from here turns every format question into a
+         * bisection: a wrong magic says the wrong kind of block was
+         * addressed, a wrong checksum says the right block is damaged, and
+         * the two want opposite investigations. */
+        kprintf("xfs: block %llu is not the %08x expected: magic %08x, crc %s, uuid %s\n",
+                (unsigned long long)fsb, magic, found,
+                xfs_crc_ok(fs, b->data, fs->blocksize, crc_off) ? "ok" : "bad",
+                xfs_uuid_ok(fs, b->data + uuid_off) ? "ok" : "bad");
         bcache_put(fs->cache, b);
         return KERR_IO;
     }
@@ -159,10 +179,58 @@ static int check_geometry(const struct xfs *fs) {
  * filesystem carrying `ro_compat` flags this reader does not implement is
  * marked unwritable, so every write path refuses it (`xfs_writable`). The
  * `incompat` and `log_incompat` sets stay a strict whitelist. */
+/* v4's features, which live in `versionnum` and `features2` rather than in
+ * the three words v5 added.
+ *
+ * **The v5 words must not be read here at all.** They sit at offsets 208 to
+ * 220, which on a v4 superblock is past the end of the structure as v4
+ * defined it — whatever is there was never a feature word. On an image
+ * `mkfs` wrote it happens to be zero, which is precisely the kind of luck
+ * that makes a wrong read work until it does not. */
+static int check_features_v4(struct xfs *fs, const uint8_t *sb) {
+    uint16_t version = xfs_be16(sb + XFS_SB_VERSIONNUM);
+    uint32_t f2 = (version & XFS_SB_V4_MOREBITS) != 0 ? xfs_be32(sb + XFS_SB_FEATURES2) : 0;
+    fs->ftype = (f2 & XFS_SB_V2_FTYPE) != 0;
+    fs->big_extent_counts = false; /* `nrext64` is v5's */
+    fs->has_finobt = false;        /* so is the free-inode b-tree */
+    /* **`attr2` is a write capability, not a read one.** With it the
+     * attribute fork's offset inside the inode may move as the fork grows;
+     * without it `mkfs` fixed that offset once and nothing may change it.
+     * Reading either is the same work, so an `attr1` filesystem is read
+     * normally — but writing an attribute to one would have to move a fork
+     * that is not allowed to move, so that is refused rather than done. */
+    fs->attr_fixed_fork = (f2 & XFS_SB_V2_ATTR2) == 0;
+    if (fs->attr_fixed_fork) {
+        kprintf("xfs: this filesystem predates attr2; attributes are read-only\n");
+    }
+    return KERR_OK;
+}
+
 static int check_features(struct xfs *fs, const uint8_t *sb) {
-    uint32_t ro = xfs_be32(sb + XFS_SB_FEAT_RO_COMPAT);
-    uint32_t in = xfs_be32(sb + XFS_SB_FEAT_INCOMPAT);
-    uint32_t log = xfs_be32(sb + XFS_SB_FEAT_LOG_INCOMPAT);
+    uint32_t ro, in, log;
+    if (!fs->v5) {
+        return check_features_v4(fs, sb);
+    }
+    ro = xfs_be32(sb + XFS_SB_FEAT_RO_COMPAT);
+    in = xfs_be32(sb + XFS_SB_FEAT_INCOMPAT);
+    log = xfs_be32(sb + XFS_SB_FEAT_LOG_INCOMPAT);
+    fs->has_finobt = (ro & XFS_FEAT_RO_FINOBT) != 0;
+    fs->attr_fixed_fork = false; /* every v5 filesystem has attr2 */
+    /* **One owner per field.** The file-type feature is in the incompat
+     * word on v5 and in `features2` on v4, so both branches of *this*
+     * function set it and nothing else does.
+     *
+     * It used to be set in `take_uuid`, which runs later — so on v4 that
+     * function, named for something else entirely, quietly overwrote what
+     * the v4 branch had worked out, and `fs->ftype` came back false on a
+     * filesystem that has the byte. The cost was not cosmetic: a shortform
+     * entry is a byte shorter without it, so every entry after the first
+     * was read at the wrong offset and the root directory became
+     * unreadable the moment anything was added to it. This is the fourth
+     * field in this tree to be set and then reset by a step that did not
+     * know it was set; one owner per field is the only thing that has
+     * stopped it recurring. */
+    fs->ftype = (in & XFS_FEAT_IN_FTYPE) != 0;
     if ((ro & ~XFS_FEAT_RO_SUPPORTED) != 0) {
         kprintf("xfs: read-only features %08x not implemented here: no writing\n",
                 ro & ~XFS_FEAT_RO_SUPPORTED);
@@ -181,7 +249,8 @@ static int check_features(struct xfs *fs, const uint8_t *sb) {
     return KERR_OK;
 }
 
-/* Checks the superblock image is a v5 one we may use. */
+/* Checks the superblock image is one we may use, and records which
+ * format it is: v4 and v5 are both read. */
 static int check_super(struct xfs *fs, const uint8_t *sb) {
     uint16_t version;
     if (xfs_be32(sb + 0) != XFS_SB_MAGIC) {
@@ -189,8 +258,49 @@ static int check_super(struct xfs *fs, const uint8_t *sb) {
         return KERR_INVAL;
     }
     version = xfs_be16(sb + XFS_SB_VERSIONNUM);
-    if ((version & XFS_SB_VERSION_MASK) != XFS_SB_VERSION_5) {
-        kprintf("xfs: version %u is not supported (v5 only)\n", version & XFS_SB_VERSION_MASK);
+    /* **Both formats, and the version decides a handful of sizes.** A v4
+     * filesystem is the same filesystem with shorter headers and no
+     * checksums; everything downstream takes those from `fs` rather than
+     * from a constant, so this is the only place that has to know. */
+    switch (version & XFS_SB_VERSION_MASK) {
+    case XFS_SB_VERSION_5:
+        fs->v5 = true;
+        fs->dinode_size = XFS_DI_V3_SIZE;
+        fs->dir_data_hdr = XFS_DIR3_DATA_HDR_SIZE;
+        fs->da_hdr = XFS_DA3_HDR_SIZE;
+        fs->dir_free_hdr = XFS_DIR3_FREE_HDR_SIZE;
+        fs->btree_hdr = XFS_BTREE_RECORDS;
+        fs->da_count = XFS_DA3_COUNT_OFF;
+        fs->da_level = XFS_DA3_LEVEL_OFF;
+        fs->attr_base = ATTR_LEAF_COUNT;
+        fs->attr_hdr = ATTR_LEAF_HDR;
+        break;
+    case XFS_SB_VERSION_4:
+        if ((version & XFS_SB_V4_DIRV2) == 0) {
+            kprintf("xfs: this v4 filesystem has v1 directories, which are a "
+                    "different format\n");
+            return KERR_NOTSUP;
+        }
+        if ((version & XFS_SB_V4_SHARED) != 0) {
+            /* Not refused: readable is useful and correct. Writing is what
+             * another host's cached metadata makes unsafe. */
+            fs->write_refused = true;
+            kprintf("xfs: this filesystem is shared read-only; mounting read-only\n");
+        }
+        fs->v5 = false;
+        fs->dinode_size = XFS_DI_V2_SIZE;
+        fs->dir_data_hdr = XFS_DIR2_DATA_HDR_SIZE;
+        fs->da_hdr = XFS_DA_HDR_SIZE;
+        fs->dir_free_hdr = XFS_DIR2_FREE_HDR_SIZE;
+        fs->btree_hdr = XFS_BTREE_V4_RECORDS;
+        fs->da_count = XFS_DA_COUNT_OFF;
+        fs->da_level = XFS_DA_LEVEL_OFF;
+        fs->attr_base = ATTR_LEAF_V4_BASE;
+        fs->attr_hdr = ATTR_LEAF_V4_HDR;
+        break;
+    default:
+        kprintf("xfs: version %u is not supported (v4 and v5 are)\n",
+                version & XFS_SB_VERSION_MASK);
         return KERR_NOTSUP;
     }
     if (sb[XFS_SB_INPROGRESS] != 0) {
@@ -206,7 +316,7 @@ static int check_super(struct xfs *fs, const uint8_t *sb) {
  * sector therefore has to lie inside the one cached block it was read in,
  * which check_geometry has already established. */
 static bool super_crc_ok(const struct xfs *fs, const uint8_t *sb) {
-    return xfs_crc_ok(sb, fs->sectsize, XFS_SB_CRC);
+    return xfs_crc_ok(fs, sb, fs->sectsize, XFS_SB_CRC);
 }
 
 /* The UUID metadata blocks carry: sb_meta_uuid when the filesystem says
@@ -217,7 +327,6 @@ static void take_uuid(struct xfs *fs, const uint8_t *sb) {
     for (uint32_t i = 0; i < 16u; i++) {
         fs->uuid[i] = from[i];
     }
-    fs->ftype = (in & XFS_FEAT_IN_FTYPE) != 0;
 }
 
 /* Copies the filesystem's label out of the superblock.
@@ -438,8 +547,63 @@ int xfs_mount(struct xfs *fs, struct bcache *cache) {
                 (unsigned long long)fs->rblocks, (unsigned long long)fs->rextents,
                 fs->rextsize);
     }
-    kprintf("xfs: %u blocks of %u bytes, %u groups, %u-byte inodes, root %u, label \"%s\"\n",
-            (uint32_t)fs->dblocks, fs->blocksize, fs->agcount, fs->inodesize,
+    /* **The format is named at mount**, because almost nothing else
+     * distinguishes the two from the outside: a v4 filesystem read with v5
+     * header sizes does not announce itself, it just returns the wrong
+     * bytes. A test that asserts this line is asserting which reader ran. */
+    kprintf("xfs: v%u, %u blocks of %u bytes, %u groups, %u-byte inodes, root %u, label \"%s\"\n",
+            fs->v5 ? 5u : 4u, (uint32_t)fs->dblocks, fs->blocksize, fs->agcount, fs->inodesize,
             (uint32_t)fs->rootino, fs->label);
     return KERR_OK;
+}
+
+/* The magic for a kind of block, in whichever format this filesystem is.
+ *
+ * A table rather than a chain of comparisons, and indexed by the enum so
+ * that adding a kind without giving it both magics does not compile. The
+ * superblock's version has already been checked, so there is no third
+ * possibility to fall through to.
+ *
+ * **The pairs are not always a changed digit.** v5 renumbered the
+ * directory and attribute magics rather than extending them — `XD2D`
+ * became `XDD3`, `0xfbee` became `0x3bee` — which is why each one is
+ * written out instead of derived. */
+uint32_t xfs_magic_for(const struct xfs *fs, enum xfs_blk kind) {
+    static const uint32_t MAGICS[XFS_BLK_KINDS][2] = {
+        /* v5                         v4 */
+        {XFS_DIR3_BLOCK_MAGIC, XFS_DIR2_BLOCK_MAGIC},
+        {XFS_DIR3_DATA_MAGIC, XFS_DIR2_DATA_MAGIC},
+        {XFS_DIR3_FREE_MAGIC, XFS_DIR2_FREE_MAGIC},
+        {XFS_DIR3_LEAF1_MAGIC, XFS_DIR2_LEAF1_MAGIC},
+        {XFS_DIR3_LEAFN_MAGIC, XFS_DIR2_LEAFN_MAGIC},
+        {XFS_DA3_NODE_MAGIC, XFS_DA_NODE_MAGIC},
+        {XFS_ATTR_LEAF_MAGIC, XFS_ATTR_LEAF_V4_MAGIC},
+        {XFS_BNOBT_MAGIC, XFS_BNOBT_V4_MAGIC},
+        {XFS_CNTBT_MAGIC, XFS_CNTBT_V4_MAGIC},
+        {XFS_INOBT_MAGIC, XFS_INOBT_V4_MAGIC},
+        {XFS_FINOBT_MAGIC, XFS_FINOBT_V4_MAGIC},
+        {XFS_BMBT_CRC_MAGIC, XFS_BMBT_V4_MAGIC},
+    };
+    if ((uint32_t)kind >= XFS_BLK_KINDS) {
+        return 0; /* no block carries zero, so this matches nothing */
+    }
+    return MAGICS[kind][fs->v5 ? 0 : 1];
+}
+
+void xfs_stamp_owner(const struct xfs *fs, uint8_t *at, uint32_t blkno_off, uint32_t uuid_off,
+                     uint32_t owner_off, uint64_t blkno, uint64_t owner) {
+    if (!fs->v5) {
+        return; /* none of these fields exists; the bytes are the block's */
+    }
+    if (blkno_off != 0) {
+        xfs_put_be64(at + blkno_off, blkno);
+    }
+    if (uuid_off != 0) {
+        for (uint32_t i = 0; i < 16u; i++) {
+            at[uuid_off + i] = fs->uuid[i];
+        }
+    }
+    if (owner_off != 0) {
+        xfs_put_be64(at + owner_off, owner);
+    }
 }

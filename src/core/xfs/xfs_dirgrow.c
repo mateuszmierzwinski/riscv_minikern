@@ -105,12 +105,9 @@ static void seal_block(struct xfs *fs, uint8_t *block, uint64_t ino, uint32_t us
     }
     xfs_put_be32(block + fs->dirblocksize - XFS_DIR2_BLOCK_TAIL_SIZE, count);
     xfs_put_be32(block + fs->dirblocksize - 4u, 0); /* no stale entries */
-    xfs_put_be32(block + XFS_DIR3_HDR_MAGIC, XFS_DIR3_BLOCK_MAGIC);
-    xfs_put_be64(block + XFS_DIR3_HDR_OWNER, ino);
-    for (uint32_t i = 0; i < 16; i++) {
-        block[XFS_DIR3_HDR_UUID + i] = fs->uuid[i];
-    }
-    xfs_reseal(block, fs->dirblocksize, XFS_DIR3_HDR_CRC);
+    xfs_put_be32(block + XFS_DIR3_HDR_MAGIC, xfs_magic_for(fs, XFS_BLK_DIR_BLOCK));
+    xfs_stamp_owner(fs, block, 0, XFS_DIR3_HDR_UUID, XFS_DIR3_HDR_OWNER, 0, ino);
+    xfs_reseal(fs, block, fs->dirblocksize, XFS_DIR3_HDR_CRC);
 }
 
 /* Copies the shortform entries into the block being built, and records each
@@ -173,7 +170,7 @@ int xfs_dir_touch(struct xfs *fs, const struct xfs_inode *dir, uint64_t now_s) {
     di = b->data + boffset;
     xfs_put_be32(di + XFS_DI_MTIME, (uint32_t)now_s);
     xfs_put_be32(di + XFS_DI_CTIME, (uint32_t)now_s);
-    xfs_reseal(di, fs->inodesize, XFS_DI_CRC);
+    xfs_reseal(fs, di, fs->inodesize, XFS_DI_CRC);
     bcache_dirty(b);
     bcache_put(fs->cache, b);
     return KERR_OK;
@@ -196,13 +193,13 @@ static int repoint_inode(struct xfs *fs, const struct xfs_inode *dir, uint64_t f
     }
     di = b->data + boffset;
     di[XFS_DI_FORMAT] = XFS_DINODE_FMT_EXTENTS;
-    xfs_extent_pack(di + XFS_DI_V3_SIZE, &e);
+    xfs_extent_pack(di + fs->dinode_size, &e);
     xfs_put_be32(di + XFS_DI_NEXTENTS, 1u);
     xfs_put_be64(di + XFS_DI_NBLOCKS, 1u);
     xfs_put_be64(di + XFS_DI_SIZE, fs->dirblocksize);
     xfs_put_be32(di + XFS_DI_MTIME, (uint32_t)now_s);
     xfs_put_be32(di + XFS_DI_CTIME, (uint32_t)now_s);
-    xfs_reseal(di, fs->inodesize, XFS_DI_CRC);
+    xfs_reseal(fs, di, fs->inodesize, XFS_DI_CRC);
     bcache_dirty(b);
     bcache_put(fs->cache, b);
     return KERR_OK;
@@ -232,7 +229,7 @@ int xfs_dir_to_block(struct xfs *fs, const struct xfs_inode *dir, const char *na
      * one being added". */
     struct hashent ents[48];
     uint32_t nents = 0;
-    uint32_t at = XFS_DIR3_DATA_HDR_SIZE;
+    uint32_t at = fs->dir_data_hdr;
     uint32_t count = dir->fork[XFS_DIR_SF_COUNT];
     uint64_t parent = xfs_be32(dir->fork + XFS_DIR_SF_PARENT);
     uint64_t fsb = 0;
@@ -295,7 +292,7 @@ static int load_block(struct xfs *fs, uint64_t fsb) {
     }
     xfs_copy_bytes(fs->dirblock, b->data, fs->blocksize);
     bcache_put(fs->cache, b);
-    return xfs_be32(fs->dirblock + XFS_DIR3_HDR_MAGIC) == XFS_DIR3_BLOCK_MAGIC ? KERR_OK
+    return xfs_be32(fs->dirblock + XFS_DIR3_HDR_MAGIC) == xfs_magic_for(fs, XFS_BLK_DIR_BLOCK) ? KERR_OK
                                                                                : KERR_NOTSUP;
 }
 
@@ -326,7 +323,7 @@ static uint32_t leaf_start(const struct xfs *fs, uint32_t *count) {
  * how an entry gets written over the first hash pair. */
 uint32_t xfs_dir_find_room(const struct xfs *fs, const uint8_t *block, uint32_t end,
                            uint32_t need) {
-    uint32_t at = XFS_DIR3_DATA_HDR_SIZE;
+    uint32_t at = fs->dir_data_hdr;
     while (at + 8u <= end) {
         uint32_t len;
         if (xfs_be16(block + at) != XFS_DIR2_DATA_FREE_TAG) {
@@ -403,8 +400,8 @@ static void index_remove(struct xfs *fs, uint32_t address) {
 static int flush_block(struct xfs *fs, const struct xfs_inode *dir, uint64_t fsb, uint64_t now_s) {
     struct bbuf *b;
     int rc;
-    xfs_put_be64(fs->dirblock + XFS_DIR3_HDR_OWNER, dir->ino);
-    xfs_reseal(fs->dirblock, fs->dirblocksize, XFS_DIR3_HDR_CRC);
+    xfs_stamp_owner(fs, fs->dirblock, 0, 0, XFS_DIR3_HDR_OWNER, 0, dir->ino);
+    xfs_reseal(fs, fs->dirblock, fs->dirblocksize, XFS_DIR3_HDR_CRC);
     rc = bcache_get(fs->cache, xfs_fsb_to_block(fs, fsb), &b);
     if (rc != KERR_OK) {
         return rc;
@@ -468,7 +465,7 @@ int xfs_dir_block_remove(struct xfs *fs, const struct xfs_inode *dir, const char
         return rc;
     }
     end = leaf_start(fs, &count);
-    at = XFS_DIR3_DATA_HDR_SIZE;
+    at = fs->dir_data_hdr;
     while (at + 8u <= end) {
         uint32_t size;
         if (xfs_be16(fs->dirblock + at) == XFS_DIR2_DATA_FREE_TAG) {

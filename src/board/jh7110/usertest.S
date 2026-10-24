@@ -2744,3 +2744,213 @@ pr_came_back_wrong:
     .balign 4
 10: j       10b
 user_pressure_end:
+
+/* **Capabilities and `seccomp`, which only a running process can show.**
+ *
+ * The rules are pure and host-tested — `caps_test` covers every refusal
+ * `cap_change_allowed` makes, and `bpf_test` covers every program the
+ * verifier rejects. What those cannot show is that the kernel *consults*
+ * them: a capability model whose bits are maintained perfectly and never
+ * asked is privilege separation on paper only, and that is exactly the
+ * failure this project has shipped twice in other guises (a declared and
+ * never-read property, and a control that was vacuous).
+ *
+ * So each step here is about the consulting:
+ *
+ *   1. The first process is root and holds `CAP_SYS_ADMIN`. `capget` says
+ *      so, which also proves the ABI's two-word split is right way round.
+ *   2. `swapon` with a nonsense path fails — but **not** with `EPERM`,
+ *      because the capability is held. This is the control: without it,
+ *      step 4's refusal would prove nothing, since every `swapon` here
+ *      fails for some reason.
+ *   3. `PR_CAPBSET_DROP` of `CAP_SYS_ADMIN` succeeds, and `PR_CAPBSET_READ`
+ *      then says it is gone.
+ *   4. `swapon` now fails with **`EPERM`**, from a process that is still
+ *      uid 0. That is the whole claim of a capability model: privilege is
+ *      what you hold, not who you are.
+ *   5. `PR_SET_NO_NEW_PRIVS` succeeds, which an unprivileged filter needs.
+ *   6. A filter that returns `ERRNO 42` for `getpid` and allows everything
+ *      else is installed, and `getpid` then returns **-42** while `write`
+ *      still works. Both halves matter: a filter that broke everything
+ *      would pass a test that only checked the refusal.
+ *
+ * 0 means every step held; 151..157 name the one that did not.
+ */
+#define SYS_CAPGET_N 90
+#define SYS_PRCTL_N 167
+#define SYS_SECCOMP_N 277
+#define SYS_SWAPON_N 224
+#define PR_CAPBSET_READ_N 23
+#define PR_CAPBSET_DROP_N 24
+#define PR_SET_NO_NEW_PRIVS_N 38
+#define CAP_SYS_ADMIN_N 21
+#define EPERM_N 1
+
+    .globl user_privsep_start
+    .globl user_privsep_end
+    .balign 4
+user_privsep_start:
+    /* A stack to put the structures on: the program is loaded without one
+     * of its own beyond what the kernel gave, and `sp` is valid here. */
+    addi    sp, sp, -256
+    /* 1. capget(&hdr, &data) — hdr at sp, data at sp+16. */
+    li      t0, 0x20080522          /* _LINUX_CAPABILITY_VERSION_3 */
+    sw      t0, 0(sp)
+    sw      zero, 4(sp)             /* pid 0 means "me" */
+    addi    a0, sp, 0
+    addi    a1, sp, 16
+    li      a7, SYS_CAPGET_N
+    ecall
+    bnez    a0, ps_capget_failed
+    /* data[0].effective is the low word; CAP_SYS_ADMIN is bit 21. */
+    lw      t0, 16(sp)
+    li      t1, 1
+    slli    t1, t1, CAP_SYS_ADMIN_N
+    and     t2, t0, t1
+    beqz    t2, ps_not_admin
+
+    /* 2. The control: swapon fails, but not for want of privilege. */
+    addi    a0, sp, 240             /* an empty path: 240 is zeroed below */
+    sw      zero, 240(sp)
+    li      a1, 0
+    li      a7, SYS_SWAPON_N
+    ecall
+    li      t0, -EPERM_N
+    beq     a0, t0, ps_perm_too_early
+
+    /* 3. Drop CAP_SYS_ADMIN from the bounding set, for good. */
+    li      a0, PR_CAPBSET_DROP_N
+    li      a1, CAP_SYS_ADMIN_N
+    li      a7, SYS_PRCTL_N
+    ecall
+    bnez    a0, ps_drop_failed
+    li      a0, PR_CAPBSET_READ_N
+    li      a1, CAP_SYS_ADMIN_N
+    li      a7, SYS_PRCTL_N
+    ecall
+    bnez    a0, ps_still_bounded
+
+    /* 4. And now the same call is refused — still uid 0. */
+    addi    a0, sp, 240
+    li      a1, 0
+    li      a7, SYS_SWAPON_N
+    ecall
+    li      t0, -EPERM_N
+    bne     a0, t0, ps_not_refused
+
+    /* 5. no_new_privs, which an unprivileged filter requires. */
+    li      a0, PR_SET_NO_NEW_PRIVS_N
+    li      a1, 1
+    li      a7, SYS_PRCTL_N
+    ecall
+    bnez    a0, ps_nnp_failed
+
+    /* 6. The filter, built on the stack at sp+32:
+     *      ld   [nr]
+     *      jeq  SYS_GETPID ? +0 : +1
+     *      ret  ERRNO|42
+     *      ret  ALLOW
+     * Each instruction is {code:u16, jt:u8, jf:u8, k:u32} = 8 bytes. */
+    li      t0, 0x0020              /* BPF_LD|BPF_W|BPF_ABS */
+    sh      t0, 32(sp)
+    sb      zero, 34(sp)
+    sb      zero, 35(sp)
+    sw      zero, 36(sp)            /* k = offsetof(nr) = 0 */
+
+    li      t0, 0x0015              /* BPF_JMP|BPF_JEQ|BPF_K */
+    sh      t0, 40(sp)
+    li      t1, 0
+    sb      t1, 42(sp)              /* jt = 0 -> the ERRNO return */
+    li      t1, 1
+    sb      t1, 43(sp)              /* jf = 1 -> the ALLOW return */
+    li      t0, SYS_GETPID
+    sw      t0, 44(sp)
+
+    li      t0, 0x0006              /* BPF_RET|BPF_K */
+    sh      t0, 48(sp)
+    sb      zero, 50(sp)
+    sb      zero, 51(sp)
+    li      t0, 0x0005002a          /* SECCOMP_RET_ERRNO | 42 */
+    sw      t0, 52(sp)
+
+    li      t0, 0x0006
+    sh      t0, 56(sp)
+    sb      zero, 58(sp)
+    sb      zero, 59(sp)
+    li      t0, 0x7fff0000          /* SECCOMP_RET_ALLOW */
+    sw      t0, 60(sp)
+
+    /* struct sock_fprog { u16 len; u64 filter; } at sp+64, with the
+     * pointer at +8 because of the alignment the ABI gives it. */
+    li      t0, 4
+    sh      t0, 64(sp)
+    addi    t0, sp, 32
+    sd      t0, 72(sp)
+
+    li      a0, 1                   /* SECCOMP_SET_MODE_FILTER */
+    li      a1, 0
+    addi    a2, sp, 64
+    li      a7, SYS_SECCOMP_N
+    ecall
+    bnez    a0, ps_filter_refused
+
+    /* getpid must now be refused with exactly that errno... */
+    li      a7, SYS_GETPID
+    ecall
+    li      t0, -42
+    bne     a0, t0, ps_not_filtered
+
+    /* ...and write must still work, or the filter proves nothing. */
+    li      a0, 1
+    addi    a1, sp, 240
+    li      a2, 1
+    li      a7, SYS_WRITE
+    ecall
+    blez    a0, ps_write_broken
+
+    li      a0, 0
+    li      a7, SYS_EXIT_GROUP
+    ecall
+
+ps_capget_failed:
+    li      a0, 151
+    li      a7, SYS_EXIT_GROUP
+    ecall
+ps_not_admin:
+    li      a0, 152
+    li      a7, SYS_EXIT_GROUP
+    ecall
+ps_perm_too_early:
+    li      a0, 153
+    li      a7, SYS_EXIT_GROUP
+    ecall
+ps_drop_failed:
+    li      a0, 154
+    li      a7, SYS_EXIT_GROUP
+    ecall
+ps_still_bounded:
+    li      a0, 155
+    li      a7, SYS_EXIT_GROUP
+    ecall
+ps_not_refused:
+    li      a0, 156
+    li      a7, SYS_EXIT_GROUP
+    ecall
+ps_nnp_failed:
+    li      a0, 157
+    li      a7, SYS_EXIT_GROUP
+    ecall
+ps_filter_refused:
+    li      a0, 158
+    li      a7, SYS_EXIT_GROUP
+    ecall
+ps_not_filtered:
+    li      a0, 159
+    li      a7, SYS_EXIT_GROUP
+    ecall
+ps_write_broken:
+    li      a0, 160
+    li      a7, SYS_EXIT_GROUP
+    ecall
+11: j       11b
+user_privsep_end:

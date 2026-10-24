@@ -88,6 +88,40 @@ cc_test(
 )
 
 cc_library(
+    name = "caps",
+    srcs = ["src/core/caps.c"],
+    hdrs = ["src/core/caps.h"],
+    strip_include_prefix = "src",
+)
+
+cc_test(
+    name = "caps_test",
+    size = "small",
+    srcs = ["test/caps_test.c"],
+    deps = [
+        ":caps",
+        ":ktest",
+    ],
+)
+
+cc_library(
+    name = "bpf",
+    srcs = ["src/core/bpf.c"],
+    hdrs = ["src/core/bpf.h"],
+    strip_include_prefix = "src",
+)
+
+cc_test(
+    name = "bpf_test",
+    size = "small",
+    srcs = ["test/bpf_test.c"],
+    deps = [
+        ":bpf",
+        ":ktest",
+    ],
+)
+
+cc_library(
     name = "tty",
     srcs = ["src/core/tty.c"],
     hdrs = ["src/core/tty.h"],
@@ -753,8 +787,10 @@ cc_library(
         "src/kernel/fdobjects.c",
         "src/kernel/tty.c",
         "src/kernel/sock_tcp.c",
+        "src/kernel/sys_priv.c",
         "src/kernel/sys_proc.c",
         "src/kernel/sys_socket.c",
+        "src/kernel/seccomp.c",
         "src/kernel/sock_udp.c",
         "src/kernel/socket.c",
         "src/kernel/file.c",
@@ -770,6 +806,7 @@ cc_library(
         "src/kernel/file.h",
         "src/kernel/signal.h",
         "src/kernel/sched.h",
+        "src/kernel/seccomp.h",
         "src/kernel/syscall.h",
         "src/kernel/uspace.h",
     ],
@@ -778,6 +815,8 @@ cc_library(
     deps = [
         ":vma",
         ":access",
+        ":bpf",
+        ":caps",
         ":arch_riscv",
         ":tty",
         ":console",
