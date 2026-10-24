@@ -149,12 +149,20 @@ static int step_down(const struct xfs *fs, uint64_t fsb, uint32_t below, uint64_
     return rc;
 }
 
-int xfs_bmbt_lookup(const struct xfs *fs, const struct xfs_inode *ip, uint64_t off,
-                    struct xfs_extent *out) {
-    uint32_t level = xfs_be16(ip->fork);
-    uint32_t nrecs = xfs_be16(ip->fork + 2u);
-    uint32_t mx = pairs_in(ip->fork_len - XFS_BMDR_HDR_BYTES);
-    const uint8_t *keys = ip->fork + XFS_BMDR_HDR_BYTES;
+/* The descent, over **whichever fork's root** it is given.
+ *
+ * Parameterised by the fork rather than reading the inode's data fork,
+ * because an inode has two and both can be b-trees: a file with hundreds of
+ * extended attributes has an attribute fork of exactly this shape, and the
+ * walk is identical — same root header, same keys, same pointers, same
+ * blocks. The two facades below name the two callers, which is what keeps
+ * the call sites readable (Rule 5.1/5.2). */
+int xfs_bmbt_lookup_in(const struct xfs *fs, const uint8_t *fork, uint32_t fork_len,
+                       uint64_t off, struct xfs_extent *out) {
+    uint32_t level = xfs_be16(fork);
+    uint32_t nrecs = xfs_be16(fork + 2u);
+    uint32_t mx = fork_len > XFS_BMDR_HDR_BYTES ? pairs_in(fork_len - XFS_BMDR_HDR_BYTES) : 0;
+    const uint8_t *keys = fork + XFS_BMDR_HDR_BYTES;
     uint64_t fsb;
     uint32_t at;
     /* The root is a node by construction — a tree with a leaf for a root is
@@ -175,4 +183,9 @@ int xfs_bmbt_lookup(const struct xfs *fs, const struct xfs_inode *ip, uint64_t o
         fsb = next;
     }
     return KERR_IO; /* deeper than any real tree: refuse rather than loop */
+}
+
+int xfs_bmbt_lookup(const struct xfs *fs, const struct xfs_inode *ip, uint64_t off,
+                    struct xfs_extent *out) {
+    return xfs_bmbt_lookup_in(fs, ip->fork, ip->fork_len, off, out);
 }

@@ -1161,10 +1161,27 @@ sparse inodes, `nrext64`, exchange-range, parent pointers, `bigtime`,
       its end — a fork whose tail is not cleared reads as whatever it used
       to be.
 
-      Still refused: a **b-tree** attribute fork. The attribute fork needs
-      its own mapper (`xfs_attr_bmap`) whatever its shape: it is a separate
-      extent list, and reading an attribute block through `xfs_bmap` would
-      return a block of the file's own contents.
+      **A b-tree attribute fork is walked too.** An inode has two forks and
+      either can outgrow the inode into a b-tree — a file with hundreds of
+      attributes has one of exactly that shape, and `mkfs` and Linux both
+      produce them. The descent is the *same* one the data fork uses, so it
+      is handed the fork rather than reimplemented for it:
+      `xfs_bmbt_lookup_in` takes the fork and its length, and the two
+      facades name the two callers (Rule 5.1/5.2). A second implementation
+      would have been a second place to get the key arithmetic wrong.
+
+      It is **host-tested, because nothing here can produce one**: a b-tree
+      attribute fork needs hundreds of attributes on one inode, and this
+      writer answers `KERR_NOSPC` long before the fork would convert, so
+      there is no board fixture to be had. The inode is built by hand, which
+      is the honest way to test a reader for a structure nothing available
+      can make — the alternative was leaving the format refused and the code
+      unwritten. The test also asserts the same refusals the data fork's
+      tree gets, since it is the same walk.
+
+      The attribute fork needs its own mapper (`xfs_attr_bmap`) whatever its
+      shape: it is a separate extent list, and reading an attribute block
+      through `xfs_bmap` would return a block of the file's own contents.
 
       **On the board**: two attributes in two namespaces set in the inode,
       a dozen more added until the fork is pushed into a leaf (`1 to leaf`,

@@ -738,6 +738,78 @@ static void build_a_btree_fork(uint64_t ino, uint64_t data_fsb) {
 /* **The format that used to be refused outright.** A 5,000-entry directory
  * is enough to put an extent map in a b-tree, so this was not an exotic
  * case: the root directory of such a filesystem could not be read at all. */
+/* The same tree, but as the **attribute** fork.
+ *
+ * `forkoff` puts it above the data fork, `di_aformat` says it is a b-tree,
+ * and the root goes at `forkoff * 8` instead of at the start of the literal
+ * area. Everything below the inode — the leaf block, its keys, its records
+ * — is identical, which is the point: an inode has two forks and either can
+ * be a b-tree, so the descent should not care which it is given. */
+static void build_a_btree_attr_fork(uint64_t ino, uint64_t data_fsb) {
+    uint8_t *leaf = block(BTREE_FSB);
+    uint8_t *di = inode_at(ino);
+    uint32_t forkoff = 16u; /* 128 bytes in: clear of a small data fork */
+    uint8_t *fork = di + XFS_DI_V3_SIZE + forkoff * 8u;
+    uint32_t room = ISIZE - XFS_DI_V3_SIZE - forkoff * 8u;
+    uint32_t maxrecs = (room - XFS_BMDR_HDR_BYTES) / 16u;
+    struct xfs_extent e = {.startoff = 0, .startblock = data_fsb, .blockcount = 1};
+    memset(leaf, 0, BS);
+    put32(leaf, XFS_BMBT_CRC_MAGIC);
+    put16(leaf + 4, 0); /* level 0: a leaf */
+    put16(leaf + 6, 1); /* one record */
+    put64(leaf + 8, ~0ull);
+    put64(leaf + 16, ~0ull);
+    put64(leaf + 24, BTREE_FSB);
+    memcpy(leaf + XFS_BMBT_UUID_OFF, block(0) + XFS_SB_UUID, 16);
+    put64(leaf + 56, ino);
+    xfs_extent_pack(leaf + XFS_BMBT_BLOCK_BYTES, &e);
+    seal(leaf, BS, XFS_BMBT_CRC_OFF);
+
+    di[XFS_DI_FORKOFF] = (uint8_t)forkoff;
+    di[XFS_DI_AFORMAT] = XFS_DINODE_FMT_BTREE;
+    memset(fork, 0, room);
+    put16(fork, 1);     /* level 1: a root over leaves */
+    put16(fork + 2, 1); /* one key and one pointer */
+    put64(fork + XFS_BMDR_HDR_BYTES, 0);
+    put64(fork + XFS_BMDR_HDR_BYTES + maxrecs * XFS_BMBT_KEY_BYTES, BTREE_FSB);
+    seal(di, ISIZE, XFS_DI_CRC);
+}
+
+/* A b-tree **attribute** fork is walked, not refused.
+ *
+ * This shape cannot be made on a real filesystem by anything here —
+ * producing one needs hundreds of attributes on one inode, and this
+ * kernel's writer answers `KERR_NOSPC` before the fork would convert. So it
+ * is built by hand, which is the honest way to test a reader for a
+ * structure nothing available can produce. The alternative was to leave the
+ * format refused and the code unwritten. */
+static void test_a_btree_attribute_fork_is_walked(void) {
+    struct xfs_inode ip;
+    struct xfs_extent e;
+    mount_fresh();
+    build_a_btree_attr_fork(FILE_INO, FILE_FSB);
+    bcache_invalidate(&cache);
+    KTEST_CHECK(xfs_inode_read(&fs, FILE_INO, &ip) == KERR_OK);
+    KTEST_CHECK(ip.aformat == XFS_DINODE_FMT_BTREE);
+    KTEST_CHECK(ip.forkoff == 16u);
+    KTEST_CHECK(xfs_attr_bmap(&fs, &ip, 0, &e) == KERR_OK);
+    KTEST_CHECK(e.startblock == FILE_FSB);
+    KTEST_CHECK(e.blockcount == 1u);
+
+    /* And the same refusals the data fork's tree gets, because it is the
+     * same descent: a root claiming to be a leaf is corrupt rather than a
+     * one-block tree, since a map that fits in the inode uses the extents
+     * format and never reaches here. */
+    mount_fresh();
+    build_a_btree_attr_fork(FILE_INO, FILE_FSB);
+    put16(inode_at(FILE_INO) + XFS_DI_V3_SIZE + 16u * 8u, 0);
+    seal(inode_at(FILE_INO), ISIZE, XFS_DI_CRC);
+    bcache_invalidate(&cache);
+    KTEST_CHECK(xfs_inode_read(&fs, FILE_INO, &ip) == KERR_OK);
+    KTEST_CHECK(xfs_attr_bmap(&fs, &ip, 0, &e) == KERR_IO);
+    KTEST_CHECK(reads_outside == 0);
+}
+
 static void test_a_btree_extent_fork_reads(void) {
     struct xfs_inode ip;
     char buf[8];
@@ -1132,6 +1204,7 @@ int main(void) {
     KTEST_RUN(test_a_block_tail_that_lies);
     KTEST_RUN(test_a_shortform_directory_that_claims_too_much);
     KTEST_RUN(test_a_btree_extent_fork_reads);
+    KTEST_RUN(test_a_btree_attribute_fork_is_walked);
     KTEST_RUN(test_fuzz_does_not_crash);
     return ktest_failures();
 }

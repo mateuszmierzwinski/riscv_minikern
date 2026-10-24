@@ -499,12 +499,22 @@ int xfs_attr_bmap(struct xfs *fs, const struct xfs_inode *ip, uint64_t logical,
     uint8_t fork[XFS_AFORK_MAX];
     uint32_t len = 0, n;
     int rc;
-    if (ip->aformat != XFS_DINODE_FMT_EXTENTS) {
+    if (ip->aformat != XFS_DINODE_FMT_EXTENTS &&
+        ip->aformat != XFS_DINODE_FMT_BTREE) {
         return KERR_NOTSUP;
     }
     rc = load_afork(fs, ip, fork, &len);
     if (rc != KERR_OK) {
         return rc;
+    }
+    /* **A b-tree attribute fork is read, not refused.** An inode has two
+     * forks and either can outgrow the inode into a b-tree; a file with
+     * hundreds of attributes has one of exactly this shape, and `mkfs` and
+     * Linux both produce them. The descent is the same one the data fork
+     * uses — same root header, same keys, same pointers — so it is handed
+     * this fork rather than reimplemented for it. */
+    if (ip->aformat == XFS_DINODE_FMT_BTREE) {
+        return xfs_bmbt_lookup_in(fs, fork, len, logical, out);
     }
     n = len / XFS_EXTENT_BYTES;
     for (uint32_t i = 0; i < n; i++) {

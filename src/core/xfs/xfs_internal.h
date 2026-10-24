@@ -427,4 +427,10 @@ int xfs_bmap(const struct xfs *fs, const struct xfs_inode *ip, uint64_t off, str
 int xfs_bmbt_lookup(const struct xfs *fs, const struct xfs_inode *ip, uint64_t off,
                     struct xfs_extent *out);
 
+/* The same descent over a fork given directly, which is how the
+ * **attribute** fork's b-tree is read: an inode has two forks and either
+ * can be a b-tree, and the walk does not care which it is handed. */
+int xfs_bmbt_lookup_in(const struct xfs *fs, const uint8_t *fork, uint32_t fork_len,
+                       uint64_t off, struct xfs_extent *out);
+
 #endif
