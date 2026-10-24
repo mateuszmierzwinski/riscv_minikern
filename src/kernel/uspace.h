@@ -501,6 +501,15 @@ uint32_t uspace_stale_records(void);
  * what this number was. */
 uint64_t uspace_pages_out_unasked(void);
 
+/* Narrates the next `n` user page faults and the reclaims they trigger, for
+ * a test that must see whether a program is making progress. */
+void uspace_trace_faults(uint32_t n);
+
+/* Faults raised purely so software would set `PTE_A`. Non-zero means this
+ * core does not update the bit itself, which is the opposite of what this
+ * project believed until the reclaim clock cleared one. */
+uint64_t uspace_accessed_faults(void);
+
 uint64_t uspace_second_chances(void);
 uint64_t uspace_empty_sweeps(void);
 

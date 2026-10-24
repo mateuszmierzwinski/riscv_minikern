@@ -34,6 +34,13 @@ static uint64_t demand_pages;
  * fault handler is above it because the trap path is read first. */
 static int back_one_page(struct uproc *p, virt_t va, uint32_t prot);
 static int back_for_region(struct uproc *p, const struct vma *r, virt_t va);
+/* Pages out if free memory is below the watermark. Declared here because
+ * the fault handler is the only caller and sits above the swap code. */
+static void reclaim_if_short(struct uproc *p);
+
+/* How many more faults to narrate, for a test that needs to see them. Set
+ * by `uspace_trace_faults`; counts itself down so a run cannot be drowned. */
+static uint32_t fault_trace;
 static int drop_pages(struct uproc *p, virt_t at, uint64_t bytes);
 static void record_stack(struct uproc *p);
 static void drop_every_file(struct uproc *p);
@@ -67,6 +74,15 @@ static bool exited;
 static uint64_t kernel_satp_saved;
 static uint64_t calls_at_start;
 static uint64_t stale_faults;
+
+/* Faults this core raised only so that software would set `PTE_A`. A
+ * non-zero count is the measurement that says the U74 does not update the
+ * bit itself — the thing this project had assumed the other way round. */
+static uint64_t accessed_faults;
+
+uint64_t uspace_accessed_faults(void) {
+    return accessed_faults;
+}
 
 /* The pair in arch/riscv/uspace_entry.S. `uspace_leave` does not return to
  * its caller: control reappears wherever `uspace_enter` was called from. */
@@ -605,6 +621,30 @@ static bool back_on_demand(struct trapframe *tf) {
     if ((region->prot & want) == 0) {
         return false; /* the region does not allow what was attempted */
     }
+    /* **Only here, on a fault from a running program.**
+     *
+     * The first version reclaimed inside `back_one_page`, which every path
+     * that maps a page goes through — including the ELF loader building a
+     * process. That is a path where the *kernel* writes into the new
+     * process's pages directly, not through a fault: the loader copies
+     * segments and builds the start stack by storing to those addresses. So
+     * the clock could page out a stack page the loader was in the middle of
+     * filling, free the frame back to the allocator, and the loader would
+     * carry on writing into memory that now belonged to something else.
+     *
+     * The board showed it as a boot that stopped with no output at all,
+     * which is what memory corruption during process construction looks
+     * like from outside.
+     *
+     * A fault is the right place on its own merits: it is the moment a
+     * *running* program needs a page, every page it owns is one it faulted
+     * for, and nothing else is holding a direct reference to them. */
+    if (fault_trace > 0) {
+        fault_trace--;
+        kprintf("uspace: fault at %llx (free %u)\n", (unsigned long long)page,
+                mem_free_pages_count());
+    }
+    reclaim_if_short(me);
     if (back_for_region(me, region, page) != KERR_OK) {
         return false; /* out of memory: a fault the process must be told about */
     }
@@ -640,6 +680,28 @@ static bool retry_after_stale_translation(struct trapframe *tf) {
      * holding something out of date. */
     if ((flags & want) == 0 || (flags & PTE_U) == 0) {
         return false;
+    }
+    /* **`A` clear is not a stale translation: it is this core asking
+     * software to set it.**
+     *
+     * RISC-V lets an implementation either update `A`/`D` itself or fault
+     * so that software can, and the JH7110's U74 faults. Nothing here had
+     * ever met that, because `pgtable_map` pre-sets both bits — so the
+     * first page whose `A` was cleared (by the reclaim clock) faulted, was
+     * found mapped and permitted, was "retried", and faulted again for
+     * ever. One cleared bit hung the machine, with no output, on the first
+     * instruction the program fetched afterwards.
+     *
+     * Setting it here is what a kernel that uses `A` has to do, and it is
+     * why the clock can exist at all. `D` goes with it on a store, because
+     * a core that faults for one faults for the other. */
+    if ((flags & PTE_A) == 0) {
+        struct uproc *me = uspace_current();
+        if (me != NULL && pgtable_set_accessed(&me->pt, tf->stval, code == EXC_STORE_PAGE_FAULT)) {
+            accessed_faults++;
+            mmu_flush_tlb_local();
+            return true;
+        }
     }
     stale_faults++;
     mmu_flush_tlb_local();
@@ -1906,10 +1968,41 @@ uint64_t uspace_pages_out_unasked(void) {
  * allocator, which is the truthful answer. */
 static void reclaim_if_short(struct uproc *p) {
     uint32_t mark = swap_watermark();
-    if (mark == 0 || !swap_enabled() || mem_free_pages_count() >= mark) {
+    uint32_t free_now;
+    uint32_t want;
+    if (mark == 0 || !swap_enabled()) {
         return;
     }
-    pages_out_unasked += uspace_reclaim_pages(p, SWAP_RECLAIM_BATCH);
+    free_now = mem_free_pages_count();
+    if (free_now >= mark) {
+        return;
+    }
+    /* **Only as many as the watermark is short of**, and never more than a
+     * batch.
+     *
+     * The first version asked for a fixed batch whenever it was below the
+     * mark, which is a thrash loop by construction: every fault paged out
+     * thirty-two pages, the program faulted them back in, and each of
+     * *those* faults paged out thirty-two more. The program made progress
+     * only in the sense that a treadmill does, and on the board it looked
+     * like a hang — a boot that stops with no output, because the program
+     * never reached its exit.
+     *
+     * Asking for the deficit makes the policy self-limiting: paging out a
+     * page frees a frame, so the deficit falls as it is served and the
+     * sweep stops of its own accord. That is what a watermark means — the
+     * point at which reclaim starts, not an amount to reclaim. */
+    want = mark - free_now;
+    want = want < SWAP_RECLAIM_BATCH ? want : SWAP_RECLAIM_BATCH;
+    {
+        uint32_t got;
+        got = uspace_reclaim_pages(p, want);
+        pages_out_unasked += got;
+        if (fault_trace > 0) {
+            kprintf("swap: reclaim %u of %u (free %u, mark %u)\n", got, want, free_now,
+                    mark);
+        }
+    }
 }
 
 static int back_one_page(struct uproc *p, virt_t va, uint32_t prot) {
@@ -1920,7 +2013,6 @@ static int back_one_page(struct uproc *p, virt_t va, uint32_t prot) {
     if (prot == 0) {
         return KERR_OK;
     }
-    reclaim_if_short(p);
     /* **Already backed, so back nothing.**
      *
      * Every caller decided to back this address by finding it absent, and
@@ -2804,6 +2896,10 @@ uint32_t uspace_reclaim_range(struct uproc *p, virt_t at, uint64_t pages) {
  * invisible from the page count alone. */
 static uint64_t second_chances;
 static uint64_t sweeps_empty;
+
+void uspace_trace_faults(uint32_t n) {
+    fault_trace = n;
+}
 
 uint64_t uspace_second_chances(void) {
     return second_chances;

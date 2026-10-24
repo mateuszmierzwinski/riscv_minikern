@@ -205,6 +205,17 @@ CASES = [
       "the log could not be replayed; mounting read-only"],
      700, None, "small"),
 
+    ("§2: swap under a watermark, with the clock choosing",
+     "minikern.swap=/swapfile:60 minikern.swappress",
+     [# The control: swappiness zero really is off.
+      "swappress: with swappiness at zero, nothing went out unasked",
+      # Then both halves of the policy, because either alone can be
+      # satisfied by the wrong code: pages going out says the watermark
+      # fired, and second chances say the **clock** chose them rather than
+      # the old take-the-first-page scan, which would report none.
+      "swappress: the watermark and the clock both acted"],
+     330, None, "swap"),
+
     ("§3: automount puts each volume where its label says",
      "minikern.volumes",
      [# The root filesystem is **registered**, not mounted a second time:
@@ -254,6 +265,8 @@ def run_case(name, bootargs, wanted, seconds, out_dir, program=None, needs_image
             img = fixtures.small_directory(at)
         elif needs_image == "twovol":
             img = fixtures.two_labelled_volumes(at)
+        elif needs_image == "swap":
+            img = fixtures.swap_volume(at)
         else:
             size = None if needs_image is True else needs_image
             img = fixtures.big_directory(at, FIXTURE_ENTRIES, size)

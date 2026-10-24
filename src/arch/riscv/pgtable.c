@@ -323,6 +323,15 @@ bool pgtable_accessed(const struct pgtable *pt, virt_t va) {
     return entry != NULL && pte_is_leaf(*entry) && (*entry & PTE_A) != 0;
 }
 
+bool pgtable_set_accessed(struct pgtable *pt, virt_t va, bool dirty) {
+    uint64_t *entry = leaf_entry(pt, va);
+    if (entry == NULL || !pte_is_leaf(*entry)) {
+        return false;
+    }
+    *entry |= PTE_A | (dirty ? PTE_D : 0u);
+    return true;
+}
+
 bool pgtable_clear_accessed(struct pgtable *pt, virt_t va) {
     uint64_t *entry = leaf_entry(pt, va);
     if (entry == NULL || !pte_is_leaf(*entry) || (*entry & PTE_A) == 0) {

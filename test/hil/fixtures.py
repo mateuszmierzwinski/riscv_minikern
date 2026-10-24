@@ -146,6 +146,41 @@ def two_labelled_volumes(at):
     return img
 
 
+# A page file big enough to be worth having and small enough to stage: 64
+# MiB is 16,384 slots, far more than any test here pages out.
+SWAPFILE_MB = 64
+
+
+def swap_volume(at):
+    """An image carrying a **real** `/swapfile`.
+
+    `swap_enable` resolves a swapfile's blocks once and then only ever
+    overwrites them, so the file has to be *allocated* rather than sparse —
+    a hole has nowhere to put a page, and the kernel refuses one. So the
+    host file is written as real zeroes and `mkfs.xfs` copies it in, which
+    is what `dd if=/dev/zero` does on a running machine and the same thing
+    the operator did by hand on the SD card.
+
+    Zeroes compress to nothing, so the 64 MiB inside a 320 MB image costs
+    almost nothing to send to the board.
+    """
+    os.makedirs(at, exist_ok=True)
+    data = payload(at)
+    swapfile = os.path.join(at, "swapfile")
+    with open(swapfile, "wb") as f:
+        f.write(b"\0" * (SWAPFILE_MB * 1024 * 1024))
+    proto = os.path.join(at, "protoswap")
+    with open(proto, "w") as f:
+        f.write("dummy\n0 0\nd--755 0 0\n"
+                f"seed ---644 0 0 {data}\n"
+                f"swapfile ---600 0 0 {swapfile}\n$\n")
+    img = os.path.join(at, "swap.img")
+    with open(img, "wb") as f:
+        f.truncate(320 * 1024 * 1024)
+    subprocess.run(MKFS + ["-n", "ftype=1", "-p", proto, img], check=True)
+    return img
+
+
 def main():
     at = sys.argv[1] if len(sys.argv) > 1 else "/tmp/minikern-fixtures"
     entries = int(sys.argv[2]) if len(sys.argv) > 2 else 3000

@@ -183,6 +183,22 @@ void pgtable_each_leaf(const struct pgtable *pt,
 bool pgtable_accessed(const struct pgtable *pt, virt_t va);
 bool pgtable_clear_accessed(struct pgtable *pt, virt_t va);
 
+/* Sets `A` (and `D` for a store) on a leaf entry, which **this core
+ * requires software to do**.
+ *
+ * RISC-V allows either behaviour: a core may update those bits itself, or
+ * raise a page fault so that software can. This kernel assumed the first —
+ * `CLAUDE.md` said so — on evidence that could not tell the cases apart,
+ * because `pgtable_map` pre-sets both bits on every mapping and so no page
+ * was ever reached with `A` clear. The first thing that cleared one (the
+ * reclaim clock) hung the machine instantly: the fault recurred for ever,
+ * since the tables and the hardware did not disagree about anything — `A`
+ * was simply clear and the core wanted software to set it.
+ *
+ * So the JH7110's U74 is the **second** kind, and this is the path that
+ * makes it work. */
+bool pgtable_set_accessed(struct pgtable *pt, virt_t va, bool dirty);
+
 int pgtable_set_swapped(struct pgtable *pt, virt_t va, uint32_t slot);
 
 /* Whether `va`'s entry says its page is out in swap, and which slot. False

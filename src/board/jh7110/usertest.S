@@ -2667,3 +2667,80 @@ mc_exit:
     li      a7, SYS_EXIT_GROUP
     ecall
 user_mapchurn_end:
+
+/* Roadmap §2: pages that go out because the machine is short of memory,
+ * not because the program asked.
+ *
+ * **It asks for nothing**, which is the entire point. `user_swap` calls
+ * `madvise(MADV_PAGEOUT)` and so proves the mechanism; this proves the
+ * *policy*: a program that allocates and uses memory while the kernel is
+ * below its watermark must have its pages taken and given back without
+ * noticing, and the kernel's `pages_out_unasked` counter is what says they
+ * went anywhere.
+ *
+ * A megabyte, touched twice. The second pass is what matters: by then the
+ * kernel has had the chance to take pages the first pass wrote, so reading
+ * the pattern back is reading through the fault handler and out of the
+ * swapfile. One pass would prove only that writing memory works.
+ *
+ * **0 is a pass**; 191..193 name the step.
+ */
+    .globl user_pressure_start
+    .globl user_pressure_end
+user_pressure_start:
+    /* mmap(NULL, 1 MiB, RW, PRIVATE|ANON) */
+    li      a0, 0
+    li      a1, 1048576
+    li      a2, 3
+    li      a3, 0x22
+    li      a4, -1
+    li      a5, 0
+    li      a7, SYS_MMAP
+    ecall
+    bltz    a0, pr_no_memory
+    mv      s3, a0
+
+    /* A word per page: the page's index plus one, so a page that comes back
+     * as zeroes or as a different page is caught rather than plausible. */
+    li      t3, 4096
+    mv      t1, s3
+    li      t2, 1
+    li      t4, 257
+pr_fill:
+    sd      t2, 0(t1)
+    add     t1, t1, t3
+    addi    t2, t2, 1
+    blt     t2, t4, pr_fill
+
+    /* And again, reading each one before writing it: every page the kernel
+     * took in the meantime faults back in here. */
+    li      t3, 4096
+    mv      t1, s3
+    li      t2, 1
+    li      t4, 257
+pr_check:
+    ld      t5, 0(t1)
+    bne     t5, t2, pr_came_back_wrong
+    sd      t2, 0(t1)
+    add     t1, t1, t3
+    addi    t2, t2, 1
+    blt     t2, t4, pr_check
+
+    li      a0, 0
+    li      a7, SYS_EXIT_GROUP
+    ecall
+
+pr_no_memory:
+    li      a0, 191
+    li      a7, SYS_EXIT_GROUP
+    ecall
+pr_came_back_wrong:
+    /* 193 plus nothing: the index is not reported because the interesting
+     * fact is that any page came back wrong at all, and the exit status is
+     * one byte. */
+    li      a0, 193
+    li      a7, SYS_EXIT_GROUP
+    ecall
+    .balign 4
+10: j       10b
+user_pressure_end:

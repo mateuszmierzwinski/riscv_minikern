@@ -1209,6 +1209,7 @@ extern const char user_huge_start[], user_huge_end[];
 extern const char user_filemap_start[], user_filemap_end[];
 extern const char user_tstp_start[], user_tstp_end[];
 extern const char user_swap_start[], user_swap_end[];
+extern const char user_pressure_start[], user_pressure_end[];
 extern const char user_regs_start[], user_regs_end[];
 extern const char user_dontneed_start[], user_dontneed_end[];
 extern const char user_mapchurn_start[], user_mapchurn_end[];
@@ -1965,6 +1966,77 @@ static void run_init_from_disk(const char *path) {
     uspace_destroy(proc);
 }
 
+/* The watermark, and its control: a program that asks for nothing.
+ *
+ * **The pressure has to be brought to the program.** No program this kernel
+ * can run will put 8 GiB of DRAM under real memory pressure, so the
+ * watermark is set to the free-page count as it stands: the program's very
+ * first allocation then drops free below it and the kernel starts paging
+ * out. Reclaim frees frames, so free rises back above the mark and reclaim
+ * stops — the equilibrium a real machine under pressure sits in, reached
+ * from the other direction.
+ *
+ * The control is the same program with the watermark at **zero**, which is
+ * what swappiness 0 means and the setting an operator actually checks for.
+ * Without it, "pages went out" would not distinguish the policy working
+ * from the policy ignoring its own switch. */
+static void run_pressure_selftest(void) {
+    uint64_t before, unasked, chances;
+    uint32_t saved_swappiness;
+    if (!swap_enabled()) {
+        kprintf("swappress: swap is not enabled, so there is no policy to test\n");
+        return;
+    }
+    /* The control first, while nothing has been paged out unasked yet.
+     *
+     * **Swappiness to zero, not the override to zero.** The override's zero
+     * means "derive the watermark", so setting it expecting the policy to be
+     * off gets the derived watermark — sixty thousand pages here — and a
+     * control that passes because free happens to be two million. That is a
+     * control proving nothing, which is worse than none: it would have
+     * signed off a policy that ignored its own switch. */
+    saved_swappiness = swap_swappiness();
+    swap_set_swappiness(0);
+    swap_set_watermark(0);
+    before = uspace_pages_out_unasked();
+    run_one_user_program("pressure", user_pressure_start, user_pressure_end);
+    if (uspace_pages_out_unasked() != before) {
+        kprintf("swappress: FAILED — pages went out with the watermark at zero\n");
+        return;
+    }
+    kprintf("swappress: with swappiness at zero, nothing went out unasked\n");
+    swap_set_swappiness(saved_swappiness);
+    /* **A little above free, not at it.** The watermark is a deficit the
+     * kernel works to close, so setting it exactly at the free count asks
+     * for a page out on every fault for ever; a modest margin asks for a
+     * bounded amount of paging and then stops, which is what a machine
+     * under real pressure does. */
+    {
+        uint32_t free_now = mem_free_pages_count();
+        kprintf("swappress: free is %u pages; setting the watermark to %u\n", free_now,
+                free_now + 64u);
+        swap_set_watermark(free_now + 64u);
+    }
+    kprintf("swappress: running the program again, under the watermark\n");
+    uspace_trace_faults(10u);
+    run_one_user_program("pressure", user_pressure_start, user_pressure_end);
+    kprintf("swappress: the second run returned\n");
+    swap_set_swappiness(0);
+    swap_set_watermark(0);
+    unasked = uspace_pages_out_unasked() - before;
+    chances = uspace_second_chances();
+    kprintf("swappress: %llu out unasked, %llu second chance(s), %llu A-bit fault(s)\n",
+            (unsigned long long)unasked, (unsigned long long)chances,
+            (unsigned long long)uspace_accessed_faults());
+    /* Both numbers, because each alone can be satisfied by the wrong code:
+     * pages going out says the watermark fired, and second chances say the
+     * **clock** chose them rather than the old take-the-first-page policy,
+     * which would report none. */
+    kprintf("swappress: %s\n", unasked > 0 && chances > 0
+                                    ? "the watermark and the clock both acted"
+                                    : "FAILED");
+}
+
 static void run_user_programs(void) {
     /* Set before anything runs, not between the programs: a trace that
      * starts half way through is worse than none, because the first half
@@ -2148,6 +2220,11 @@ static void run_user_programs(void) {
     if (cmdline_has(boot_cmdline, "minikern.swapout")) {
         run_one_user_program("swap", user_swap_start, user_swap_end);
         report_swap();
+    }
+    /* Roadmap §2: the watermark — pages out because memory is short, with
+     * the control that proves the policy and not merely the mechanism. */
+    if (cmdline_has(boot_cmdline, "minikern.swappress")) {
+        run_pressure_selftest();
     }
     /* Roadmap §0: every register a preempted thread is entitled to keep.
      * **0** is a pass; any other value is the register that came back

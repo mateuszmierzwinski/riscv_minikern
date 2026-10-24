@@ -576,7 +576,7 @@ Ordering inside a section is roughly by what unblocks the most.
       shrinking `brk` drops pages the record never described. Only `munmap`
       wants both. The record goes first, since it is the only step that can
       fail having changed nothing.
-- [ ] **Swap.** (L) **Planned now and started** — the operator asked for it,
+- [x] **Swap.** (L) **Done, watermark and victim policy included** — the operator asked for it,
       "Windows style": a **file** on the filesystem rather than a partition,
       with the path and the pressure root's to choose, and **off by
       default**.
@@ -630,10 +630,60 @@ Ordering inside a section is roughly by what unblocks the most.
       read all sixteen back — **exit 0**, with the kernel reporting `16
       pages sent out by a process, 16 faulted back in` and no slot left
       taken. The Go program runs unchanged with swap enabled.
-      **Still owed**: the watermark that decides when to swap without being
-      asked, which is what `swappiness` will scale, and a victim choice
-      better than "the first page of the first region" — both of which need
-      a machine under memory pressure to mean anything.
+      **Both of those are done now.**
+
+      The **watermark** is the free-page count below which the kernel pages
+      out unasked, scaled by swappiness and **zero at zero** — the knob has
+      to include "off", because that is the setting an operator checks for.
+      It reclaims **the deficit**, not a fixed amount: paging out a page
+      frees a frame, so the shortfall falls as it is served and the sweep
+      stops of its own accord. Asking for a fixed batch instead is a thrash
+      loop by construction, which is what the first version did — page out
+      thirty-two, have them faulted straight back in, page out thirty-two
+      more — and on the board it looked exactly like a hang.
+
+      It runs **on a fault and nowhere else**. The first version reclaimed
+      inside `back_one_page`, which every mapping path goes through —
+      including the ELF loader building a process, where the *kernel* writes
+      into the new process's pages directly rather than through a fault. The
+      clock could free a frame the loader was still filling.
+
+      The **victim choice** is a clock. `PTE_A` says whether a page has been
+      touched, so a page whose bit is clear has not been used since the
+      sweep that cleared it; a page whose bit is set gets it cleared and a
+      second chance. The cursor is a **virtual address**, not a region
+      index, because regions come and go between sweeps and an index would
+      point somewhere different each time — which is how a rotating policy
+      quietly becomes the fixed one it replaced. Clearing bits needs one TLB
+      flush per sweep: a hart holding a translation whose `A` is already set
+      never writes the table again, so without the flush a cleared bit stays
+      clear however hard the page is used, and the clock would evict the
+      busiest page on the machine.
+
+      **And it found that this core does not update `A` in hardware**, which
+      this project had recorded as a measured fact the other way round. See
+      `CLAUDE.md` §5: the evidence for the old claim was a Go binary running,
+      which proves nothing when `pgtable_map` pre-sets `A` on every mapping
+      and no page is ever reached with it clear. Clearing one bit hung the
+      machine silently — mapped, permitted, not stale, so the retry path
+      flushed and retried for ever. The kernel now sets `A` on such a fault
+      and counts it.
+
+      **On the board**, with a 64 MiB `/swapfile` in the image: a program
+      that asks for nothing touches a megabyte twice under a watermark set
+      just above the free count, and reports `315 out unasked, 419 second
+      chance(s), 104 A-bit fault(s)` — pages going out proves the watermark
+      fired, second chances prove the *clock* chose them rather than a scan
+      from the beginning, and the A-bit faults are the core's behaviour
+      measured rather than assumed. The control, in the same run: with
+      swappiness at zero, nothing goes out at all.
+
+      That control was itself wrong at first and worth recording: it set the
+      watermark **override** to zero, and zero there means "derive it from
+      swappiness", not "off". With swappiness 60 the derived mark was about
+      sixty thousand pages and free was two million, so the control passed
+      because the machine was empty — proving nothing, while reading as
+      proof that the switch worked.
 - [x] **Huge pages for user space.** (M) **Done**, for 2 MiB pages, and only
       when a program asks: `MAP_HUGETLB` was in the refused list until there
       were huge pages to give, which is the right place for a flag to wait.

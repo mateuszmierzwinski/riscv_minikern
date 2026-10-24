@@ -68,7 +68,14 @@ void swap_set_swappiness(uint32_t swappiness);
  *
  * `swap_set_watermark` overrides it absolutely, which is how the path is
  * tested: no program this kernel can run will put 8 GiB under pressure, so
- * the pressure is brought to the program instead. */
+ * the pressure is brought to the program instead.
+ *
+ * **Zero is not "off" for the override**, it is "derive it from swappiness"
+ * — and a control that set the override to zero expecting nothing to be
+ * paged out got the *derived* watermark instead, which on this board is
+ * about sixty thousand pages. It passed, because free was two million, and
+ * proved nothing at all. Turning the policy off means setting
+ * **swappiness** to zero, which is what swappiness zero is for. */
 /* How many pages one unasked reclaim takes. A batch rather than one page,
  * because the sweep's first pass may only clear accessed bits and the fence
  * that makes it honest is paid per sweep: asking for one page at a time
