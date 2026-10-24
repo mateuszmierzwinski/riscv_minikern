@@ -53,6 +53,7 @@
 #include "kernel/syscall.h"
 #include "kernel/uspace.h"
 #include "kernel/probe.h"
+#include "drivers/dwmac.h"
 #include "drivers/dwmac_probe.h"
 #include "kernel/volumes.h"
 #include "lib/sha256.h"
@@ -923,6 +924,31 @@ static void bring_up_clocks(uint64_t dtb) {
  * and clocks, and deliberately *before* a driver exists: the GMAC is a
  * larger block than the SD controller this tree already wrote twice, once
  * for the wrong register map. */
+/* Roadmap §4: the board's own Ethernet brought up, as far as the link.
+ *
+ * `minikern.gmacup` asks. Stopping at the link is deliberate: it is the
+ * point at which the clocks, the register mapping, MDIO and the PHY are all
+ * known to work together, and every one of those was a separate wrong guess
+ * before the probe measured it. Frames need descriptor rings, which is the
+ * next step and has nothing left to discover. */
+static void bring_up_the_ethernet(uint64_t dtb) {
+    struct fdt fdt;
+    const struct netdev_port *port = NULL;
+    uint32_t mbit = 0;
+    bool full = false;
+    if (fdt_open(&fdt, (const void *)(uintptr_t)dtb, FDT_MAX_BYTES) != KERR_OK) {
+        kprintf("dwmac: no device tree\n");
+        return;
+    }
+    if (dwmac_init(&fdt, &port) != KERR_OK) {
+        kprintf("dwmac: not brought up\n");
+        return;
+    }
+    if (dwmac_link_up(&mbit, &full)) {
+        kprintf("dwmac: ready at %u Mbit %s duplex\n", mbit, full ? "full" : "half");
+    }
+}
+
 static void probe_the_ethernet(uint64_t dtb) {
     struct fdt fdt;
     if (fdt_open(&fdt, (const void *)(uintptr_t)dtb, FDT_MAX_BYTES) != KERR_OK) {
@@ -2460,6 +2486,9 @@ void kmain(uint64_t hart, uint64_t dtb) {
     bring_up_gpio(dtb);
     if (cmdline_has(boot_cmdline, "minikern.gmac")) {
         probe_the_ethernet(dtb);
+    }
+    if (cmdline_has(boot_cmdline, "minikern.gmacup")) {
+        bring_up_the_ethernet(dtb);
     }
     bring_up_other_harts(dtb, hart);
     /* **After the harts are up**, because half of what it measures is about

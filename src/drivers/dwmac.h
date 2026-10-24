@@ -1,0 +1,44 @@
+/* The board's own Ethernet: a DesignWare GMAC 5.20 on the JH7110.
+ *
+ * Everything the register map, the PHY and the clocks needed was measured
+ * first, by `dwmac_probe` — see `CLAUDE.md` §3. The short version: the
+ * dwmac4 register layout (MDIO at 0x200/0x204, version at 0x110 reading
+ * 0x4152), a Motorcomm YT8531 PHY, `rgmii-id`, and the controller to bind
+ * is `ethernet@16040000` because that is where the cable is.
+ */
+#ifndef DRIVERS_DWMAC_H
+#define DRIVERS_DWMAC_H
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#include "core/ports.h"
+#include "core/types.h"
+
+struct fdt;
+
+/* Brings up one controller and reports it as a network device.
+ *
+ * `sink` is where received frames are delivered; it may be installed later
+ * with `dwmac_set_sink`. Returns `KERR_NODEV` when the tree has no
+ * controller this driver recognises, or the reason it could not be started.
+ */
+int dwmac_init(const struct fdt *fdt, const struct netdev_port **port);
+
+/* Where received frames go. */
+void dwmac_set_sink(const struct frame_sink *sink);
+
+/* Takes whatever the controller has received and delivers it. Polled,
+ * because the kernel has no interrupt for this device yet; one call drains
+ * what is ready and returns how many frames it passed on. */
+uint32_t dwmac_poll(void);
+
+/* The link, as the PHY reports it: whether it is up, and at what speed in
+ * megabits. Both are what the MAC must be configured to match, so they are
+ * read rather than assumed. */
+bool dwmac_link_up(uint32_t *mbit, bool *full_duplex);
+
+/* The MAC address the controller was given. */
+void dwmac_address(uint8_t out[6]);
+
+#endif

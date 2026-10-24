@@ -205,6 +205,16 @@ CASES = [
       "the log could not be replayed; mounting read-only"],
      700, None, "small"),
 
+    ("§4: the board's own Ethernet negotiates a link",
+     "minikern.gmacup",
+     [# The PHY the probe identified, and a negotiated link on the
+      # controller that has the cable. The speed is asserted because the MAC
+      # has to be configured to match it: a MAC set for gigabit on a
+      # hundred-megabit link loses every frame and says nothing.
+      "dwmac: PHY at 0, id 4f51e91b",
+      "dwmac: link up at 1000 Mbit, full duplex"],
+     120, None, False),
+
     ("§2: swap under a watermark, with the clock choosing",
      "minikern.swap=/swapfile:60 minikern.swappress",
      [# The control: swappiness zero really is off.

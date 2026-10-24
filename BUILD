@@ -859,6 +859,23 @@ cc_library(
     ],
 )
 
+# The board's own Ethernet. Everything its register map, PHY and clocks
+# needed was measured by the probe below first — CLAUDE.md §3 records what,
+# and why a driver written before that would have been the wrong driver.
+cc_library(
+    name = "drivers_dwmac",
+    srcs = ["src/drivers/dwmac.c"],
+    hdrs = ["src/drivers/dwmac.h"],
+    strip_include_prefix = "src",
+    target_compatible_with = ["//platforms:riscv64"],
+    deps = [
+        ":arch_riscv",
+        ":console",
+        ":core_boot",
+        ":drivers_gpio",
+    ],
+)
+
 # Reconnaissance for the board's own Ethernet: which of the two controllers,
 # which DesignWare register generation, which PHY, and whether it clocks.
 # Reads only; the driver follows once the board has answered.
@@ -1013,6 +1030,7 @@ cc_library(
         ":kernel_swap",
         ":kernel_uspace",
         ":virtio_net",
+        ":drivers_dwmac",
         ":dwmac_probe",
         ":kernel_volumes",
         ":kernel_xfs",

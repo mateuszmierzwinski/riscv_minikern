@@ -1414,7 +1414,38 @@ sparse inodes, `nrext64`, exchange-range, parent pointers, `bigtime`,
 
 ## 4. Drivers and board hardware
 
-- [ ] **The board's Ethernet (DesignWare GMAC).** (L) The network stack and
+- [~] **The board's Ethernet (DesignWare GMAC).** (L) **The link comes up on
+      the board**; frames still need descriptor rings.
+
+      `dwmac: /soc/ethernet@16040000, version 00004152` /
+      `address 6c:cf:39:00:b6:89` / `PHY at 0, id 4f51e91b` /
+      `link up at 1000 Mbit, full duplex` — on the first attempt, because
+      everything it needed had been measured first rather than guessed (see
+      `CLAUDE.md` §3 and the probe's six runs).
+
+      Three choices in it that came from measurements rather than from how
+      such a driver usually looks:
+
+      - **`@16040000` is tried before `@16030000`**, not in tree order,
+        because the cable is in the second controller — the first bring-up
+        measured it negotiating while the other timed out. A driver binding
+        in tree order reports a dead link on a working board.
+      - **The PHY address is searched, not read from `phy-handle`**: the
+        probe found the same PHY answering at two addresses, so one number
+        would have been right by luck.
+      - **The link bit is read twice before it is believed**, because it
+        latches low: one read says "the link was lost at some point", and
+        the second says what is true now.
+
+      The MAC address is taken from the registers the firmware programmed
+      rather than invented, so this kernel appears on the network as the
+      same machine U-Boot was.
+
+      What remains: the dwmac4 DMA block at 0x1000, four-word descriptors,
+      page-aligned buffers, and `send`/`poll` over them. Nothing there is
+      unknown.
+
+- [ ] **The board's Ethernet: frames.** (M) The network stack and
       sockets work over virtio-net; on the VisionFive 2 there is no driver,
       so the board has no network. The cable is in the **second** controller
       (`ethernet@16040000`), which is the one that negotiates.
