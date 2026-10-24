@@ -108,6 +108,7 @@ static int take(struct xfs *fs, const uint8_t *di, uint64_t ino, struct xfs_inod
         .big_extent_counts = big,
         .format = di[XFS_DI_FORMAT],
         .aformat = di[XFS_DI_AFORMAT],
+        .realtime = (xfs_be16(di + XFS_DI_FLAGS) & XFS_DIFLAG_REALTIME) != 0,
         .forkoff = di[XFS_DI_FORKOFF],
         .fork_len = avail < XFS_FORK_MAX ? avail : XFS_FORK_MAX,
     };

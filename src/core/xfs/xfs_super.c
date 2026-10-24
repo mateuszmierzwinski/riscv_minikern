@@ -252,6 +252,11 @@ static int mount_from_super(struct xfs *fs, const uint8_t *sb) {
     take_geometry(fs, sb);
     take_uuid(fs, sb);
     take_label(fs, sb);
+    fs->rblocks = xfs_be64(sb + XFS_SB_RBLOCKS);
+    fs->rextents = xfs_be64(sb + XFS_SB_REXTENTS);
+    fs->rbmino = xfs_be64(sb + XFS_SB_RBMINO);
+    fs->rsumino = xfs_be64(sb + XFS_SB_RSUMINO);
+    fs->rextsize = xfs_be32(sb + XFS_SB_REXTSIZE);
     fs->uquotino = xfs_be64(sb + XFS_SB_UQUOTINO);
     fs->gquotino = xfs_be64(sb + XFS_SB_GQUOTINO);
     fs->pquotino = xfs_be64(sb + XFS_SB_PQUOTINO);
@@ -274,6 +279,24 @@ static int mount_from_super(struct xfs *fs, const uint8_t *sb) {
  * that has changed is that the log can now be read. So this is the mount's
  * last step, arriving late — and if the log turns out clean, or replays,
  * the read-only restriction it imposed is lifted. */
+int xfs_attach_rt(struct xfs *fs, struct bcache *rt) {
+    if (fs == NULL || rt == NULL || !fs->mounted) {
+        return KERR_INVAL;
+    }
+    if (fs->rblocks == 0) {
+        return KERR_NOTSUP; /* this filesystem has no realtime subvolume */
+    }
+    /* **No check, and nothing becomes writable.** Unlike the log, the
+     * realtime device carries file data and no metadata: there is nothing
+     * on it to verify and nothing about the filesystem's consistency that
+     * depends on it. Attaching it makes realtime files readable and
+     * changes nothing else. */
+    fs->rt_cache = rt;
+    kprintf("xfs: the realtime device is attached, %llu extents of %u block(s)\n",
+            (unsigned long long)fs->rextents, fs->rextsize);
+    return KERR_OK;
+}
+
 int xfs_attach_log(struct xfs *fs, struct bcache *log) {
     int rc;
     if (fs == NULL || log == NULL || !fs->mounted) {
@@ -409,6 +432,12 @@ int xfs_mount(struct xfs *fs, struct bcache *cache) {
     }
     fs->mounted = true;
     xfs_quota_report(fs);
+    if (fs->rblocks != 0) {
+        kprintf("xfs: a realtime subvolume of %llu block(s) in %llu extent(s) of %u; "
+                "attach its device to read those files\n",
+                (unsigned long long)fs->rblocks, (unsigned long long)fs->rextents,
+                fs->rextsize);
+    }
     kprintf("xfs: %u blocks of %u bytes, %u groups, %u-byte inodes, root %u, label \"%s\"\n",
             (uint32_t)fs->dblocks, fs->blocksize, fs->agcount, fs->inodesize,
             (uint32_t)fs->rootino, fs->label);

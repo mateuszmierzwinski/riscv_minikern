@@ -122,6 +122,22 @@ struct xfs {
     uint64_t gquotino;
     uint64_t pquotino;
     uint16_t qflags;
+    /* The **realtime subvolume**: a second device holding file data only,
+     * with no metadata of its own. A file marked realtime has its extents
+     * on it, and they look exactly like any other extents — so a reader
+     * that ignored the flag would fetch the right block numbers from the
+     * wrong device and hand back whatever the data device holds there.
+     *
+     * `rt_cache` is NULL until the device is attached, which makes a
+     * realtime file's *data* unreadable while leaving the rest of the
+     * filesystem entirely usable: unlike the log, this is per-file and so
+     * does not justify refusing writes everywhere. */
+    struct bcache *rt_cache;
+    uint64_t rblocks;
+    uint64_t rextents;
+    uint64_t rbmino;
+    uint64_t rsumino;
+    uint32_t rextsize;
     uint64_t dir_leaf_block; /* directory data lives below this logical block */
     uint64_t dir_free_block; /* and the free blocks of a node directory above */
     uint32_t blocksize;
@@ -287,6 +303,10 @@ struct xfs_inode {
      * paying for the rare case in every one of them. */
     uint8_t aformat;
     uint8_t forkoff;
+    /* This file's data is on the realtime device (`XFS_DIFLAG_REALTIME`).
+     * Its extent records are indistinguishable from any other file's, so
+     * this flag is the only thing that says where they point. */
+    bool realtime;
 };
 
 /* The type byte a directory entry carries when the filesystem has the
@@ -399,6 +419,31 @@ int xfs_quota_get(struct xfs *fs, uint8_t type, uint32_t id, struct xfs_dquot *o
 
 /* Says what the filesystem asks for, at mount. */
 void xfs_quota_report(const struct xfs *fs);
+
+/* The realtime bitmap: a plain file on the **data** device holding one bit
+ * per realtime extent, in which **a set bit means free**.
+ *
+ * That polarity is the opposite of most bitmaps and is why these are named
+ * rather than exposed: a caller that assumed 1 = used would see a fresh
+ * subvolume as entirely full. */
+bool xfs_rt_extent_is_free(struct xfs *fs, uint64_t n);
+int xfs_rt_free_extents(struct xfs *fs, uint64_t *out);
+
+/* Takes a run of `count` free realtime extents, first fit, and returns the
+ * first one's number. All of it or none — a half-marked run is a bitmap
+ * that disagrees with the inodes. */
+int xfs_rt_alloc(struct xfs *fs, uint64_t count, uint64_t *start);
+int xfs_rt_release(struct xfs *fs, uint64_t start, uint64_t count);
+
+/* Gives the filesystem its **realtime** device, so that files marked
+ * realtime can be read.
+ *
+ * Nothing in the superblock names it, exactly as with an external log —
+ * Linux is told with `-o rtdev=`. Until it is attached, a realtime file's
+ * data reads as `KERR_NODEV` and everything else works: the realtime
+ * device holds file contents and no metadata, so its absence costs those
+ * files and nothing more. */
+int xfs_attach_rt(struct xfs *fs, struct bcache *rt);
 
 /* Gives the filesystem the device its **external** log lives on.
  *

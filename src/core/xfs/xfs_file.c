@@ -46,12 +46,37 @@ static int read_chunk(struct xfs *fs, const struct xfs_inode *ip, uint64_t at, u
     if (rc != KERR_OK) {
         return rc;
     }
-    rc = bcache_get(fs->cache, xfs_fsb_to_block(fs, e.startblock + ((at >> fs->blocklog) - e.startoff)), &b);
+    /* **Which device, decided by the inode and not by the extent.**
+     *
+     * A realtime file's extent records are indistinguishable from any
+     * other file's: the same `startoff`, `startblock` and `blockcount`. The
+     * only thing that says they address the realtime device is the inode's
+     * flag — so a reader that ignored it would fetch perfectly valid block
+     * numbers from the wrong device and hand back whatever the data device
+     * holds there, which is somebody else's file rather than an error.
+     *
+     * The realtime device also needs no `xfs_fsb_to_block`: a realtime
+     * block number is linear, with no allocation group packed into its high
+     * bits, because the realtime subvolume has no allocation groups. Running
+     * it through that conversion is the same class of mistake as the log's
+     * `logstart`, which this tree has already paid for once — and in the
+     * opposite direction, which is why it is said here. */
+    {
+        uint64_t block = e.startblock + ((at >> fs->blocklog) - e.startoff);
+        if (ip->realtime) {
+            if (fs->rt_cache == NULL) {
+                return KERR_NODEV; /* the realtime device is not attached */
+            }
+            rc = bcache_get(fs->rt_cache, block, &b);
+        } else {
+            rc = bcache_get(fs->cache, xfs_fsb_to_block(fs, block), &b);
+        }
+    }
     if (rc != KERR_OK) {
         return rc;
     }
     xfs_copy_bytes(out, b->data + within, chunk);
-    bcache_put(fs->cache, b);
+    bcache_put(ip->realtime ? fs->rt_cache : fs->cache, b);
     return KERR_OK;
 }
 
@@ -132,14 +157,27 @@ static int write_chunk(struct xfs *fs, const struct xfs_inode *ip, uint64_t at, 
     if (rc != KERR_OK) {
         return rc;
     }
-    rc = bcache_get(fs->cache, xfs_fsb_to_block(fs, e.startblock + ((at >> fs->blocklog) - e.startoff)),
-                    &b);
+    /* The same choice the read path makes, for the same reason: a realtime
+     * file's extents address the realtime device, and writing them to the
+     * data device would overwrite whatever lives at those block numbers —
+     * which is other files' contents, silently. */
+    {
+        uint64_t block = e.startblock + ((at >> fs->blocklog) - e.startoff);
+        if (ip->realtime) {
+            if (fs->rt_cache == NULL) {
+                return KERR_NODEV;
+            }
+            rc = bcache_get(fs->rt_cache, block, &b);
+        } else {
+            rc = bcache_get(fs->cache, xfs_fsb_to_block(fs, block), &b);
+        }
+    }
     if (rc != KERR_OK) {
         return rc;
     }
     xfs_copy_bytes(b->data + within, in, chunk);
     bcache_dirty(b);
-    bcache_put(fs->cache, b);
+    bcache_put(ip->realtime ? fs->rt_cache : fs->cache, b);
     return KERR_OK;
 }
 
@@ -201,6 +239,43 @@ static int extend_fork(struct xfs_inode *ip, uint8_t *di, const struct xfs_exten
  * which of the two shapes the extent list then takes — and splitting it
  * would pass four values across the boundary to say half of it (Rule 11,
  * Parameters/Single derivation). */
+/* One more realtime extent for a realtime file.
+ *
+ * **A realtime block number is linear**: the realtime subvolume has no
+ * allocation groups, so there is no group number packed into the high bits
+ * and none of the `agblklog` shifting the data device needs. Applying that
+ * shift here would produce a block number far outside the device — the
+ * mirror image of the log's `logstart`, which this tree got wrong in the
+ * other direction and has a scar for.
+ *
+ * `rextsize` is the allocation granularity in blocks, so extent `n` begins
+ * at block `n * rextsize`. With the common `rextsize` of 1 those are the
+ * same number, which is exactly the coincidence that would hide a missing
+ * multiplication — so it is written out rather than assumed away. */
+static int grow_realtime(struct xfs *fs, struct xfs_inode *ip, uint8_t *di,
+                         struct xfs_extent *last) {
+    uint64_t extent = 0;
+    int rc;
+    if (fs->rt_cache == NULL) {
+        return KERR_NODEV; /* nowhere to put the data once it is allocated */
+    }
+    if (fs->rextsize == 0) {
+        return KERR_INVAL;
+    }
+    rc = xfs_rt_alloc(fs, 1u, &extent);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    rc = extend_fork(ip, di, last, extent * fs->rextsize);
+    if (rc != KERR_OK) {
+        /* The extent was taken but the fork would not hold it: give it
+         * back, or the bitmap says used and no inode refers to it — a leak
+         * that only a repair tool could find. */
+        (void)xfs_rt_release(fs, extent, 1u);
+    }
+    return rc;
+}
+
 static int grow_file(struct xfs *fs, struct xfs_inode *ip, uint64_t end) {
     uint64_t block;
     uint32_t boffset;
@@ -221,6 +296,10 @@ static int grow_file(struct xfs *fs, struct xfs_inode *ip, uint64_t end) {
             xfs_extent_unpack(ip->fork + (ip->nextents - 1u) * XFS_EXTENT_BYTES, &last);
             agno = xfs_fsb_ag(fs, last.startblock);
             want = (uint32_t)((last.startblock + last.blockcount) & mask);
+        }
+        if (ip->realtime) {
+            rc = grow_realtime(fs, ip, di, &last);
+            continue;
         }
         rc = xfs_alloc_somewhere(fs, &agno, 1u, want, &got);
         if (rc != KERR_OK) {

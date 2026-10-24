@@ -137,6 +137,12 @@
 #define XFS_DI_VERSION_3  3u
 
 /* di_flags2 */
+/* `di_flags`. **The realtime flag changes which device a file's extents
+ * are on**, which is the only thing about it a reader has to honour: the
+ * extent records look identical, and reading them against the data device
+ * returns whatever that device happens to hold at those block numbers. */
+#define XFS_DIFLAG_REALTIME 0x0001u
+
 #define XFS_DIFLAG2_NREXT64 0x10u /* this inode uses the 64-bit extent layout */
 
 /* di_format */
@@ -389,6 +395,11 @@
 
 /* The superblock's free-block counter, which a change has to keep in step. */
 #define XFS_SB_FDBLOCKS 144u /* u64 */
+#define XFS_SB_RBLOCKS  16u  /* u64: blocks on the realtime device */
+#define XFS_SB_REXTENTS 24u  /* u64: realtime extents, which is rblocks/rextsize */
+#define XFS_SB_RBMINO   64u  /* u64: the realtime bitmap's inode */
+#define XFS_SB_RSUMINO  72u  /* u64: the realtime summary's inode */
+#define XFS_SB_REXTSIZE 80u  /* u32: blocks per realtime extent */
 #define XFS_SB_UQUOTINO 160u /* u64: the user quota file's inode, 0 if none */
 #define XFS_SB_GQUOTINO 168u /* u64: the group quota file's */
 #define XFS_SB_QFLAGS   176u /* u16: which quotas are accounted and enforced */

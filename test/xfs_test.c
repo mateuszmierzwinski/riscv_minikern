@@ -730,6 +730,217 @@ static void build_external_log(void) {
  * The device is deliberately a *different* one, with its own storage and
  * its own range check, so a reader that quietly used the filesystem's own
  * device would read the wrong bytes and be caught rather than pass. */
+/* The realtime device: a third device, holding file data and no metadata.
+ *
+ * Deliberately **populated differently from the data device at the same
+ * block numbers**, which is the whole point of the test: a realtime file's
+ * extent records are indistinguishable from any other file's, so a reader
+ * that ignored the inode's flag would fetch valid block numbers from the
+ * wrong device and return somebody else's bytes rather than an error. Only
+ * different content at the same address can catch that. */
+#define RT_BLOCKS 8u
+#define RT_FSB    3u /* the realtime block this file's one extent points at */
+
+static uint8_t rtdisk[RT_BLOCKS * BS];
+static uint8_t rtcache_mem[4u * BS];
+static struct bcache rtcache;
+static struct blockdev rtdev;
+
+static int rtdisk_read(void *self, uint64_t lba, uint32_t count, void *buf) {
+    (void)self;
+    if (!blockdev_in_range(&rtdev, lba, count)) {
+        reads_outside++;
+        return KERR_INVAL;
+    }
+    memcpy(buf, rtdisk + lba * BS, count * BS);
+    return KERR_OK;
+}
+
+static int rtdisk_write(void *self, uint64_t lba, uint32_t count, const void *buf) {
+    (void)self;
+    if (!blockdev_in_range(&rtdev, lba, count)) {
+        reads_outside++;
+        return KERR_INVAL;
+    }
+    memcpy(rtdisk + lba * BS, buf, count * BS);
+    return KERR_OK;
+}
+
+#define RT_INO 105u
+
+/* A realtime file, and a decoy at the same block number on the data device.
+ *
+ * The extent points at realtime block `RT_FSB` with no allocation group
+ * packed into it — the realtime subvolume has none, so a realtime block
+ * number is linear and must *not* go through `xfs_fsb_to_block`. */
+static void build_a_realtime_file(const char *content, const char *decoy) {
+    uint8_t *di;
+    struct xfs_extent e = {.startoff = 0, .startblock = RT_FSB, .blockcount = 1};
+
+    memset(rtdisk, 0, sizeof rtdisk);
+    memcpy(rtdisk + RT_FSB * BS, content, strlen(content));
+    rtdev = (struct blockdev){.read = rtdisk_read,
+                              .write = rtdisk_write,
+                              .flush = disk_flush,
+                              .block_size = BS,
+                              .blocks = RT_BLOCKS};
+    bcache_init(&rtcache, &rtdev, rtcache_mem, 4u);
+
+    /* The decoy: the same block number on the *data* device. */
+    memset(block(RT_FSB), 0, BS);
+    memcpy(block(RT_FSB), decoy, strlen(decoy));
+
+    di = build_inode(RT_INO, 0100644u, XFS_DINODE_FMT_EXTENTS, strlen(content));
+    put32(di + XFS_DI_NEXTENTS, 1u);
+    put64(di + XFS_DI_NBLOCKS, 1u);
+    put16(di + XFS_DI_FLAGS, XFS_DIFLAG_REALTIME);
+    xfs_extent_pack(di + XFS_DI_V3_SIZE, &e);
+    seal(di, ISIZE, XFS_DI_CRC);
+
+    put64(block(0) + XFS_SB_RBLOCKS, RT_BLOCKS);
+    put64(block(0) + XFS_SB_REXTENTS, RT_BLOCKS);
+    put32(block(0) + XFS_SB_REXTSIZE, 1u);
+    seal(block(0), 512u, XFS_SB_CRC);
+}
+
+/* The realtime bitmap: a plain file on the **data** device, one bit per
+ * realtime extent, **set meaning free**.
+ *
+ * `RT_BLOCKS` is 8, so the whole bitmap is one byte — and the fixture puts
+ * `0xff` in it, every extent free, which is what `mkfs` leaves. The file is
+ * given an extents fork rather than a local one because writing to it is
+ * the point and this writer only grows extent-format files. */
+#define RBM_INO 106u
+#define RBM_FSB 15u
+
+static void build_a_realtime_bitmap(uint8_t bits) {
+    uint8_t *di;
+    struct xfs_extent e = {.startoff = 0, .startblock = RBM_FSB, .blockcount = 1};
+    memset(block(RBM_FSB), 0, BS);
+    block(RBM_FSB)[0] = bits;
+    di = build_inode(RBM_INO, 0100600u, XFS_DINODE_FMT_EXTENTS, 1u);
+    put32(di + XFS_DI_NEXTENTS, 1u);
+    put64(di + XFS_DI_NBLOCKS, 1u);
+    xfs_extent_pack(di + XFS_DI_V3_SIZE, &e);
+    seal(di, ISIZE, XFS_DI_CRC);
+    put64(block(0) + XFS_SB_RBMINO, RBM_INO);
+    seal(block(0), 512u, XFS_SB_CRC);
+}
+
+/* The realtime bitmap, and writing a realtime file through it.
+ *
+ * **A set bit means free**, which is the opposite of the convention most
+ * bitmaps use and the one thing here that silently inverts everything if
+ * taken for granted — so the first assertion is that a bitmap of `0xff`
+ * reads as eight *free* extents, not zero. Confirmed against a filesystem
+ * `mkfs.xfs -r rtdev=` actually made: 25600 extents gave exactly 25600 set
+ * bits.
+ *
+ * Then the round trip that matters: a realtime file is grown, which must
+ * take its extent from this bitmap rather than from an allocation group,
+ * and the bytes must land on the realtime device. The decoy on the data
+ * device catches a writer that used the wrong one — it would corrupt
+ * another file's blocks rather than fail. */
+static void test_the_realtime_bitmap_allocates(void) {
+    struct xfs_inode ip;
+    uint64_t free_now = 0, start = 0;
+    char buf[32];
+    uint32_t put = 0, got = 0;
+    mount_fresh();
+    build_a_realtime_file("x", "data device decoy");
+    build_a_realtime_bitmap(0xffu);
+    bcache_invalidate(&cache);
+    KTEST_CHECK(xfs_mount(&fs, &cache) == KERR_OK);
+    KTEST_CHECK(xfs_attach_rt(&fs, &rtcache) == KERR_OK);
+
+    KTEST_CHECK(xfs_rt_free_extents(&fs, &free_now) == KERR_OK);
+    KTEST_CHECK(free_now == RT_BLOCKS);
+    KTEST_CHECK(xfs_rt_extent_is_free(&fs, 0));
+    KTEST_CHECK(xfs_rt_extent_is_free(&fs, RT_BLOCKS - 1u));
+
+    /* Taking extents reduces the count, and gives the first free run. */
+    KTEST_CHECK(xfs_rt_alloc(&fs, 2u, &start) == KERR_OK);
+    KTEST_CHECK(start == 0);
+    KTEST_CHECK(!xfs_rt_extent_is_free(&fs, 0));
+    KTEST_CHECK(!xfs_rt_extent_is_free(&fs, 1));
+    KTEST_CHECK(xfs_rt_extent_is_free(&fs, 2));
+    KTEST_CHECK(xfs_rt_free_extents(&fs, &free_now) == KERR_OK);
+    KTEST_CHECK(free_now == RT_BLOCKS - 2u);
+
+    /* Giving them back restores it: the bitmap is the only record, so a
+     * release that did not actually set the bits would lose the space with
+     * nothing to notice. */
+    KTEST_CHECK(xfs_rt_release(&fs, 0, 2u) == KERR_OK);
+    KTEST_CHECK(xfs_rt_free_extents(&fs, &free_now) == KERR_OK);
+    KTEST_CHECK(free_now == RT_BLOCKS);
+
+    /* A run longer than the subvolume is refused rather than wrapped. */
+    KTEST_CHECK(xfs_rt_alloc(&fs, RT_BLOCKS + 1u, &start) == KERR_NOSPC);
+    KTEST_CHECK(xfs_rt_free_extents(&fs, &free_now) == KERR_OK);
+    KTEST_CHECK(free_now == RT_BLOCKS); /* and nothing was taken on the way */
+
+    /* Writing a realtime file: the extent comes from this bitmap and the
+     * bytes land on the realtime device. */
+    KTEST_CHECK(xfs_inode_read(&fs, RT_INO, &ip) == KERR_OK);
+    KTEST_CHECK(xfs_file_write(&fs, &ip, 0, "written to realtime", 19u, &put) == KERR_OK);
+    KTEST_CHECK(put == 19u);
+    memset(buf, 0, sizeof buf);
+    KTEST_CHECK(xfs_file_read(&fs, &ip, 0, buf, sizeof buf, &got) == KERR_OK);
+    KTEST_CHECK(got == 19u);
+    KTEST_CHECK(memcmp(buf, "written to realtime", 19) == 0);
+    /* And the data device still holds its decoy, untouched: a writer that
+     * used the wrong device would have overwritten it. */
+    KTEST_CHECK(memcmp(block(RT_FSB), "data device decoy", 17) == 0);
+    KTEST_CHECK(reads_outside == 0);
+}
+
+/* The realtime subvolume: a file's data comes from its own device.
+ *
+ * Three things, and the middle one is the one that would silently do the
+ * wrong thing. A realtime file is **unreadable but not an error** while the
+ * device is absent — the rest of the filesystem is untouched, because the
+ * realtime device holds data and no metadata, so unlike a missing log this
+ * costs those files and nothing else. Once attached, the file reads **from
+ * that device**: the decoy at the same block number on the data device is
+ * what a reader that ignored the flag would return. And an ordinary file is
+ * unaffected throughout. */
+static void test_a_realtime_file_is_read_from_its_own_device(void) {
+    struct xfs_inode ip;
+    char buf[32];
+    uint32_t got = 0;
+    mount_fresh();
+    build_a_realtime_file("from the realtime device", "from the data device!!");
+    bcache_invalidate(&cache);
+    KTEST_CHECK(xfs_mount(&fs, &cache) == KERR_OK);
+
+    /* Absent: the file's metadata reads fine, its data does not. */
+    KTEST_CHECK(xfs_inode_read(&fs, RT_INO, &ip) == KERR_OK);
+    KTEST_CHECK(ip.realtime);
+    KTEST_CHECK(ip.size == 24u);
+    KTEST_CHECK(xfs_file_read(&fs, &ip, 0, buf, sizeof buf, &got) == KERR_NODEV);
+
+    /* An ordinary file is untouched by the realtime device's absence. */
+    KTEST_CHECK(xfs_inode_read(&fs, FILE_INO, &ip) == KERR_OK);
+    KTEST_CHECK(!ip.realtime);
+    KTEST_CHECK(xfs_file_read(&fs, &ip, 0, buf, sizeof buf, &got) == KERR_OK);
+
+    /* Attached: the data comes from the realtime device, not the decoy. */
+    KTEST_CHECK(xfs_attach_rt(&fs, &rtcache) == KERR_OK);
+    KTEST_CHECK(xfs_inode_read(&fs, RT_INO, &ip) == KERR_OK);
+    memset(buf, 0, sizeof buf);
+    KTEST_CHECK(xfs_file_read(&fs, &ip, 0, buf, sizeof buf, &got) == KERR_OK);
+    KTEST_CHECK(got == 24u);
+    KTEST_CHECK(memcmp(buf, "from the realtime device", 24) == 0);
+    KTEST_CHECK(reads_outside == 0);
+
+    /* A filesystem with no realtime subvolume refuses the attachment,
+     * rather than accepting a device no file can refer to. */
+    mount_fresh();
+    KTEST_CHECK(xfs_mount(&fs, &cache) == KERR_OK);
+    KTEST_CHECK(xfs_attach_rt(&fs, &rtcache) == KERR_NOTSUP);
+    KTEST_CHECK(reads_outside == 0);
+}
+
 /* A quota file with one record in it, for user id 7.
  *
  * The record's **place is its id**, so id 7 lives at `7 * 136` and the file
@@ -1428,6 +1639,8 @@ int main(void) {
     KTEST_RUN(test_holes_and_unwritten_read_as_zeroes);
     KTEST_RUN(test_read_only_features_mount_but_forbid_writing);
     KTEST_RUN(test_a_superblock_that_cannot_be_trusted);
+    KTEST_RUN(test_a_realtime_file_is_read_from_its_own_device);
+    KTEST_RUN(test_the_realtime_bitmap_allocates);
     KTEST_RUN(test_quotas_are_read);
     KTEST_RUN(test_an_external_log_is_read_from_its_own_device);
     KTEST_RUN(test_a_dirty_log_is_checked);
