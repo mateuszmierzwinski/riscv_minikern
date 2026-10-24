@@ -252,6 +252,10 @@ static int mount_from_super(struct xfs *fs, const uint8_t *sb) {
     take_geometry(fs, sb);
     take_uuid(fs, sb);
     take_label(fs, sb);
+    fs->uquotino = xfs_be64(sb + XFS_SB_UQUOTINO);
+    fs->gquotino = xfs_be64(sb + XFS_SB_GQUOTINO);
+    fs->pquotino = xfs_be64(sb + XFS_SB_PQUOTINO);
+    fs->qflags = (uint16_t)xfs_be16(sb + XFS_SB_QFLAGS);
     rc = check_geometry(fs);
     if (rc != KERR_OK) {
         return rc;
@@ -404,6 +408,7 @@ int xfs_mount(struct xfs *fs, struct bcache *cache) {
         return rc;
     }
     fs->mounted = true;
+    xfs_quota_report(fs);
     kprintf("xfs: %u blocks of %u bytes, %u groups, %u-byte inodes, root %u, label \"%s\"\n",
             (uint32_t)fs->dblocks, fs->blocksize, fs->agcount, fs->inodesize,
             (uint32_t)fs->rootino, fs->label);

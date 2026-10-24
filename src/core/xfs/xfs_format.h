@@ -389,6 +389,59 @@
 
 /* The superblock's free-block counter, which a change has to keep in step. */
 #define XFS_SB_FDBLOCKS 144u /* u64 */
+#define XFS_SB_UQUOTINO 160u /* u64: the user quota file's inode, 0 if none */
+#define XFS_SB_GQUOTINO 168u /* u64: the group quota file's */
+#define XFS_SB_QFLAGS   176u /* u16: which quotas are accounted and enforced */
+#define XFS_SB_PQUOTINO 232u /* u64: the project quota file's, added in v5 */
+
+/* `sb_qflags`. **Accounting and enforcement are separate**, which is the
+ * distinction a reader has to keep: a filesystem can count usage without
+ * refusing anything, and `mkfs.xfs -m uquota` sets both while creating
+ * neither inode — those appear when a kernel first mounts it with quotas
+ * on, so a fresh quota filesystem has the flags and no files. */
+#define XFS_UQUOTA_ACCT 0x0001u
+#define XFS_UQUOTA_ENFD 0x0002u
+#define XFS_UQUOTA_CHKD 0x0004u
+#define XFS_PQUOTA_ACCT 0x0008u
+#define XFS_OQUOTA_ENFD 0x0010u
+#define XFS_OQUOTA_CHKD 0x0020u
+#define XFS_GQUOTA_ACCT 0x0040u
+#define XFS_GQUOTA_ENFD 0x0080u
+#define XFS_GQUOTA_CHKD 0x0100u
+#define XFS_PQUOTA_ENFD 0x0200u
+#define XFS_PQUOTA_CHKD 0x0400u
+
+/* A disk quota record. The quota files are plain files whose contents are
+ * an array of these, and a record's place in the array **is** its id:
+ * record `n` is at `n * XFS_DQUOT_BYTES`. There is no index and no search —
+ * which is why a quota file is sparse, and why reading one is an ordinary
+ * file read at a computed offset. */
+#define XFS_DQUOT_MAGIC   0x4451u /* "DQ" */
+#define XFS_DQUOT_VERSION 3u      /* on a v5 filesystem */
+#define XFS_DQUOT_BYTES   136u
+
+#define XFS_DQ_MAGIC         0u   /* be16 */
+#define XFS_DQ_VERSION       2u   /* u8 */
+#define XFS_DQ_TYPE          3u   /* u8 */
+#define XFS_DQ_ID            4u   /* be32 */
+#define XFS_DQ_BLK_HARD      8u   /* be64, in filesystem blocks */
+#define XFS_DQ_BLK_SOFT      16u  /* be64 */
+#define XFS_DQ_INO_HARD      24u  /* be64, a count of inodes */
+#define XFS_DQ_INO_SOFT      32u  /* be64 */
+#define XFS_DQ_BCOUNT        40u  /* be64: blocks in use */
+#define XFS_DQ_ICOUNT        48u  /* be64: inodes in use */
+#define XFS_DQ_RTB_HARD      72u  /* be64, the realtime subvolume's */
+#define XFS_DQ_RTB_SOFT      80u  /* be64 */
+#define XFS_DQ_RTBCOUNT      88u  /* be64 */
+#define XFS_DQ_CRC_OFF       108u /* u32, little-endian */
+#define XFS_DQ_UUID_OFF      120u /* 16 bytes */
+
+/* Which quota a record belongs to. A record carries its own type, so a user
+ * record found in the group file is a record in the wrong file — worth
+ * checking, because the id alone cannot tell them apart. */
+#define XFS_DQTYPE_USER    0x01u
+#define XFS_DQTYPE_PROJ    0x02u
+#define XFS_DQTYPE_GROUP   0x04u
 
 /* ── the inode btrees ────────────────────────────────────────────────────
  * Two trees of the same shape: every inode chunk (`IAB3`), and the chunks

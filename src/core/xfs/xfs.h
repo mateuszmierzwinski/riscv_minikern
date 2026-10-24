@@ -114,6 +114,14 @@ struct xfs {
      * read: the filesystem is still readable and must not be written, for
      * the same reason a dirty log makes it read-only. */
     bool log_detached;
+    /* Quotas: which kinds this filesystem counts and enforces, and the
+     * three files that hold the records. The inode numbers are **zero on a
+     * fresh quota filesystem** — `mkfs.xfs` records the intent and a kernel
+     * makes the files on first mount — so zero means "not yet", not "no". */
+    uint64_t uquotino;
+    uint64_t gquotino;
+    uint64_t pquotino;
+    uint16_t qflags;
     uint64_t dir_leaf_block; /* directory data lives below this logical block */
     uint64_t dir_free_block; /* and the free blocks of a node directory above */
     uint32_t blocksize;
@@ -355,6 +363,43 @@ typedef int (*xfs_attr_fn)(void *self, const uint8_t *name, uint32_t namelen,
  * `KERR_NOSPC` when the inode is full rather than building a half-finished
  * leaf. A value kept in blocks of its own is reported as present and
  * refused on read. */
+/* One quota record, as the three quota files hold them.
+ *
+ * Block counts are in filesystem blocks and inode counts are inodes, which
+ * is how the format stores them: converting to bytes here would be a choice
+ * a caller might disagree with, and the block size is right there. */
+struct xfs_dquot {
+    uint32_t id;
+    uint8_t type;
+    uint64_t blocks_hard;
+    uint64_t blocks_soft;
+    uint64_t inodes_hard;
+    uint64_t inodes_soft;
+    uint64_t blocks_used;
+    uint64_t inodes_used;
+    uint64_t rt_blocks_hard;
+    uint64_t rt_blocks_soft;
+    uint64_t rt_blocks_used;
+};
+
+/* Whether a kind of quota is counted, and whether it is actually refused.
+ *
+ * Two questions, not one: a filesystem can account without enforcing, which
+ * is what `-m uquota` gives until somebody sets a limit. A caller that
+ * treated "accounted" as "enforced" would report limits that are not
+ * applied. */
+bool xfs_quota_accounted(const struct xfs *fs, uint8_t type);
+bool xfs_quota_enforced(const struct xfs *fs, uint8_t type);
+
+/* One id's record. `KERR_NOTSUP` when this filesystem does not count that
+ * kind, `KERR_NODEV` when it does but the file has not been made yet (which
+ * is every freshly formatted quota filesystem), and `KERR_NOENT` for an id
+ * with no record — a quota file is sparse and most ids are holes. */
+int xfs_quota_get(struct xfs *fs, uint8_t type, uint32_t id, struct xfs_dquot *out);
+
+/* Says what the filesystem asks for, at mount. */
+void xfs_quota_report(const struct xfs *fs);
+
 /* Gives the filesystem the device its **external** log lives on.
  *
  * A filesystem whose `sb_logstart` is zero keeps its log on a separate

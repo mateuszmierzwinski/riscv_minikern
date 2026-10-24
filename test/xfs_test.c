@@ -730,6 +730,114 @@ static void build_external_log(void) {
  * The device is deliberately a *different* one, with its own storage and
  * its own range check, so a reader that quietly used the filesystem's own
  * device would read the wrong bytes and be caught rather than pass. */
+/* A quota file with one record in it, for user id 7.
+ *
+ * The record's **place is its id**, so id 7 lives at `7 * 136` and the file
+ * has to be at least that long — which is why a real quota file is sparse
+ * and why this one is a LOCAL fork holding only what it must. The inode is
+ * given the data fork's extents pointing at a block we fill, because a
+ * record at offset 952 does not fit in an inode.
+ *
+ * `QUOTA_INO` and `QUOTA_FSB` are a spare inode and a spare block of the
+ * synthetic filesystem. */
+#define QUOTA_INO 104u
+#define QUOTA_FSB 14u
+
+static void build_a_quota_file(uint32_t id, uint64_t blk_hard, uint64_t blocks_used) {
+    uint8_t *di;
+    uint8_t *blk = block(QUOTA_FSB);
+    uint32_t at = id * XFS_DQUOT_BYTES;
+    struct xfs_extent e = {.startoff = 0, .startblock = QUOTA_FSB, .blockcount = 1};
+    uint8_t *r;
+    memset(blk, 0, BS);
+    r = blk + at;
+    put16(r + XFS_DQ_MAGIC, XFS_DQUOT_MAGIC);
+    r[XFS_DQ_VERSION] = XFS_DQUOT_VERSION;
+    r[XFS_DQ_TYPE] = XFS_DQTYPE_USER;
+    put32(r + XFS_DQ_ID, id);
+    put64(r + XFS_DQ_BLK_HARD, blk_hard);
+    put64(r + XFS_DQ_BLK_SOFT, blk_hard / 2u);
+    put64(r + XFS_DQ_INO_HARD, 1000u);
+    put64(r + XFS_DQ_BCOUNT, blocks_used);
+    put64(r + XFS_DQ_ICOUNT, 3u);
+    memcpy(r + XFS_DQ_UUID_OFF, block(0) + XFS_SB_UUID, 16);
+    seal(r, XFS_DQUOT_BYTES, XFS_DQ_CRC_OFF);
+
+    di = build_inode(QUOTA_INO, 0100600u, XFS_DINODE_FMT_EXTENTS,
+                     (uint64_t)at + XFS_DQUOT_BYTES);
+    put32(di + XFS_DI_NEXTENTS, 1u);
+    put64(di + XFS_DI_NBLOCKS, 1u);
+    xfs_extent_pack(di + XFS_DI_V3_SIZE, &e);
+    seal(di, ISIZE, XFS_DI_CRC);
+
+    put64(block(0) + XFS_SB_UQUOTINO, QUOTA_INO);
+    put16(block(0) + XFS_SB_QFLAGS, XFS_UQUOTA_ACCT | XFS_UQUOTA_ENFD);
+    seal(block(0), 512u, XFS_SB_CRC);
+}
+
+/* Quotas: what the filesystem asks for, and one record read out of it.
+ *
+ * **A fresh quota filesystem is the normal case and reads as "not yet".**
+ * `mkfs.xfs -m uquota` sets the flags and leaves the inode numbers zero —
+ * a kernel makes the files on first mount — so "counted, but no file" is a
+ * true answer and `KERR_NODEV` is how it is said. Returning `KERR_NOENT`
+ * there would conflate it with an id that simply has no record, which is
+ * the ordinary case on a populated file. */
+static void test_quotas_are_read(void) {
+    struct xfs_dquot dq;
+    mount_fresh();
+    put16(block(0) + XFS_SB_QFLAGS, XFS_UQUOTA_ACCT | XFS_UQUOTA_ENFD);
+    seal(block(0), 512u, XFS_SB_CRC);
+    bcache_invalidate(&cache);
+    KTEST_CHECK(xfs_mount(&fs, &cache) == KERR_OK);
+    KTEST_CHECK(xfs_quota_accounted(&fs, XFS_DQTYPE_USER));
+    KTEST_CHECK(xfs_quota_enforced(&fs, XFS_DQTYPE_USER));
+    KTEST_CHECK(!xfs_quota_accounted(&fs, XFS_DQTYPE_GROUP));
+    KTEST_CHECK(xfs_quota_get(&fs, XFS_DQTYPE_USER, 7u, &dq) == KERR_NODEV);
+    /* A kind the filesystem does not count is refused differently again. */
+    KTEST_CHECK(xfs_quota_get(&fs, XFS_DQTYPE_GROUP, 7u, &dq) == KERR_NOTSUP);
+
+    /* And with a file: the record for id 7 reads back with its limits. */
+    mount_fresh();
+    build_a_quota_file(7u, 4096u, 19u);
+    bcache_invalidate(&cache);
+    KTEST_CHECK(xfs_mount(&fs, &cache) == KERR_OK);
+    KTEST_CHECK(xfs_quota_get(&fs, XFS_DQTYPE_USER, 7u, &dq) == KERR_OK);
+    KTEST_CHECK(dq.id == 7u);
+    KTEST_CHECK(dq.blocks_hard == 4096u);
+    KTEST_CHECK(dq.blocks_soft == 2048u);
+    KTEST_CHECK(dq.blocks_used == 19u);
+    KTEST_CHECK(dq.inodes_used == 3u);
+
+    /* An id whose record was never written is a hole, and a hole is not an
+     * error: a quota file is sparse by construction and most ids are holes.
+     * Id 6 shares the block with 7 and is zeroes. */
+    KTEST_CHECK(xfs_quota_get(&fs, XFS_DQTYPE_USER, 6u, &dq) == KERR_NOENT);
+    /* An id past the file's end is the same answer by a different route. */
+    KTEST_CHECK(xfs_quota_get(&fs, XFS_DQTYPE_USER, 9000u, &dq) == KERR_NOENT);
+
+    /* A record whose checksum does not match must not be believed: a torn
+     * one would otherwise read as a limit nobody set. */
+    mount_fresh();
+    build_a_quota_file(7u, 4096u, 19u);
+    block(QUOTA_FSB)[7u * XFS_DQUOT_BYTES + XFS_DQ_CRC_OFF] ^= 0xffu;
+    bcache_invalidate(&cache);
+    KTEST_CHECK(xfs_mount(&fs, &cache) == KERR_OK);
+    KTEST_CHECK(xfs_quota_get(&fs, XFS_DQTYPE_USER, 7u, &dq) == KERR_IO);
+
+    /* And a record of the wrong *kind* sitting in the user file is wrong
+     * however good its checksum: the id cannot tell them apart, so the
+     * type is what catches a group record in the user's file. */
+    mount_fresh();
+    build_a_quota_file(7u, 4096u, 19u);
+    block(QUOTA_FSB)[7u * XFS_DQUOT_BYTES + XFS_DQ_TYPE] = XFS_DQTYPE_GROUP;
+    seal(block(QUOTA_FSB) + 7u * XFS_DQUOT_BYTES, XFS_DQUOT_BYTES, XFS_DQ_CRC_OFF);
+    bcache_invalidate(&cache);
+    KTEST_CHECK(xfs_mount(&fs, &cache) == KERR_OK);
+    KTEST_CHECK(xfs_quota_get(&fs, XFS_DQTYPE_USER, 7u, &dq) == KERR_IO);
+    KTEST_CHECK(reads_outside == 0);
+}
+
 static void test_an_external_log_is_read_from_its_own_device(void) {
     mount_fresh();
     put64(block(0) + XFS_SB_LOGSTART, 0);
@@ -1320,6 +1428,7 @@ int main(void) {
     KTEST_RUN(test_holes_and_unwritten_read_as_zeroes);
     KTEST_RUN(test_read_only_features_mount_but_forbid_writing);
     KTEST_RUN(test_a_superblock_that_cannot_be_trusted);
+    KTEST_RUN(test_quotas_are_read);
     KTEST_RUN(test_an_external_log_is_read_from_its_own_device);
     KTEST_RUN(test_a_dirty_log_is_checked);
     KTEST_RUN(test_the_check_stays_inside_the_filesystem);
