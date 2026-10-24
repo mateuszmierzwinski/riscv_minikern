@@ -1053,17 +1053,54 @@ sparse inodes, `nrext64`, exchange-range, parent pointers, `bigtime`,
       file given an attribute while empty would otherwise never hold a
       single extent.
 
-      The **leaf format is read only**. Linux writes one as soon as a set
-      outgrows the inode, so refusing to read them would leave this kernel
-      blind to attributes on an ordinary filesystem; but writing one needs a
-      hash index, a free map and an allocation on the attribute fork, and a
-      half-built leaf reads as *corrupt* rather than absent. So
-      `xfs_attr_set` answers `KERR_NOSPC` when the inode is full. A value
-      held in blocks of its own is reported as present and refused on read,
-      rather than handing back a block number as if it were data. The
-      attribute fork needs its own mapper (`xfs_attr_bmap`): it is a
-      separate extent list, and reading an attribute block through
-      `xfs_bmap` would return a block of the file's own contents.
+      **The leaf format is written too**, so an attribute set is no longer
+      capped by the inode. When the shortform fork fills, it becomes a leaf
+      block — taking the new attribute with it rather than converting as a
+      step of its own, because converting first and adding after would leave
+      a leaf on disk that does not hold what the caller asked for, having
+      grown the file's metadata for nothing. Entries stay sorted by hash
+      (the same `xfs_da_hashname` directories use), pairs pack downward from
+      the end of the block while the entry array grows up from the header,
+      and the **free map** is maintained: it is what `xfs_repair` reads to
+      decide whether a block has room, so leaving it wrong is invisible here
+      and visible to every other tool. A removal leaves a **hole** rather
+      than compacting — packing a pair out would mean moving every pair
+      below it and rewriting every `nameidx`, and the format carries a
+      `holes` flag precisely to tolerate gaps until a writer needs the
+      space.
+
+      **Writing it is what tested the reader, and the reader was wrong.**
+      `xfs_attr_leaf_name_local` is `{valuelen be16; namelen u8; nameval[]}`
+      — the *value's* length first. The reader had `namelen` at offset zero,
+      which costs nothing visible on a short name and mangles every longer
+      one, and it had shipped that way because there was no leaf block to
+      read it against. This is the "code that compiled and never ran"
+      pattern that cost this project five bugs in one session, caught the
+      one way it can be: by making the thing it claims to read.
+
+      A second trap was in **this code's own interface**. The listing
+      callback handed out the raw flag byte, and `XFS_ATTR_LOCAL` is a
+      *storage* property — set for a local value in a leaf, not set in a
+      shortform fork — while `ROOT`/`SECURE` are the namespace. So a `user.`
+      attribute's flags read 0 in the inode and 1 in a leaf, and the first
+      consumer of the callback concluded it had changed namespace. The
+      lookup paths already masked correctly; only the listing leaked the
+      bits, so only the listing could mislead. It reports the namespace
+      alone now.
+
+      Still refused: a **b-tree** attribute fork, and a value held in blocks
+      of its own — reported as present and refused on read, rather than
+      handing back a block number as if it were data. The attribute fork
+      needs its own mapper (`xfs_attr_bmap`): it is a separate extent list,
+      and reading an attribute block through `xfs_bmap` would return a block
+      of the file's own contents.
+
+      **On the board**: two attributes in two namespaces set in the inode,
+      a dozen more added until the fork is pushed into a leaf (`1 to leaf`,
+      counted, because a set that happened to fit would exercise none of
+      it), all fourteen listed and one read back byte for byte **after a
+      remount**, one removed without disturbing the rest, and a name in an
+      unknown namespace refused.
 
 - [x] **Directory growth: shortform into block format.** (M) **Done, and
       verified on the board.** A directory stopped accepting names at about

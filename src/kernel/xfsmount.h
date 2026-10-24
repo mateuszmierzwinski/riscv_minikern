@@ -159,6 +159,9 @@ uint64_t xfsmount_inode_chunks_added(void);
  * rather than merely exist. */
 uint64_t xfsmount_leaf_splits(void);
 
+/* Attribute forks that outgrew the inode and became a leaf block. */
+uint64_t xfsmount_attrs_to_leaf(void);
+
 /* Allocations that had to leave the group they asked for. */
 uint64_t xfsmount_alloc_other_group(void);
 

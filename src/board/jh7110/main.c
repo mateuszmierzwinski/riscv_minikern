@@ -1599,6 +1599,8 @@ static int tally_attr(void *self, const uint8_t *name, uint32_t namelen, uint8_t
                       uint32_t valuelen) {
     struct attr_tally *t = self;
     t->seen++;
+    /* `flags` is the namespace alone, so zero means `user.` whether the
+     * attribute is in the inode or in a leaf block. */
     t->found_colour = t->found_colour || (namelen == 6u && name[0] == 'c' && flags == 0);
     (void)valuelen;
     return KERR_OK;
@@ -1622,9 +1624,10 @@ static int tally_attr(void *self, const uint8_t *name, uint32_t namelen, uint8_t
 static int attributes_round_trip(void) {
     static const uint8_t purple[] = {'p', 'u', 'r', 'p', 'l', 'e'};
     static const uint8_t level[] = {'9'};
-    uint8_t out[16];
+    uint8_t out[32];
     uint32_t len = 0;
     struct attr_tally t = {0, false};
+    uint64_t conversions = 0;
     int rc = xfsmount_create("a1", 0100644u);
     rc = rc != KERR_OK ? rc : xfsmount_attr_set("a1", "user.colour", purple, sizeof purple);
     rc = rc != KERR_OK ? rc : xfsmount_attr_set("a1", "trusted.level", level, sizeof level);
@@ -1663,6 +1666,49 @@ static int attributes_round_trip(void) {
     if (xfsmount_attr_get("a1", "user.level", out, sizeof out, &len) != KERR_NOENT) {
         return KERR_IO;
     }
+    /* **Past what the inode holds**, so the fork has to become a leaf
+     * block. Half a 512-byte inode's literal area is 168 bytes, and each of
+     * these costs about thirty, so a dozen crosses it comfortably. Without
+     * this the leaf writer would never run — and the leaf *reader* would
+     * stay unexercised too, which is how its name/value layout came to be
+     * wrong in the first place. */
+    for (uint32_t i = 0; rc == KERR_OK && i < 12u; i++) {
+        char attr[20] = "user.filler00";
+        uint8_t body[16];
+        attr[11] = (char)('0' + i / 10u);
+        attr[12] = (char)('0' + i % 10u);
+        for (uint32_t k = 0; k < sizeof body; k++) {
+            body[k] = (uint8_t)('a' + i);
+        }
+        rc = xfsmount_attr_set("a1", attr, body, sizeof body);
+    }
+    conversions = xfsmount_attrs_to_leaf();
+    if (rc != KERR_OK || conversions == 0) {
+        kprintf("fswrite: the attribute fork did not become a leaf (rc %d, %llu)\n", rc,
+                (unsigned long long)conversions);
+        return rc != KERR_OK ? rc : KERR_IO;
+    }
+    /* Everything still there, through the leaf: the two originals and the
+     * twelve fillers. And read **after a mount**, so the leaf block is read
+     * from the disk rather than from the buffer that wrote it. */
+    rc = xfsmount_remount();
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    len = 0;
+    rc = xfsmount_attr_get("a1", "user.filler07", out, sizeof out, &len);
+    if (rc != KERR_OK || len != 16u || out[0] != 'h') {
+        kprintf("fswrite: a leaf attribute read back wrong (rc %d, %u bytes, 0x%x)\n", rc,
+                len, len > 0 ? out[0] : 0u);
+        return rc != KERR_OK ? rc : KERR_IO;
+    }
+    t.seen = 0;
+    t.found_colour = false;
+    rc = xfsmount_attr_list("a1", tally_attr, &t);
+    if (rc != KERR_OK || t.seen != 14u || !t.found_colour) {
+        kprintf("fswrite: the leaf listed %u attribute(s), wanted 14\n", t.seen);
+        return rc != KERR_OK ? rc : KERR_IO;
+    }
     rc = xfsmount_attr_remove("a1", "user.colour");
     rc = rc != KERR_OK ? rc
                        : (xfsmount_attr_get("a1", "user.colour", out, sizeof out, &len) ==
@@ -1671,7 +1717,15 @@ static int attributes_round_trip(void) {
                               : KERR_IO);
     /* Removing one must not remove the other. */
     rc = rc != KERR_OK ? rc : xfsmount_attr_get("a1", "trusted.level", out, sizeof out, &len);
-    kprintf("fswrite: attributes set, listed, survived a mount, removed\n");
+    /* **The captured count, not a fresh read.** The mount below this point
+     * resets the filesystem's counters, so reading them at the end reports
+     * zero for work that certainly happened — which it did, and said `0 to
+     * leaf` on a run where the conversion had just been asserted a few
+     * lines above. Third time in this session that a re-mount wiped a
+     * number that was then read: the rule is that a counter is captured
+     * where it is meaningful, not where it is convenient to print. */
+    kprintf("fswrite: attributes set, listed, survived a mount, removed; %llu to leaf\n",
+            (unsigned long long)conversions);
     return rc;
 }
 

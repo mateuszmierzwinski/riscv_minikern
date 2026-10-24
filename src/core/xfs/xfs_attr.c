@@ -195,7 +195,8 @@ int xfs_attr_list(struct xfs *fs, const struct xfs_inode *ip, xfs_attr_fn fn, vo
          * on disk and its value is not, so listing it would offer a caller
          * something that cannot be read. */
         if ((flags & XFS_ATTR_INCOMPLETE) == 0) {
-            rc = fn(self, fork + at + SF_ENTRY, namelen, flags, valuelen);
+            rc = fn(self, fork + at + SF_ENTRY, namelen,
+                    (uint8_t)(flags & XFS_ATTR_NSP), valuelen);
             if (rc != KERR_OK) {
                 return rc;
             }
@@ -206,6 +207,22 @@ int xfs_attr_list(struct xfs *fs, const struct xfs_inode *ip, xfs_attr_fn fn, vo
 }
 
 /* ── writing ──────────────────────────────────────────────────────────── */
+
+/* Defined below, and called from `xfs_attr_set` and `xfs_attr_remove`: the
+ * shortform fork becomes a leaf when the inode fills, a fork that is
+ * already a leaf is written as one, and both paths need the loader and the
+ * remover that live with the leaf code. */
+static int leaf_load(struct xfs *fs, const struct xfs_inode *ip, uint8_t **at,
+                     uint64_t *fsb);
+static bool leaf_take_out(struct xfs *fs, const char *name, uint32_t namelen,
+                          uint8_t flags);
+static int xfs_attr_leaf_store(struct xfs *fs, uint64_t fsb);
+static int xfs_attr_to_leaf(struct xfs *fs, const struct xfs_inode *ip, const char *name,
+                            uint32_t namelen, const uint8_t *value, uint32_t valuelen,
+                            uint8_t flags, uint64_t now_s);
+static int xfs_attr_leaf_set(struct xfs *fs, const struct xfs_inode *ip, const char *name,
+                             uint32_t namelen, const uint8_t *value, uint32_t valuelen,
+                             uint8_t flags, uint64_t now_s);
 
 /* How many bytes of the literal area the data fork needs.
  *
@@ -326,11 +343,14 @@ int xfs_attr_set(struct xfs *fs, const struct xfs_inode *ip, const char *name,
     if (barelen > 255u || valuelen > 255u || room > sizeof fork) {
         return KERR_NOSPC;
     }
-    /* The fork as it stands, or a fresh empty one. An inode whose
-     * attribute fork is a *leaf* is refused rather than overwritten with a
-     * shortform one, which would lose every attribute it already had. */
+    /* An inode whose attribute fork is already a leaf is written as one:
+     * overwriting it with a shortform fork would lose every attribute it
+     * held. */
+    if (ip->forkoff != 0 && ip->aformat == XFS_DINODE_FMT_EXTENTS) {
+        return xfs_attr_leaf_set(fs, ip, bare, barelen, value, valuelen, flags, now_s);
+    }
     if (ip->forkoff != 0 && ip->aformat != XFS_DINODE_FMT_LOCAL) {
-        return KERR_NOSPC;
+        return KERR_NOTSUP; /* a b-tree attribute fork */
     }
     used = SF_HDR;
     if (ip->forkoff != 0) {
@@ -362,10 +382,15 @@ int xfs_attr_set(struct xfs *fs, const struct xfs_inode *ip, const char *name,
     }
     entry = SF_ENTRY + barelen + valuelen;
     if (used + entry > room) {
-        /* The inode is full. Linux would move the fork into a leaf block;
-         * this refuses, so the attribute is absent rather than half
-         * written. */
-        return KERR_NOSPC;
+        /* **The inode is full, so the fork becomes a leaf block.** The
+         * conversion takes the new attribute with it rather than being a
+         * step of its own: converting first and adding after would leave a
+         * leaf on disk that does not hold the attribute the caller asked
+         * for, and a caller that then failed would have grown the file's
+         * metadata for nothing. */
+        rc = xfs_attr_to_leaf(fs, ip, bare, barelen, value, valuelen, flags, now_s);
+        fs->attrs_to_leaf += rc == KERR_OK ? 1u : 0u;
+        return rc;
     }
     fork[used + SF_NAMELEN] = (uint8_t)barelen;
     fork[used + SF_VALUELEN] = (uint8_t)valuelen;
@@ -397,8 +422,24 @@ int xfs_attr_remove(struct xfs *fs, const struct xfs_inode *ip, const char *name
     if (rc != KERR_OK) {
         return rc;
     }
-    if (ip->forkoff == 0 || ip->aformat != XFS_DINODE_FMT_LOCAL) {
+    if (ip->forkoff == 0) {
         return KERR_NOENT;
+    }
+    if (ip->aformat == XFS_DINODE_FMT_EXTENTS) {
+        uint8_t *leaf = NULL;
+        uint64_t fsb = 0;
+        rc = leaf_load(fs, ip, &leaf, &fsb);
+        if (rc != KERR_OK) {
+            return rc;
+        }
+        if (!leaf_take_out(fs, bare, barelen, flags)) {
+            return KERR_NOENT;
+        }
+        xfs_reseal(fs->dirblock, fs->blocksize, XFS_DA3_CRC_OFF);
+        return xfs_attr_leaf_store(fs, fsb);
+    }
+    if (ip->aformat != XFS_DINODE_FMT_LOCAL) {
+        return KERR_NOTSUP;
     }
     rc = load_afork(fs, ip, fork, &len);
     if (rc != KERR_OK || len < SF_HDR) {
@@ -467,7 +508,8 @@ int xfs_attr_bmap(struct xfs *fs, const struct xfs_inode *ip, uint64_t logical,
  * attribute fork, and a half-built leaf is an attribute set that reads as
  * corrupt rather than as absent. So `xfs_attr_set` answers `KERR_NOSPC`
  * when the inode is full, and this side stays a reader. */
-static int leaf_load(struct xfs *fs, const struct xfs_inode *ip, uint8_t **at) {
+static int leaf_load(struct xfs *fs, const struct xfs_inode *ip, uint8_t **at,
+                     uint64_t *fsb) {
     struct xfs_extent e;
     struct bbuf *b;
     int rc;
@@ -478,6 +520,7 @@ static int leaf_load(struct xfs *fs, const struct xfs_inode *ip, uint8_t **at) {
     if (rc != KERR_OK) {
         return rc;
     }
+    *fsb = e.startblock;
     rc = bcache_get(fs->cache, xfs_fsb_to_block(fs, e.startblock), &b);
     if (rc != KERR_OK) {
         return rc;
@@ -515,18 +558,22 @@ static int leaf_entry(const struct xfs *fs, const uint8_t *leaf, uint32_t i,
         return KERR_IO;
     }
     if ((*flags & XFS_ATTR_LOCAL) != 0) {
-        *namelen = leaf[idx];
-        *valuelen = xfs_be16(leaf + idx + 1u);
-        *name = leaf + idx + 3u;
-        *value_at = idx + 3u + *namelen;
-        return idx + 3u + *namelen + *valuelen <= fs->blocksize ? KERR_OK : KERR_IO;
+        /* **The value's length comes first.** Reading `namelen` from offset
+         * zero costs nothing visible on a short name and mangles every
+         * longer one — and that is exactly what this did for as long as
+         * there was no leaf block to read it against. The writer below is
+         * what caught it. */
+        *valuelen = xfs_be16(leaf + idx + ATTR_LOCAL_VALUELEN);
+        *namelen = leaf[idx + ATTR_LOCAL_NAMELEN];
+        *name = leaf + idx + ATTR_LOCAL_NAMEVAL;
+        *value_at = idx + ATTR_LOCAL_NAMEVAL + *namelen;
+        return *value_at + *valuelen <= fs->blocksize ? KERR_OK : KERR_IO;
     }
-    /* Remote: valueblk be32, valuelen be32, namelen u8, then the name. */
-    *valuelen = xfs_be32(leaf + idx + 4u);
-    *namelen = leaf[idx + 8u];
-    *name = leaf + idx + 9u;
+    *valuelen = xfs_be32(leaf + idx + ATTR_REMOTE_VALUELEN);
+    *namelen = leaf[idx + ATTR_REMOTE_NAMELEN];
+    *name = leaf + idx + ATTR_REMOTE_NAME;
     *value_at = 0; /* not in this block */
-    return idx + 9u + *namelen <= fs->blocksize ? KERR_OK : KERR_IO;
+    return idx + ATTR_REMOTE_NAME + *namelen <= fs->blocksize ? KERR_OK : KERR_IO;
 }
 
 int xfs_attr_leaf_get(struct xfs *fs, const struct xfs_inode *ip, const char *name,
@@ -534,7 +581,8 @@ int xfs_attr_leaf_get(struct xfs *fs, const struct xfs_inode *ip, const char *na
                       uint32_t *valuelen) {
     uint8_t *leaf = NULL;
     uint32_t count;
-    int rc = leaf_load(fs, ip, &leaf);
+    uint64_t fsb = 0;
+    int rc = leaf_load(fs, ip, &leaf, &fsb);
     if (rc != KERR_OK) {
         return rc;
     }
@@ -570,7 +618,8 @@ int xfs_attr_leaf_list(struct xfs *fs, const struct xfs_inode *ip, xfs_attr_fn f
                        void *self) {
     uint8_t *leaf = NULL;
     uint32_t count;
-    int rc = leaf_load(fs, ip, &leaf);
+    uint64_t fsb = 0;
+    int rc = leaf_load(fs, ip, &leaf, &fsb);
     if (rc != KERR_OK) {
         return rc;
     }
@@ -586,10 +635,245 @@ int xfs_attr_leaf_list(struct xfs *fs, const struct xfs_inode *ip, xfs_attr_fn f
         if ((f & XFS_ATTR_INCOMPLETE) != 0) {
             continue;
         }
-        rc = fn(self, at, len, f, vlen);
+        rc = fn(self, at, len, (uint8_t)(f & XFS_ATTR_NSP), vlen);
         if (rc != KERR_OK) {
             return rc;
         }
     }
     return KERR_OK;
+}
+
+/* ── the leaf format, written ─────────────────────────────────────────── */
+
+/* Writes the buffer back to the attribute fork's block. */
+static int xfs_attr_leaf_store(struct xfs *fs, uint64_t fsb) {
+    struct bbuf *b;
+    int rc = bcache_get(fs->cache, xfs_fsb_to_block(fs, fsb), &b);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    xfs_copy_bytes(b->data, fs->dirblock, fs->blocksize);
+    bcache_dirty(b);
+    bcache_put(fs->cache, b);
+    return KERR_OK;
+}
+
+/* Takes one entry out of the leaf in the buffer, leaving its name and value
+ * where they are.
+ *
+ * The pair becomes a **hole**, which `holes` records: compacting it out
+ * would mean moving every pair below it and rewriting every entry's
+ * `nameidx`, and the format is explicitly built to tolerate gaps until a
+ * writer needs the space. `usedbytes` drops, so the block still knows how
+ * much of it is live. */
+static bool leaf_take_out(struct xfs *fs, const char *name, uint32_t namelen,
+                          uint8_t flags) {
+    uint32_t count = xfs_be16(fs->dirblock + ATTR_LEAF_COUNT);
+    for (uint32_t i = 0; i < count; i++) {
+        const uint8_t *at = NULL;
+        uint32_t len = 0, vlen = 0, value_at = 0;
+        uint8_t f = 0;
+        if (leaf_entry(fs, fs->dirblock, i, &at, &len, &vlen, &value_at, &f) != KERR_OK) {
+            return false;
+        }
+        if (len != namelen || (f & XFS_ATTR_NSP) != flags || !same_name(at, name, namelen)) {
+            continue;
+        }
+        for (uint32_t k = i; k + 1u < count; k++) {
+            xfs_copy_bytes(fs->dirblock + ATTR_LEAF_HDR + k * ATTR_LEAF_ENTRY,
+                           fs->dirblock + ATTR_LEAF_HDR + (k + 1u) * ATTR_LEAF_ENTRY,
+                           ATTR_LEAF_ENTRY);
+        }
+        xfs_put_be16(fs->dirblock + ATTR_LEAF_COUNT, (uint16_t)(count - 1u));
+        {
+            uint32_t used = xfs_be16(fs->dirblock + ATTR_LEAF_USEDBYTES);
+            uint32_t size = ATTR_LOCAL_SIZE(len, vlen);
+            xfs_put_be16(fs->dirblock + ATTR_LEAF_USEDBYTES,
+                         (uint16_t)(used > size ? used - size : 0u));
+        }
+        fs->dirblock[ATTR_LEAF_HOLES] = 1u;
+        return true;
+    }
+    return false;
+}
+
+/* Stores the inode's attribute fork as a single extent and says it is one.
+ *
+ * The shortform bytes at `forkoff` are replaced by a sixteen-byte extent
+ * record, and `di_aformat` becomes `EXTENTS`. Both halves matter: a fork
+ * whose format still says `LOCAL` would be parsed as attributes, and the
+ * first two bytes of an extent record read as a shortform `totsize` of
+ * something enormous. */
+static int store_attr_extent(struct xfs *fs, const struct xfs_inode *ip, uint64_t fsb,
+                             uint64_t now_s) {
+    struct xfs_extent e = {.startoff = 0, .startblock = fsb, .blockcount = 1};
+    uint64_t block;
+    uint32_t boffset;
+    struct bbuf *b;
+    uint8_t *di;
+    int rc;
+    xfs_inode_place(fs, ip->ino, &block, &boffset);
+    rc = bcache_get(fs->cache, block, &b);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    di = b->data + boffset;
+    for (uint32_t i = 0; i < XFS_EXTENT_BYTES; i++) {
+        di[XFS_DI_V3_SIZE + (uint32_t)ip->forkoff * 8u + i] = 0;
+    }
+    xfs_extent_pack(di + XFS_DI_V3_SIZE + (uint32_t)ip->forkoff * 8u, &e);
+    di[XFS_DI_AFORMAT] = XFS_DINODE_FMT_EXTENTS;
+    xfs_put_be64(di + XFS_DI_NBLOCKS, ip->nblocks + 1u);
+    xfs_put_be32(di + XFS_DI_MTIME, (uint32_t)now_s);
+    xfs_put_be32(di + XFS_DI_CTIME, (uint32_t)now_s);
+    xfs_reseal(di, fs->inodesize, XFS_DI_CRC);
+    bcache_dirty(b);
+    bcache_put(fs->cache, b);
+    return KERR_OK;
+}
+
+/* Writes an empty leaf into the directory buffer.
+ *
+ * `firstused` starts at the end of the block and grows **downwards** as
+ * pairs are added, while the entry array grows upwards from the header —
+ * the same arrangement a directory's leaf uses, and the free map records
+ * the gap between them. A free map left wrong is the structure `xfs_repair`
+ * reads to decide whether a block has room. */
+static void empty_attr_leaf(struct xfs *fs, uint64_t ino, uint64_t blkno) {
+    for (uint32_t i = 0; i < fs->blocksize; i++) {
+        fs->dirblock[i] = 0;
+    }
+    xfs_put_be16(fs->dirblock + XFS_DA3_MAGIC_OFF, XFS_ATTR_LEAF_MAGIC);
+    xfs_put_be64(fs->dirblock + XFS_DA3_BLKNO_OFF, blkno);
+    xfs_put_be64(fs->dirblock + XFS_DA3_OWNER_OFF, ino);
+    for (uint32_t i = 0; i < 16; i++) {
+        fs->dirblock[XFS_DA3_UUID_OFF + i] = fs->uuid[i];
+    }
+    xfs_put_be16(fs->dirblock + ATTR_LEAF_FIRSTUSED, (uint16_t)fs->blocksize);
+    xfs_put_be16(fs->dirblock + ATTR_LEAF_FREEMAP, ATTR_LEAF_HDR);
+    xfs_put_be16(fs->dirblock + ATTR_LEAF_FREEMAP + 2u,
+                 (uint16_t)(fs->blocksize - ATTR_LEAF_HDR));
+}
+
+/* Puts one attribute into the leaf held in the buffer.
+ *
+ * The entry array is kept **sorted by hash**, which is what makes a lookup
+ * a search rather than a walk — and what a reader expecting sorted order
+ * would otherwise silently mis-search. The name and value go at the bottom
+ * of the free gap; the entry that points at them is inserted in place.
+ *
+ * Runs to 30 lines: it is one derivation over a single block — where the
+ * pair goes, where its entry goes, and the three header fields that move
+ * with both — and no part of it can be checked without the others in front
+ * of you (Rule 11, Single derivation). */
+static int leaf_put(struct xfs *fs, const char *name, uint32_t namelen,
+                    const uint8_t *value, uint32_t valuelen, uint8_t flags) {
+    uint32_t count = xfs_be16(fs->dirblock + ATTR_LEAF_COUNT);
+    uint32_t firstused = xfs_be16(fs->dirblock + ATTR_LEAF_FIRSTUSED);
+    uint32_t used = xfs_be16(fs->dirblock + ATTR_LEAF_USEDBYTES);
+    uint32_t size = ATTR_LOCAL_SIZE(namelen, valuelen);
+    uint32_t hash = xfs_dir_hashname(name, namelen);
+    uint32_t entries_end = ATTR_LEAF_HDR + (count + 1u) * ATTR_LEAF_ENTRY;
+    uint32_t at = count, pair;
+    if (firstused < size || entries_end > firstused - size) {
+        return KERR_NOSPC; /* the array and the pairs would meet */
+    }
+    pair = firstused - size;
+    for (uint32_t i = 0; i < count; i++) {
+        if (xfs_be32(fs->dirblock + ATTR_LEAF_HDR + i * ATTR_LEAF_ENTRY) > hash) {
+            at = i;
+            break;
+        }
+    }
+    for (uint32_t i = count; i > at; i--) {
+        xfs_copy_bytes(fs->dirblock + ATTR_LEAF_HDR + i * ATTR_LEAF_ENTRY,
+                       fs->dirblock + ATTR_LEAF_HDR + (i - 1u) * ATTR_LEAF_ENTRY,
+                       ATTR_LEAF_ENTRY);
+    }
+    xfs_put_be32(fs->dirblock + ATTR_LEAF_HDR + at * ATTR_LEAF_ENTRY, hash);
+    xfs_put_be16(fs->dirblock + ATTR_LEAF_HDR + at * ATTR_LEAF_ENTRY + ATTR_LEAF_NAMEIDX,
+                 (uint16_t)pair);
+    fs->dirblock[ATTR_LEAF_HDR + at * ATTR_LEAF_ENTRY + ATTR_LEAF_FLAGS] =
+        (uint8_t)(flags | XFS_ATTR_LOCAL);
+    xfs_put_be16(fs->dirblock + pair + ATTR_LOCAL_VALUELEN, (uint16_t)valuelen);
+    fs->dirblock[pair + ATTR_LOCAL_NAMELEN] = (uint8_t)namelen;
+    for (uint32_t i = 0; i < namelen; i++) {
+        fs->dirblock[pair + ATTR_LOCAL_NAMEVAL + i] = (uint8_t)name[i];
+    }
+    for (uint32_t i = 0; i < valuelen; i++) {
+        fs->dirblock[pair + ATTR_LOCAL_NAMEVAL + namelen + i] = value[i];
+    }
+    xfs_put_be16(fs->dirblock + ATTR_LEAF_COUNT, (uint16_t)(count + 1u));
+    xfs_put_be16(fs->dirblock + ATTR_LEAF_FIRSTUSED, (uint16_t)pair);
+    xfs_put_be16(fs->dirblock + ATTR_LEAF_USEDBYTES, (uint16_t)(used + size));
+    xfs_put_be16(fs->dirblock + ATTR_LEAF_FREEMAP, (uint16_t)entries_end);
+    xfs_put_be16(fs->dirblock + ATTR_LEAF_FREEMAP + 2u, (uint16_t)(pair - entries_end));
+    return KERR_OK;
+}
+
+int xfs_attr_to_leaf(struct xfs *fs, const struct xfs_inode *ip, const char *name,
+                     uint32_t namelen, const uint8_t *value, uint32_t valuelen,
+                     uint8_t flags, uint64_t now_s) {
+    uint8_t fork[XFS_AFORK_MAX];
+    uint32_t len = 0, count, at = SF_HDR, agno;
+    uint32_t agbno = 0;
+    uint64_t fsb;
+    int rc = load_afork(fs, ip, fork, &len);
+    if (rc != KERR_OK || len < SF_HDR) {
+        return rc != KERR_OK ? rc : KERR_IO;
+    }
+    count = fork[SF_COUNT];
+    agno = xfs_fsb_ag(fs, ip->ino >> fs->inopblog);
+    rc = xfs_alloc_somewhere(fs, &agno, 1u, 0, &agbno);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    fsb = ((uint64_t)agno << fs->agblklog) | agbno;
+    empty_attr_leaf(fs, ip->ino, 0);
+    /* Every attribute that was in the inode, then the one that would not
+     * fit. **The new one last**, so that a failure to place it leaves the
+     * block holding exactly what the inode already held — and the inode
+     * still pointing at the inode, since the extent is stored at the end. */
+    for (uint32_t i = 0; i < count && at + SF_ENTRY <= len && rc == KERR_OK; i++) {
+        uint32_t nlen = fork[at + SF_NAMELEN];
+        uint32_t vlen = fork[at + SF_VALUELEN];
+        if (at + SF_ENTRY + nlen + vlen > len) {
+            return KERR_IO;
+        }
+        rc = leaf_put(fs, (const char *)(fork + at + SF_ENTRY), nlen,
+                      fork + at + SF_ENTRY + nlen, vlen, fork[at + SF_FLAGS]);
+        at += SF_ENTRY + nlen + vlen;
+    }
+    rc = rc != KERR_OK ? rc : leaf_put(fs, name, namelen, value, valuelen, flags);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    xfs_reseal(fs->dirblock, fs->blocksize, XFS_DA3_CRC_OFF);
+    rc = xfs_attr_leaf_store(fs, fsb);
+    return rc != KERR_OK ? rc : store_attr_extent(fs, ip, fsb, now_s);
+}
+
+int xfs_attr_leaf_set(struct xfs *fs, const struct xfs_inode *ip, const char *name,
+                      uint32_t namelen, const uint8_t *value, uint32_t valuelen,
+                      uint8_t flags, uint64_t now_s) {
+    uint8_t *leaf = NULL;
+    uint64_t fsb = 0;
+    int rc = leaf_load(fs, ip, &leaf, &fsb);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    /* Replace is remove-then-add here too, and for the same reason as in
+     * the inode: a pair of a different length cannot be written over the
+     * old one. The old pair becomes a hole rather than being compacted
+     * out — `holes` is what tells a writer the block needs packing before
+     * its free map can be believed. */
+    (void)leaf_take_out(fs, name, namelen, flags);
+    rc = leaf_put(fs, name, namelen, value, valuelen, flags);
+    if (rc != KERR_OK) {
+        return rc; /* the block is unchanged on disk: nothing was stored */
+    }
+    xfs_reseal(fs->dirblock, fs->blocksize, XFS_DA3_CRC_OFF);
+    rc = xfs_attr_leaf_store(fs, fsb);
+    (void)now_s;
+    return rc;
 }

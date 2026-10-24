@@ -159,6 +159,29 @@
 #define ATTR_LEAF_ENTRY     8u  /* hashval be32, nameidx be16, flags u8, pad u8 */
 #define ATTR_LEAF_NAMEIDX   4u  /* be16, within an entry */
 #define ATTR_LEAF_FLAGS     6u  /* u8, within an entry */
+#define ATTR_LEAF_USEDBYTES 58u /* be16 */
+#define ATTR_LEAF_FIRSTUSED 60u /* be16: the lowest name/value byte in use */
+#define ATTR_LEAF_HOLES     62u /* u8: a removal left a gap */
+#define ATTR_LEAF_FREEMAP   64u /* three {base be16, size be16} */
+
+/* A **local** name/value pair, and the field order that matters: the value
+ * length comes first as a be16, *then* the one-byte name length, then the
+ * name and the value. Reading them the other way round — namelen first —
+ * costs nothing on a short name and silently mangles everything else, and
+ * it is what this reader did for as long as there was no leaf block to read
+ * it against. */
+#define ATTR_LOCAL_VALUELEN 0u /* be16 */
+#define ATTR_LOCAL_NAMELEN  2u /* u8 */
+#define ATTR_LOCAL_NAMEVAL  3u /* the name, then the value */
+
+/* A **remote** pair, whose value lives in blocks of its own. */
+#define ATTR_REMOTE_VALUEBLK 0u /* be32 */
+#define ATTR_REMOTE_VALUELEN 4u /* be32 */
+#define ATTR_REMOTE_NAMELEN  8u /* u8 */
+#define ATTR_REMOTE_NAME     9u
+
+/* A local pair's bytes in the block, which the format rounds to eight. */
+#define ATTR_LOCAL_SIZE(nlen, vlen) (((nlen) + (vlen) + 3u + 7u) & ~7u)
 
 #define XFS_DINODE_FMT_DEV     0u
 #define XFS_DINODE_FMT_LOCAL   1u /* the fork holds the data itself */

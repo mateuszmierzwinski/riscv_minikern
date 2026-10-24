@@ -376,6 +376,10 @@ uint64_t xfsmount_leaf_splits(void) {
     return fs.leaf_splits;
 }
 
+uint64_t xfsmount_attrs_to_leaf(void) {
+    return fs.attrs_to_leaf;
+}
+
 /* ── writing ───────────────────────────────────────────────────────────── */
 
 /* What goes in a timestamp, given that this board has no clock.

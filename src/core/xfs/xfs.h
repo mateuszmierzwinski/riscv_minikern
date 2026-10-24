@@ -176,6 +176,10 @@ struct xfs {
      * format grow rather than merely exist. The conversion alone makes two
      * leaves, so a directory that never needed a third never ran it. */
     uint64_t leaf_splits;
+    /* Attribute forks moved out of the inode into a leaf block. Counted
+     * because an attribute set that happened to fit inside the inode would
+     * exercise none of that path while passing every check. */
+    uint64_t attrs_to_leaf;
     /* Data blocks added to a directory that had filled the ones it had. */
     uint64_t dir_blocks_added;
     /* Allocations answered by a group other than the one asked for. Zero
@@ -311,8 +315,14 @@ int xfs_path_lookup(struct xfs *fs, const char *path, struct xfs_inode *out);
  * KERR_ISDIR for a directory — its bytes are structure, not content, and
  * xfs_dir_list is how they are read. */
 /* What a listing reports for one attribute: its stored name (without the
- * namespace prefix), the flags that say which namespace it is in, and how
- * long its value is. */
+ * namespace prefix), **the namespace alone**, and how long its value is.
+ *
+ * The namespace, not the raw flag byte. `XFS_ATTR_LOCAL` says where the
+ * value is kept and is set in a leaf block but not in a shortform fork — so
+ * a caller comparing the whole byte sees a `user.` attribute appear to
+ * change namespace the moment its fork outgrows the inode. The first
+ * consumer of this callback did exactly that and the board caught it, which
+ * is reason enough to hand out the thing callers actually mean. */
 typedef int (*xfs_attr_fn)(void *self, const uint8_t *name, uint32_t namelen,
                            uint8_t flags, uint32_t valuelen);
 

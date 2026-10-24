@@ -191,7 +191,13 @@ CASES = [
       # the filesystem was mounted afresh — which is the only step that
       # proves they reached the disk rather than a variable, since the
       # writer and the reader are the same code.
-      "fswrite: attributes set, listed, survived a mount, removed",
+      # Attributes written, read back, listed, found again after the
+      # filesystem was mounted afresh, and the fork pushed **out of the
+      # inode into a leaf block** — the count matters because a set that
+      # happened to fit inside the inode would exercise none of the leaf
+      # writer, and the leaf *reader* was wrong for exactly that reason
+      # until the writer existed to check it.
+      "fswrite: attributes set, listed, survived a mount, removed; 1 to leaf",
       "the log was replayed; the filesystem is clean",
       "the log could not be replayed; mounting read-only"],
      700, None, "small"),
