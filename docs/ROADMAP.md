@@ -1009,43 +1009,61 @@ sparse inodes, `nrext64`, exchange-range, parent pointers, `bigtime`,
       run: with replay refused, the same filesystem mounts **read-only**. (M) A dirty log is refused rather than replayed, so an
       unclean shutdown needs `xfs_repair` on another machine. Deliberate for
       now — guessing at a log is how data is lost — but it is a gap.
-- [ ] **Extended attributes.** (M) Not read at all, which is also why parent
-      pointers are accepted but unusable.
-- [ ] **External logs, quotas, the realtime subvolume, v4 filesystems,
-      inode sizes other than 256 and 512.** (M each) Refused.
-- [x] **Hard links and rename, and the write path running at all.** (M)
-      **Done for the shortform case, and verified on the board — where it
-      turned out the rest of the write path had never run either.**
+- [x] **Extended attributes.** (M) **Done for the shortform fork, read and
+      written, and board-proven across a mount.** This was recorded as
+      blocked on testability rather than difficulty: setting an xattr needs
+      a mounted filesystem, which needs root, and `mkfs.xfs`'s protofile
+      cannot express one — so there was no way to make a sample to read.
 
-      `xfs_create` **had no caller**. Create, unlink and write were written,
-      compiled and reachable from nothing, so "writing works for the simple
-      cases" was a claim about code existing rather than about behaviour.
-      They are reachable now (`xfsmount_create`, `_write`, `_link`,
-      `_rename`, `_unlink`, on names in the root, which is as far as a write
-      path limited to shortform directories can honestly reach) and
-      exercised by `minikern.fswrite`.
+      The way in was to notice that **shortform attributes live entirely
+      inside the inode's literal area**. The writer allocates nothing, so
+      writing them is what makes reading them testable: set, read back,
+      list, remove, and then **mount the filesystem again** and read them
+      once more. That last step is the one that matters, because everything
+      before it would pass on a kernel that kept attributes in a variable —
+      the writer and the reader are the same code and would agree with each
+      other about anything.
 
-      `link` and `rename` are arrangements of the two operations create and
-      unlink already had, plus the thing that makes them safe: the **link
-      count**. `unlink` had been refusing any file whose count was above one
-      — reasonable while nothing could produce one, and a bug the moment
-      `link` existed, because removing one name from a file with two would
-      have freed the inode under the other. It now removes the name and
-      decrements, and frees only at the last one.
+      Three facts the format insists on, each of which a reader written
+      alone would have got wrong silently:
 
-      `rename` adds before it removes, because a crash between them leaves
-      the file reachable under **both** names where the other order leaves
-      it reachable under neither — and with no log replay, neither can be
-      undone. A directory may be renamed within its parent but not moved to
-      another: its `..` and both parents' counts would be wrong.
+      - **The namespace is a flag, not part of the name.** Linux presents
+        `user.foo`; XFS stores `foo` with no flag, `trusted.foo` as `foo`
+        with ROOT, `security.foo` as `foo` with SECURE. Keeping the prefix
+        in the name would find nothing Linux wrote and write nothing Linux
+        could find — while passing any test that used only its own output,
+        which is why the test uses all three namespaces and checks that
+        `user.level` is *absent* after `trusted.level` was set. A prefix
+        this kernel does not know is **refused** rather than stored as a
+        user attribute.
+      - **`forkoff` of zero means there is no attribute fork**, not "it
+        starts at the beginning". The first version computed
+        `(data_fork_bytes + 7) / 8`, which for a freshly created empty file
+        is exactly zero: it stored the fork and then stamped "no fork here"
+        over it. The board read back `KERR_NOENT` for an attribute it had
+        just written.
+      - **Replace is remove-then-add.** Entries are packed with no gaps, so
+        a new value of a different length cannot be written over the old
+        one; doing it anyway eats the first bytes of the entry after it.
 
-      **On the board**, every step, each checking what the previous one
-      claimed: create, write, read back, link, both names resolving to one
-      inode with a count of two, rename, the old name gone, unlink one name
-      with the other still reading the same bytes, and unlink the last. A
-      standing case, on a RAM-disk image that is discarded at the next power
-      cycle — so a test that corrupts a filesystem costs nothing and the
-      operator's card is never touched.
+      The default offset is **half the literal area**, as Linux does, and
+      for a reason rather than symmetry: the data fork cannot be moved once
+      attributes sit above it — `extend_fork` refuses to grow past its
+      bound, which is what stops a growing file from eating them — so a
+      file given an attribute while empty would otherwise never hold a
+      single extent.
+
+      The **leaf format is read only**. Linux writes one as soon as a set
+      outgrows the inode, so refusing to read them would leave this kernel
+      blind to attributes on an ordinary filesystem; but writing one needs a
+      hash index, a free map and an allocation on the attribute fork, and a
+      half-built leaf reads as *corrupt* rather than absent. So
+      `xfs_attr_set` answers `KERR_NOSPC` when the inode is full. A value
+      held in blocks of its own is reported as present and refused on read,
+      rather than handing back a block number as if it were data. The
+      attribute fork needs its own mapper (`xfs_attr_bmap`): it is a
+      separate extent list, and reading an attribute block through
+      `xfs_bmap` would return a block of the file's own contents.
 
 - [x] **Directory growth: shortform into block format.** (M) **Done, and
       verified on the board.** A directory stopped accepting names at about

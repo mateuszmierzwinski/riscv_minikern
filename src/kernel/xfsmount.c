@@ -456,6 +456,50 @@ int xfsmount_read_at(const char *name, uint64_t off, void *buf, uint32_t len) {
     return rc != KERR_OK ? rc : (got == len ? KERR_OK : KERR_IO);
 }
 
+/* The inode a name in the root directory refers to, for the attribute
+ * calls below — all of which act on an inode rather than a path, because
+ * that is the shape the filesystem's own interface takes. */
+static int inode_for(const char *name, struct xfs_inode *ip) {
+    struct xfs_inode root;
+    uint64_t ino = 0;
+    int rc = root_inode(&root);
+    rc = rc != KERR_OK ? rc : xfs_dir_lookup(&fs, &root, name, name_length(name), &ino);
+    return rc != KERR_OK ? rc : xfs_inode_read(&fs, ino, ip);
+}
+
+int xfsmount_attr_set(const char *name, const char *attr, const void *value,
+                      uint32_t valuelen) {
+    struct xfs_inode ip;
+    int rc = inode_for(name, &ip);
+    rc = rc != KERR_OK ? rc
+                       : xfs_attr_set(&fs, &ip, attr, name_length(attr), value, valuelen,
+                                      now_seconds());
+    return rc != KERR_OK ? rc : xfs_flush(&fs);
+}
+
+int xfsmount_attr_get(const char *name, const char *attr, void *out, uint32_t room,
+                      uint32_t *valuelen) {
+    struct xfs_inode ip;
+    int rc = inode_for(name, &ip);
+    return rc != KERR_OK ? rc
+                         : xfs_attr_get(&fs, &ip, attr, name_length(attr), out, room,
+                                        valuelen);
+}
+
+int xfsmount_attr_remove(const char *name, const char *attr) {
+    struct xfs_inode ip;
+    int rc = inode_for(name, &ip);
+    rc = rc != KERR_OK ? rc
+                       : xfs_attr_remove(&fs, &ip, attr, name_length(attr), now_seconds());
+    return rc != KERR_OK ? rc : xfs_flush(&fs);
+}
+
+int xfsmount_attr_list(const char *name, xfs_attr_fn fn, void *self) {
+    struct xfs_inode ip;
+    int rc = inode_for(name, &ip);
+    return rc != KERR_OK ? rc : xfs_attr_list(&fs, &ip, fn, self);
+}
+
 int xfsmount_link(const char *existing, const char *newname) {
     struct xfs_inode root;
     uint64_t ino = 0;

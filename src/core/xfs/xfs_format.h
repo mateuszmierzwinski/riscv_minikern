@@ -140,6 +140,26 @@
 #define XFS_DIFLAG2_NREXT64 0x10u /* this inode uses the 64-bit extent layout */
 
 /* di_format */
+/* An attribute's namespace, which XFS keeps in a flag rather than in the
+ * name: Linux's `user.foo` is stored as `foo` with no flag, `trusted.foo`
+ * as `foo` with ROOT, `security.foo` as `foo` with SECURE. A reader that
+ * took the prefix to be part of the name would find nothing Linux wrote and
+ * write nothing Linux could find. */
+#define XFS_ATTR_LOCAL      0x01u /* the value is in the fork, not a block */
+#define XFS_ATTR_ROOT       0x02u /* the `trusted.` namespace */
+#define XFS_ATTR_SECURE     0x04u /* the `security.` namespace */
+#define XFS_ATTR_INCOMPLETE 0x80u /* a set that was interrupted: skip it */
+#define XFS_ATTR_NSP (XFS_ATTR_ROOT | XFS_ATTR_SECURE)
+
+/* A leaf block of attributes, for reading what Linux wrote when the set
+ * outgrew the inode. The header is a `da3` blkinfo and then its own fields. */
+#define XFS_ATTR_LEAF_MAGIC 0x3beeu
+#define ATTR_LEAF_COUNT     56u /* be16 */
+#define ATTR_LEAF_HDR       80u /* blkinfo, count, usedbytes, firstused, holes, freemap */
+#define ATTR_LEAF_ENTRY     8u  /* hashval be32, nameidx be16, flags u8, pad u8 */
+#define ATTR_LEAF_NAMEIDX   4u  /* be16, within an entry */
+#define ATTR_LEAF_FLAGS     6u  /* u8, within an entry */
+
 #define XFS_DINODE_FMT_DEV     0u
 #define XFS_DINODE_FMT_LOCAL   1u /* the fork holds the data itself */
 #define XFS_DINODE_FMT_EXTENTS 2u /* the fork holds extent records */

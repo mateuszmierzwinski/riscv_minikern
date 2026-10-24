@@ -187,6 +187,11 @@ CASES = [
       # back to read-only. Both, because "replayed" would otherwise be
       # unfalsifiable: the fallback is what a kernel does when it meets a
       # log item it cannot apply, so it is a live path, not history.
+      # Attributes were written, read back, listed, and found again after
+      # the filesystem was mounted afresh — which is the only step that
+      # proves they reached the disk rather than a variable, since the
+      # writer and the reader are the same code.
+      "fswrite: attributes set, listed, survived a mount, removed",
       "the log was replayed; the filesystem is clean",
       "the log could not be replayed; mounting read-only"],
      700, None, "small"),

@@ -62,6 +62,14 @@ bool xfs_uuid_ok(const struct xfs *fs, const uint8_t *uuid);
 int xfs_meta_block(struct xfs *fs, uint64_t fsb, uint32_t magic, uint32_t magic2, uint32_t crc_off,
                    uint32_t uuid_off, struct bbuf **out);
 
+/* The leaf-format attribute reader, reached from `xfs_attr_get`/`_list`
+ * when the fork is not shortform (xfs_attr.c). */
+int xfs_attr_leaf_get(struct xfs *fs, const struct xfs_inode *ip, const char *name,
+                      uint32_t namelen, uint8_t flags, uint8_t *out, uint32_t room,
+                      uint32_t *valuelen);
+int xfs_attr_leaf_list(struct xfs *fs, const struct xfs_inode *ip, xfs_attr_fn fn,
+                       void *self);
+
 /* Checks the structures this reader walks, without writing anything
  * (xfs_check.c): both headers of every group, their four b-tree roots, the
  * counts each group states about itself, and the root inode.
@@ -172,6 +180,14 @@ void xfs_extent_unpack(const uint8_t *p, struct xfs_extent *out);
 
 /* Packs one back, which is the exact inverse (there is a round-trip test). */
 void xfs_extent_pack(uint8_t *p, const struct xfs_extent *e);
+
+/* Maps a logical block of the **attribute** fork, which is a separate
+ * extent list in the inode's literal area above `di_forkoff`.
+ *
+ * The data fork's mapper cannot answer for it: reading an attribute block
+ * through `xfs_bmap` would return a block of the file's own contents. */
+int xfs_attr_bmap(struct xfs *fs, const struct xfs_inode *ip, uint64_t logical,
+                  struct xfs_extent *out);
 
 /* Takes `count` contiguous free blocks from a group, preferring to start at
  * `want` and otherwise taking the **smallest** free extent that fits.

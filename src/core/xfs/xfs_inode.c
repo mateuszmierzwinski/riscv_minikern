@@ -107,6 +107,8 @@ static int take(struct xfs *fs, const uint8_t *di, uint64_t ino, struct xfs_inod
                         : xfs_be32(di + XFS_DI_NEXTENTS),
         .big_extent_counts = big,
         .format = di[XFS_DI_FORMAT],
+        .aformat = di[XFS_DI_AFORMAT],
+        .forkoff = di[XFS_DI_FORKOFF],
         .fork_len = avail < XFS_FORK_MAX ? avail : XFS_FORK_MAX,
     };
     if (out->format == XFS_DINODE_FMT_BTREE && out->fork_len <= XFS_BMDR_HDR_BYTES) {

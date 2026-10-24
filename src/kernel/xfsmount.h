@@ -19,6 +19,11 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+/* For `xfs_attr_fn`, the shape of an attribute listing's callback. This
+ * header otherwise names no filesystem type, which is why it had no
+ * filesystem include until attributes needed one. */
+#include "core/xfs/xfs.h"
+
 /* Mounts the filesystem on the attached disk. KERR_NODEV when there is no
  * disk, and whatever the filesystem says when there is one it will not
  * accept — which includes a dirty log, a feature set it does not fully
@@ -124,6 +129,16 @@ int xfsmount_write(const char *name, uint64_t off, const void *buf, uint32_t len
  * needs the file to fit in one allocation, which a test that fills an
  * allocation group deliberately does not. */
 int xfsmount_read_at(const char *name, uint64_t off, void *buf, uint32_t len);
+/* Extended attributes of a file in the root directory. Names carry Linux's
+ * namespace prefix (`user.`, `trusted.`, `security.`), which the filesystem
+ * translates into the flag it stores. */
+int xfsmount_attr_set(const char *name, const char *attr, const void *value,
+                      uint32_t valuelen);
+int xfsmount_attr_get(const char *name, const char *attr, void *out, uint32_t room,
+                      uint32_t *valuelen);
+int xfsmount_attr_remove(const char *name, const char *attr);
+int xfsmount_attr_list(const char *name, xfs_attr_fn fn, void *self);
+
 int xfsmount_link(const char *existing, const char *newname);
 int xfsmount_rename(const char *from, const char *to);
 int xfsmount_unlink(const char *name);

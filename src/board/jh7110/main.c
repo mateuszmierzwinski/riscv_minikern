@@ -1589,6 +1589,92 @@ static int refused_replay_is_read_only(void) {
     return KERR_OK;
 }
 
+/* Counts what a listing reports, and notices the one it is looking for. */
+struct attr_tally {
+    uint32_t seen;
+    bool found_colour;
+};
+
+static int tally_attr(void *self, const uint8_t *name, uint32_t namelen, uint8_t flags,
+                      uint32_t valuelen) {
+    struct attr_tally *t = self;
+    t->seen++;
+    t->found_colour = t->found_colour || (namelen == 6u && name[0] == 'c' && flags == 0);
+    (void)valuelen;
+    return KERR_OK;
+}
+
+/* Extended attributes: set, read back, list, remove — and then **mount the
+ * filesystem again** and read them once more.
+ *
+ * The remount is the part that matters. Everything before it would pass on
+ * a kernel that kept attributes in a variable: the writer and the reader
+ * are the same code and would agree with each other about anything. Only
+ * re-reading the inode from the disk proves the bytes went there, and the
+ * shortform fork lives in the inode's literal area, which is also the one
+ * place where getting the offset wrong would quietly overwrite the file's
+ * own extent list.
+ *
+ * Three namespaces, because XFS stores the namespace as a **flag** and the
+ * name without its prefix: a test using only `user.` would pass just as
+ * well on a kernel that stored the prefix as part of the name, which Linux
+ * would then not find. */
+static int attributes_round_trip(void) {
+    static const uint8_t purple[] = {'p', 'u', 'r', 'p', 'l', 'e'};
+    static const uint8_t level[] = {'9'};
+    uint8_t out[16];
+    uint32_t len = 0;
+    struct attr_tally t = {0, false};
+    int rc = xfsmount_create("a1", 0100644u);
+    rc = rc != KERR_OK ? rc : xfsmount_attr_set("a1", "user.colour", purple, sizeof purple);
+    rc = rc != KERR_OK ? rc : xfsmount_attr_set("a1", "trusted.level", level, sizeof level);
+    if (rc != KERR_OK) {
+        kprintf("fswrite: setting an attribute failed (rc %d)\n", rc);
+        return rc;
+    }
+    /* A name in a namespace this kernel does not know is refused, not
+     * stored as a user attribute: a name that round-trips here and means
+     * something else to Linux is worse than one that was rejected. */
+    if (xfsmount_attr_set("a1", "nonsense.x", level, 1u) == KERR_OK) {
+        return KERR_IO;
+    }
+    rc = xfsmount_attr_get("a1", "user.colour", out, sizeof out, &len);
+    if (rc != KERR_OK || len != sizeof purple || out[0] != 'p' || out[5] != 'e') {
+        kprintf("fswrite: user.colour read back wrong (rc %d, %u bytes)\n", rc, len);
+        return rc != KERR_OK ? rc : KERR_IO;
+    }
+    rc = xfsmount_attr_list("a1", tally_attr, &t);
+    if (rc != KERR_OK || t.seen != 2u || !t.found_colour) {
+        kprintf("fswrite: listing saw %u attribute(s)\n", t.seen);
+        return rc != KERR_OK ? rc : KERR_IO;
+    }
+    /* **Across a mount.** The attributes have to be on the disk. */
+    rc = xfsmount_remount();
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    len = 0;
+    rc = xfsmount_attr_get("a1", "trusted.level", out, sizeof out, &len);
+    if (rc != KERR_OK || len != 1u || out[0] != '9') {
+        kprintf("fswrite: trusted.level did not survive the mount (rc %d)\n", rc);
+        return rc != KERR_OK ? rc : KERR_IO;
+    }
+    /* And the namespaces really are distinct: `user.level` was never set. */
+    if (xfsmount_attr_get("a1", "user.level", out, sizeof out, &len) != KERR_NOENT) {
+        return KERR_IO;
+    }
+    rc = xfsmount_attr_remove("a1", "user.colour");
+    rc = rc != KERR_OK ? rc
+                       : (xfsmount_attr_get("a1", "user.colour", out, sizeof out, &len) ==
+                                  KERR_NOENT
+                              ? KERR_OK
+                              : KERR_IO);
+    /* Removing one must not remove the other. */
+    rc = rc != KERR_OK ? rc : xfsmount_attr_get("a1", "trusted.level", out, sizeof out, &len);
+    kprintf("fswrite: attributes set, listed, survived a mount, removed\n");
+    return rc;
+}
+
 static void run_write_selftest(void) {
     static const char text[] = "a file this kernel wrote";
     const uint32_t len = (uint32_t)(sizeof text - 1u);
@@ -1648,6 +1734,9 @@ static void run_write_selftest(void) {
     ok = ok && wrote_and_checked("one group alone must refuse", one_group_refuses());
     /* Last, because it leaves the filesystem read-only: anything after it
      * would be testing a mount that refuses writes by design. */
+    /* Before the dirty-log steps, which leave the filesystem read-only in
+     * the control's case and would refuse an attribute write. */
+    ok = ok && wrote_and_checked("attributes round trip", attributes_round_trip());
     ok = ok && wrote_and_checked("a dirty log is replayed", dirty_then_remount());
     ok = ok && wrote_and_checked("refused replay stays read-only",
                                  refused_replay_is_read_only());

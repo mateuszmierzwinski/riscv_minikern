@@ -80,6 +80,10 @@
  * rather than here. */
 #define XFS_LABEL_BYTES 13u
 
+/* The largest attribute fork this reads: the literal area of the largest
+ * inode it accepts (512 bytes, less the 176-byte core). */
+#define XFS_AFORK_MAX 336u
+
 /* The hash pairs of a block directory under conversion: one pair per entry,
  * and an entry is at least sixteen bytes, so a third of the block is past
  * the ceiling. */
@@ -235,6 +239,22 @@ struct xfs_inode {
     uint8_t format;
     uint8_t fork[XFS_FORK_MAX];
     uint32_t fork_len;
+    /* **The attribute fork**, which shares the literal area with the data
+     * fork and begins where `di_forkoff` says.
+     *
+     * `forkoff` is in eight-byte units and **zero means there is no
+     * attribute fork at all** — not "it starts at the beginning", which is
+     * the reading that would make every inode appear to have one. Setting
+     * the first attribute on an inode therefore has to choose a `forkoff`,
+     * and choose it so that the data fork still fits below it.
+     *
+     * Only the two bytes that *locate* the fork are kept here; its contents
+     * are read on demand. Copying them into every inode doubled this struct
+     * and pushed three functions holding two inodes over the kernel's 1 KiB
+     * frame limit — and most inodes have no attributes at all, so it was
+     * paying for the rare case in every one of them. */
+    uint8_t aformat;
+    uint8_t forkoff;
 };
 
 /* The type byte a directory entry carries when the filesystem has the
@@ -290,6 +310,29 @@ int xfs_path_lookup(struct xfs *fs, const char *path, struct xfs_inode *out);
  * an extent that was allocated but never written, read as zeroes.
  * KERR_ISDIR for a directory — its bytes are structure, not content, and
  * xfs_dir_list is how they are read. */
+/* What a listing reports for one attribute: its stored name (without the
+ * namespace prefix), the flags that say which namespace it is in, and how
+ * long its value is. */
+typedef int (*xfs_attr_fn)(void *self, const uint8_t *name, uint32_t namelen,
+                           uint8_t flags, uint32_t valuelen);
+
+/* Extended attributes. Names are Linux's — `user.foo`, `trusted.foo`,
+ * `security.foo` — and the namespace is translated to the flag XFS stores,
+ * because XFS does not keep the prefix in the name.
+ *
+ * Shortform is read **and written**: it lives inside the inode, so a set
+ * needs no block. The leaf format is read only, and `xfs_attr_set` answers
+ * `KERR_NOSPC` when the inode is full rather than building a half-finished
+ * leaf. A value kept in blocks of its own is reported as present and
+ * refused on read. */
+int xfs_attr_get(struct xfs *fs, const struct xfs_inode *ip, const char *name,
+                 uint32_t namelen, uint8_t *out, uint32_t room, uint32_t *valuelen);
+int xfs_attr_list(struct xfs *fs, const struct xfs_inode *ip, xfs_attr_fn fn, void *self);
+int xfs_attr_set(struct xfs *fs, const struct xfs_inode *ip, const char *name,
+                 uint32_t namelen, const uint8_t *value, uint32_t valuelen, uint64_t now_s);
+int xfs_attr_remove(struct xfs *fs, const struct xfs_inode *ip, const char *name,
+                    uint32_t namelen, uint64_t now_s);
+
 int xfs_file_read(struct xfs *fs, const struct xfs_inode *ip, uint64_t off, void *buf, uint32_t len,
                   uint32_t *got);
 
