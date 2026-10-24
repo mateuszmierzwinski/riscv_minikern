@@ -182,7 +182,13 @@ CASES = [
       # A filesystem the kernel left dirty mounts read-only after a check,
       # rather than being refused — a power cut must not make a disk
       # unreadable.
-      "the log is dirty; checked sound, mounting read-only"],
+      # A filesystem the kernel left dirty is replayed and comes back
+      # writable — and, in the same run, refusing the replay still falls
+      # back to read-only. Both, because "replayed" would otherwise be
+      # unfalsifiable: the fallback is what a kernel does when it meets a
+      # log item it cannot apply, so it is a live path, not history.
+      "the log was replayed; the filesystem is clean",
+      "the log could not be replayed; mounting read-only"],
      700, None, "small"),
 
     ("§3: automount puts each volume where its label says",

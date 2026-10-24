@@ -242,7 +242,22 @@ static int mount_from_super(struct xfs *fs, const uint8_t *sb) {
 int xfs_mount(struct xfs *fs, struct bcache *cache) {
     struct bbuf *b;
     int rc;
+    /* **Policy set by the caller survives the reset; what the filesystem
+     * knows about itself does not.**
+     *
+     * The reset is here so that a re-mount cannot inherit stale geometry
+     * from the last one — and it wiped these two in the same breath, which
+     * is how `no_replay` came to be set by a test and ignored by the mount
+     * it was set for. That happened three times over in one feature, in
+     * three different places, each one looking like a different bug: the
+     * caller zeroed the struct, this zeroed it again, and the one knob that
+     * had to cross the boundary was zeroed with it. A reset that is
+     * deliberate about what it keeps is the only way that stops recurring. */
+    bool keep_no_replay = fs->no_replay;
+    bool keep_skip_unmount = fs->skip_unmount_record;
     *fs = (struct xfs){.cache = cache};
+    fs->no_replay = keep_no_replay;
+    fs->skip_unmount_record = keep_skip_unmount;
     rc = bcache_get(cache, 0, &b);
     if (rc != KERR_OK) {
         return rc;
@@ -270,13 +285,29 @@ int xfs_mount(struct xfs *fs, struct bcache *cache) {
     rc = xfs_log_check(fs);
     if (rc == KERR_DIRTY) {
         fs->log_was_dirty = true;
-        fs->write_refused = true;
         rc = xfs_check(fs);
         if (rc != KERR_OK) {
             kprintf("xfs: the log is dirty and the check found faults: refusing to mount\n");
             return rc;
         }
-        kprintf("xfs: the log is dirty; checked sound, mounting read-only\n");
+        /* **Checked first, then replayed.** Replaying into metadata that is
+         * already broken multiplies the damage, so the sound-enough
+         * verdict is a precondition and not a nicety.
+         *
+         * A replay that cannot finish is **not** a failure to mount: it
+         * leaves the filesystem exactly as the log found it and the mount
+         * falls back to read-only, which is where this filesystem was
+         * before replay existed. The only thing lost is the ability to
+         * write, and a kernel that refused the disk outright over an item
+         * type it did not recognise would be strictly worse. */
+        rc = fs->no_replay ? KERR_NOTSUP : xfs_log_replay(fs);
+        if (rc != KERR_OK) {
+            fs->write_refused = true;
+            kprintf("xfs: the log could not be replayed; mounting read-only\n");
+        } else {
+            fs->log_replayed = true;
+            kprintf("xfs: the log was replayed; the filesystem is clean\n");
+        }
     } else if (rc != KERR_OK) {
         return rc;
     }

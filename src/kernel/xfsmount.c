@@ -16,6 +16,20 @@
 static struct xfs fs;
 static bool mounted;
 
+/* **Policy, which must survive a re-mount; the filesystem's state must
+ * not.** `xfsmount_remount` zeroes the whole `struct xfs` so that the
+ * filesystem is read as a fresh boot would read it — and that wiped these
+ * two along with it, including the one that was supposed to govern the very
+ * mount being started. The control that proves the read-only fallback still
+ * works was the thing that found it: the knob was set, cleared by the
+ * zeroing, and replay ran anyway.
+ *
+ * They are both test instruments (`-refuse-replay`, `-leave-log-dirty`),
+ * which is why they live here rather than being passed to `xfs_mount`: a
+ * mount argument for something no real caller sets would be worse. */
+static bool policy_no_replay;
+static bool policy_skip_unmount;
+
 int xfsmount_attach(void) {
     struct bcache *cache = disk_cache();
     int rc;
@@ -46,20 +60,32 @@ int xfsmount_remount(void) {
     }
     bcache_invalidate(cache);
     mounted = false;
-    for (uint32_t i = 0; i < sizeof fs; i++) {
-        ((uint8_t *)&fs)[i] = 0;
-    }
+    /* `xfs_mount` resets the struct itself, keeping exactly the two policy
+     * flags set here — so zeroing it a second time from this side would
+     * only wipe them again, which is what it used to do. */
+    fs.no_replay = policy_no_replay;
+    fs.skip_unmount_record = policy_skip_unmount;
     rc = xfs_mount(&fs, cache);
     mounted = rc == KERR_OK;
     return rc;
 }
 
 void xfsmount_leave_log_dirty(bool on) {
+    policy_skip_unmount = on;
     fs.skip_unmount_record = on;
 }
 
 bool xfsmount_log_was_dirty(void) {
     return fs.log_was_dirty;
+}
+
+bool xfsmount_log_replayed(void) {
+    return fs.log_replayed;
+}
+
+void xfsmount_refuse_replay(bool on) {
+    policy_no_replay = on;
+    fs.no_replay = on;
 }
 
 const char *xfsmount_label(void) {

@@ -118,6 +118,15 @@ struct xfs {
      * writable, and until then a write would build on a state the log says
      * is already superseded. */
     bool log_was_dirty;
+    /* The log was dirty and **was replayed**, so the filesystem is clean
+     * and writable. Distinct from `log_was_dirty`, which stays true: one
+     * says what was found, the other what was done about it. */
+    bool log_replayed;
+    /* Refuses to replay, so that a test can show the read-only fallback is
+     * still reached — the behaviour every unclean filesystem had until
+     * replay existed, and the one a kernel falls back to when it meets a
+     * log item it does not understand. */
+    bool no_replay;
     /* Leaves the next logged transaction **without** its unmount record,
      * which is what a power cut does — the transaction is in the log and
      * nothing says the filesystem was put down.

@@ -28,9 +28,7 @@
  */
 
 #define XLOG_REC_TAIL_LSN   24u
-#define XLOG_REC_CRC        32u
 #define XLOG_REC_PREV_BLOCK 36u
-#define XLOG_REC_CYCLE_DATA 44u /* 64 entries, one per 512-byte data sector */
 #define XLOG_REC_FMT        300u
 #define XLOG_REC_FS_UUID    304u
 #define XLOG_REC_SIZE       320u
@@ -50,34 +48,10 @@
  * magic number", and reading our own bytes back out of the image is what
  * settled where it belongs. Its three words are native-endian, like the
  * unmount record's magic, because recovery reads them as plain `uint`s. */
-#define XFS_TRANS_HEADER_MAGIC 0x5452414eu /* "TRAN" */
 #define XFS_TRANS_SETATTR_SIZE 2u          /* what a size change is */
-#define TRANS_HDR_MAGIC     0u  /* u32 */
-#define TRANS_HDR_TYPE      4u  /* u32 */
-#define TRANS_HDR_TID       8u  /* u32 */
-#define TRANS_HDR_NUM_ITEMS 12u /* u32 */
-#define TRANS_HDR_SIZE      16u /* **measured**: recovery registers an item only
-                                 * when the operation's length is exactly this,
-                                 * and at 12 it silently did not — after which it
-                                 * read the next operation as another header and
-                                 * reported a bad magic number. */
 
-#define XLOG_START_TRANS  0x01u
-#define XLOG_COMMIT_TRANS 0x02u
 
 /* The inode item's format header, as the log carries it (56 bytes in v5). */
-#define XFS_LI_INODE     0x123bu
-#define XFS_ILOG_CORE    0x0001u
-#define ILF_TYPE         0u  /* u16 */
-#define ILF_SIZE         2u  /* u16: how many operations this item occupies */
-#define ILF_FIELDS       4u  /* u32 */
-#define ILF_ASIZE        8u  /* u16 */
-#define ILF_DSIZE        10u /* u16 */
-#define ILF_INO          16u /* u64 */
-#define ILF_BLKNO        40u /* u64: the inode chunk's device block */
-#define ILF_LEN          48u /* u32: its length in 512-byte blocks */
-#define ILF_BOFFSET      52u /* u32: the inode's byte offset within it */
-#define ILF_STRUCT_SIZE  56u
 
 /* The logged form of an inode core: 176 bytes at the **same offsets** as the
  * on-disk core, but **native-endian**. Confirmed field by field against
@@ -158,6 +132,31 @@ static void log_dinode_from_disk(uint8_t *out, const uint8_t *di) {
         }
     }
     copy(out + XFS_DI_UUID, di + XFS_DI_UUID, 16);
+}
+
+/* The inverse, for replay: a logged inode core back into an on-disk one.
+ *
+ * **A logged inode is not an on-disk inode.** Each field keeps its offset
+ * but is written in the host's byte order rather than big-endian, because
+ * the log is replayed by the machine that wrote it. Copying the logged
+ * bytes straight into the inode therefore writes a little-endian core over
+ * a big-endian one — which is what the first version of replay did, and it
+ * corrupted every inode it touched while reporting success. The board said
+ * so by failing to read a file that had been written *before* the crash
+ * being recovered from.
+ *
+ * Field by field, and **only** the fields in the table: a wholesale
+ * 176-byte copy would also zero `di_next_unlinked`, which the log does not
+ * carry and the unlinked list needs. Everything outside the table is left
+ * as the inode already has it, and the caller reseals. */
+void xfs_log_dinode_to_disk(uint8_t *di, const uint8_t *logged) {
+    for (uint32_t f = 0; f < sizeof CORE_FIELDS / sizeof CORE_FIELDS[0]; f++) {
+        uint32_t off = CORE_FIELDS[f].off, len = CORE_FIELDS[f].len;
+        for (uint32_t i = 0; i < len; i++) {
+            di[off + i] = logged[off + len - 1u - i];
+        }
+    }
+    copy(di + XFS_DI_UUID, logged + XFS_DI_UUID, 16);
 }
 
 /* A record under construction: the header sector, then the operation
@@ -296,6 +295,17 @@ static int write_unmount(struct xfs *fs, uint64_t bb) {
     return rc != KERR_OK ? rc : clear_after(fs, bb + 2u);
 }
 
+/* Puts an unmount record at the start of the log, which is what makes the
+ * log clean.
+ *
+ * Exposed for replay: once it has applied everything the log held, the log
+ * must stop saying so — otherwise the next mount replays the same
+ * transactions again. Applying them twice is harmless, because the result
+ * is the same metadata; never coming back writable is not. */
+int xfs_log_mark_clean(struct xfs *fs) {
+    return write_unmount(fs, 0);
+}
+
 /* How many 512-byte sectors the built operations occupy. */
 static uint32_t used_sectors(void) {
     return (record_used + XLOG_SECTOR - 1u) / XLOG_SECTOR;
@@ -362,7 +372,21 @@ int xfs_log_inodes(struct xfs *fs, const struct xfs_log_inode_item *items, uint3
      * has asked for it to be left off, which is the shape a power cut
      * leaves behind. */
     if (fs->skip_unmount_record) {
-        return rc;
+        /* **The log has to actually end here.** `clear_after` is otherwise
+         * only reached through `write_unmount`, so skipping the unmount
+         * record also skipped the clearing — and the *previous* write's
+         * unmount record, further down the log, survived. `find_newest`
+         * found that one and pronounced the log clean.
+         *
+         * It went unnoticed because the first test of it passed by
+         * accident: the transaction it wrote was larger than the one
+         * before, so it happened to overwrite the stale unmount record. A
+         * later test whose transaction was the *same* size did not, and the
+         * instrument quietly stopped working. Clearing makes "the newest
+         * record is not an unmount" true by construction rather than by
+         * arithmetic about sizes — and it is the more faithful model of a
+         * crash immediately after commit. */
+        return rc != KERR_OK ? rc : clear_after(fs, 1u + sectors);
     }
     return rc != KERR_OK ? rc : write_unmount(fs, 1u + sectors);
 }

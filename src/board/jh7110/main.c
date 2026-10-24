@@ -1363,12 +1363,18 @@ static int read_back(const char *name, const char *want, uint32_t len) {
     if (rc != KERR_OK) {
         return rc;
     }
+    /* **Which part was wrong, not merely that something was.** A single
+     * `KERR_IO` for "not found", "wrong length" and "wrong bytes" sends the
+     * next person to read three different pieces of code. */
     if (size != len) {
+        kprintf("fswrite: %s is %u bytes, wanted %u\n", path, size, len);
         kfree(bytes);
         return KERR_IO;
     }
     for (uint32_t i = 0; i < len; i++) {
         if (bytes[i] != (uint8_t)want[i]) {
+            kprintf("fswrite: %s differs at byte %u: 0x%x not 0x%x\n", path, i, bytes[i],
+                    (uint8_t)want[i]);
             kfree(bytes);
             return KERR_IO;
         }
@@ -1511,11 +1517,12 @@ static int one_group_refuses(void) {
  * log proves the parser; a log this kernel wrote and failed to close proves
  * the path a real machine takes.
  *
- * Three things are then asserted, and the second is the one that matters.
- * The filesystem **mounts** — a power cut must not make a disk unreadable.
- * It is **read-only** — its metadata is behind a log saying something newer
- * happened, so a write would build on a superseded state. And a **read
- * still works**, which is what the whole arrangement is for. */
+ * What is asserted is the whole arrangement: the filesystem **mounts** (a
+ * power cut must not make a disk unreadable), its log is seen to have been
+ * **dirty**, it was **replayed**, it is therefore **writable** again, and
+ * the file written before the cut is still there. Replay is the step that
+ * turns "readable" into "as it was", and without the writable check the
+ * test would pass on a kernel that only checked and mounted read-only. */
 static int dirty_then_remount(void) {
     static const char text[] = "written before the power went";
     int rc = xfsmount_create("d1", 0100644u);
@@ -1537,10 +1544,48 @@ static int dirty_then_remount(void) {
     if (!xfsmount_log_was_dirty()) {
         return KERR_IO; /* the log closed cleanly: the test proved nothing */
     }
-    if (xfsmount_writable()) {
-        return KERR_IO; /* readable is right; writable is the bug */
+    if (!xfsmount_log_replayed() || !xfsmount_writable()) {
+        kprintf("fswrite: replayed %u, writable %u\n", xfsmount_log_replayed() ? 1u : 0u,
+                xfsmount_writable() ? 1u : 0u);
+        return KERR_IO;
     }
-    return read_back("d1", text, sizeof text - 1u);
+    rc = read_back("d1", text, sizeof text - 1u);
+    kprintf("fswrite: after replay, /d1 reads rc %d\n", rc);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    /* And it really is writable, not merely marked so. */
+    rc = xfsmount_create("d3", 0100644u);
+    kprintf("fswrite: after replay, create /d3 rc %d\n", rc);
+    return rc;
+}
+
+/* The control: with replay refused, the same filesystem still mounts and is
+ * still read-only.
+ *
+ * **Without this, "replayed" would be unfalsifiable.** The read-only
+ * fallback is what a kernel does when it meets a log item it cannot apply,
+ * so it is a live path rather than dead history — and a test that only ever
+ * saw the replay succeed could not tell a working fallback from one that
+ * had rotted. */
+static int refused_replay_is_read_only(void) {
+    int rc;
+    xfsmount_leave_log_dirty(true);
+    rc = xfsmount_create("d4", 0100644u);
+    xfsmount_leave_log_dirty(false);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    xfsmount_refuse_replay(true);
+    rc = xfsmount_remount();
+    xfsmount_refuse_replay(false);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    if (!xfsmount_log_was_dirty() || xfsmount_log_replayed() || xfsmount_writable()) {
+        return KERR_IO;
+    }
+    return KERR_OK;
 }
 
 static void run_write_selftest(void) {
@@ -1602,7 +1647,9 @@ static void run_write_selftest(void) {
     ok = ok && wrote_and_checked("one group alone must refuse", one_group_refuses());
     /* Last, because it leaves the filesystem read-only: anything after it
      * would be testing a mount that refuses writes by design. */
-    ok = ok && wrote_and_checked("a dirty log mounts read-only", dirty_then_remount());
+    ok = ok && wrote_and_checked("a dirty log is replayed", dirty_then_remount());
+    ok = ok && wrote_and_checked("refused replay stays read-only",
+                                 refused_replay_is_read_only());
     kprintf("fswrite: %s\n", ok ? "every step passed" : "a step FAILED");
 }
 

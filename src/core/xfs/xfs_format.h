@@ -381,4 +381,56 @@
  * record header always occupies one sector of it. */
 #define XLOG_SECTOR 512u
 
+/* **The first four bytes of every data sector are not the data.** The
+ * writer stamps the record's cycle number into them and keeps the real
+ * bytes in `h_cycle_data` in the header — so that a torn write is
+ * detectable: a sector whose first word is not this record's cycle was
+ * never written. Replay has to put them back before it can read an
+ * operation header, and a replay that did not would find a length and a
+ * client id taken from the middle of a cycle number. */
+#define XLOG_REC_CYCLE_DATA 44u /* 64 entries, one per 512-byte data sector */
+#define XLOG_REC_CRC        32u /* u32, little-endian */
+
+/* The operation flags that frame a transaction, and the item types inside
+ * one. Shared with the writer, which puts them there (xfs_logwrite.c). */
+#define XLOG_START_TRANS  0x01u
+#define XLOG_COMMIT_TRANS 0x02u
+#define XLOG_CONTINUE_TRANS 0x04u
+#define XLOG_WAS_CONT_TRANS 0x08u
+#define XLOG_END_TRANS    0x10u
+
+#define XFS_TRANS_HEADER_MAGIC 0x5452414eu /* "TRAN" */
+#define TRANS_HDR_MAGIC     0u  /* u32 */
+#define TRANS_HDR_TYPE      4u  /* u32 */
+#define TRANS_HDR_TID       8u  /* u32 */
+#define TRANS_HDR_NUM_ITEMS 12u /* u32 */
+#define TRANS_HDR_SIZE      16u
+
+/* An inode log item: the format structure, then the fields it names. Every
+ * field is **little-endian** — a log item is written in the host's byte
+ * order, unlike everything else on an XFS filesystem, because the log is
+ * replayed by the machine that wrote it. */
+#define XFS_LI_INODE     0x123bu
+#define XFS_LI_BUF       0x123cu
+#define ILF_TYPE         0u  /* u16 */
+#define ILF_SIZE         2u  /* u16: how many operations this item occupies */
+#define ILF_FIELDS       4u  /* u32 */
+#define ILF_ASIZE        8u  /* u16 */
+#define ILF_DSIZE        10u /* u16 */
+#define ILF_INO          16u /* u64 */
+#define ILF_BLKNO        40u /* u64: the inode chunk's device block */
+#define ILF_LEN          48u /* u32: its length in 512-byte blocks */
+#define ILF_BOFFSET      52u /* u32: the inode's byte offset within it */
+#define ILF_STRUCT_SIZE  56u
+#define XFS_ILOG_CORE    0x0001u /* the item carries the inode's core */
+
+/* A buffer log item: a block, and a bitmap of which 128-byte chunks of it
+ * the record carries. This is what Linux logs most metadata as. */
+#define BLF_FLAGS        2u  /* u16 */
+#define BLF_LEN          4u  /* u16: the buffer's length in 512-byte blocks */
+#define BLF_BLKNO        8u  /* u64: its device block */
+#define BLF_MAP_SIZE     16u /* u32: words in the dirty-chunk bitmap */
+#define BLF_DATA_MAP     20u /* the bitmap itself */
+#define BLF_CHUNK        128u /* a bitmap bit covers this many bytes */
+
 #endif

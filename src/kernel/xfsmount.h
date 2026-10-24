@@ -41,6 +41,14 @@ void xfsmount_leave_log_dirty(bool on);
  * it is read-only. */
 bool xfsmount_log_was_dirty(void);
 
+/* Whether that dirty log was replayed, which is what makes the filesystem
+ * writable again rather than merely readable. */
+bool xfsmount_log_replayed(void);
+
+/* Refuses to replay, so a test can show the read-only fallback still
+ * works — what a kernel does when it meets a log item it cannot apply. */
+void xfsmount_refuse_replay(bool on);
+
 /* The filesystem's label, which is what decides where it is mounted. */
 const char *xfsmount_label(void);
 

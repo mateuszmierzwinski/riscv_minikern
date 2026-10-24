@@ -924,7 +924,77 @@ sparse inodes, `nrext64`, exchange-range, parent pointers, `bigtime`,
       address in it. A range check that does not check every range is the
       same defect twice.
 
-- [ ] **Log replay.** (M) A dirty log is refused rather than replayed, so an
+- [x] **Log replay.** (M) **Done, and it took four board runs to believe —
+      three of which found something.** A dirty filesystem was checked and
+      mounted read-only, which made it readable; replay is what makes it
+      *writable* again: apply what the log says, write an unmount record,
+      and the filesystem is clean.
+
+      It understands **inode items** (what this kernel's writer produces)
+      and **buffer items** (what Linux logs most metadata as). Everything
+      else — extent-freeing intents, inode creation, quotas — is refused,
+      and the filesystem stays read-only until a kernel that understands
+      them has a turn.
+
+      **All or nothing, because this is the most dangerous code here.**
+      Every other operation acts on what it is told; this one acts on what
+      it infers from a structure a crash was in the middle of writing, and
+      getting it wrong does not fail to mount — it writes plausible rubbish
+      and the damage surfaces later, somewhere else. So: a transaction
+      without its `COMMIT_TRANS` is dropped (a crash leaves exactly one of
+      those, at the end); an item type it does not understand abandons the
+      **whole** replay rather than being skipped, because applying a
+      transaction's other items produces a state the filesystem never had;
+      and nothing reaches the disk until the entire log has read clean —
+      the writes land in the block cache, which is flushed once at the end
+      and invalidated on abort. An abort is not a failure to mount: it
+      falls back to read-only, and a kernel that refused the disk outright
+      over an unrecognised item would be strictly worse.
+
+      One thing replay must undo that is easy to miss: the writer stamps
+      the record's cycle number over the **first four bytes of every data
+      sector**, so that a torn write is detectable, keeping the originals in
+      `h_cycle_data`. Without putting them back, the first operation header
+      in the second sector has its length and client id read out of the
+      middle of a cycle number.
+
+      **The bug that mattered, and how it was caught.** A logged inode is
+      *not* an on-disk inode: each field keeps its offset but is written in
+      the **host's** byte order, because the log is replayed by the machine
+      that wrote it. The first version copied the logged bytes straight in,
+      writing a little-endian core over a big-endian one — **corrupting
+      every inode it touched while reporting success**, log marked clean and
+      filesystem declared writable. What found it was the test asserting
+      something replay never touches: a file written *before* the simulated
+      crash. A test that checked only "did replay run" and "is it writable"
+      would have passed green on a filesystem-eating defect. The conversion
+      is an involution over the writer's own field table, and it writes
+      **only** the fields in that table — a wholesale 176-byte copy would
+      zero `di_next_unlinked`, which the log does not carry.
+
+      **Three more, all found by the control** that proves the read-only
+      fallback still works, and none of them in replay:
+
+      - the log writer reached `clear_after` only through `write_unmount`,
+        so skipping the unmount record left the *previous* write's unmount
+        record further down the log — `find_newest` found it and called the
+        log clean. The first dirty-log test passed only because its
+        transaction happened to be **larger** than the one before and
+        overwrote the stale record; a later one of equal size did not, and
+        the instrument had quietly stopped working;
+      - `xfsmount_remount` zeroed the whole `struct xfs`, wiping the flag
+        meant to govern that very mount;
+      - and `xfs_mount` zeroed it **again**, a few lines before reading it.
+        Three places, each looking like a different bug. The reset is now
+        deliberate about what it keeps, at the one chokepoint.
+
+      **On the board**: the kernel logs a transaction, omits the unmount
+      record — what a machine losing power mid-write leaves — and mounts
+      again from the disk with the cache dropped. The log reads dirty, the
+      check reports four groups sound, the log is replayed, the filesystem
+      is **writable**, the file written before the cut reads back byte for
+      byte, and a new file can be created. Then the control, in the same
+      run: with replay refused, the same filesystem mounts **read-only**. (M) A dirty log is refused rather than replayed, so an
       unclean shutdown needs `xfs_repair` on another machine. Deliberate for
       now — guessing at a log is how data is lost — but it is a gap.
 - [ ] **Extended attributes.** (M) Not read at all, which is also why parent

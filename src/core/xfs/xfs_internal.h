@@ -76,6 +76,26 @@ int xfs_check(struct xfs *fs);
  * an unmount record, KERR_NOTSUP when it is anything else. */
 int xfs_log_check(struct xfs *fs);
 
+/* Replays the log into the metadata (xfs_logreplay.c), so that a filesystem
+ * a crash left behind comes back **clean and writable** rather than
+ * read-only.
+ *
+ * All or nothing: a transaction without its commit is dropped, an item type
+ * it does not understand abandons the whole replay, and nothing reaches the
+ * disk until the entire log has been read without complaint. An abort is
+ * not a failure — the caller falls back to the read-only mount. */
+int xfs_log_replay(struct xfs *fs);
+
+/* Converts a logged inode core into an on-disk one (xfs_logwrite.c).
+ *
+ * A logged inode keeps each field's offset but writes it in the host's byte
+ * order, so replay cannot simply copy the bytes in. Only the fields the log
+ * carries are written; the caller reseals. */
+void xfs_log_dinode_to_disk(uint8_t *di, const uint8_t *logged);
+
+/* Writes an unmount record, which is what makes a log clean. */
+int xfs_log_mark_clean(struct xfs *fs);
+
 /* Where an inode lives: the device block holding its chunk, and its byte
  * offset within that block. The same arithmetic the reader uses, exposed
  * because a write has to put the inode back where it came from. */

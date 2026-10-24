@@ -204,6 +204,40 @@ def offer_filesystem_image(path):
     return name, size, None
 
 
+def open_tap(path):
+    """A FIFO to copy the console into, or None.
+
+    **Non-blocking, and never load-bearing.** A FIFO opened for writing
+    normally blocks until a reader attaches, which would hang every
+    unattended suite run until somebody typed `cat`; and a slow reader would
+    stall the loop that is the only thing draining the serial port, so the
+    port's own buffer would overflow and the instrument would corrupt its
+    own measurement. `O_NONBLOCK` turns both of those into a dropped write
+    instead, which is the right trade for a convenience view: the file next
+    to it is the record, and this is a window onto it.
+    """
+    if path is None:
+        return None
+    if not os.path.exists(path):
+        os.mkfifo(path, 0o600)
+    try:
+        return os.open(path, os.O_WRONLY | os.O_NONBLOCK)
+    except OSError:
+        # Nobody is reading yet. Not an error: the run matters, the view
+        # does not, and a reader that attaches later picks up from there.
+        return None
+
+
+def write_tap(fd, chunk):
+    """Copies a chunk to the FIFO, dropping it if nobody can take it."""
+    if fd is None:
+        return
+    try:
+        os.write(fd, chunk)
+    except OSError:
+        pass  # no reader, or its buffer is full: the file has it anyway
+
+
 def ranges_overlap(spans):
     """Refuses a layout where two things the boot loader loads collide.
 
@@ -231,7 +265,8 @@ def serve_beside_the_image(path):
     return name, os.path.getsize(target)
 
 
-def boot(bootargs, capture_seconds, out_path, wait_seconds=0.0, program=None, fs_image=None):
+def boot(bootargs, capture_seconds, out_path, wait_seconds=0.0, program=None, fs_image=None,
+         fifo_path=None):
     """Power-cycles, loads and boots, and captures the console."""
     log = bytearray()
     steps_ok = True
@@ -273,10 +308,28 @@ def boot(bootargs, capture_seconds, out_path, wait_seconds=0.0, program=None, fs
                 pass
         send(port, f"booti {LOAD_AT} - " + "${fdtcontroladdr}")
         deadline = time.time() + capture_seconds
-        while time.time() < deadline:
-            log.extend(port.read(4096))
-    with open(out_path, "wb") as f:
-        f.write(bytes(log))
+        # **Written as it arrives, not at the end.** The whole console used
+        # to be held in memory and dumped once the capture window closed, so
+        # during a run — which for the directory-growth cases is twelve
+        # minutes — there was nothing to look at, and the port is held under
+        # the flock so a second terminal cannot attach either. The operator
+        # could not watch their own board. `tail -f` works now.
+        tap = open_tap(fifo_path)
+        with open(out_path, "wb") as live:
+            # The U-Boot transcript first: it is what diagnosed the fixture
+            # that was decompressed over the kernel, so it belongs in the
+            # file even though the interesting part comes after it.
+            live.write(bytes(log))
+            live.flush()
+            while time.time() < deadline:
+                chunk = port.read(4096)
+                if chunk:
+                    log.extend(chunk)
+                    live.write(chunk)
+                    live.flush()
+                    write_tap(tap, chunk)
+        if tap is not None:
+            os.close(tap)
     held.close()
     return steps_ok
 
@@ -290,6 +343,9 @@ def main():
                     help="how long to capture after booti (default 60)")
     ap.add_argument("-o", "--out", default="hil.log", help="where to write the log")
     ap.add_argument("-q", "--quiet", action="store_true", help="do not echo the log")
+    ap.add_argument("--fifo", default=None,
+                    help="also copy the console into this FIFO, best effort "
+                         "(made if absent; dropped when nothing is reading)")
     ap.add_argument("-i", "--image", default=None,
                     help="a filesystem image to fetch into DRAM and mount (minikern.disk=ram)")
     ap.add_argument("-p", "--program", default=None,
@@ -330,7 +386,7 @@ def main():
         ranges_overlap(spans)
         how = "sent whole" if fs[2] is None else f"expands from {fs[2]} bytes"
         print(f"hil: {fs[0]} is {fs[1]} bytes at {IMAGE_AT:#x}, {how}")
-    ok = boot(bootargs, args.seconds, args.out, args.wait, program, fs)
+    ok = boot(bootargs, args.seconds, args.out, args.wait, program, fs, args.fifo)
     if not args.quiet:
         text = open(args.out, "rb").read().decode("utf-8", "replace")
         start = text.find("Starting kernel")
