@@ -83,9 +83,11 @@ static uint64_t le64(const uint8_t *p) {
  * operation header in the second sector has a length and a client id taken
  * from the middle of a cycle number. */
 static int read_record(struct xfs *fs, uint64_t bb, uint32_t *bytes, uint32_t *nops) {
-    uint64_t base = xfs_fsb_to_block(fs, fs->logstart) * (uint64_t)fs->blocksize;
     uint32_t len, sectors;
-    int rc = bcache_pread(fs->cache, base + bb * XLOG_SECTOR, record, XLOG_SECTOR);
+    int rc = fs->log_cache == NULL
+                 ? KERR_NODEV
+                 : bcache_pread(fs->log_cache, fs->log_base + bb * XLOG_SECTOR, record,
+                                XLOG_SECTOR);
     if (rc != KERR_OK) {
         return rc;
     }
@@ -98,7 +100,7 @@ static int read_record(struct xfs *fs, uint64_t bb, uint32_t *bytes, uint32_t *n
         sectors > 64u) {
         return KERR_NOTSUP; /* a record larger than this can hold */
     }
-    rc = bcache_pread(fs->cache, base + (bb + 1u) * XLOG_SECTOR,
+    rc = bcache_pread(fs->log_cache, fs->log_base + (bb + 1u) * XLOG_SECTOR,
                       record + XLOG_REC_HDR_SIZE, sectors * XLOG_SECTOR);
     if (rc != KERR_OK) {
         return rc;

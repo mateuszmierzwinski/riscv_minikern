@@ -263,6 +263,42 @@ static int mount_from_super(struct xfs *fs, const uint8_t *sb) {
     return KERR_OK;
 }
 
+/* Gives the filesystem the device its external log is on, and re-asks the
+ * question the mount could not answer without it.
+ *
+ * The check and the replay are the same ones the mount runs; the only thing
+ * that has changed is that the log can now be read. So this is the mount's
+ * last step, arriving late — and if the log turns out clean, or replays,
+ * the read-only restriction it imposed is lifted. */
+int xfs_attach_log(struct xfs *fs, struct bcache *log) {
+    int rc;
+    if (fs == NULL || log == NULL || !fs->mounted) {
+        return KERR_INVAL;
+    }
+    if (fs->logstart != 0) {
+        return KERR_NOTSUP; /* this filesystem's log is inside it */
+    }
+    fs->log_cache = log;
+    fs->log_base = 0; /* an external log starts at its device's first byte */
+    fs->log_detached = false;
+    rc = xfs_log_check(fs);
+    if (rc == KERR_DIRTY) {
+        rc = xfs_check(fs);
+        rc = rc != KERR_OK ? rc : (fs->no_replay ? KERR_NOTSUP : xfs_log_replay(fs));
+        if (rc != KERR_OK) {
+            kprintf("xfs: the external log is dirty and could not be replayed\n");
+            return rc;
+        }
+        fs->log_replayed = true;
+    } else if (rc != KERR_OK) {
+        return rc;
+    }
+    fs->write_refused = false;
+    kprintf("xfs: the external log is attached and %s; the filesystem is writable\n",
+            fs->log_replayed ? "was replayed" : "clean");
+    return KERR_OK;
+}
+
 int xfs_mount(struct xfs *fs, struct bcache *cache) {
     struct bbuf *b;
     int rc;
@@ -306,8 +342,40 @@ int xfs_mount(struct xfs *fs, struct bcache *cache) {
      * caller will observe is the specification. A reader may observe a
      * filesystem as of its last commit; nobody may write over a log that
      * says something newer happened. */
+    /* **Where the log is, decided once.** An internal log is a run inside
+     * this filesystem, so its device is this one and its base is
+     * `logstart` — which is AG-encoded and goes through `xfs_fsb_to_block`
+     * like any other filesystem block, a conversion the read path once
+     * missed while the write path did it (`CLAUDE.md` §5). An external log
+     * has `sb_logstart` of zero and lives on a device nothing here has been
+     * given yet. */
+    if (fs->logstart != 0) {
+        fs->log_cache = cache;
+        fs->log_base = xfs_fsb_to_block(fs, fs->logstart) * (uint64_t)fs->blocksize;
+    } else {
+        fs->log_cache = NULL;
+        fs->log_base = 0;
+        fs->log_detached = true;
+    }
     rc = xfs_log_check(fs);
-    if (rc == KERR_DIRTY) {
+    /* **A log that cannot be reached is not a log that is dirty.** There is
+     * nothing to replay and nothing to check a replay against, so the
+     * filesystem mounts read-only and waits for its device: everything
+     * committed before the last unmount is intact and readable, and writing
+     * without being able to read the log would be worse than refusing or
+     * waiting.
+     *
+     * This block was first written into `xfs_attach_log` by a textual edit
+     * that matched the wrong one of two identical lines — where it is
+     * unreachable, because attaching is what makes the device present. The
+     * test went on failing and the code looked right in isolation, which is
+     * the whole hazard of editing by pattern in a file with two copies of a
+     * call. */
+    if (rc == KERR_NODEV) {
+        fs->write_refused = true;
+        kprintf("xfs: mounting read-only until the log's device is attached\n");
+        rc = KERR_OK;
+    } else if (rc == KERR_DIRTY) {
         fs->log_was_dirty = true;
         rc = xfs_check(fs);
         if (rc != KERR_OK) {
@@ -324,7 +392,7 @@ int xfs_mount(struct xfs *fs, struct bcache *cache) {
          * before replay existed. The only thing lost is the ability to
          * write, and a kernel that refused the disk outright over an item
          * type it did not recognise would be strictly worse. */
-        rc = fs->no_replay ? KERR_NOTSUP : xfs_log_replay(fs);
+        rc = fs->no_replay || fs->log_cache == NULL ? KERR_NOTSUP : xfs_log_replay(fs);
         if (rc != KERR_OK) {
             fs->write_refused = true;
             kprintf("xfs: the log could not be replayed; mounting read-only\n");

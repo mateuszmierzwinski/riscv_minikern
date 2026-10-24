@@ -94,6 +94,26 @@ struct xfs {
     uint64_t dblocks;     /* blocks in the filesystem */
     uint64_t rootino;
     uint64_t logstart;    /* the internal log's first block, 0 when external */
+    /* **Where the log actually is**, which is not always this filesystem's
+     * own device.
+     *
+     * An *internal* log is a run of blocks inside the filesystem, and
+     * `log_cache` is the filesystem's own cache with `log_base` the byte
+     * offset of `logstart`. An **external** log is a whole separate device
+     * — `sb_logstart` reads zero and the log begins at that device's first
+     * byte — so `log_cache` is somebody else's cache and `log_base` is 0.
+     *
+     * Keeping both as a cache and an offset means every reader of the log
+     * is written once: the check, the replay and the writer all take the
+     * device from here and none of them knows which kind it is. The
+     * alternative — a branch at each of the four places that computes a log
+     * address — is four places to forget. */
+    struct bcache *log_cache;
+    uint64_t log_base;
+    /* The log is on a device that has not been attached, so it cannot be
+     * read: the filesystem is still readable and must not be written, for
+     * the same reason a dirty log makes it read-only. */
+    bool log_detached;
     uint64_t dir_leaf_block; /* directory data lives below this logical block */
     uint64_t dir_free_block; /* and the free blocks of a node directory above */
     uint32_t blocksize;
@@ -335,6 +355,20 @@ typedef int (*xfs_attr_fn)(void *self, const uint8_t *name, uint32_t namelen,
  * `KERR_NOSPC` when the inode is full rather than building a half-finished
  * leaf. A value kept in blocks of its own is reported as present and
  * refused on read. */
+/* Gives the filesystem the device its **external** log lives on.
+ *
+ * A filesystem whose `sb_logstart` is zero keeps its log on a separate
+ * device, which nothing in the superblock names — Linux is told with
+ * `-o logdev=`, and this is the equivalent. Until it is attached the log
+ * cannot be read, so the filesystem mounts **read-only**: refusing it
+ * outright would make a configuration somebody chose deliberately look like
+ * a corrupt disk, and writing to it without being able to read its log
+ * would be worse than either.
+ *
+ * Attaching checks the log and, if it is clean or can be replayed, lifts
+ * the restriction — so the ordinary sequence is mount, attach, write. */
+int xfs_attach_log(struct xfs *fs, struct bcache *log);
+
 int xfs_attr_get(struct xfs *fs, const struct xfs_inode *ip, const char *name,
                  uint32_t namelen, uint8_t *out, uint32_t room, uint32_t *valuelen);
 int xfs_attr_list(struct xfs *fs, const struct xfs_inode *ip, xfs_attr_fn fn, void *self);

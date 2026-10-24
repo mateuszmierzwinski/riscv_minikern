@@ -181,6 +181,39 @@ def swap_volume(at):
     return img
 
 
+# An external log has to be at least this big, which `mkfs.xfs` enforces
+# and is the reason the log device dwarfs what it holds.
+EXTLOG_MB = 80
+
+
+def external_log_volume(at):
+    """A filesystem whose log is on a **separate device**, and that device.
+
+    Returns both paths: the data image has `sb_logstart == 0`, which is how
+    XFS says "my log is elsewhere", and nothing in it names where. That is
+    the point of the configuration and the reason the kernel has to be told
+    — Linux is told with `-o logdev=`.
+
+    `mkfs.xfs` will not make an external log under 64 MB, so the log device
+    is 80 MB for a 320 MB filesystem. Both are mostly zeroes and compress
+    to nothing.
+    """
+    os.makedirs(at, exist_ok=True)
+    data = payload(at)
+    proto = os.path.join(at, "protoext")
+    with open(proto, "w") as f:
+        f.write(f"dummy\n0 0\nd--755 0 0\nseed ---644 0 0 {data}\n$\n")
+    img = os.path.join(at, "ext.img")
+    log = os.path.join(at, "extlog.img")
+    with open(img, "wb") as f:
+        f.truncate(320 * 1024 * 1024)
+    with open(log, "wb") as f:
+        f.truncate(EXTLOG_MB * 1024 * 1024)
+    subprocess.run(MKFS + ["-n", "ftype=1", "-l", f"logdev={log}", "-p", proto, img],
+                   check=True)
+    return img, log
+
+
 def main():
     at = sys.argv[1] if len(sys.argv) > 1 else "/tmp/minikern-fixtures"
     entries = int(sys.argv[2]) if len(sys.argv) > 2 else 3000

@@ -54,8 +54,10 @@ static uint8_t scratch[XLOG_SECTOR];
  * read at a wrong offset too and mounted anyway, because the bytes there
  * were zero and zero means "this log was never written". */
 static int read_bb(struct xfs *fs, uint64_t bb, uint8_t *buf) {
-    uint64_t off = xfs_fsb_to_block(fs, fs->logstart) * (uint64_t)fs->blocksize + bb * XLOG_SECTOR;
-    return bcache_pread(fs->cache, off, buf, XLOG_SECTOR);
+    if (fs->log_cache == NULL) {
+        return KERR_NODEV; /* an external log whose device is not attached */
+    }
+    return bcache_pread(fs->log_cache, fs->log_base + bb * XLOG_SECTOR, buf, XLOG_SECTOR);
 }
 
 /* The cycle a basic block belongs to, or 0 when it has never been written.
@@ -216,9 +218,24 @@ int xfs_log_check(struct xfs *fs) {
     uint32_t cycle;
     bool unmount = false;
     int rc;
-    if (fs->logstart == 0 || fs->logblocks == 0) {
-        kprintf("xfs: an external log is not supported\n");
-        return KERR_NOTSUP;
+    if (fs->logblocks == 0) {
+        kprintf("xfs: the superblock describes no log at all\n");
+        return KERR_INVAL;
+    }
+    /* **An external log is a configuration, not a defect.** Its device is
+     * not named anywhere in the superblock, so until somebody attaches one
+     * the log cannot be read — and a log that cannot be read is exactly the
+     * situation a dirty log puts the filesystem in: readable, and not to be
+     * written. Refusing the mount instead would make a deliberate choice
+     * look like a corrupt disk. */
+    /* `KERR_NODEV`, not `KERR_DIRTY`: those are different situations and
+     * the caller acts differently on them. A dirty log has work in it that
+     * can be checked and replayed; a log on an unattached device has
+     * nothing that *can* be read, so running the checker would produce a
+     * verdict nothing could act on and replaying is not even a question. */
+    if (fs->log_cache == NULL) {
+        kprintf("xfs: the log is on a separate device, which is not attached\n");
+        return KERR_NODEV;
     }
     rc = read_bb(fs, 0, scratch);
     if (rc != KERR_OK) {

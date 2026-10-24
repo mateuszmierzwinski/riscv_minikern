@@ -233,9 +233,9 @@ static void seal(uint32_t sectors) {
  * the tail, found them inconsistent, and declared the log to hold metadata
  * changes that had to be replayed. */
 static int flush_record(struct xfs *fs, uint64_t bb, uint32_t sectors) {
-    uint64_t base = xfs_fsb_to_block(fs, fs->logstart) * (uint64_t)fs->blocksize;
+    uint64_t base = fs->log_base;
     uint32_t bytes = XLOG_REC_HDR_SIZE + sectors * XLOG_SECTOR;
-    return bcache_pwrite(fs->cache, base + bb * XLOG_SECTOR, record, bytes);
+    return bcache_pwrite(fs->log_cache, base + bb * XLOG_SECTOR, record, bytes);
 }
 
 /* Zeroes the blocks after a batch, so that nothing a *previous* batch wrote
@@ -254,7 +254,7 @@ static int flush_record(struct xfs *fs, uint64_t bb, uint32_t sectors) {
 #define XLOG_CLEAR_BLOCKS (XLOG_MAX_SECTORS + 1u + 2u)
 
 static int clear_after(struct xfs *fs, uint64_t bb) {
-    uint64_t base = xfs_fsb_to_block(fs, fs->logstart) * (uint64_t)fs->blocksize;
+    uint64_t base = fs->log_base;
     uint32_t left = XLOG_CLEAR_BLOCKS;
     /* In passes the size of the record buffer, because the window to clear
      * is longer than that buffer: zeroing all of it in one go wrote past
@@ -263,7 +263,7 @@ static int clear_after(struct xfs *fs, uint64_t bb) {
     zero(record, sizeof record);
     while (left > 0) {
         uint32_t now = left < XLOG_MAX_SECTORS ? left : XLOG_MAX_SECTORS;
-        int rc = bcache_pwrite(fs->cache, base + bb * XLOG_SECTOR, record, now * XLOG_SECTOR);
+        int rc = bcache_pwrite(fs->log_cache, base + bb * XLOG_SECTOR, record, now * XLOG_SECTOR);
         if (rc != KERR_OK) {
             return rc;
         }

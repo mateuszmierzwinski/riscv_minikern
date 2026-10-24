@@ -663,16 +663,115 @@ static void damage_log_no_record(void) {
  *
  * The distinction being asserted is `KERR_DIRTY` against `KERR_NOTSUP`:
  * the mount reached the checker rather than stopping at the log. */
+/* A second device, holding nothing but a log: what an **external** log is.
+ *
+ * Separate storage, a separate `blockdev` and a separate cache, because
+ * that is the whole of the configuration — the filesystem's superblock says
+ * `logstart == 0` and names nothing, so the log's device is something the
+ * kernel is handed rather than something it can find. */
+static uint8_t logdisk[LOG_BLOCKS * BS];
+static uint8_t logcache_mem[4u * BS];
+static struct bcache logcache;
+static struct blockdev logdev;
+
+static int logdisk_read(void *self, uint64_t lba, uint32_t count, void *buf) {
+    (void)self;
+    if (!blockdev_in_range(&logdev, lba, count)) {
+        reads_outside++;
+        return KERR_INVAL;
+    }
+    memcpy(buf, logdisk + lba * BS, count * BS);
+    return KERR_OK;
+}
+
+static int logdisk_write(void *self, uint64_t lba, uint32_t count, const void *buf) {
+    (void)self;
+    if (!blockdev_in_range(&logdev, lba, count)) {
+        reads_outside++;
+        return KERR_INVAL;
+    }
+    memcpy(logdisk + lba * BS, buf, count * BS);
+    return KERR_OK;
+}
+
+/* The same clean log the internal one gets, but at **its own device's first
+ * byte** rather than at `logstart`. That offset is the one thing an
+ * external log changes about reading it, which is why the reader takes a
+ * base rather than computing one. */
+static void build_external_log(void) {
+    memset(logdisk, 0, sizeof logdisk);
+    put32(logdisk + XLOG_REC_MAGIC, XLOG_MAGIC);
+    put32(logdisk + XLOG_REC_CYCLE, 1u);
+    put32(logdisk + XLOG_REC_VERSION, 2u);
+    put32(logdisk + XLOG_REC_LEN, 512u);
+    put32(logdisk + XLOG_REC_NUM_OPS, 1u);
+    put32(logdisk + XLOG_SECTOR + XLOG_OP_LEN, 8u);
+    logdisk[XLOG_SECTOR + XLOG_OP_CLIENTID] = XLOG_CLIENT_LOG;
+    logdisk[XLOG_SECTOR + XLOG_OP_FLAGS] = XLOG_UNMOUNT_TRANS;
+    put16(logdisk + XLOG_SECTOR + XLOG_OP_HDR_SIZE, XLOG_UNMOUNT_MAGIC);
+    logdev = (struct blockdev){.read = logdisk_read,
+                               .write = logdisk_write,
+                               .flush = disk_flush,
+                               .block_size = BS,
+                               .blocks = LOG_BLOCKS};
+    bcache_init(&logcache, &logdev, logcache_mem, 4u);
+}
+
+/* An external log: read-only until its device arrives, writable after.
+ *
+ * **Both halves matter.** A filesystem whose log is elsewhere used to be
+ * refused outright, which made a configuration somebody chose look like a
+ * corrupt disk — so the first half is that it mounts at all, and read-only,
+ * because a log that cannot be read is exactly the position a dirty log
+ * leaves things in. The second half is that attaching the device lifts
+ * that: otherwise "supported" would mean "mounts and can never be written",
+ * which is not support.
+ *
+ * The device is deliberately a *different* one, with its own storage and
+ * its own range check, so a reader that quietly used the filesystem's own
+ * device would read the wrong bytes and be caught rather than pass. */
+static void test_an_external_log_is_read_from_its_own_device(void) {
+    mount_fresh();
+    put64(block(0) + XFS_SB_LOGSTART, 0);
+    seal(block(0), 512u, XFS_SB_CRC);
+    bcache_invalidate(&cache);
+    KTEST_CHECK(xfs_mount(&fs, &cache) == KERR_OK);
+    KTEST_CHECK(fs.log_detached);
+    KTEST_CHECK(!xfs_writable(&fs));
+
+    build_external_log();
+    KTEST_CHECK(xfs_attach_log(&fs, &logcache) == KERR_OK);
+    KTEST_CHECK(!fs.log_detached);
+    KTEST_CHECK(xfs_writable(&fs));
+    KTEST_CHECK(reads_outside == 0);
+
+    /* And a filesystem whose log is *internal* refuses the attachment,
+     * rather than quietly pointing its log reader at a device that holds
+     * somebody else's. */
+    mount_fresh();
+    KTEST_CHECK(xfs_mount(&fs, &cache) == KERR_OK);
+    KTEST_CHECK(xfs_attach_log(&fs, &logcache) == KERR_NOTSUP);
+    KTEST_CHECK(reads_outside == 0);
+}
+
 static void test_a_dirty_log_is_checked(void) {
     void (*dirty[])(void) = {damage_log_not_unmount, damage_log_wrong_client,
                              damage_log_many_ops, damage_log_newer_record};
     for (uint32_t i = 0; i < sizeof dirty / sizeof dirty[0]; i++) {
         KTEST_CHECK(mount_with(dirty[i]) == KERR_DIRTY);
     }
-    /* An external log and an unreadable one are refusals of a different
-     * kind: the first is a device this kernel was not given, the second is
-     * not a statement about cleanliness at all. Neither reaches the check. */
-    KTEST_CHECK(mount_with(damage_log_external) == KERR_NOTSUP);
+    /* **An external log mounts, read-only.** It is a configuration
+     * somebody chose, not a defect: the log is on a device the superblock
+     * does not name, so until one is attached the log cannot be read — and
+     * a log that cannot be read leaves the filesystem exactly where a dirty
+     * one does, readable and not to be written. This line used to expect
+     * `KERR_NOTSUP`, which made a deliberate choice indistinguishable from
+     * a corrupt disk. */
+    KTEST_CHECK(mount_with(damage_log_external) == KERR_OK);
+    KTEST_CHECK(fs.log_detached);
+    KTEST_CHECK(!xfs_writable(&fs));
+    /* A log this reader cannot find a record in is still a refusal, and a
+     * different kind: it is not a statement about cleanliness at all. */
     KTEST_CHECK(mount_with(damage_log_no_record) == KERR_NOTSUP);
     /* A log that was never written has nothing to replay, so it is clean
      * and the check never runs — which is what lets this fixture, with no
@@ -1221,6 +1320,7 @@ int main(void) {
     KTEST_RUN(test_holes_and_unwritten_read_as_zeroes);
     KTEST_RUN(test_read_only_features_mount_but_forbid_writing);
     KTEST_RUN(test_a_superblock_that_cannot_be_trusted);
+    KTEST_RUN(test_an_external_log_is_read_from_its_own_device);
     KTEST_RUN(test_a_dirty_log_is_checked);
     KTEST_RUN(test_the_check_stays_inside_the_filesystem);
     KTEST_RUN(test_an_inode_that_cannot_be_trusted);
