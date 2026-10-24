@@ -859,6 +859,22 @@ cc_library(
     ],
 )
 
+# Reconnaissance for the board's own Ethernet: which of the two controllers,
+# which DesignWare register generation, which PHY, and whether it clocks.
+# Reads only; the driver follows once the board has answered.
+cc_library(
+    name = "dwmac_probe",
+    srcs = ["src/drivers/dwmac_probe.c"],
+    hdrs = ["src/drivers/dwmac_probe.h"],
+    strip_include_prefix = "src",
+    target_compatible_with = ["//platforms:riscv64"],
+    deps = [
+        ":console",
+        ":core_boot",
+        ":drivers_gpio",
+    ],
+)
+
 # The mount table: which filesystem is mounted where, and automount by the
 # filesystem's label. ROOT becomes /, anything else a volume under /volumes.
 cc_library(
@@ -997,6 +1013,7 @@ cc_library(
         ":kernel_swap",
         ":kernel_uspace",
         ":virtio_net",
+        ":dwmac_probe",
         ":kernel_volumes",
         ":kernel_xfs",
     ],

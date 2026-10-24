@@ -53,6 +53,7 @@
 #include "kernel/syscall.h"
 #include "kernel/uspace.h"
 #include "kernel/probe.h"
+#include "drivers/dwmac_probe.h"
 #include "kernel/volumes.h"
 #include "lib/sha256.h"
 #include "kernel/probe.h"
@@ -913,6 +914,22 @@ static void bring_up_clocks(uint64_t dtb) {
     }
     kprintf("crg: sys at %016llx, aon at %016llx\n", (unsigned long long)crg_base(CRG_SYS),
             (unsigned long long)crg_base(CRG_AON));
+}
+
+/* Roadmap §4: what the board's own Ethernet actually is, before a line of
+ * driver is written for it. `minikern.gmac` asks.
+ *
+ * Here beside the other hardware bring-up because it needs the device tree
+ * and clocks, and deliberately *before* a driver exists: the GMAC is a
+ * larger block than the SD controller this tree already wrote twice, once
+ * for the wrong register map. */
+static void probe_the_ethernet(uint64_t dtb) {
+    struct fdt fdt;
+    if (fdt_open(&fdt, (const void *)(uintptr_t)dtb, FDT_MAX_BYTES) != KERR_OK) {
+        kprintf("gmac: no device tree\n");
+        return;
+    }
+    (void)dwmac_probe(&fdt);
 }
 
 static void bring_up_gpio(uint64_t dtb) {
@@ -2441,6 +2458,9 @@ void kmain(uint64_t hart, uint64_t dtb) {
     bring_up_filesystem();
     run_disk_benchmark();
     bring_up_gpio(dtb);
+    if (cmdline_has(boot_cmdline, "minikern.gmac")) {
+        probe_the_ethernet(dtb);
+    }
     bring_up_other_harts(dtb, hart);
     /* **After the harts are up**, because half of what it measures is about
      * them: how many are schedulable, and what an interrupt between two of

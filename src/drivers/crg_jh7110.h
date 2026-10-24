@@ -70,6 +70,24 @@ static inline uint32_t crg_reset_bit(uint32_t id) {
 /* The bit that enables a clock. */
 #define CRG_CLOCK_ENABLE_BIT 31u
 
+/* **Not every clock in this generator has a gate.**
+ *
+ * A JH7110 clock register is one of several kinds. A *gate* keeps its
+ * enable in bit 31. An *inverter* has no gate at all: bit 30 selects the
+ * polarity of a clock that is simply always on, and bit 31 is not
+ * implemented. There are also muxes (bits 27:24) and dividers (bits 23:0),
+ * and one register may combine them.
+ *
+ * This matters because `crg_enable_clock` writes bit 31 and reads it back —
+ * which is the right check for a gate and a **false negative** for an
+ * inverter, whose bit 31 can never stick. Both of the board's Ethernet
+ * controllers were refused for exactly that reason: each names an inverted
+ * transmit clock, GMAC0's at AON index 6 and GMAC1's at SYS index 106, and
+ * both read `0x4000_0000` — polarity set, no divider, no gate. */
+#define CRG_CLOCK_INVERT_BIT 30u
+#define CRG_CLOCK_MUX_MASK   0x0f000000u
+#define CRG_CLOCK_DIV_MASK   0x00ffffffu
+
 /* Finds the generators in the device tree and maps them. Returns how many
  * were found; 0 means this is not a JH7110. */
 uint32_t crg_jh7110_init(const struct fdt *fdt);
@@ -79,6 +97,17 @@ uint32_t crg_jh7110_init(const struct fdt *fdt);
  * KERR_NOENT when that generator was not found, KERR_IO when the enable bit
  * does not stay set — which is what happens when the *parent* clock is off,
  * and is worth distinguishing from "I wrote it and assumed". */
+/* Enables a clock.
+ *
+ * `KERR_OK` when its gate is on, `KERR_NOTSUP` when the clock has **no
+ * gate** — an inverter, which is already running and whose bit 31 can never
+ * be set — and `KERR_IO` when the bit refuses for any other reason, which
+ * is the diagnosis that caught the always-on pin controller being switched
+ * on through the wrong generator.
+ *
+ * The three answers are worth keeping apart. Collapsing the middle one into
+ * `KERR_IO` refused two working clocks; collapsing it into `KERR_OK` would
+ * throw away the check that found a real bug. */
 int crg_enable_clock(enum crg_domain domain, uint32_t index);
 
 /* Releases a reset and **confirms it** through the status register, which

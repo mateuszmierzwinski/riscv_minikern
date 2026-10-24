@@ -63,11 +63,27 @@ int crg_enable_clock(enum crg_domain domain, uint32_t index) {
     if (domain >= CRG_DOMAINS || !domains[domain].up) {
         return KERR_NOENT;
     }
-    write_reg(domain, off, read_reg(domain, off) | CLOCK_ENABLE);
-    /* Read back. An enable bit that does not stay set means the parent clock
-     * is off, and the difference between that and "I wrote it" is the
-     * difference between a diagnosis and a mystery. */
-    return (read_reg(domain, off) & CLOCK_ENABLE) != 0 ? KERR_OK : KERR_IO;
+    uint32_t before = read_reg(domain, off);
+    write_reg(domain, off, before | CLOCK_ENABLE);
+    /* Read back. An enable bit that does not stay set used to mean one
+     * thing here — the parent is off — and "the difference between that and
+     * 'I wrote it' is the difference between a diagnosis and a mystery".
+     * That is still true, and it was not the whole truth. */
+    if ((read_reg(domain, off) & CLOCK_ENABLE) != 0) {
+        return KERR_OK;
+    }
+    /* **An inverter has no gate**, so its bit 31 can never stick: bit 30 is
+     * the polarity of a clock that is always on, and the rest of the
+     * register is empty. Reporting that as a failure refused both of this
+     * board's Ethernet controllers, each of which names an inverted
+     * transmit clock — and the refusal was indistinguishable from the real
+     * fault this check exists to catch. Saying which it is costs one
+     * comparison. */
+    if ((before & (1u << CRG_CLOCK_INVERT_BIT)) != 0 &&
+        (before & (CRG_CLOCK_MUX_MASK | CRG_CLOCK_DIV_MASK)) == 0) {
+        return KERR_NOTSUP;
+    }
+    return KERR_IO;
 }
 
 int crg_release_reset(enum crg_domain domain, uint32_t id) {
@@ -149,7 +165,9 @@ int crg_enable_device(const struct fdt *fdt, const char *path) {
                 continue; /* a clock from some other provider: not ours to switch */
             }
             rc = crg_enable_clock(domain, (uint32_t)index);
-            if (rc != KERR_OK) {
+            /* A clock with no gate is already running, which is as good as
+             * having switched it on. */
+            if (rc != KERR_OK && rc != KERR_NOTSUP) {
                 return rc;
             }
             any = true;
