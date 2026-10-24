@@ -888,6 +888,18 @@ sparse inodes, `nrext64`, exchange-range, parent pointers, `bigtime`,
       **boot order** rather than of the disk, so fitting a second drive can
       silently change which filesystem is the system.
 
+      **One `struct xfs` per device**, which the first version got wrong.
+      It automounted every candidate *and* let `xfsmount` mount the one it
+      adopts, so that device had two independent block caches, both able to
+      write — one holding stale metadata while the other changed it.
+      Nothing had broken only because no path resolved into the duplicate,
+      which is luck rather than design. Automount now starts from the
+      **second** candidate and the root filesystem enters the table through
+      `volumes_register`, which stores a *pointer* to `xfsmount`'s mount. A
+      consequence worth noting: the listing had to move after
+      `xfsmount_attach`, since before it the table describes every
+      filesystem on the machine except the one it is running from.
+
       `/volumes` is a **virtual directory**, synthesised from the table. A
       directory that exists because the kernel says so needs no block, no
       inode and no space, and cannot disagree with what is actually mounted.

@@ -193,8 +193,13 @@ CASES = [
 
     ("§3: automount puts each volume where its label says",
      "minikern.volumes",
-     ["volumes: \"ROOT\" mounted at /",
+     [# The root filesystem is **registered**, not mounted a second time:
+      # automount and `xfsmount` owning the same device gave it two
+      # write-capable block caches. The wording differs between the two for
+      # exactly that reason, so the test asserts both forms.
+      "volumes: \"ROOT\" at / (the root filesystem's own mount)",
       "volumes: \"DATA\" mounted at /volumes/DATA",
+      "volumes: 2 mounted",
       # The policy held *and* each volume's own file was reachable only
       # through its own mount point. A kernel that mounted both at / would
       # satisfy a test that merely counted mounts.

@@ -13,9 +13,24 @@
 #define VOLUMES_PATH_MAX 48u
 #define VOLUMES_CACHE_SLOTS 16u
 
+/* One entry in the table.
+ *
+ * `use` is what resolution hands back, and it is not always `&own`: the
+ * root filesystem is mounted by `xfsmount` — which every caller written
+ * before this table existed still goes through — so the table **points at**
+ * that mount rather than making a second one of its own.
+ *
+ * That distinction is the whole reason this struct has two fields for one
+ * filesystem. Automounting every candidate *and* letting `xfsmount` mount
+ * the one it adopts gave the same device two independent block caches, both
+ * able to write: one holding stale metadata while the other changed it.
+ * Nothing had gone wrong yet because no path resolved into the duplicate,
+ * which is luck rather than design — the same luck as the card that mounted
+ * at a wrong log offset because the bytes there happened to be zero. */
 struct volume {
-    struct xfs fs;
+    struct xfs own;   /* storage, for a volume this table mounted itself */
     struct bcache cache;
+    struct xfs *use;  /* &own, or somebody else's mount */
     char at[VOLUMES_PATH_MAX];
     bool used;
 };
@@ -124,17 +139,19 @@ static bool mount_one(uint32_t index, const struct blockdev *dev) {
         kprintf("volumes: no memory for volume %u\n", index);
         return false;
     }
-    rc = xfs_mount(&v->fs, &v->cache);
+    rc = xfs_mount(&v->own, &v->cache);
+    v->use = &v->own;
     if (rc != KERR_OK) {
         kprintf("volumes: candidate %u is not a filesystem this kernel mounts (rc %d)\n",
                 index, rc);
         return false;
     }
-    mount_point_for(v->fs.label, index, v->at, sizeof v->at);
+    mount_point_for(v->own.label, index, v->at, sizeof v->at);
     v->used = true;
     count++;
-    kprintf("volumes: \"%s\" mounted at %s%s\n", v->fs.label[0] != '\0' ? v->fs.label : "(no label)",
-            v->at, xfs_writable(&v->fs) ? "" : " (read-only)");
+    kprintf("volumes: \"%s\" mounted at %s%s\n",
+            v->own.label[0] != '\0' ? v->own.label : "(no label)", v->at,
+            xfs_writable(&v->own) ? "" : " (read-only)");
     return true;
 }
 
@@ -154,17 +171,34 @@ static uint32_t prefix_match(const char *path, const char *at) {
     return begins_with(path, at, &len) ? len : 0u;
 }
 
+void volumes_register(struct xfs *fs, uint32_t index) {
+    struct volume *v;
+    if (count >= VOLUMES_MAX || fs == NULL) {
+        return;
+    }
+    v = &table[count];
+    v->use = fs;
+    v->used = true;
+    mount_point_for(fs->label, index, v->at, sizeof v->at);
+    count++;
+    kprintf("volumes: \"%s\" at %s%s (the root filesystem's own mount)\n",
+            fs->label[0] != '\0' ? fs->label : "(no label)", v->at,
+            xfs_writable(fs) ? "" : " (read-only)");
+}
+
 uint32_t volumes_automount(void) {
     uint32_t candidates = disk_volume_count();
     count = 0;
-    for (uint32_t i = 0; i < candidates && count < VOLUMES_MAX; i++) {
+    /* **From the second candidate.** The first is the one
+     * `adopt_partition_or_whole` gives to `xfsmount`, and mounting it here
+     * as well would be the same device under two caches. It reaches the
+     * table through `volumes_register` instead, pointed at rather than
+     * copied. */
+    for (uint32_t i = 1; i < candidates && count < VOLUMES_MAX; i++) {
         const struct blockdev *dev = disk_volume(i);
         if (dev != NULL) {
             (void)mount_one(i, dev);
         }
-    }
-    if (count == 0) {
-        kprintf("volumes: nothing mounted\n");
     }
     return count;
 }
@@ -191,7 +225,7 @@ struct xfs *volumes_resolve(const char *path, const char **within) {
     } else {
         *within = path[best] == '\0' ? "/" : path + best;
     }
-    return &table[pick].fs;
+    return table[pick].use;
 }
 
 uint32_t volumes_count(void) {
@@ -203,11 +237,11 @@ const char *volumes_at(uint32_t i) {
 }
 
 const char *volumes_label(uint32_t i) {
-    return i < count ? table[i].fs.label : "";
+    return i < count && table[i].use != NULL ? table[i].use->label : "";
 }
 
 bool volumes_readonly(uint32_t i) {
-    return i < count ? !xfs_writable(&table[i].fs) : true;
+    return i < count && table[i].use != NULL ? !xfs_writable(table[i].use) : true;
 }
 
 bool volumes_is_the_dir(const char *path) {

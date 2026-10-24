@@ -41,6 +41,13 @@ int xfsmount_attach(void) {
         return rc;
     }
     mounted = true;
+    /* **Into the table, pointed at rather than mounted again.** This mount
+     * is the root filesystem and `volumes_automount` deliberately skips the
+     * candidate it came from, so this is what puts it where its label asks
+     * — `/` for `ROOT`, `/volumes/<label>` otherwise. Without it the table
+     * would describe every filesystem on the machine except the one the
+     * machine is running from. */
+    volumes_register(&fs, 0);
     return KERR_OK;
 }
 

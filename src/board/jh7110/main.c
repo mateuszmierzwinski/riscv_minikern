@@ -465,10 +465,7 @@ static void list_the_volumes(void) {
  * RAM disk by a test still mounts it by hand. Automount is what a machine
  * does when nobody told it anything. */
 static void automount_the_disk(void) {
-    if (volumes_automount() == 0) {
-        return;
-    }
-    list_the_volumes();
+    (void)volumes_automount();
 }
 
 /* Whether two NUL-terminated strings are the same. The kernel has no libc
@@ -538,6 +535,10 @@ static void bring_up_filesystem(void) {
         return;
     }
     kprintf("xfs: mounted read-only, %d entries in /\n", entries);
+    /* **After** `xfsmount_attach`, because that is when the root
+     * filesystem enters the table: listing before it would report every
+     * volume except the one the machine is running from. */
+    list_the_volumes();
     (void)xfsmount_show_file("/hello.txt");
     checksum_a_file();
 }

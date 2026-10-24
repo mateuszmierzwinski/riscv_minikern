@@ -43,6 +43,16 @@ struct xfs;
  * named in the log. */
 uint32_t volumes_automount(void);
 
+/* Adds a filesystem somebody else mounted to the table, at the mount point
+ * its label asks for.
+ *
+ * This is how the **root filesystem** gets into the table: `xfsmount` owns
+ * that mount, because every caller written before this table existed goes
+ * through it, so the table points at it rather than mounting the same
+ * device a second time. `volumes_automount` starts from the second
+ * candidate for the same reason. `index` names it when it has no label. */
+void volumes_register(struct xfs *fs, uint32_t index);
+
 /* The filesystem that owns `path`, and the remainder of the path within it.
  *
  * Longest prefix wins, so `/volumes/DATA/x` reaches the DATA volume and not
