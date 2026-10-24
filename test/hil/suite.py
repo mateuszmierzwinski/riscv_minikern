@@ -198,6 +198,9 @@ CASES = [
       # writer, and the leaf *reader* was wrong for exactly that reason
       # until the writer existed to check it.
       "fswrite: attributes set, listed, survived a mount, removed; 1 to leaf",
+      # A value too large to share a block with its name goes into blocks of
+      # its own, and comes back byte for byte across a mount.
+      "fswrite: a 3000-byte value went to its own blocks and came back",
       "the log was replayed; the filesystem is clean",
       "the log could not be replayed; mounting read-only"],
      700, None, "small"),

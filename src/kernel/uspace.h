@@ -154,6 +154,12 @@ struct uproc {
     virt_t stack_top;
     uint64_t context[USPACE_CONTEXT_WORDS];
     bool built;
+    /* Where the reclaim clock last stopped: a **virtual address**, not an
+     * index into the regions. Regions come and go between sweeps, so an
+     * index would point at a different region each time — which is how a
+     * rotating policy quietly becomes a fixed one that always takes the
+     * first page it sees. */
+    virt_t reclaim_cursor;
 };
 
 /* ── the process table ─────────────────────────────────────────────────────
@@ -484,6 +490,19 @@ uint64_t uspace_moved_pages(void);
  * zero means something mapped memory without recording it, which is this
  * kernel's most expensive class of defect. */
 uint32_t uspace_stale_records(void);
+
+/* How the reclaim clock is doing: pages left alone because the hardware
+ * said they had been touched, and sweeps that found nothing cold. Zero
+ * second chances means the clock is choosing exactly as the policy it
+ * replaced did, which is the one thing a page count cannot show. */
+/* Pages sent out because free memory was below the watermark, rather than
+ * because a program asked. Zero on a machine that never came under
+ * pressure, which is most of them — so a test of the watermark has to say
+ * what this number was. */
+uint64_t uspace_pages_out_unasked(void);
+
+uint64_t uspace_second_chances(void);
+uint64_t uspace_empty_sweeps(void);
 
 /* How many pages were backed at `mmap` because the caller asked for them up
  * front (`MAP_POPULATE`) rather than on first touch. It is how "the flag is

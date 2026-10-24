@@ -1088,12 +1088,33 @@ sparse inodes, `nrext64`, exchange-range, parent pointers, `bigtime`,
       bits, so only the listing could mislead. It reports the namespace
       alone now.
 
-      Still refused: a **b-tree** attribute fork, and a value held in blocks
-      of its own — reported as present and refused on read, rather than
-      handing back a block number as if it were data. The attribute fork
-      needs its own mapper (`xfs_attr_bmap`): it is a separate extent list,
-      and reading an attribute block through `xfs_bmap` would return a block
-      of the file's own contents.
+      **A value too large to share a block with its name goes into blocks
+      of its own**, read and written. Each block carries its own offset into
+      the value and its byte count, and both are checked while the value is
+      reassembled: a block that is sound in isolation but belongs at a
+      different offset is what a misplaced write produces, and concatenating
+      blindly would give back a value wrong in the middle and right at both
+      ends — the hardest kind to notice. The blocks are asked for as **one
+      extent**, so the fork costs one record however long the value is.
+
+      Two mistakes here, both about *order*. The dispatch asked what shape
+      the fork was before asking how big the value was, so a three-kilobyte
+      value on an already-converted leaf went to the local writer and came
+      back `KERR_NOSPC` **on a filesystem with 300 MB free** — where a value
+      lives is a property of the value, not of the fork. And
+      `store_attr_extent` cleared only the sixteen bytes of the extent it
+      was writing when the fork changed format from shortform to extents,
+      leaving the old attribute *text* in the slots above: `attr_fork_end`
+      unpacked it and reported the fork ending at logical block
+      2,981,740,977. **A format change must clear its fork**, because an
+      extent list's zero tail is how both the appender and the reader find
+      its end — a fork whose tail is not cleared reads as whatever it used
+      to be.
+
+      Still refused: a **b-tree** attribute fork. The attribute fork needs
+      its own mapper (`xfs_attr_bmap`) whatever its shape: it is a separate
+      extent list, and reading an attribute block through `xfs_bmap` would
+      return a block of the file's own contents.
 
       **On the board**: two attributes in two namespaces set in the inode,
       a dozen more added until the fork is pushed into a leaf (`1 to leaf`,

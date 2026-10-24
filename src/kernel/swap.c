@@ -1,5 +1,7 @@
 #include "kernel/swap.h"
 
+#include "kernel/mem.h"
+
 #include <stddef.h>
 
 #include "core/console.h"
@@ -108,6 +110,39 @@ bool swap_enabled(void) {
 
 uint32_t swap_swappiness(void) {
     return swap.swappiness;
+}
+
+/* An absolute watermark, for a test. Zero means "derive it".
+ *
+ * A machine with 8 GiB cannot be put under real memory pressure by any
+ * program this kernel can run, so the pressure has to be moved to the
+ * program rather than the program to the pressure. This is the same kind of
+ * instrument as `keepadvice` and the replay refusal: a knob that exists so
+ * that a path which only happens on a full machine can be reached on an
+ * empty one. */
+static uint32_t watermark_override;
+
+void swap_set_watermark(uint32_t pages) {
+    watermark_override = pages;
+}
+
+uint32_t swap_watermark(void) {
+    uint32_t total = mem_total_pages();
+    if (watermark_override != 0) {
+        return watermark_override;
+    }
+    /* **Scaled by swappiness, and zero at zero.** Swappiness is the
+     * operator saying how willing the machine should be to page out, and
+     * the one thing it must mean exactly is that *nothing* is paged out
+     * unasked at zero — otherwise the knob does not include "off", which is
+     * the setting people actually check for.
+     *
+     * The fraction is deliberately small: a watermark is the point at which
+     * reclaim *starts*, not a target, so it wants to be far enough above
+     * empty that a burst of allocation does not run the machine out while
+     * pages are being written, and no further. A sixteenth of memory at the
+     * highest setting is a few hundred megabytes on this board. */
+    return (uint32_t)((uint64_t)total * swap_swappiness() / (16u * 127u));
 }
 
 void swap_set_swappiness(uint32_t swappiness) {

@@ -180,8 +180,30 @@
 #define ATTR_REMOTE_NAMELEN  8u /* u8 */
 #define ATTR_REMOTE_NAME     9u
 
-/* A local pair's bytes in the block, which the format rounds to eight. */
+/* A local pair's bytes in the block, and a remote one's — both rounded to
+ * eight. A remote entry carries only the name and where the value lives, so
+ * its size does not depend on the value's length at all, which is the whole
+ * point of it. */
 #define ATTR_LOCAL_SIZE(nlen, vlen) (((nlen) + (vlen) + 3u + 7u) & ~7u)
+#define ATTR_REMOTE_SIZE(nlen) (((nlen) + 9u + 7u) & ~7u)
+
+/* A **remote value block**: the value itself, with a header of its own on a
+ * v5 filesystem so that a torn or misplaced block is detectable rather than
+ * being read as value bytes. */
+#define XFS_ATTR3_RMT_MAGIC 0x5841524du /* "XARM" */
+#define ATTR_RMT_CRC        8u   /* u32, little-endian */
+#define ATTR_RMT_UUID       12u  /* 16 bytes */
+#define ATTR_RMT_OWNER      28u  /* u64: the inode it belongs to */
+#define ATTR_RMT_BLKNO      36u  /* u64 */
+#define ATTR_RMT_LSN        44u  /* u64 */
+#define ATTR_RMT_OFFSET     52u  /* u32: this block's offset into the value */
+#define ATTR_RMT_BYTES      56u  /* u32: value bytes in this block */
+#define ATTR_RMT_HDR        60u  /* then the value bytes */
+
+/* The largest value this writes, which bounds the blocks a single set may
+ * need. XFS itself allows 64 KiB; this takes a quarter of that, which is
+ * eight 4 KiB blocks and more than any label or ACL in practice. */
+#define XFS_ATTR_VALUE_MAX 16384u
 
 #define XFS_DINODE_FMT_DEV     0u
 #define XFS_DINODE_FMT_LOCAL   1u /* the fork holds the data itself */

@@ -1878,6 +1878,40 @@ uint32_t uspace_backed_twice(void) {
     return backed_twice;
 }
 
+/* Pages reclaimed because free memory had fallen below the watermark,
+ * rather than because a program asked. */
+static uint64_t pages_out_unasked;
+
+uint64_t uspace_pages_out_unasked(void) {
+    return pages_out_unasked;
+}
+
+/* Pages out, if free memory is below the watermark.
+ *
+ * **Here, at the moment a page is needed**, rather than on a timer: this is
+ * the one place that knows memory is about to be consumed, and a reclaim
+ * that runs just before an allocation is a reclaim whose result is still
+ * true when the allocation happens. A housekeeping beat would be the other
+ * option and would have to guess how much to free.
+ *
+ * It reclaims from **this** process, which is the honest limit of what this
+ * knows: there is no global page list, so "the coldest page on the machine"
+ * is not a question anything here can answer. The process that is
+ * allocating is at least a process whose pages exist, and under real
+ * pressure every process reaches this path.
+ *
+ * A failure to reclaim is not an error. The allocation below may still
+ * succeed — the watermark is where reclaim *starts*, not where memory runs
+ * out — and if it does not, the caller gets `KERR_NOMEM` from the
+ * allocator, which is the truthful answer. */
+static void reclaim_if_short(struct uproc *p) {
+    uint32_t mark = swap_watermark();
+    if (mark == 0 || !swap_enabled() || mem_free_pages_count() >= mark) {
+        return;
+    }
+    pages_out_unasked += uspace_reclaim_pages(p, SWAP_RECLAIM_BATCH);
+}
+
 static int back_one_page(struct uproc *p, virt_t va, uint32_t prot) {
     phys_t page = 0;
     phys_t already = 0;
@@ -1886,6 +1920,7 @@ static int back_one_page(struct uproc *p, virt_t va, uint32_t prot) {
     if (prot == 0) {
         return KERR_OK;
     }
+    reclaim_if_short(p);
     /* **Already backed, so back nothing.**
      *
      * Every caller decided to back this address by finding it absent, and
@@ -2763,20 +2798,105 @@ uint32_t uspace_reclaim_range(struct uproc *p, virt_t at, uint64_t pages) {
     return done;
 }
 
-uint32_t uspace_reclaim_pages(struct uproc *p, uint32_t want) {
-    uint32_t done = 0;
-    if (p == NULL || !swap_enabled()) {
-        return 0;
-    }
-    for (uint32_t i = 0; i < p->vmas.n && done < want; i++) {
+/* Pages given a second chance because they had been accessed, and sweeps
+ * that found nothing to take. Reported because the difference between "this
+ * policy chose well" and "this policy is the old one wearing a hat" is
+ * invisible from the page count alone. */
+static uint64_t second_chances;
+static uint64_t sweeps_empty;
+
+uint64_t uspace_second_chances(void) {
+    return second_chances;
+}
+
+uint64_t uspace_empty_sweeps(void) {
+    return sweeps_empty;
+}
+
+/* One step of the clock: the next page at or after the cursor, wrapping.
+ *
+ * The cursor is a virtual address rather than an index, because regions are
+ * added and removed between sweeps and an index would point at a different
+ * region each time — which is how a "rotating" policy quietly becomes a
+ * fixed one. */
+static bool next_candidate(struct uproc *p, virt_t from, virt_t *va, bool *wrapped) {
+    virt_t best = 0;
+    bool found = false;
+    for (uint32_t i = 0; i < p->vmas.n; i++) {
         const struct vma *r = &p->vmas.v[i];
+        virt_t at;
         if (!may_page_out(r)) {
             continue;
         }
-        for (virt_t va = r->start; va < r->end && done < want; va += PAGE_SIZE) {
-            done += page_out_one(p, va) ? 1u : 0u;
+        at = r->start > from ? r->start : from;
+        if (at >= r->end) {
+            continue;
+        }
+        if (!found || at < best) {
+            best = at;
+            found = true;
         }
     }
+    if (found) {
+        *va = best;
+        return true;
+    }
+    /* Nothing at or after the cursor: start again from the bottom, once. */
+    if (*wrapped || from == 0) {
+        return false;
+    }
+    *wrapped = true;
+    return next_candidate(p, 0, va, wrapped);
+}
+
+uint32_t uspace_reclaim_pages(struct uproc *p, uint32_t want) {
+    uint32_t done = 0;
+    uint64_t looked = 0;
+    bool wrapped = false;
+    bool cleared_any = false;
+    if (p == NULL || !swap_enabled()) {
+        return 0;
+    }
+    /* **A clock, not a scan from the beginning.** The old policy took the
+     * first page of the first region every time, which on a program with a
+     * hot heap at the bottom of its address space is the worst possible
+     * choice: it evicts what is being used and leaves what is not.
+     *
+     * This asks the hardware instead. `PTE_A` is set when a page is
+     * touched, so a page whose bit is clear has not been used since the
+     * sweep that cleared it: that is the page to take. A page whose bit is
+     * set gets it **cleared** and is left alone — a second chance — and the
+     * cursor moves on. Over successive sweeps the cursor rotates and the
+     * pages that keep coming back with the bit clear are the cold ones.
+     *
+     * The bound is two passes' worth of pages: the first may do nothing but
+     * clear bits, which is the price of learning what is cold, and a third
+     * pass would mean evicting pages the second pass had just given a
+     * chance to. */
+    while (done < want && looked < 2u * (uint64_t)want + 64u) {
+        virt_t va = 0;
+        if (!next_candidate(p, p->reclaim_cursor, &va, &wrapped)) {
+            break;
+        }
+        p->reclaim_cursor = va + PAGE_SIZE;
+        looked++;
+        if (pgtable_clear_accessed(&p->pt, va)) {
+            second_chances++;
+            cleared_any = true;
+            continue;
+        }
+        done += page_out_one(p, va) ? 1u : 0u;
+    }
+    /* **The flush that makes the next sweep honest.** A hart holding a
+     * translation whose `A` was already set never writes the table again,
+     * so a bit cleared above would stay clear however hard the page is
+     * used — and the next sweep would evict the busiest page on the
+     * machine. One fence per sweep rather than one per page: the cost is
+     * paid once for the information the whole sweep gathered. */
+    if (cleared_any) {
+        published_removal();
+    }
+    sweeps_empty += done == 0 ? 1u : 0u;
     return done;
 }
 

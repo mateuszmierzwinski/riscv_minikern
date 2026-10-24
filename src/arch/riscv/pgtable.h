@@ -165,6 +165,24 @@ void pgtable_each_leaf(const struct pgtable *pt,
 /* Records that `va`'s page has gone out to `slot`, replacing its mapping
  * with an invalid entry that remembers where. The page must be mapped now;
  * KERR_NOENT when it is not. */
+/* The **accessed** bit of a leaf entry, read and cleared.
+ *
+ * `pgtable_map` sets `PTE_A` on every mapping it makes, deliberately — an
+ * implementation that *faults* to set it would fault on every first access,
+ * and this kernel would rather not depend on which kind of core it is on.
+ * The consequence for a reclaim sweep is that a page's `A` means "mapped or
+ * touched" the first time it is seen and "touched since I last looked"
+ * every time after, which is exactly how a clock algorithm expects to be
+ * told: the first pass clears, later passes decide.
+ *
+ * **Clearing it needs the translation flushed**, which the caller does.
+ * A hart whose TLB holds the entry with `A` already set has no reason to
+ * write the table again, so without a flush the bit would stay clear
+ * however much the page is used — and a clock would evict the busiest page
+ * on the machine. */
+bool pgtable_accessed(const struct pgtable *pt, virt_t va);
+bool pgtable_clear_accessed(struct pgtable *pt, virt_t va);
+
 int pgtable_set_swapped(struct pgtable *pt, virt_t va, uint32_t slot);
 
 /* Whether `va`'s entry says its page is out in swap, and which slot. False

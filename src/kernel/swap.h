@@ -62,6 +62,22 @@ bool swap_enabled(void);
 uint32_t swap_swappiness(void);
 void swap_set_swappiness(uint32_t swappiness);
 
+/* **The free-page count below which the kernel pages out without being
+ * asked**, scaled by swappiness and zero when swappiness is zero — so that
+ * the knob genuinely includes "off".
+ *
+ * `swap_set_watermark` overrides it absolutely, which is how the path is
+ * tested: no program this kernel can run will put 8 GiB under pressure, so
+ * the pressure is brought to the program instead. */
+/* How many pages one unasked reclaim takes. A batch rather than one page,
+ * because the sweep's first pass may only clear accessed bits and the fence
+ * that makes it honest is paid per sweep: asking for one page at a time
+ * would pay that cost for every page. */
+#define SWAP_RECLAIM_BATCH 32u
+
+uint32_t swap_watermark(void);
+void swap_set_watermark(uint32_t pages);
+
 /* Writes a frame out, reporting the slot it went to. KERR_NOSPC when the
  * file is full, KERR_NODEV when swap is off. */
 int swap_out(phys_t page, uint32_t *slot);

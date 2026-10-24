@@ -1709,6 +1709,43 @@ static int attributes_round_trip(void) {
         kprintf("fswrite: the leaf listed %u attribute(s), wanted 14\n", t.seen);
         return rc != KERR_OK ? rc : KERR_IO;
     }
+    /* **A value that cannot live in a block with its name**, so it goes
+     * into blocks of its own. Three kilobytes needs one on a 4 KiB
+     * filesystem; the bytes are a pattern rather than a constant so that a
+     * block written at the wrong offset, or two blocks swapped, is a
+     * mismatch rather than a coincidence. */
+    {
+        static uint8_t big[3000];
+        static uint8_t got[3000];
+        for (uint32_t i = 0; i < sizeof big; i++) {
+            big[i] = (uint8_t)(i * 31u + 7u);
+        }
+        rc = xfsmount_attr_set("a1", "user.blob", big, sizeof big);
+        if (rc != KERR_OK) {
+            kprintf("fswrite: a remote value would not be written (rc %d)\n", rc);
+            return rc;
+        }
+        /* Across a mount, so the value's blocks are read from the disk. */
+        rc = xfsmount_remount();
+        rc = rc != KERR_OK ? rc
+                           : xfsmount_attr_get("a1", "user.blob", got, sizeof got, &len);
+        if (rc != KERR_OK || len != sizeof big) {
+            kprintf("fswrite: a remote value read back %u bytes (rc %d)\n", len, rc);
+            return rc != KERR_OK ? rc : KERR_IO;
+        }
+        for (uint32_t i = 0; i < sizeof big; i++) {
+            if (got[i] != big[i]) {
+                kprintf("fswrite: the remote value differs at byte %u\n", i);
+                return KERR_IO;
+            }
+        }
+        /* And a buffer too small is refused rather than half filled. */
+        if (xfsmount_attr_get("a1", "user.blob", got, 16u, &len) != KERR_RANGE) {
+            return KERR_IO;
+        }
+        kprintf("fswrite: a %u-byte value went to its own blocks and came back\n",
+                (uint32_t)sizeof big);
+    }
     rc = xfsmount_attr_remove("a1", "user.colour");
     rc = rc != KERR_OK ? rc
                        : (xfsmount_attr_get("a1", "user.colour", out, sizeof out, &len) ==

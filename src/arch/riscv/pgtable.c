@@ -318,6 +318,20 @@ static uint64_t *leaf_entry(const struct pgtable *pt, virt_t va) {
     return (uint64_t *)&table[index_at(va, 0)];
 }
 
+bool pgtable_accessed(const struct pgtable *pt, virt_t va) {
+    const uint64_t *entry = leaf_entry((struct pgtable *)pt, va);
+    return entry != NULL && pte_is_leaf(*entry) && (*entry & PTE_A) != 0;
+}
+
+bool pgtable_clear_accessed(struct pgtable *pt, virt_t va) {
+    uint64_t *entry = leaf_entry(pt, va);
+    if (entry == NULL || !pte_is_leaf(*entry) || (*entry & PTE_A) == 0) {
+        return false;
+    }
+    *entry &= ~(uint64_t)PTE_A;
+    return true;
+}
+
 int pgtable_set_swapped(struct pgtable *pt, virt_t va, uint32_t slot) {
     uint64_t *entry = leaf_entry(pt, va);
     if (entry == NULL || !pte_is_leaf(*entry)) {
