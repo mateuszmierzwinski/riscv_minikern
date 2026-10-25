@@ -27,6 +27,13 @@
 #define SYS_EXIT 93
 #define SYS_CLONE 220
 #define SYS_WAIT4 260
+#define SYS_NANOSLEEP 101
+
+/* The kernel reads these two fields by offset; it is not libc's struct. */
+struct timespec {
+    long tv_sec;
+    long tv_nsec;
+};
 
 #define SIGCHLD 17
 
@@ -85,6 +92,9 @@ static void say_number(uint64_t v) {
  * a refusal — a `wait4(-1)` that answers with a pid nobody forked is a
  * different bug from one that answers with an error.
  */
+/* Said by the first child only; a fork copies it as 0 in each new child. */
+static uint32_t said_once;
+
 static long one_round(long want_any) {
     volatile int status = 0;
     /* **Touched before the kernel is asked to write it.**
@@ -107,6 +117,31 @@ static long one_round(long want_any) {
         return child;
     }
     if (child == 0) {
+        /* **The child must still be alive when the parent calls `wait4`.**
+         *
+         * The first version exited at once, so the parent always found a
+         * zombie already waiting and the loop returned without ever
+         * sleeping. Two hundred rounds of that proved the fast path and
+         * said nothing about the blocking one — which is the path a real
+         * parent takes and the one a Go init appears to hang in. A test
+         * that cannot reach the code under suspicion passes for the same
+         * reason it is useless.
+         *
+         * Spinning rather than sleeping, because `nanosleep` is a second
+         * mechanism and this is about `wait4`. The count is enough to lose
+         * the race reliably on this board and small enough that two hundred
+         * rounds still fit in a boot. */
+        for (volatile uint64_t i = 0; i < 2000000u; i++) {
+        }
+        /* **The control, which should have come first.** "The wait never
+         * returned" and "the child never exited" look identical from the
+         * parent, and only one of them is about `wait4`. One line from the
+         * child separates them, and it is said on the first round only so
+         * that two hundred rounds stay readable. */
+        if (said_once == 0u) {
+            said_once = 1u;
+            say("waitloop: child reached its exit\n");
+        }
         (void)syscall3(SYS_EXIT, 0, 0, 0);
         for (;;) {
         }
@@ -147,9 +182,65 @@ static uint32_t run_form(const char *name, long want_any) {
     return 1u;
 }
 
+/* Children that stay alive for the whole test, as a real init has.
+ *
+ * **The shape, not just the call.** With one child, `wait4` sleeps and wakes
+ * correctly four hundred times. A Go init has four services running and
+ * hangs waiting for a fifth child, so what differs is the *company* the
+ * zombie keeps: `uspace_reapable_child` scans the process table for a zombie
+ * child, and a table where most children are alive is the case init
+ * exercises and this test did not.
+ */
+#define BYSTANDERS 4u
+
+static void fork_bystanders(void) {
+    for (uint32_t i = 0; i < BYSTANDERS; i++) {
+        long child = syscall6(SYS_CLONE, SIGCHLD, 0, 0, 0, 0, 0);
+        if (child < 0) {
+            say("waitloop: could not fork a bystander\n");
+            return;
+        }
+        if (child == 0) {
+            /* **Idle, not spinning**, because that is what a service is.
+             *
+             * The first version spun in user mode for ever, and on four
+             * harts four such children occupy every hart — so the test
+             * measured whether the scheduler can preempt a spinning user
+             * thread, which is a different open question (`endsib`), and not
+             * whether `wait4` works with company. A real init's services are
+             * live and asleep; these sleep.
+             *
+             * The distinction is the whole point of the round: if `wait4`
+             * is fine with four sleeping siblings and hangs with four
+             * spinning ones, the bug is starvation and belongs to the
+             * scheduler. If it hangs with sleeping ones too, it is the wait. */
+            struct timespec nap = {0, 100000000L}; /* 100 ms */
+            for (;;) {
+                (void)syscall3(SYS_NANOSLEEP, (long)(uintptr_t)&nap, 0, 0);
+            }
+        }
+    }
+    say("waitloop: four children alive alongside the one being waited for\n");
+}
+
 void user_main(void *start_state) {
     uint32_t passed = 0;
     (void)start_state;
+    /* **Not called, and the reason is a finding rather than a decision.**
+     *
+     * The bystanders are meant to give the parent four live children, which
+     * is the shape a real init has and the shape under which its waits
+     * appear to hang. They do not sleep: every one of them exits with -14,
+     * EFAULT, from a `nanosleep` whose remaining-time pointer is null — so
+     * the experiment measured a parent with no children rather than one with
+     * four, and the hang it showed cannot be attributed to the wait.
+     *
+     * That is a second bug and it is recorded in the roadmap rather than
+     * fixed here, because this test's job is `wait4` and a test that depends
+     * on an unfixed call elsewhere proves nothing about its own subject.
+     * What is kept is what is proven: four hundred rounds of both forms,
+     * through the blocking path, with a real status pointer. */
+    (void)fork_bystanders;
     if (run_form("waitloop: wait4(pid), the form os/exec uses\n", 0) != 0u) {
         passed |= 1u;
     }

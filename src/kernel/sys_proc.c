@@ -556,6 +556,22 @@ static int64_t sys_wait4(struct trapframe *tf) {
     if (me == NULL) {
         return KERR_SRCH;
     }
+    /* **Whether the any-child form is called at all, and what it finds.**
+     *
+     * A C reproducer does 200 of these cleanly and a Go init's reaper
+     * appears never to return from one. Those cannot both be true of the
+     * same call, so the first question is whether the call is being made —
+     * if nothing prints, the reaper goroutine is not running and the bug is
+     * on the Go side of the boundary. Capped, and only the -1 form, because
+     * the per-pid form is every service's own wait and would flood it. */
+    if (want <= 0) {
+        static uint32_t said;
+        if (said < 6u) {
+            said++;
+            kprintf("wait4any: pid %u asks; children %u\n", me->pid,
+                    uspace_count_children(me->pid));
+        }
+    }
     for (;;) {
         child = want > 0 ? uspace_by_pid((uint32_t)want) : uspace_reapable_child(me->pid);
         if (child != NULL && want > 0 && (child->parent_pid != me->pid || !child->zombie)) {

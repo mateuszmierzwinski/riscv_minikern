@@ -3086,3 +3086,45 @@ that changed nothing.
 **Variant B is still open**: `rc` exec'd and producing no output at all. It
 is not this bug, and the next step for it is the kernel's side of an exec
 that produces nothing.
+
+### `nanosleep` with a null remaining-time pointer kills the caller
+
+Found while building the company for the `wait4` test: four children told to
+sleep in a loop all exited with **-14**, EFAULT, instead of sleeping.
+`nanosleep(&nap, NULL)` is the ordinary way to call it — the second argument
+is where the kernel writes what is *left* of the sleep if a signal cuts it
+short, and a caller that does not care passes null. Something on that path
+treats the null as an address to write to.
+
+It is the same class as the copy-on-write bug fixed above, and the same
+class as the bug that started this hunt: **a pointer the caller is entitled
+to omit, validated as though it were required.** `wait4` already had the
+right shape for its status (`status_at != 0 &&`), which is why that one
+failed only on the copy-on-write page and not on null.
+
+**It also invalidated an experiment, which is the more useful half.** The
+bystanders existed to give the parent four live children — the shape a real
+init has, and the shape under which its waits appear to hang. They died
+instead, so the round measured a parent with **no** children and the hang it
+produced cannot be blamed on the wait. The conclusion drawn from it before
+the control ran would have been wrong, and the control was one line: a print
+from the child saying it reached its exit.
+
+That is the second time in this hunt that the instrument was the thing at
+fault, and the first time cost seven fixes. The rule is getting shorter each
+time it is restated: **print from both sides of the thing you are measuring.**
+
+### What `wait4` is now proven to do, and what is still unknown
+
+Proven on the board, four hundred rounds, status pointer and all: both forms
+— `wait4(pid)` as `os/exec` uses it and `wait4(-1)` as PID 1 collects
+orphans with — return correctly for a child that exits *after* the parent
+has blocked. The first version of that test had the child exit first, so the
+parent always found a zombie already waiting and **never slept**: two hundred
+rounds proved the fast path and said nothing about the blocking one. A test
+that cannot reach the code under suspicion passes for the same reason it is
+useless.
+
+Still unknown: whether a parent with several live children behaves the same.
+That is the shape a real init has, and it needs `nanosleep` fixed first so
+the siblings can stay alive to be company.
