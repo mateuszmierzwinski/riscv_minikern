@@ -219,11 +219,19 @@ static int64_t sys_clone(struct trapframe *tf) {
         struct uproc *me = uspace_current();
         uint64_t limit = uspace_rlimit_nproc();
         if (me != NULL && uspace_count_by_uid(me->uid) >= limit) {
+            /* **Which limit, in the message.** Both refusals below are
+             * EAGAIN, and a userland sees only "resource temporarily
+             * unavailable" — which is what sent me looking at four
+             * different limits for one failure. Saying which one was
+             * reached turns that into a fact. */
+            kprintf("clone: uid %u is at its %llu-process limit\n", me->uid,
+                    (unsigned long long)limit);
             return KERR_AGAIN;
         }
     }
     child = uspace_alloc();
     if (child == NULL) {
+        kprintf("clone: every one of the %u process slots is in use\n", PROC_MAX);
         return KERR_AGAIN;
     }
     /* The one decision that matters: a copied address space, or a borrowed
@@ -554,7 +562,6 @@ static int64_t sys_wait4(struct trapframe *tf) {
                     c != NULL && c->zombie ? 1u : 0u, c != NULL ? c->parent_pid : 0u,
                     sched_ticks_seen(), sched_deadline_wakes());
         }
-        rounds++;
         uspace_wait_for_child(me);
     }
     pid = child->pid;
@@ -573,6 +580,107 @@ static int64_t sys_wait4(struct trapframe *tf) {
     return (int64_t)pid;
 }
 
+/* waitid(idtype, id, infop, options, rusage) — what Go blocks on.
+ *
+ * **The board named this one too.** Go's `os` package waits for a child
+ * through `waitid` with `WEXITED|WNOWAIT` before reaping it with `wait4`:
+ * the two-step exists so that a `Process` can be waited on by several
+ * goroutines without one of them consuming the status the others need.
+ * With `waitid` answering ENOSYS, that sequence does not behave as the
+ * library expects, and the failure surfaces later as something else.
+ *
+ * `WNOWAIT` is the part that matters and the part that makes this more than
+ * a wrapper: it means *do not reap*. A version that forwarded to the
+ * ordinary wait would consume the zombie, and the `wait4` that followed
+ * would then find no child and report ECHILD — a child that exited
+ * successfully reported as never having existed.
+ *
+ * Only `P_PID` and `P_ALL` are answered; `P_PGID` and `P_PIDFD` are refused,
+ * because this kernel has neither process groups a child can be selected by
+ * nor pidfds. A refusal names what it cannot do; a silent widening to "any
+ * child" would hand back the wrong one.
+ */
+#define P_ALL 0u
+#define P_PID 1u
+#define WNOHANG_BIT 1u
+#define WEXITED_BIT 4u
+#define WNOWAIT_BIT 0x01000000u
+/* siginfo_t's first five words, which are all `waitid` fills: signo, errno,
+ * code, then the pid and uid of the child. */
+#define SI_SIGNO 0u
+#define SI_ERRNO 4u
+#define SI_CODE 8u
+#define SI_PID 16u
+#define SI_UID 20u
+#define SI_STATUS 24u
+#define SI_BYTES 128u
+#define CLD_EXITED 1u
+#define CLD_KILLED 2u
+
+static void write_le32(uint8_t *at, uint32_t v) {
+    at[0] = (uint8_t)v;
+    at[1] = (uint8_t)(v >> 8);
+    at[2] = (uint8_t)(v >> 16);
+    at[3] = (uint8_t)(v >> 24);
+}
+
+static int64_t sys_waitid(struct trapframe *tf) {
+    uint64_t idtype = sysarg(tf, 0);
+    uint32_t id = (uint32_t)sysarg(tf, 1);
+    virt_t infop = sysarg(tf, 2);
+    uint64_t options = sysarg(tf, 3);
+    struct uproc *me = uspace_current();
+    struct uproc *child = NULL;
+    uint8_t info[SI_BYTES] = {0};
+    if (me == NULL) {
+        return KERR_SRCH;
+    }
+    if (idtype != P_ALL && idtype != P_PID) {
+        return KERR_INVAL;
+    }
+    if ((options & WEXITED_BIT) == 0) {
+        /* Only exits are reported here: there is no job control, so
+         * WSTOPPED and WCONTINUED can never become true and a wait for
+         * them would block for ever. */
+        return KERR_INVAL;
+    }
+    for (;;) {
+        child = idtype == P_PID ? uspace_by_pid(id) : uspace_reapable_child(me->pid);
+        if (child != NULL && child->parent_pid != me->pid) {
+            return KERR_CHILD;
+        }
+        if (child != NULL && child->zombie) {
+            break;
+        }
+        if ((options & WNOHANG_BIT) != 0) {
+            return 0;
+        }
+        if (uspace_count_children(me->pid) == 0) {
+            return KERR_CHILD;
+        }
+        uspace_wait_for_child(me);
+    }
+    /* **Written by offset, little-endian by hand.** A `siginfo_t` laid out
+     * as a C struct here would be this compiler's idea of the layout rather
+     * than the ABI's, and the two have differed in this tree before. */
+    write_le32(info + SI_SIGNO, 17u); /* SIGCHLD */
+    write_le32(info + SI_CODE, CLD_EXITED);
+    write_le32(info + SI_PID, child->pid);
+    write_le32(info + SI_UID, child->uid);
+    write_le32(info + SI_STATUS, (uint32_t)(child->status & 0xff));
+    if (infop != 0 && uspace_copy_out(infop, info, SI_BYTES) != KERR_OK) {
+        return KERR_FAULT;
+    }
+    /* **WNOWAIT leaves the zombie for `wait4`.** Reaping here is what would
+     * make the caller's next wait report ECHILD for a child that exited
+     * perfectly well. */
+    if ((options & WNOWAIT_BIT) == 0) {
+        uspace_destroy(child);
+        uspace_release(child);
+    }
+    return 0;
+}
+
 static int64_t sys_getppid(struct trapframe *tf) {
     struct uproc *me = uspace_current();
     (void)tf;
@@ -583,6 +691,7 @@ const struct syscall_entry sys_proc_table[] = {
     {220, "clone", sys_clone},
     {221, "execve", sys_execve},
     {260, "wait4", sys_wait4},
+    {95, "waitid", sys_waitid},
     {SYS_SWAPON, "swapon", sys_swapon},
     {SYS_SWAPOFF, "swapoff", sys_swapoff},
     {129, "kill", sys_kill},

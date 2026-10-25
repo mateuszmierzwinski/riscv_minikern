@@ -286,3 +286,112 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+# QuokkaOS's userland, on a filesystem the board can actually boot.
+#
+# **Why a protofile and not a loop mount.** Putting files into an XFS image
+# normally means `losetup` and `mount`, which need privileges this account
+# does not have. `mkfs.xfs -p` takes a *protofile*: a description of the tree
+# to create while the filesystem is being made, including directories and
+# **symlinks** — which is what makes this fixture possible at all, because a
+# runlevel is a directory of symlinks and QuokkaOS's whole enable/disable
+# model is built on them.
+#
+# The tree is the one the board test asserts on: three services where b
+# needs a and c uses b, a becoming ready only after it writes a file, and a
+# fourth that dies on purpose so the restart can be observed.
+QUOKKA_MB = 320
+
+
+def _proto_line(mode, name, source):
+    """One protofile entry. The format is unforgiving about spacing."""
+    return f"{name} {mode} 0 0 {source}"
+
+
+def quokka_userland(at, init_binary, rc_binary, service_binary):
+    """An XFS image holding init, rc, a test service and a default runlevel.
+
+    The service files are written to the host first and copied in by
+    `mkfs.xfs`, so what the board parses is the same bytes this function
+    wrote — there is no second copy to drift.
+    """
+    os.makedirs(at, exist_ok=True)
+    services = {
+        "a": ('description = "becomes ready late"\n'
+              'command = ["/bin/qservice", "-name", "a", "-touch", "/run/a.ready",'
+              ' "-delay", "400ms"]\n'
+              "[ready]\n"
+              'file = "/run/a.ready"\n'
+              'timeout = "20s"\n'),
+        "b": ('description = "needs a"\n'
+              'command = ["/bin/qservice", "-name", "b"]\n'
+              "[depend]\n"
+              'need = ["a"]\n'),
+        "c": ('description = "uses b"\n'
+              'command = ["/bin/qservice", "-name", "c"]\n'
+              "[depend]\n"
+              'use = ["b"]\n'),
+        "dies": ('description = "exits on purpose, to be restarted"\n'
+                 'command = ["/bin/qservice", "-name", "dies", "-die-after", "1s"]\n'
+                 "[restart]\n"
+                 'policy = "always"\n'
+                 'backoff = "100ms..200ms"\n'
+                 'max_in_window = "20/60s"\n'),
+    }
+    written = {}
+    for name, body in services.items():
+        path = os.path.join(at, f"{name}.toml")
+        with open(path, "w") as f:
+            f.write(body)
+        written[name] = path
+
+    # The protofile. Indentation is irrelevant; the `$` tokens close
+    # directories and are what the format uses instead of braces.
+    lines = ["dummy", "0 0", "d--755 0 0"]
+    lines.append("bin d--755 0 0")
+    lines.append(_proto_line("---755", "qservice", service_binary))
+    lines.append(_proto_line("---755", "rc", rc_binary))
+    lines.append("$")
+    lines.append("etc d--755 0 0")
+    lines.append("init.d d--755 0 0")
+    for name, path in written.items():
+        lines.append(_proto_line("---644", f"{name}.toml", path))
+    lines.append("$")
+    lines.append("conf.d d--755 0 0")
+    lines.append("$")
+    # The marker that asks init to run rc at the end of the boot. A real
+    # root does not carry it; this image does, which is how the board test
+    # gets rc's own output onto the console without the kernel having to
+    # pass init any arguments.
+    lines.append("quokka d--755 0 0")
+    lines.append(_proto_line("---644", "rc-check", written["a"]))
+    lines.append("$")
+    lines.append("runlevels d--755 0 0")
+    lines.append("default d--755 0 0")
+    for name in written:
+        # A symlink, which is what "enabled" means — and the reason this
+        # fixture needs the kernel's symlinkat and readlinkat at all.
+        lines.append(f"{name}.toml l--777 0 0 /etc/init.d/{name}.toml")
+    lines.append("$")
+    lines.append("$")
+    lines.append("$")
+    lines.append("var d--755 0 0")
+    lines.append("log d--755 0 0")
+    lines.append("$")
+    lines.append("$")
+    lines.append("run d--755 0 0")
+    lines.append("quokka d--755 0 0")
+    lines.append("$")
+    lines.append("$")
+    lines.append(_proto_line("---755", "init", init_binary))
+    lines.append("$")
+    proto = os.path.join(at, "quokka.proto")
+    with open(proto, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+    img = os.path.join(at, "quokka.img")
+    with open(img, "wb") as f:
+        f.truncate(QUOKKA_MB * 1024 * 1024)
+    subprocess.run(MKFS + ["-L", "ROOT", "-n", "ftype=1", "-p", proto, img], check=True)
+    return img

@@ -739,20 +739,57 @@ static int64_t sys_fcntl(struct trapframe *tf) {
     }
 }
 
+/* How long a blocking read waits before giving up and answering EAGAIN.
+ *
+ * A deadline rather than for ever, because a wait with none is a hang with
+ * no message — this kernel's own recorded rule. Thirty seconds is longer
+ * than any read a program here does on purpose and short enough that a
+ * mistake is diagnosable rather than indistinguishable from a lock-up. */
+#define READ_BLOCK_NS 30000000000ull
+
 static int64_t sys_read(struct trapframe *tf) {
     struct file *f = fd_get((int32_t)sysarg(tf, 0));
     void *to = (void *)(uintptr_t)sysarg(tf, 1);
     uint64_t n = sysarg(tf, 2);
+    uint32_t room;
+    uint64_t deadline;
     if (f == NULL) {
         return KERR_BADF;
     }
     if (f->ops->read == NULL) {
         return KERR_INVAL;
     }
-    if (n != 0 && !may_write(to, n > (1u << 20) ? (1u << 20) : n)) {
+    room = (uint32_t)(n > (1u << 20) ? (1u << 20) : n);
+    if (n != 0 && !may_write(to, room)) {
         return KERR_FAULT;
     }
-    return f->ops->read(f, to, (uint32_t)(n > (1u << 20) ? (1u << 20) : n));
+    /* **A blocking descriptor blocks.** It did not: every object here
+     * answers `EAGAIN` when it has nothing, which is right for a
+     * non-blocking caller and was being handed to blocking ones too.
+     *
+     * Go hid that for sockets — its netpoller sets `O_NONBLOCK` and waits in
+     * epoll — but `os/exec` reads the child's status pipe with a *blocking*
+     * read, and a child that succeeds writes nothing at all. So the parent
+     * got `EAGAIN`, and Go reads a failed read of that pipe as **the child
+     * having failed**: every `exec` reported `fork/exec: resource
+     * temporarily unavailable` while nothing on the exec path had refused
+     * anything. Four boots went into clone, execve, the process table and
+     * the thread table before the dispatcher was asked which syscall
+     * answered `EAGAIN` and said `read`.
+     *
+     * The wait is on the poller key, which is what every object already
+     * wakes when its readiness changes. */
+    deadline = timer_ns() + READ_BLOCK_NS;
+    for (;;) {
+        int64_t got = f->ops->read(f, to, room);
+        if (got != KERR_AGAIN || (f->flags & O_NONBLOCK) != 0) {
+            return got;
+        }
+        if (timer_ns() >= deadline) {
+            return KERR_AGAIN;
+        }
+        (void)sched_futex_wait(SCHED_POLLER_KEY, timer_ns() + 20000000ull);
+    }
 }
 
 static int64_t sys_write(struct trapframe *tf) {
@@ -1133,6 +1170,66 @@ static int64_t sys_renameat2(struct trapframe *tf) {
     }
     rc = copy_in_path(tf, 3, to);
     return rc != KERR_OK ? rc : xfsmount_rename_path(from, to);
+}
+
+/* fstat(fd, statbuf) — the board asked for this one by name.
+ *
+ * **Found by running a userland, not by reading a list.** Go's `os` package
+ * stats its own descriptors during process setup, and the kernel answered
+ * ENOSYS; the program carried on and then failed somewhere less obvious.
+ * That is the shape of an ABI gap: it does not announce itself where it
+ * happens.
+ *
+ * What it reports is what a descriptor can honestly say. A descriptor with
+ * bytes behind it is a regular file of that size; anything else — a console,
+ * a pipe, a socket — is a character device of no size, which is what makes a
+ * Go program treat it as a stream it must not try to seek. Claiming a
+ * regular file for a pipe would be worse than this: a caller would then
+ * believe a seek could work.
+ */
+static int64_t sys_fstat(struct trapframe *tf) {
+    uint8_t out[STAT_BYTES] = {0};
+    const uint8_t *bytes = NULL;
+    uint32_t size = 0;
+    int32_t fd = (int32_t)sysarg(tf, 0);
+    uint32_t mode = 0020666u; /* a character device, the honest default */
+    if (fdobjects_file_of(fd) == NULL) {
+        return KERR_BADF;
+    }
+    if (fdobjects_file_bytes(fd, &bytes, &size) == KERR_OK) {
+        mode = 0100644u;
+    } else {
+        size = 0;
+    }
+    put_stat_u32(out, STAT_MODE, mode);
+    put_stat_u32(out, STAT_NLINK, 1u);
+    put_stat_u64(out, STAT_SIZE, size);
+    put_stat_u32(out, STAT_BLKSIZE, STAT_REPORTED_BLKSIZE);
+    put_stat_u64(out, STAT_BLOCKS, (size + 511u) / 512u);
+    /* The descriptor number as an inode, widened before the addition
+     * rather than after it: `(uint64_t)(fd + 1)` overflows in `int` first,
+     * which clang-tidy objects to and is right to. */
+    put_stat_u64(out, STAT_INO, (uint64_t)fd + 1u);
+    put_stat_u64(out, STAT_DEV, 1u);
+    return uspace_copy_out(sysarg(tf, 1), out, STAT_BYTES) == KERR_OK ? 0 : KERR_FAULT;
+}
+
+/* uname(buf) — six 65-byte fields, in order.
+ *
+ * A Go program reads this during start-up on some paths, and a userland that
+ * cannot say what it is running on has no way to report itself. The strings
+ * are the ones this system actually is: a kernel that called itself Linux
+ * here would be lying to anything that looked, and the Linux *ABI* is what
+ * is shared, not the kernel. */
+static int64_t sys_uname(struct trapframe *tf) {
+    static const char *const fields[6] = {"minikern", "quokka", "1.0", "QuokkaOS", "riscv64", ""};
+    uint8_t out[6u * 65u] = {0};
+    for (uint32_t f = 0; f < 6u; f++) {
+        for (uint32_t i = 0; i < 64u && fields[f][i] != '\0'; i++) {
+            out[f * 65u + i] = (uint8_t)fields[f][i];
+        }
+    }
+    return uspace_copy_out(sysarg(tf, 0), out, sizeof out) == KERR_OK ? 0 : KERR_FAULT;
 }
 
 static int64_t sys_eventfd2(struct trapframe *tf) {
@@ -1615,6 +1712,8 @@ static const struct syscall_entry table[] = {
     {SYS_PIPE2, "pipe2", sys_pipe2},
     {SYS_OPENAT, "openat", sys_openat},
     {79u, "newfstatat", sys_newfstatat},
+    {80u, "fstat", sys_fstat},
+    {160u, "uname", sys_uname},
     {61u, "getdents64", sys_getdents64},
     {34u, "mkdirat", sys_mkdirat},
     {35u, "unlinkat", sys_unlinkat},
@@ -1725,6 +1824,23 @@ bool syscall_dispatch(struct trapframe *tf) {
             uint64_t a0 = sysarg(tf, 0), a1 = sysarg(tf, 1), a2 = sysarg(tf, 2);
             uint64_t a3 = sysarg(tf, 3);
             tf->x[10] = (uint64_t)e->call(tf);
+            /* **Any syscall that answers EAGAIN, named.**
+             *
+             * Four separate paths on the fork/exec route answer EAGAIN, and
+             * a Go program reports every one of them as the same string:
+             * "fork/exec: resource temporarily unavailable". Instrumenting
+             * them one at a time cost three boots and proved three of them
+             * innocent, because the real one was somewhere I had not
+             * thought to look. Asking the dispatcher instead needs no
+             * guess about which syscall it is. */
+            if ((int64_t)tf->x[10] == KERR_AGAIN) {
+                static uint32_t said_again;
+                if (said_again < 12u) {
+                    said_again++;
+                    kprintf("syscall: %s (%llu) answered EAGAIN\n", e->name,
+                            (unsigned long long)nr);
+                }
+            }
             if (tracing) {
                 kprintf("call:   -> %lld\n", (long long)(int64_t)tf->x[10]);
             }

@@ -78,9 +78,21 @@ struct thread_signals {
  * fatal ("failed to create new OS thread") — so the table has to be sized
  * for the runtime's appetite rather than the program's.
  *
- * Sixty-four costs 64 slots and, at four pages of kernel stack each, a
- * megabyte of memory on a machine that has gigabytes. */
-#define SCHED_MAX_THREADS 64u
+ * **Sixty-four was not enough for a userland, and the board said so in the
+ * least helpful way available.** A Go runtime keeps several OS threads per
+ * process — an M per busy P, plus the garbage collector's and the network
+ * poller's — so QuokkaOS's init plus four Go services exhausted the table.
+ * What a program saw was `fork/exec: resource temporarily unavailable`,
+ * which is `EAGAIN` from `spawn`, which is indistinguishable from the three
+ * other things that answer `EAGAIN` on that path. It took a kprintf in each
+ * of them to find out which.
+ *
+ * Two hundred and fifty-six, at four pages of kernel stack each, is four
+ * megabytes on a machine with eight gigabytes — and it is the difference
+ * between a kernel that can host a handful of Go programs and one that
+ * cannot. The table is still fixed: a limit that is reached and says which
+ * limit it was beats an allocator that fails somewhere less obvious. */
+#define SCHED_MAX_THREADS 256u
 
 /* Starts the scheduler and makes the process's first thread, which enters
  * user mode at `frame`'s `sepc` with `frame`'s registers and `sp`. Reports

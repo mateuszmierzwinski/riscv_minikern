@@ -101,10 +101,22 @@
 
 /* One process: its address space, where it starts, and the kernel context
  * to come back to when it stops. */
-/* How many processes may exist. Two is the interesting number — a shell
- * running a program — and four leaves room for the shape of `os/exec`, where
- * a parent, a vforked child and whatever it execs are briefly all alive. */
-#define PROC_MAX 4u
+/* How many processes may exist.
+ *
+ * **Four was sized for a shell, and an init needs more than a shell.** The
+ * old number allowed a parent, a vforked child and whatever it execs — which
+ * is the shape of one `os/exec` call. QuokkaOS's init *is* PID 1 with a
+ * service per entry in a runlevel, and it hit the wall at its fourth
+ * service: `fork/exec: resource temporarily unavailable`, on the board, with
+ * no indication that the limit was the kernel's rather than the memory's.
+ *
+ * Sixteen, because a `struct uproc` is about two and a half kilobytes, so
+ * the table is forty kilobytes against eight gigabytes of DRAM — and because
+ * a runlevel of a dozen services plus init plus the `os/exec` transient is
+ * the shape this now has to fit. It is still a fixed table: a limit that is
+ * reached and says so beats an allocator that fails somewhere less
+ * obvious. */
+#define PROC_MAX 16u
 
 struct uproc {
     /* ── identity ──────────────────────────────────────────────────────── */

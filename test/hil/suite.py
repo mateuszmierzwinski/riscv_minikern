@@ -26,6 +26,7 @@ under the output directory so a failure can be read rather than re-run.
 import argparse
 import os
 import subprocess
+import tempfile
 import sys
 
 import fixtures
@@ -257,6 +258,35 @@ CASES = [
       "fswrite: a 3000-byte value went to its own blocks and came back",
       "the log was replayed; the filesystem is clean"],
      700, None, "v4big"),
+
+    # **QuokkaOS's init, on the board, from a filesystem.**
+    #
+    # The whole userland on one XFS image: /init, /bin/rc, /bin/qservice, and
+    # a default runlevel of four services as *symlinks* — which is what makes
+    # this a test of the kernel's symlinkat and readlinkat as well as of
+    # init. The symlinks were written by `mkfs.xfs`, not by this kernel, so
+    # the read path is checked against the real format rather than against
+    # our own writer.
+    #
+    # What is asserted is the behaviour the dependency graph exists for: b
+    # starts only after a is *ready*, and a becomes ready 400ms after it
+    # starts by writing a file. A dependent that started on a PID would beat
+    # that. Then `dies` exits on purpose and is restarted, and rc's own
+    # binary prints the status table to the console.
+    ("quokka: init starts a runlevel in order, supervises it, and answers rc",
+     "minikern.init",
+     ["init: QuokkaOS on",
+      # a's readiness file is written by the service itself, so this line
+      # proves the service ran and the check is reading what it wrote.
+      "a: ready, wrote /run/a.ready",
+      # Every service up, which for b and c means their dependencies were
+      # ready first — the graph refusing to start them otherwise.
+      "init: level 1 of",
+      # rc, through its own binary and its own socket.
+      "init: running /bin/rc list",
+      "SERVICE",
+      "init: rc list returned cleanly"],
+     400, None, "quokka"),
 
     # **Capabilities and `seccomp`, consulted rather than merely kept.**
     #
@@ -527,6 +557,25 @@ def built(target):
     return os.path.join(workspace, rel)
 
 
+# QuokkaOS's binaries, cross-built for the board.
+#
+# Built here rather than taken from bazel-bin for the reason the image's own
+# staleness check exists: `bazel-bin` points at the most recent
+# configuration's output, so a binary staged from it after a coverage run is
+# the instrumented one. Building to a known path means the bytes in the
+# fixture are the bytes this function just produced.
+QUOKKA = os.path.join(HERE, "..", "..", "..", "..", "..", "go", "quokkaos")
+
+
+def built_go(what):
+    """Cross-builds one QuokkaOS binary for riscv64 and returns its path."""
+    out = os.path.join(tempfile.gettempdir(), f"quokka-{what}-riscv64")
+    env = dict(os.environ, CGO_ENABLED="0", GOOS="linux", GOARCH="riscv64")
+    subprocess.run(["go", "build", "-ldflags=-s -w", "-o", out, f"./cmd/{what}"],
+                   cwd=os.path.abspath(QUOKKA), env=env, check=True)
+    return out
+
+
 def run_case(name, bootargs, wanted, seconds, out_dir, program=None, needs_image=False):
     log_path = os.path.join(out_dir, name.split(" ")[0].replace("/", "_").replace("§", "s")
                             + ".log")
@@ -543,6 +592,9 @@ def run_case(name, bootargs, wanted, seconds, out_dir, program=None, needs_image
             img = fixtures.two_labelled_volumes(at)
         elif needs_image == "swap":
             img = fixtures.swap_volume(at)
+        elif needs_image == "quokka":
+            img = fixtures.quokka_userland(at, built_go("init"), built_go("rc"),
+                                           built_go("qservice"))
         elif needs_image == "v4":
             img = fixtures.v4_filesystem(at)
         elif needs_image == "v4big":

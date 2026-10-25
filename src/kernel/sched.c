@@ -383,7 +383,15 @@ static int spawn(struct uproc *proc, const struct trapframe *frame, uint64_t sp,
     phys_t stack = 0;
     int rc;
     if (slot == SCHED_MAX_THREADS) {
+        /* **Said once, with the number.** This is EAGAIN, and so are three
+         * other refusals on the fork path; a userland sees only "resource
+         * temporarily unavailable" and cannot tell them apart. Naming the
+         * limit here is what turned four boots of guessing into one fact. */
         spawn_failures++;
+        if (spawn_failures == 1u) {
+            kprintf("sched: **all %u thread slots are in use**; no more can be started\n",
+                    SCHED_MAX_THREADS);
+        }
         return KERR_AGAIN;
     }
     rc = mem_alloc_pages(KSTACK_PAGES, 1, &stack);
