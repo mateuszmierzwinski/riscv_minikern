@@ -1413,6 +1413,19 @@ user_image(
 # than a demonstration: both sides write the same addresses and each checks
 # it sees only its own.
 user_binary(
+    name = "waitloop",
+    srcs = [
+        "src/userland/start.S",
+        "src/userland/waitloop/main.c",
+    ],
+)
+
+user_image(
+    name = "waitloop.elf",
+    program = ":waitloop",
+)
+
+user_binary(
     name = "forktest",
     srcs = [
         "src/userland/forktest/main.c",

@@ -2991,3 +2991,98 @@ the second invented `smp_index_misses` for something called
 `smp_hart_misses` and only the linker caught it. **This file's oldest lesson
 is that a textual edit matching nothing is a silent no-op**, and the fix is
 mechanical: assert the text changed.
+
+### The fourteen-item list, checked against the tree rather than from memory
+
+The list of what this kernel lacks has been re-read several times as though
+nothing on it had been done. Each item was looked up in the tree, and most of
+them have an implementation. The point of writing this down is that **a status
+list that lags the code sends the next reader to the wrong place** — a lesson
+this file already records from the XFS entries that named sparse inodes and
+`nrext64` as refused while both were read.
+
+| Item | Where it is | State |
+|---|---|---|
+| Privilege separation, capabilities, seccomp | `sys_priv.c` (`capset`, `prctl`), `seccomp.c` (BPF filters, strict mode, inherit), `uspace_capable(CAP_*)`, `setuid`/`geteuid` in `sys_proc.c` | **Implemented and enforced**: the decision is taken on the dispatch path at `syscall.c:2284`, not merely stored |
+| ASLR | `uspace.c`, `aslr_on = true` by default, `minikern.noaslr` to turn it off | **Implemented**, on by default |
+| Kernel in the top half | — | **Partial.** Step C unresolved; the patch needs rebasing against the committed `noaslr` move. The two security holes the item names are closed by checking permissions instead of a constant, which was the right fix regardless |
+| Interrupt-driven I/O | one `irqwait` primitive; SD and NVMe converted | **Partial.** The PLDA bridge's INTx demux hangs on the first waited command, so `minikern.nvmeirq` defaults off and the drivers fall back to spinning with the lock released. That fallback is also what hid `sched_wait_on`'s sleeper never returning |
+| The big kernel lock | one lock around the kernel | **Deliberately not split**, which is what the item itself says: it should wait until something is measured to be blocked on it |
+| `me()` scans the hart table | `index_by_id[]` in `smp.c` | **Done, and proven**: `smp: hart index is a load (0 scans, 0 unidentified)` |
+| The board's Ethernet, and the stack over it | `dwmac.c`, `dwmac_probe.c` | **Implemented**: the GMAC carries the stack, took a DHCP lease and got a DNS answer |
+| SPI, I²C, PWM, watchdog | `spi_pl022.c`, `i2c_dw.c`, `pwm_jh7110.c`, `wdt_jh7110.c` | **Implemented.** RTC is **not written**, and the operator's instruction was that thermals are the focus and the rest can be mocked and roadmapped |
+| USB | `xhci.c` | **Partial**: the port never reaches PED, so nothing enumerates behind it |
+| A routing table | `net_route.c` (`add`/`del`/`at`/`lookup`, longest prefix), `route_test` | **Implemented and wired**: the IPv4 send path consults it at `net_ipv4.c:186` |
+| TCP SACK | `net_tcp_in.c`, `net_tcp_out.c` | **Built, against the list**, which marks it deliberately not planned. Worth an explicit decision to keep or revert rather than leaving it ambiguous |
+| Unix-domain sockets | `sock_unix.c` | **Implemented.** The `.bss` mask anomaly recorded against it is open |
+| netlink | `sock_netlink.c` | **Implemented** |
+| DNS | `/etc/resolv.conf` synthesised in `fdobjects.c:226` from the DHCP lease, `minikern.dns=` to override, and `src/userland/resolve` | **Implemented**: user space can resolve a name, which is what the item asked for |
+
+So the genuinely open work is **four things**, not fourteen: the top-half
+move, the bridge's INTx demux, the USB port reaching PED, and an RTC. Beside
+them sit three recorded anomalies — the unix-socket `.bss` mask, the GMAC
+strict-filter unicast refusal (worked around with promiscuous mode), and
+variant B of the QuokkaOS board case.
+
+Two meta-points, because they are the reason this table exists:
+
+- **"Not implemented in this session" and "not implemented" are different
+  claims**, and conflating them is how the same finished work gets re-opened.
+  Every row above was checked by reading the tree, not by remembering it.
+- **Presence is not enforcement**, and the row that matters most shows why
+  the distinction is worth making: a seccomp filter that is accepted, stored
+  and never consulted would satisfy "seccomp exists" while refusing nothing.
+  It is consulted, at a named line, which is the form a status claim should
+  take.
+
+### A syscall could not write to a page `fork` had just write-protected
+
+**Variant A of the QuokkaOS case, root-caused and fixed**, and it was a
+kernel bug rather than anything about waiting.
+
+Copy-on-write clears `PTE_W` in *both* processes, so a present, user,
+read-only page is the ordinary state of a stack page immediately after a
+fork — a page the process has not written **yet**, not one it may not write.
+A store fault resolved that. The syscall pointer checks did not: `range_has`
+saw a page without `PTE_W`, refused, and `uspace_copy_out` returned EFAULT
+for a perfectly good pointer.
+
+The call that breaks is the one a parent makes first. `wait4(pid, &status,
+...)` writes the status through a pointer that is almost always on the very
+page the fork just write-protected, so **every `wait4` with a status pointer
+failed after a fork.** A Go init on top looked as though its waits never
+returned, because its reaper read the EFAULT as "no children yet" and went
+back to sleep — a silent error handler turning a kernel refusal into a hang
+two layers away.
+
+`uspace_break_cow` is now a function both paths call, and the check resolves
+the sharing instead of refusing it. It returns false for a page that is not
+copy-on-write, so a genuine permission refusal still refuses — and the Rule
+25 hostile-argument suite still accepts **0** of its bad pointers, which is
+the check that matters for a change to pointer validation.
+
+**The general rule, which is the part worth keeping:** a kernel's answer must
+not depend on whether a program reached a page through an instruction or
+through a syscall. Two paths validated the same thing and only one of them
+knew about copy-on-write, so the same address was writable to the hardware
+and unwritable to the kernel.
+
+**How it was found, after seven fixes that were not it.** A reproducer, at a
+rate the real case could never reach: `src/userland/waitloop` forks, exits
+and waits **two hundred times in each of the two forms** — `wait4(pid)`,
+which `os/exec` uses, and `wait4(-1)`, which PID 1 collects orphans with.
+It failed at round 0, which is a far better thing to be given than an
+intermittent hang: EFAULT, immediately, every time. From there the kernel
+said the rest itself once asked — `copyflags: 0x3fffe44000 has 112, wanted
+4; region prot 3`, a page with read and user but not write, inside a region
+recorded read-write.
+
+The two numbers in that line are what made it unambiguous, and printing the
+region's rights beside the page's was the step that turned "a bad pointer"
+into "a bad check". The hypothesis before it — a demand-paged page not yet
+backed — was wrong, and was eliminated in one boot by a `volatile` store
+that changed nothing.
+
+**Variant B is still open**: `rc` exec'd and producing no output at all. It
+is not this bug, and the next step for it is the kernel's side of an exec
+that produces nothing.

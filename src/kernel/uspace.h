@@ -739,6 +739,15 @@ int uspace_fork(struct uproc *child, struct uproc *parent);
  * climbs without the program progressing is a fault loop. */
 uint32_t uspace_handled_faults(void);
 
+/* Gives a process its own copy of a shared copy-on-write page at `va`.
+ *
+ * Called by the store-fault handler and by the syscall pointer checks: a
+ * page left read-only by `fork` is one the process has not written yet, not
+ * one it may not write, and a syscall that refuses it reports EFAULT for a
+ * perfectly good pointer. False means the page was not copy-on-write, so
+ * the caller's refusal stands. */
+bool uspace_break_cow(struct uproc *me, virt_t va);
+
 uint32_t uspace_cow_copies(void);
 uint32_t uspace_cow_takeovers(void);
 

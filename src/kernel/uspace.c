@@ -483,14 +483,40 @@ static bool resolve_copy_on_write(struct trapframe *tf) {
      * handled fault prints nothing. Isolation starts with knowing whose
      * address space the fault is in. */
     struct uproc *me = uspace_current();
+    if ((tf->scause & ~SCAUSE_INTERRUPT) != EXC_STORE_PAGE_FAULT || me == NULL) {
+        return false;
+    }
+    return uspace_break_cow(me, va);
+}
+
+/* Gives a process its own copy of a shared page, or takes the last one over.
+ *
+ * **Reachable from a syscall as well as from a fault**, which is the whole
+ * reason it is now a function of its own. `fork` write-protects the pages
+ * the two processes share, so a page that is present, user and read-only is
+ * not necessarily one the process may not write — it is usually one it has
+ * not written *yet*. A fault resolves that; a syscall validating a pointer
+ * into the same page did not, and refused with EFAULT instead.
+ *
+ * That is not a rare corner. `wait4` is the first thing a parent does after
+ * forking, and it writes the status through a pointer that is almost always
+ * on the stack page the fork has just write-protected. So every
+ * `wait4(pid, &status, ...)` after a fork failed, and a Go init built on it
+ * looked as though its waits never returned — its reaper read the EFAULT as
+ * "no children yet" and went back to sleep.
+ *
+ * Returns false when the page is not copy-on-write at all, which is the
+ * caller's signal that the refusal is real.
+ */
+bool uspace_break_cow(struct uproc *me, virt_t va) {
     phys_t phys = 0, fresh = 0;
     uint64_t prot = 0, size = 0;
-    if ((tf->scause & ~SCAUSE_INTERRUPT) != EXC_STORE_PAGE_FAULT || me == NULL) {
+    if (me == NULL) {
         return false;
     }
     if (!pgtable_lookup(&me->pt, va, &phys, &prot, &size) || (prot & PTE_COW) == 0) {
         if (cow_copies + cow_takeovers < 6u && syscall_tracing_errors()) {
-            kprintf("cow: pid %u fault at %016llx: mapped %u prot %llx\n", me->pid,
+            kprintf("cow: pid %u asked about %016llx: mapped %u prot %llx\n", me->pid,
                     (unsigned long long)va,
                     pgtable_lookup(&me->pt, va, &phys, &prot, &size) ? 1u : 0u,
                     (unsigned long long)prot);
@@ -1834,6 +1860,22 @@ static bool range_has(virt_t at, uint32_t n, uint64_t want) {
         return true;
     }
     if (p == NULL || at == 0 || at >= USER_TOP || n > USER_TOP - at) {
+        /* **Which branch, and for what address.**
+         *
+         * A `wait4` that answers EFAULT for an ordinary stack address is
+         * either a bad pointer or a bad check, and the two want opposite
+         * work. Said a few times and then never again, because a program
+         * that passes bad pointers deliberately — the hostile-argument
+         * self-test — would otherwise flood it. */
+        static uint32_t said;
+        if (said < 4u) {
+            said++;
+            kprintf("copyrange: refused %p n %u want %llx: %s\n", (void *)(uintptr_t)at, n,
+                    (unsigned long long)want,
+                    p == NULL ? "no process"
+                              : at == 0 ? "null"
+                                        : at >= USER_TOP ? "at or past USER_TOP" : "length wraps");
+        }
         return false;
     }
     for (virt_t va = at & ~(PAGE_SIZE - 1u); va < at + n; va += PAGE_SIZE) {
@@ -1844,9 +1886,38 @@ static bool range_has(virt_t at, uint32_t n, uint64_t want) {
              * not touched, or an address it has no claim on. The region
              * record is what tells them apart. */
             if (!make_present((struct uproc *)p, va, want)) {
+                static uint32_t said;
+                if (said < 4u) {
+                    said++;
+                    kprintf("copyback: %p could not be backed for want %llx\n",
+                            (void *)(uintptr_t)va, (unsigned long long)want);
+                }
                 return false;
             }
             if (!pgtable_lookup(&p->pt, va, &phys, &flags, &size)) {
+                return false;
+            }
+        }
+        /* **A page left read-only by `fork` is one this process has not
+         * written yet, not one it may not write.**
+         *
+         * Copy-on-write clears `PTE_W` in both processes, so a present,
+         * user, read-only page is the *ordinary* state of a stack page just
+         * after a fork. Refusing it here reported EFAULT for a perfectly
+         * good pointer, and the call it broke is the one a parent makes
+         * first: `wait4(pid, &status, ...)` writes the status through a
+         * pointer that is almost always on that very page. A Go init built
+         * on it looked as though its waits never returned.
+         *
+         * A store fault would have resolved this; the check has to resolve
+         * it too, or the kernel's answer depends on whether the program
+         * reached the page through an instruction or through a syscall.
+         * `uspace_break_cow` returns false when the page is not
+         * copy-on-write, so a genuine permission refusal still refuses. */
+        if ((want & PTE_W) != 0 && (flags & PTE_W) == 0 && (flags & PTE_U) != 0 &&
+            (flags & PTE_COW) != 0) {
+            if (!uspace_break_cow((struct uproc *)p, va) ||
+                !pgtable_lookup(&p->pt, va, &phys, &flags, &size)) {
                 return false;
             }
         }

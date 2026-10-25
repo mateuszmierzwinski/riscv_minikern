@@ -454,6 +454,30 @@ CASES = [
       "exited with 127"],
      200, "//:unixsock.elf"),
 
+    # **Does wait4 return for a child that has exited, two hundred times?**
+    #
+    # A Go init on this kernel shows two failures that alternate between
+    # boots, and one is a parent whose wait4 never returns for a child the
+    # kernel has already recorded as a zombie. Seven changes were aimed at
+    # that from hypotheses before the wait itself was measured; this measures
+    # the wait, at a rate that can tell "broken" from "rare" in one boot
+    # instead of one wait per boot.
+    #
+    # Both forms, because init needs both and they are not the same call:
+    # wait4(pid) is what os/exec does, wait4(-1) is what PID 1 collects
+    # orphans with and is the one the reaper blocks in. A kernel that got one
+    # right and the other wrong would look intermittent from a program using
+    # both. 3 is both halves; the progress lines localise a hang, which is
+    # the one fact silence destroys.
+    ("§P2: wait4 returns for an exited child, two hundred times, both forms",
+     "",
+     ["waitloop: wait4(pid), the form os/exec uses",
+      "waitloop:   through round 200",
+      "waitloop: wait4(-1), the form PID 1 collects orphans with",
+      "waitloop: passed mask 3",
+      "exited with 3"],
+     200, "//:waitloop.elf"),
+
     # **A name resolved from user space**, which is the roadmap's DNS item.
     #
     # The program is the assertion: it reads /etc/resolv.conf, sends a query
