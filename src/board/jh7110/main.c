@@ -2090,6 +2090,7 @@ static void drive_a_pin(void) {
  * rather than the kernel. */
 extern const char user_program_start[], user_program_end[];
 extern const char user_faulter_start[], user_faulter_end[];
+extern const char user_execone_start[], user_execone_end[];
 extern const char user_spin_start[], user_spin_end[];
 extern const char user_nice_start[], user_nice_end[];
 extern const char user_pin_start[], user_pin_end[];
@@ -2222,7 +2223,15 @@ static void report_hart_usage(void) {
 /* Runs a real program: an ELF read off the filesystem, loaded at the
  * addresses its own headers name, started with the state a C runtime
  * expects. This is the path a Go binary will take. */
-#define INIT_MAX_BYTES (4u * 1024u * 1024u)
+/* The largest `/init` this will read.
+ *
+ * **Sixteen megabytes, because a Go init with its symbols is five.** Four
+ * was chosen when the only thing being loaded was a hand-written test
+ * program, and a real userland walked into it: the board answered EFBIG and
+ * the whole boot stopped at a number nobody had revisited. `execve`'s own
+ * limit is eight, so this being smaller meant init had a tighter bound than
+ * the programs it starts — which is the wrong way round. */
+#define INIT_MAX_BYTES (16u * 1024u * 1024u)
 
 /* Exercises the write path, which had never been run at all.
  *
@@ -2353,6 +2362,107 @@ static int rename_moves_a_name(void) {
     }
     (void)bytes;
     (void)size;
+    return KERR_OK;
+}
+
+/* A mode written and read back, which is the whole of chmod working.
+ *
+ * The permission bits only: the read compares against `0777` of the mode,
+ * because the type bits are not the caller's to set and a test that compared
+ * the whole word would fail for the right reason and look like the wrong
+ * one. */
+/* The attribute tests' own file.
+ *
+ * **Created here rather than borrowed.** The first version used `/w1`, which
+ * an earlier step in this self-test unlinks — so the mode test failed with
+ * ENOENT and looked like a broken chmod. A test that depends on another
+ * test's leftovers is a test that reports the wrong thing. */
+static int make_attr_subject(void) {
+    return xfsmount_write_at("/", "w_attr", 0, "x", 1u);
+}
+
+static int chmod_round_trip(void) {
+    uint32_t mode = 0;
+    uint64_t size = 0;
+    uint32_t nlink = 0;
+    int rc = make_attr_subject();
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    rc = xfsmount_chmod_path("/w_attr", 0640u);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    rc = xfsmount_stat_full("/w_attr", &mode, &size, &nlink);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    if ((mode & 07777u) != 0640u) {
+        kprintf("fswrite:   the mode came back %o, want 640\n", mode & 07777u);
+        return KERR_INVAL;
+    }
+    return KERR_OK;
+}
+
+/* **The check that matters more than the round trip.** A caller passing a
+ * whole mode word must not be able to turn a regular file into a directory
+ * or a symlink: the type bits come from disk and the caller's are masked
+ * away. Asking for a directory's type on a regular file and finding it still
+ * a regular file is what proves that. */
+static int chmod_keeps_the_type(void) {
+    uint32_t mode = 0;
+    uint64_t size = 0;
+    uint32_t nlink = 0;
+    int rc = xfsmount_chmod_path("/w_attr", 0040755u); /* S_IFDIR | 0755 */
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    rc = xfsmount_stat_full("/w_attr", &mode, &size, &nlink);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    if ((mode & 0170000u) != 0100000u) {
+        kprintf("fswrite:   the type became %o; a chmod changed what the file is\n",
+                mode & 0170000u);
+        return KERR_INVAL;
+    }
+    if ((mode & 07777u) != 0755u) {
+        kprintf("fswrite:   the permissions came back %o, want 755\n", mode & 07777u);
+        return KERR_INVAL;
+    }
+    return KERR_OK;
+}
+
+/* An owner written and read back, including the -1 convention: changing the
+ * group alone must leave the owner where it was, which is the case a
+ * version that always wrote both would break silently. */
+static int chown_round_trip(void) {
+    uint32_t uid = 0;
+    uint32_t gid = 0;
+    int rc = xfsmount_chown_path("/w_attr", 1000u, 1001u);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    rc = xfsmount_owner_of("/w_attr", &uid, &gid);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    if (uid != 1000u || gid != 1001u) {
+        kprintf("fswrite:   the owner came back %u:%u, want 1000:1001\n", uid, gid);
+        return KERR_INVAL;
+    }
+    rc = xfsmount_chown_path("/w_attr", XFS_OWNER_UNCHANGED, 1002u);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    rc = xfsmount_owner_of("/w_attr", &uid, &gid);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    if (uid != 1000u || gid != 1002u) {
+        kprintf("fswrite:   after changing only the group: %u:%u, want 1000:1002\n", uid, gid);
+        return KERR_INVAL;
+    }
     return KERR_OK;
 }
 
@@ -2906,6 +3016,9 @@ static void run_write_selftest(void) {
     ok = ok && wrote_and_checked("a symlink round trips", symlink_round_trip());
     ok = ok && wrote_and_checked("a long target is refused", long_target_refused());
     ok = ok && wrote_and_checked("readlink refuses a file", readlink_refuses_a_file());
+    ok = ok && wrote_and_checked("a mode is set and read back", chmod_round_trip());
+    ok = ok && wrote_and_checked("chmod cannot change the file type", chmod_keeps_the_type());
+    ok = ok && wrote_and_checked("an owner is set and read back", chown_round_trip());
     ok = ok && wrote_and_checked("a rename moves a name", rename_moves_a_name());
     ok = ok && wrote_and_checked("allocate past one group", fill_past_one_group());
     ok = ok && wrote_and_checked("one group alone must refuse", one_group_refuses());
@@ -3202,6 +3315,13 @@ static void run_user_programs(void) {
                                                        .ready = console_input_ready};
         ktty_init(&port, 1u);
         (void)timer_add_housekeeping_hook(poll_tty_from_beat);
+    }
+    /* **One thread, one execve**: the comparison that separates "exec is
+     * broken" from "exec after Go's multi-threaded fork is broken". It needs
+     * a filesystem with /bin/qservice on it, which the QuokkaOS fixture
+     * image has. */
+    if (cmdline_has(boot_cmdline, "minikern.execone")) {
+        run_one_user_program("execone", user_execone_start, user_execone_end);
     }
     if (cmdline_has(boot_cmdline, "minikern.user")) {
         run_one_user_program("hello", user_program_start, user_program_end);

@@ -17,6 +17,7 @@
 
 #define SYS_WRITE 64
 #define SYS_EXIT 93
+#define SYS_EXECVE 221
 #define SYS_CLONE 220
 #define SYS_SETPRIORITY 140
 #define SYS_CLOCK_GETTIME 113
@@ -3160,3 +3161,73 @@ klogdev_path:
     .balign 4
 13: j       13b
 user_klogdev_end:
+
+/* ── a single-threaded execve, to settle the exec'd-Go fault ──────────────
+ *
+ * **The one comparison left.** A Go program runs when the kernel loads it
+ * and faults when another Go program execs it, with the image, the stack,
+ * the loader, the handlers and the tables all measured and identical. What
+ * has not been separated is "execve is broken" from "execve *after Go's
+ * multi-threaded fork* is broken" — because every exec on this board so far
+ * has come from a Go runtime with half a dozen threads alive, where
+ * `sched_end_siblings` and `sched_await_siblings` have work to do.
+ *
+ * This program has exactly one thread, by construction. It execs
+ * `/bin/qservice` with a real argv and nothing else going on. If the service
+ * then starts, exec is sound and the fault belongs to the multi-threaded
+ * case; if it faults identically, exec itself is wrong and every Go detail
+ * above was a distraction.
+ */
+    .globl user_execone_start
+    .globl user_execone_end
+user_execone_start:
+    li      a0, 1
+    lla     a1, execone_says
+    li      a2, execone_says_end - execone_says
+    li      a7, SYS_WRITE
+    ecall
+    /* **The argv array is built on the stack, not in the blob.**
+     *
+     * A `.dword execone_path` table holds the *link-time* address, and this
+     * program is copied to wherever the loader puts it — so the pointers
+     * were wrong at runtime and execve refused before it read anything.
+     * `lla` is pc-relative and correct; the pointers it produces go on the
+     * stack, which is where a real argv lives anyway. */
+    addi    sp, sp, -32
+    lla     t0, execone_path
+    sd      t0, 0(sp)
+    lla     t0, execone_arg1
+    sd      t0, 8(sp)
+    lla     t0, execone_arg2
+    sd      t0, 16(sp)
+    sd      zero, 24(sp)
+    lla     a0, execone_path
+    mv      a1, sp
+    addi    a2, sp, 24          /* envp: the NULL already on the stack */
+    li      a7, SYS_EXECVE
+    ecall
+    /* Only reached when execve refused: say so with its own error code. */
+    li      a0, 1
+    lla     a1, execone_failed
+    li      a2, execone_failed_end - execone_failed
+    li      a7, SYS_WRITE
+    ecall
+    li      a0, 9
+    li      a7, SYS_EXIT
+    ecall
+2:  j       2b
+
+    .balign 8
+execone_path:
+    .asciz  "/bin/qservice"
+execone_arg1:
+    .asciz  "-name"
+execone_arg2:
+    .asciz  "solo"
+execone_says:
+    .ascii  "execone: one thread, about to execve /bin/qservice\n"
+execone_says_end:
+execone_failed:
+    .ascii  "execone: execve REFUSED\n"
+execone_failed_end:
+user_execone_end:

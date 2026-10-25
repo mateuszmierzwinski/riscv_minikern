@@ -66,6 +66,14 @@ bool sbi_probe_extension(long eid);
  * reports the error if the firmware declines, rather than idling in silence. */
 void sbi_shutdown(void);
 
+/* Restarts the machine through the firmware's cold-reset request.
+ *
+ * Separate from `sbi_shutdown` because they are different requests to the
+ * firmware and a caller asking to reboot must not be powered off instead —
+ * a board that goes dark when it was told to restart needs someone to walk
+ * to it, which on a development board is the whole cost. */
+void sbi_reboot(void);
+
 /* The timer: one absolute deadline per hart, against the `time` CSR. */
 void sbi_set_timer(uint64_t when);
 

@@ -7,6 +7,10 @@
 #define SBI_SRST_SYSTEM_RESET 0L
 #define SBI_SRST_SHUTDOWN 0L
 #define SBI_SRST_REASON_NONE 0L
+/* Reset type 1 is a cold reboot: the firmware re-initialises everything,
+ * which is what a kernel asking to start over means. Type 2 is a warm one,
+ * which leaves hart state in place and is of no use here. */
+#define SBI_SRST_COLD_REBOOT 1L
 #define SBI_TIME_SET_TIMER 0L
 #define SBI_HSM_HART_START 0L
 #define SBI_HSM_HART_STOP 1L
@@ -58,6 +62,14 @@ void sbi_shutdown(void) {
     /* Only reached when the firmware declines. Said out loud, because the
      * ARM kernel's equivalent silently idled and looked like a hang. */
     kprintf("sbi: the firmware refused to power off (error %ld)\n", r.error);
+}
+
+void sbi_reboot(void) {
+    /* A **cold** reset: the warm one leaves the hart state in place, which
+     * is of no use to a kernel that is asking to start over. */
+    struct sbi_ret r = sbi_call(SBI_EXT_SRST, SBI_SRST_SYSTEM_RESET, SBI_SRST_COLD_REBOOT,
+                                SBI_SRST_REASON_NONE, 0, 0);
+    kprintf("sbi: the firmware refused to reboot (error %ld)\n", r.error);
 }
 
 void sbi_set_timer(uint64_t when) {

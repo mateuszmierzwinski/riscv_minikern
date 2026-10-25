@@ -22,6 +22,7 @@
 #include <stddef.h>
 
 #include "core/console.h"
+#include "arch/riscv/sbi.h"
 #include "core/errno.h"
 #include "kernel/file.h"
 #include "core/access.h"
@@ -38,7 +39,10 @@
 #define CLONE_THREAD 0x00010000u
 
 /* The largest program this will load, and the largest argument list. */
-#define EXEC_MAX_BYTES (8u * 1024u * 1024u)
+/* Sixteen, matching `/init`'s: a Go binary with its symbol table is several
+ * megabytes, and a limit that rejects a program for carrying the symbols
+ * that make its faults diagnosable is a limit arguing for worse debugging. */
+#define EXEC_MAX_BYTES (16u * 1024u * 1024u)
 #define EXEC_MAX_ARGS 32u
 #define EXEC_MAX_PATH 128u
 
@@ -135,6 +139,21 @@ static int64_t sys_execve(struct trapframe *tf) {
     rc = copy_vector_in(sysarg(tf, 1), storage, argv, &argc);
     if (rc != KERR_OK) {
         return rc;
+    }
+    /* **What the new program will be told it was called.**
+     *
+     * A Go program faults in `runtime.sysargs` walking `argv` to find the
+     * auxiliary vector, at address 8 — which is `argv == NULL` with the
+     * first index. That points at this call rather than at the stack
+     * builder, so this says what was actually copied in before anything
+     * downstream can be blamed for it. */
+    {
+        static uint32_t said;
+        if (said < 6u) {
+            said++;
+            kprintf("execve: %s with argc %u, argv[0] %s\n", path, argc,
+                    argc > 0 && argv[0] != NULL ? argv[0] : "(none)");
+        }
     }
     rc = xfsmount_read_file(path, EXEC_MAX_BYTES, &image, &size);
     if (rc != KERR_OK) {
@@ -681,6 +700,121 @@ static int64_t sys_waitid(struct trapframe *tf) {
     return 0;
 }
 
+/* setgroups(size, list) — the rest of a privilege drop.
+ *
+ * **Without it a drop is not a drop.** `setuid` and `setgid` move the
+ * primary identity and leave the supplementary groups alone, so a process
+ * that was root keeps root's groups and everything they open. Init had to
+ * say in its log that `user =` was weaker than it looked, which is the
+ * honest thing to do about a missing syscall and no substitute for having
+ * it.
+ *
+ * `size` zero is the important case and the one a careless implementation
+ * gets wrong: it means *clear them all*, which is what a service dropping
+ * to an unprivileged account wants, and an implementation that treated a
+ * null list as an error would make the common case impossible.
+ */
+static int64_t sys_setgroups(struct trapframe *tf) {
+    uint64_t count = sysarg(tf, 0);
+    virt_t list = sysarg(tf, 1);
+    struct uproc *me = uspace_current();
+    uint32_t wanted[PROC_MAX_GROUPS];
+    if (me == NULL) {
+        return KERR_SRCH;
+    }
+    if (!uspace_capable(CAP_SETGID)) {
+        return KERR_PERM;
+    }
+    if (count > PROC_MAX_GROUPS) {
+        return KERR_INVAL;
+    }
+    /* Copied in **before** anything is changed, so a faulting list leaves
+     * the credential exactly as it was rather than half replaced. */
+    if (count > 0) {
+        if (list == 0) {
+            return KERR_FAULT;
+        }
+        if (uspace_copy_in(wanted, list, (uint32_t)(count * sizeof(uint32_t))) != KERR_OK) {
+            return KERR_FAULT;
+        }
+    }
+    for (uint32_t i = 0; i < (uint32_t)count; i++) {
+        me->groups[i] = wanted[i];
+    }
+    me->ngroups = (uint32_t)count;
+    return 0;
+}
+
+/* getgroups(size, list) — the readback, which a program uses to check that
+ * its own drop took effect. `size` zero asks only for the count, which is
+ * how a caller sizes its buffer. */
+static int64_t sys_getgroups(struct trapframe *tf) {
+    uint64_t room = sysarg(tf, 0);
+    virt_t list = sysarg(tf, 1);
+    struct uproc *me = uspace_current();
+    if (me == NULL) {
+        return KERR_SRCH;
+    }
+    if (room == 0) {
+        return (int64_t)me->ngroups;
+    }
+    if (room < me->ngroups) {
+        return KERR_INVAL;
+    }
+    if (me->ngroups > 0 &&
+        uspace_copy_out(list, me->groups, me->ngroups * (uint32_t)sizeof(uint32_t)) != KERR_OK) {
+        return KERR_FAULT;
+    }
+    return (int64_t)me->ngroups;
+}
+
+/* reboot(magic1, magic2, cmd, arg) — how a shutdown runlevel ends.
+ *
+ * **The magic numbers are checked, which is the whole point of them.** They
+ * exist so that a wild call cannot power a machine off, and a kernel that
+ * ignored them would turn any stray syscall with the right number into a
+ * power cut. Linux's values are used because a program built for Linux
+ * passes Linux's.
+ *
+ * Only two commands are answered. `LINUX_REBOOT_CMD_RESTART` and
+ * `_POWER_OFF` are what an init asks for; `_HALT`, `_CAD_ON` and the rest
+ * mean things this kernel does not have, and a refusal naming them beats
+ * powering off when asked to halt.
+ */
+#define REBOOT_MAGIC1 0xfee1deadu
+#define REBOOT_MAGIC2 0x28121969u
+#define REBOOT_CMD_RESTART 0x01234567u
+#define REBOOT_CMD_POWER_OFF 0x4321fedcu
+
+static int64_t sys_reboot(struct trapframe *tf) {
+    uint32_t magic1 = (uint32_t)sysarg(tf, 0);
+    uint32_t magic2 = (uint32_t)sysarg(tf, 1);
+    uint32_t cmd = (uint32_t)sysarg(tf, 2);
+    if (magic1 != REBOOT_MAGIC1 || magic2 != REBOOT_MAGIC2) {
+        return KERR_INVAL;
+    }
+    if (!uspace_capable(CAP_SYS_BOOT)) {
+        return KERR_PERM;
+    }
+    /* **Said before it happens.** The console is the only record of why a
+     * board went away, and a machine that resets with nothing on the wire
+     * is indistinguishable from one that crashed. */
+    switch (cmd) {
+    case REBOOT_CMD_RESTART:
+        kprintf("reboot: restarting, by request of pid %u\n",
+                uspace_current() != NULL ? uspace_current()->pid : 0u);
+        sbi_reboot();
+        return KERR_IO; /* only reached when the firmware declined */
+    case REBOOT_CMD_POWER_OFF:
+        kprintf("reboot: powering off, by request of pid %u\n",
+                uspace_current() != NULL ? uspace_current()->pid : 0u);
+        sbi_shutdown();
+        return KERR_IO;
+    default:
+        return KERR_NOTSUP;
+    }
+}
+
 static int64_t sys_getppid(struct trapframe *tf) {
     struct uproc *me = uspace_current();
     (void)tf;
@@ -705,6 +839,9 @@ const struct syscall_entry sys_proc_table[] = {
     {177, "getegid", sys_getegid},
     {146, "setuid", sys_setuid},
     {144, "setgid", sys_setgid},
+    {159, "setgroups", sys_setgroups},
+    {142, "reboot", sys_reboot},
+    {158, "getgroups", sys_getgroups},
     {173, "getppid", sys_getppid},
     {0, NULL, NULL},
 };

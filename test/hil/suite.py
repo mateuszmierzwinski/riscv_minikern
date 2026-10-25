@@ -571,7 +571,12 @@ def built_go(what):
     """Cross-builds one QuokkaOS binary for riscv64 and returns its path."""
     out = os.path.join(tempfile.gettempdir(), f"quokka-{what}-riscv64")
     env = dict(os.environ, CGO_ENABLED="0", GOOS="linux", GOARCH="riscv64")
-    subprocess.run(["go", "build", "-ldflags=-s -w", "-o", out, f"./cmd/{what}"],
+    # **Symbols kept.** The first version stripped them for size, and then a
+    # fault in one of these binaries reported an address that could not be
+    # looked up — so it was looked up in an unstripped rebuild instead, whose
+    # addresses are different, and the answer was wrong. A megabyte of symbol
+    # table is worth less than a diagnosable fault.
+    subprocess.run(["go", "build", "-o", out, f"./cmd/{what}"],
                    cwd=os.path.abspath(QUOKKA), env=env, check=True)
     return out
 

@@ -194,6 +194,16 @@ int xfsmount_link_path(const char *from, const char *to);
  * constant: the bound is the inode's literal area. */
 uint32_t xfsmount_symlink_limit(void);
 
+/* Sets a path's permission bits. The file-type bits are preserved, so this
+ * cannot change what kind of thing something is. */
+int xfsmount_chmod_path(const char *path, uint32_t mode);
+
+/* Sets a path's owner and group; `XFS_OWNER_UNCHANGED` leaves one alone. */
+int xfsmount_chown_path(const char *path, uint32_t uid, uint32_t gid);
+
+/* Reads a path's owner and group, which `stat` does not report here. */
+int xfsmount_owner_of(const char *path, uint32_t *uid, uint32_t *gid);
+
 /* Moves a name within one volume. KERR_XDEV across two, because a rename is
  * not a copy. This is the mechanism a bounded log file rotates with: there
  * is no ftruncate either, so moving the file aside is the only option. */

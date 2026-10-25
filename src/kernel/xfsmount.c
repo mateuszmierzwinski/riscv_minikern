@@ -1129,3 +1129,45 @@ int xfsmount_rename_path(const char *from, const char *to) {
     }
     return rename_resolved(fromvol, fromdir, fromleaf, fromlen, todir, toleaf, tolen);
 }
+
+/* ── mode and owner ───────────────────────────────────────────────────────
+ *
+ * The two of them share a resolver because the only difference is which
+ * field changes, and a second copy of "find the volume, look the path up,
+ * call through" is where the volume check gets dropped.
+ */
+static __attribute__((noinline)) int resolve_for_attrs(const char *path, struct xfs **vol,
+                                                       struct xfs_inode *ip) {
+    const char *within = path;
+    *vol = owner_of(path, &within);
+    if (*vol == NULL) {
+        return KERR_NODEV;
+    }
+    return xfs_path_lookup(*vol, within[0] == '\0' ? "/" : within, ip);
+}
+
+int xfsmount_chmod_path(const char *path, uint32_t mode) {
+    struct xfs *vol = NULL;
+    struct xfs_inode ip;
+    int rc = resolve_for_attrs(path, &vol, &ip);
+    return rc != KERR_OK ? rc : xfs_chmod(vol, &ip, mode, now_seconds());
+}
+
+int xfsmount_chown_path(const char *path, uint32_t uid, uint32_t gid) {
+    struct xfs *vol = NULL;
+    struct xfs_inode ip;
+    int rc = resolve_for_attrs(path, &vol, &ip);
+    return rc != KERR_OK ? rc : xfs_chown(vol, &ip, uid, gid, now_seconds());
+}
+
+int xfsmount_owner_of(const char *path, uint32_t *uid, uint32_t *gid) {
+    struct xfs *vol = NULL;
+    struct xfs_inode ip;
+    int rc = resolve_for_attrs(path, &vol, &ip);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    *uid = ip.uid;
+    *gid = ip.gid;
+    return KERR_OK;
+}

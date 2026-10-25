@@ -2497,3 +2497,221 @@ existed; or bring them back and keep them green, which means maintaining a
 second target environment for a project whose whole method is the real
 silicon. What is not acceptable is the present state looking like coverage
 while failing, and that is what this entry is for.
+
+### The exec'd-Go fault, and what is ruled out
+
+A Go program that the kernel loads directly runs. The same binary exec'd by
+another Go program faults, every time, at the same instruction — and the
+board test for QuokkaOS's init fails on it.
+
+The fault is `runtime.sysargs + 0x34`, which disassembles to
+`MOV (X6), X6` with `X6 = argv + n*8`: the loop in
+
+    for argv_index(argv, n) != nil { n++ }
+
+that walks past `argv` and `envp` to find the auxiliary vector. The address
+is **8**, which is what that load computes when `argv` is 0 and `n` is 1 —
+or when `n` has run up past 2^31 and `MOVW`'s sign extension has wrapped the
+product back to a small number.
+
+**Ruled out, each by measurement rather than reasoning:**
+
+- *The program.* It runs when the kernel loads it directly (`qservice:
+  started, pid 3`), so nothing about the binary is at fault.
+- *`argc`.* The kernel prints what it copied in — `argc 5`, `argc 7`,
+  `argc 3`, matching the service files exactly — so `copy_vector_in` and
+  `sys_execve` are sound.
+- *The stack block's layout.* The builder's output is dumped word by word.
+  For `argc 5` it reads: five `argv` pointers, `0`, two `envp` pointers,
+  `0`, then `6` — `AT_PAGESZ`. Walked the way `sysargs` walks it, the loop
+  starts at index 6, finds two non-nil entries, finds the NULL at 8, and
+  lands on the auxiliary vector. It is correct. The `argc 1` case the
+  direct load uses is correct too, and identical in shape.
+- *A size limit.* `/init` is read with a 16 MB bound now, not 4, and
+  `execve`'s matches; the earlier `EFBIG` was that and is fixed.
+- *The shared exec scratch.* Fixed (below), and the fault survives the fix,
+  so it was a real bug but not this one.
+
+**It was never an `argv` bug, and the registers said so once they were
+printed.** At the fault: `a0 0`, `a1 0`, `a2 ffffffffffffffff`. `sysargs`
+takes `(argc, argv)`, so it was entered with zero and nil — which is not what
+`_rt0_riscv64_linux` passes, since that computes `argv` as `sp+8` and the
+process demonstrably reads `argc 5` at its own `sp`.
+
+The faulting thread ids are 6, 7 and 9, and I read that as "these are
+cloned threads, and a thread does not run `sysargs`". **That was wrong, and
+measuring it said so.** Thread ids here are *global*, so the first thread of
+the second process is tid 6 — and the clone trace proves the point from the
+other side: every `CLONE_THREAD` in the boot comes from pid 1, and the
+exec'd processes never call `clone` at all before they die.
+
+So the faulting thread is the process's **first** thread, running `sysargs`
+exactly where it should, with `argc` and `argv` zero.
+
+**Thread creation was investigated on that wrong premise and is correct**,
+which is worth keeping: `sched_spawn` passes `is_child`, so `a0` is zeroed;
+the child's `sp` is exactly the stack it was given, which Go's riscv64 clone
+requires because its child reads `fn`, `g` and `m` from below that pointer;
+and `child.sepc = tf->sepc + 4` sends it past the `ecall`. Measured on the
+board: `sepc 7cafe`, and below the stack `7a6f8` — a code address — with two
+plausible pointers after it. Nothing there is wrong.
+
+**Everything about the process's start state is now measured and correct**,
+and the mechanism is still unknown. That is an honest state, not a
+conclusion, and the measurements are listed so the next attempt starts from
+facts rather than from this entry's earlier guesses.
+
+On the exact binary the board ran: entry `0x75fe8` is
+`_rt0_riscv64_linux`, and `0x46774` is `runtime.sysargs + 0x34`.
+
+At entry, through the process's own page tables: the stack pointer is the
+block's base, `argc` reads back as 5, 7 and 3 matching the service files,
+the stack is **writable** (a magic word written below the block reads back),
+and the block's words are correct — argv pointers, NULL, envp pointers,
+NULL, `AT_PAGESZ`. At fault time, the entry stack pointer *still* holds the
+right `argc`, so nothing overwrote it.
+
+And yet `sysargs` is reached with `a0` and `a1` zero. Go's `rt0_go` saves
+`argc` and `argv` below the stack pointer and reloads them before calling
+`args`, which made "the stack is not writable" the obvious candidate — and
+it is writable. That is the fourth mechanism proposed for this fault and the
+fourth refuted: a null `argv` from the kernel, a silent allocator failure, a
+cloned thread resuming wrongly, and a read-only stack.
+
+**Two more eliminated this round, both by reading rather than by booting:**
+
+- *The trap return not restoring `sp`.* It does: `trap_entry.S` ends
+  `ld sp, FRAME_X(2)(sp); sret`, with a comment saying exactly why the user
+  case must come from the frame. A syscall normally leaves `sp` unchanged,
+  so `execve` would have been the only caller to expose a bug here — which
+  made it worth checking, and it is correct.
+- *A stack too small for Go's `g0`.* `runtime.sysargs` opens with a
+  stack-guard check that, if taken, saves `X10` and `X11` to `8(X2)` and
+  `16(X2)` — which at entry is *inside the argv array*. Go sizes `g0`'s
+  stack as the entry `sp` less 64 KB, so a stack smaller than that would
+  send every early call down that path and clobber `argv`. The kernel gives
+  64 pages, 256 KB. Eliminated.
+
+So `X11` really is `argv` at the faulting instruction — the disassembly shows
+it untouched between the prologue and `ADD X11, X6, X6` — and it really is
+zero, while every piece of memory and every register the kernel controls is
+demonstrably right.
+
+**Go is not involved. `minikern.execone` is the reproducer.**
+
+Forty lines of hand-written assembly: one thread, no runtime, `execve` of
+`/bin/qservice` with a three-entry argv. The exec'd program faults
+**identically** — `sepc 0x46774`, `stval 8`, `a0 0`, `a1 0`, `a2 -1`. So
+`execve` itself is wrong, and the parent's threads, Go's fork, and
+`sched_end_siblings` were all distractions. Every exec on this board had come
+from a Go runtime, which is why it looked like a Go problem for seven
+mechanisms running.
+
+It is also a far cheaper reproducer: one boot against the fixture image,
+rather than the whole init suite, and no Go in the parent to reason about.
+
+(The first version of it refused rather than faulted, and that was my bug:
+the `argv` array was a `.dword` table holding **link-time** addresses, and
+the blob is copied to wherever the loader puts it. `lla` is pc-relative and
+was fine; the pointers it produces go on the stack now, which is where an
+argv belongs anyway.)
+
+**Three real omissions found and fixed on the way, none of them the cause.**
+`uspace_exec` copies the new address space field by field, and the build path
+writes eleven fields while the copy adopted nine. `vmas` was the serious one:
+after an `execve` the process held the **new page table and the old
+program's list of regions**, so every demand-paged fault was judged against
+regions that no longer existed, `mmap` would place into a dead program's
+gaps, and `fork` would copy from it. `shares_pt` left stale tells the kernel
+a private page table is borrowed; `main_tid` names a thread that is gone.
+
+**The design is the defect.** A list of assignments has to be kept in step
+with a function in another file and nothing checks that it is. The structural
+fix is to seed the scratch with everything that must survive an `execve` and
+then adopt it whole — `*p = *fresh` — so that omission becomes impossible
+rather than merely noticed. That is worth doing before the next field is
+added, and it is not done here because it needs care over `caps`, the
+descriptor table and the child bookkeeping, which must survive.
+
+**Also eliminated this round:** the two entry paths. `uspace_enter_frame`
+and the trap return restore the same registers, each loading its own base
+register last — `x10` in the first case because `a0` carried the frame, `sp`
+in the second for the same reason. Both are correct.
+
+**The sharpest statement of the bug, and the one that eliminates the whole
+image-and-stack area: the same binary, loaded both ways, has identical
+segments — and one works.**
+
+    direct load, works:   va 180000..1c0160 file a900 mem 40160 prot 3
+    exec'd, faults:       va 180000..1c0160 file a900 mem 40160 prot 3
+
+Byte for byte the same, including the `.bss` tail — `memsz` less `filesz`,
+219 KB of zero fill, which is where `runtime.argv` at `0x18aa10` lives.
+`qservice: started, pid 3` on the direct load of the *exact* fixture binary.
+So the ELF loader, the segment permissions and the zero-fill are all
+eliminated, and the earlier `.bss` lead is answered: the mapping is the same.
+
+(The first comparison I ran appeared to show a difference, and did not: the
+two runs used two different builds. Comparing the same bytes was the whole
+point and I nearly drew a conclusion without doing it.)
+
+**Also eliminated, from reading:** `execve` does reset signal handlers —
+`signal_reset()` is called beside `fd_close_on_exec()` and
+`cap_after_exec()`, with a comment saying why. A forked child inheriting
+init's handler addresses into a new image would have been a clean
+explanation, and it is not available.
+
+**What that leaves** is the state an exec'd process inherits that a fresh one
+does not, with the image, the stack, the handlers and the loader all now
+excluded: it was cloned from init, so its thread is a clone rather than a
+first thread, and `sched_end_siblings`/`sched_await_siblings` have run over
+it. The next measurement is to exec from a *single-threaded* parent — a
+program that forks and execs with no other threads alive — which separates
+"exec is broken" from "exec after Go's multi-threaded fork is broken" in one
+boot.
+
+**The earlier lead, now answered rather than pending**, because it is cheap and this tree
+already records an unexplained anomaly in the same area: `sysargs` begins
+`MOV 16(X27), X6` — a load through `g`, the goroutine register, which points
+into `.bss`. A `.bss` that is mapped wrongly for an exec'd image would break
+every early Go path in ways that look like garbage arguments, and the
+unix-socket `.bss` mask anomaly elsewhere in this file has never been
+explained. Comparing an exec'd image's `.bss` mapping against a
+directly-loaded one is one boot's work.
+
+**The earlier contradiction, now resolved in favour of the instrument:**
+the `exec-entry` print reads through `uspace_copy_in`, which uses the loaded
+address space — and adoption happens in `uspace_exec` *before*
+`uspace_restart_thread` is called from `sys_execve`, so it was reading the
+new space and the measurement stands.
+
+- The kernel writes `argc 5` into the block, and the process reads `argc 5`
+  back *through its own page tables* at `p->stack_top` — both printed.
+- `uspace_restart_thread` sets `tf->x[2] = p->stack_top`.
+- Yet the program reaches `sysargs` with `a0` and `a1` zero, which means
+  `_rt0_riscv64_linux` read zero from `0(sp)`.
+
+All three cannot hold. The `exec-entry` print reads through
+`uspace_copy_in`, which uses the *currently loaded* address space — so if
+the new space is adopted after that point, it was reading the old one and
+proving nothing. That is the first thing to check, and it is a flaw in the
+instrument rather than in the kernel.
+
+Everything in the list above still holds as *ruled out*; what changed is that
+it was ruled out of a problem that turned out to be somewhere else entirely.
+Three of those measurements were taken to test a theory that was wrong from
+the start, and the one that cost nothing — printing two registers — would
+have redirected all of them. It is unconditional now.
+
+**The earlier note, kept because the reasoning is still sound:** What remains between a
+correct block and a program that faults reading address 8 is the state the
+process actually starts in: the stack pointer it is entered with, how much
+of the stack is mapped at entry, and the entry address itself. The dump
+above prints the block as the *builder* wrote it into a physical page — not
+as the process can read it through its own page tables, which is the one
+thing not yet compared between the two paths.
+
+The diagnostics are left in place, capped: the `argc` line in `sys_execve`,
+the block dump in `build_start_state`, and the dispatcher's EAGAIN report.
+Each of them turned a theory into a fact, and two of them turned a confident
+theory of mine into a wrong one.

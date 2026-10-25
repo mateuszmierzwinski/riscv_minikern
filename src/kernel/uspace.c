@@ -850,6 +850,35 @@ static bool on_user_trap(struct trapframe *tf) {
             (unsigned long long)sched_current_tid(), (unsigned long long)tf->x[2],
             trap_cause_name(tf->scause), (unsigned long long)tf->sepc,
             (unsigned long long)tf->stval);
+    /* **a0 and a1 with every fault, not only when asked.**
+     *
+     * They are the first two arguments of whatever was running, and in the
+     * fault being chased here they are `argc` and `argv`: the difference
+     * between "the kernel handed this program a null argv" and "the
+     * arithmetic reaching that address came from somewhere else" is two
+     * registers, and printing them only on request meant three boots went
+     * by without them. */
+    kprintf("uspace:   a0 %016llx a1 %016llx a2 %016llx\n", (unsigned long long)tf->x[10],
+            (unsigned long long)tf->x[11], (unsigned long long)tf->x[12]);
+    /* **What is at the entry stack pointer, now.**
+     *
+     * `p->stack_top` holds the stack pointer the process was started on —
+     * the builder overwrites it with the block's base. Reading the first
+     * word of that block at fault time says whether the `argc` the kernel
+     * wrote is still there. Three measurements currently contradict each
+     * other and one of them must be wrong; this is the one that reads the
+     * same memory at a different time. */
+    if (uspace_current() != NULL) {
+        uint64_t argc_now = 0;
+        virt_t entry_sp = uspace_current()->stack_top;
+        if (uspace_copy_in(&argc_now, entry_sp, 8u) != KERR_OK) {
+            kprintf("uspace:   entry sp %016llx is unreadable now\n",
+                    (unsigned long long)entry_sp);
+        } else {
+            kprintf("uspace:   entry sp %016llx still holds argc %llu\n",
+                    (unsigned long long)entry_sp, (unsigned long long)argc_now);
+        }
+    }
     /* The registers, when asked for. A faulting address alone says where the
      * program stopped but not what it was holding, and the difference
      * between "a pointer was null" and "a pointer was wrong" is the whole
@@ -994,6 +1023,26 @@ static uint64_t prot_bits(uint32_t prot) {
 static int load_segment(struct uproc *p, const struct elf_load *l, const uint8_t *image) {
     uint64_t start = l->vaddr & ~(PAGE_SIZE - 1u);
     uint64_t end = (l->vaddr + l->memsz + PAGE_SIZE - 1u) & ~(PAGE_SIZE - 1u);
+    /* **Each segment as it is laid down, for comparing the two load paths.**
+     *
+     * A Go program runs when the kernel loads it directly and faults when
+     * another program `execve`s it, and six proposed mechanisms have been
+     * refuted. Both paths come through here, so printing what each one maps
+     * either shows a difference or removes the loader from the list — and
+     * the zero-fill tail, where `.bss` comes from, is `memsz` minus
+     * `filesz`, which is the number this is really about. */
+    {
+        static uint32_t said;
+        if (said < 10u) {
+            said++;
+            kprintf("segment: pid %u va %llx..%llx file %llx mem %llx prot %u\n",
+                    uspace_current() != NULL ? uspace_current()->pid : 0u,
+                    (unsigned long long)l->vaddr,
+                    (unsigned long long)l->vaddr + (unsigned long long)l->memsz,
+                    (unsigned long long)l->filesz, (unsigned long long)l->memsz,
+                    (unsigned)l->prot);
+        }
+    }
     /* The program's own segments belong in the address space's record like
      * everything else. They are below the window `mmap` places into, so
      * nothing would be put on top of them — but a record that is only
@@ -1140,6 +1189,28 @@ static int build_start_state(struct uproc *p, const struct elf_image *img, const
                       &args, &sp, &used);
     if (rc != KERR_OK) {
         return rc;
+    }
+    /* **The first words of the block a program will start on.**
+     *
+     * A Go program faults in `runtime.sysargs` walking `argv` for the NULL
+     * that precedes the auxiliary vector. The kernel passes the right
+     * `argc` — that was checked — so what is left is what this builder
+     * actually wrote, and reading the words is the only way to know. Capped
+     * at two dumps, because every boot builds several. */
+    {
+        static uint32_t dumped;
+        if (dumped < 2u) {
+            const uint64_t *w = (const uint64_t *)(uintptr_t)(stack +
+                                                              USER_STACK_PAGES * PAGE_SIZE -
+                                                              (p->stack_top - sp));
+            dumped++;
+            kprintf("ustack: sp %llx argc %llu; words:", (unsigned long long)sp,
+                    (unsigned long long)w[0]);
+            for (uint32_t i = 1; i < 12u; i++) {
+                kprintf(" %llx", (unsigned long long)w[i]);
+            }
+            kprintf("\n");
+        }
     }
     for (uint32_t i = 0; rc == KERR_OK && i < USER_STACK_PAGES; i++) {
         rc = pgtable_map(&p->pt, p->stack_top - (uint64_t)(i + 1u) * PAGE_SIZE,
@@ -1420,16 +1491,60 @@ void uspace_wait_for_child(struct uproc *parent) {
  *
  * Static, not a local: a `struct uproc` is two and a half kilobytes and the
  * frame-size guard refuses that on a stack — twice now, which is the guard
- * earning its place. One is enough because an `execve` holds the kernel lock
- * from beginning to end and never sleeps, so two cannot overlap. */
-static struct uproc exec_scratch;
+ * earning its place.
+ *
+ * **One per process slot, because the claim that justified a single one was
+ * false.** It read: "an `execve` holds the kernel lock from beginning to end
+ * and never sleeps, so two cannot overlap." It does sleep.
+ * `sys_execve` calls `sched_await_siblings`, which waits on a channel with
+ * `sched_wait_on` — and that releases the kernel lock. So two `execve`s
+ * overlap whenever two threads exec at once, and they were sharing one
+ * buffer: the second clobbered the first's half-built address space and the
+ * first process faulted as soon as it was resumed.
+ *
+ * It took a userland to expose it. QuokkaOS's init starts a runlevel's
+ * independent services in parallel, so two `os/exec` calls land together on
+ * every boot; a shell running one program at a time never could. The
+ * symptom was a Go program that ran perfectly when the kernel loaded it
+ * directly and faulted when another Go program exec'd it — which is what
+ * separated this from a dozen other theories.
+ *
+ * Sixteen slots at two and a half kilobytes is forty kilobytes, against
+ * eight gigabytes of DRAM. Indexing by slot rather than taking a lock keeps
+ * the property the original wanted — no allocation, no ordering to get
+ * wrong — without resting on an invariant the code does not hold. */
+static struct uproc exec_scratch[PROC_MAX];
+
+/* The scratch belonging to one process.
+ *
+ * Indexed by its slot, which is its position in `procs`: a process has
+ * exactly one, it cannot be exec'ing twice at once, and nothing else may
+ * touch it. A pointer outside the table would be a caller error rather than
+ * a case to handle, so it is asserted by falling back to slot zero — which
+ * is wrong but bounded, where indexing off the end is neither. */
+static struct uproc *scratch_for(const struct uproc *p) {
+    uint64_t slot = (uint64_t)(p - procs);
+    if (p < procs || slot >= PROC_MAX) {
+        return &exec_scratch[0];
+    }
+    return &exec_scratch[slot];
+}
 
 /* Frees a set of page tables that belong to nobody, which is what the old
  * address space becomes once a new one has been adopted.
  *
  * The holder is static for the same reason the scratch is: a `struct uproc`
- * on a stack is two and a half kilobytes, which the frame guard refuses, and
- * an `execve` is serialised by the kernel lock. */
+ * on a stack is two and a half kilobytes, which the frame guard refuses.
+ *
+ * **One is enough here, but not for the reason this used to give.** It said
+ * "an `execve` is serialised by the kernel lock", which is the same false
+ * claim the scratch above rested on — `execve` sleeps in
+ * `sched_await_siblings`, so two of them do overlap. What makes a single
+ * holder safe is narrower and worth stating exactly: this function writes
+ * it and calls `uspace_destroy` immediately, and nothing in that path
+ * sleeps or releases the lock, so no second execve can run between the
+ * write and the use. That is a property of these three lines rather than of
+ * `execve`, and a line added between them that could sleep would break it. */
 static struct uproc free_holder;
 
 static void free_tables(struct pgtable *pt) {
@@ -1442,7 +1557,7 @@ int uspace_exec(struct uproc *p, const uint8_t *image, uint32_t bytes, const cha
                 const char *const *argv, uint32_t argc) {
     struct pgtable old = p->pt;
     bool had_own = !p->shares_pt;
-    struct uproc *fresh = &exec_scratch;
+    struct uproc *fresh = scratch_for(p);
     int rc;
     /* The new address space is built **beside** the old one, so a failure
      * here leaves the process exactly as it was. A program that handles a
@@ -1479,6 +1594,34 @@ int uspace_exec(struct uproc *p, const uint8_t *image, uint32_t bytes, const cha
     p->stack_top = fresh->stack_top;
     p->trampoline = fresh->trampoline;
     p->mmap_floor = fresh->mmap_floor;
+    /* **The address-space record, which was being left behind.**
+     *
+     * Every other field of the new address space was adopted and this one
+     * was not, so after an `execve` the process held the *new* page table
+     * and the *old* program's list of regions. Everything that consults the
+     * record then consults a map of a program that no longer exists: a
+     * demand-paged fault is judged against regions that are gone, `mmap`
+     * places into the dead program's gaps, and `fork` copies from it.
+     *
+     * The symptom was a program that ran perfectly when the kernel loaded
+     * it directly and faulted when anything `execve`d it. Seven other
+     * mechanisms were proposed and refuted first — the image, the stack,
+     * the loader, the handlers, the tables, the trap return, thread
+     * creation — because the fault looked like a Go runtime problem and
+     * every exec on this board came from a Go runtime. A forty-line
+     * assembly program with one thread and one `execve` reproduced it
+     * identically, which is what finally pointed here: the parent's
+     * threads had nothing to do with it. */
+    p->vmas = fresh->vmas;
+    /* **The other two the field-by-field copy omitted.** The build path
+     * writes eleven fields of the address space and this adopted nine, which
+     * is the defect this whole block invites: a list of assignments has to
+     * be kept in step with a function somewhere else, and nothing checks
+     * that it is. `shares_pt` left stale tells the kernel a private page
+     * table is borrowed, so the teardown of the *next* exec would decline to
+     * free it; `main_tid` left stale names a thread that no longer exists. */
+    p->shares_pt = fresh->shares_pt;
+    p->main_tid = fresh->main_tid;
     p->built = true;
     p->shares_pt = false;
     /* **The capabilities are transformed here, on the process itself.**
@@ -1518,6 +1661,41 @@ void uspace_restart_thread(struct trapframe *tf, const struct uproc *p) {
     tf->sstatus = sstatus;
     tf->sepc = p->entry;
     tf->x[2] = p->stack_top;
+    /* **What the program will read at its own stack pointer.**
+     *
+     * Everything else about this path has been measured and is right: the
+     * block's words, `argc` as copied in, the limits. What has not been
+     * compared between a kernel-loaded program and an exec'd one is the
+     * *process's own view* — the block was dumped out of the physical page
+     * the builder wrote, not read back through the page tables the program
+     * will use. This reads the first word the way the program will. */
+    {
+        static uint32_t said;
+        uint64_t argc_seen = 0;
+        if (said < 4u) {
+            said++;
+            if (uspace_copy_in(&argc_seen, p->stack_top, 8u) != KERR_OK) {
+                kprintf("exec-entry: sp %llx is NOT READABLE by the process\n",
+                        (unsigned long long)p->stack_top);
+            } else {
+                /* **Is the stack writable?** Go's `rt0_go` saves `argc` and
+                 * `argv` below the stack pointer and reloads them before
+                 * calling `args`, so a stack that reads but does not write
+                 * hands `sysargs` a zero `argc` and a nil `argv` — which is
+                 * exactly what the fault shows. A magic word written and
+                 * read back below the block answers it; the block itself is
+                 * left alone. */
+                uint64_t magic = 0x5151515151515151ull;
+                uint64_t back = 0;
+                bool wrote = uspace_copy_out(p->stack_top - 32u, &magic, 8u) == KERR_OK;
+                bool read = uspace_copy_in(&back, p->stack_top - 32u, 8u) == KERR_OK;
+                kprintf("exec-entry: sp %llx argc %llu entry %llx; stack write %s, read back %llx\n",
+                        (unsigned long long)p->stack_top, (unsigned long long)argc_seen,
+                        (unsigned long long)p->entry, wrote ? "ok" : "REFUSED",
+                        read ? (unsigned long long)back : 0ull);
+            }
+        }
+    }
 }
 
 uint64_t uspace_stale_faults(void) {

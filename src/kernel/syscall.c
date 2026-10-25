@@ -1232,6 +1232,41 @@ static int64_t sys_uname(struct trapframe *tf) {
     return uspace_copy_out(sysarg(tf, 0), out, sizeof out) == KERR_OK ? 0 : KERR_FAULT;
 }
 
+/* fchmodat(dirfd, path, mode, flags) and fchownat(dirfd, path, uid, gid, flags).
+ *
+ * **The two the init work asked for by name.** A service file saying
+ * `dirs = ["/run/httpd:0750:www"]` could create the directory and neither
+ * set its mode nor its owner, so init logged that it could not — a
+ * directory asked to be 0750 and left 0755 is a security difference the
+ * admin had to be told about. Now it can be honoured.
+ *
+ * `flags` is refused rather than ignored when it asks for anything:
+ * `AT_SYMLINK_NOFOLLOW` changes which inode is affected, and silently
+ * following a symlink for a caller who asked not to is how a privileged
+ * `chown` is turned into an attack.
+ */
+static int64_t sys_fchmodat(struct trapframe *tf) {
+    char path[OPEN_MAX_PATH];
+    int rc;
+    if (sysarg(tf, 3) != 0) {
+        return KERR_NOTSUP;
+    }
+    rc = copy_in_path(tf, 1, path);
+    return rc != KERR_OK ? rc : xfsmount_chmod_path(path, (uint32_t)sysarg(tf, 2));
+}
+
+static int64_t sys_fchownat(struct trapframe *tf) {
+    char path[OPEN_MAX_PATH];
+    int rc;
+    if (sysarg(tf, 4) != 0) {
+        return KERR_NOTSUP;
+    }
+    rc = copy_in_path(tf, 1, path);
+    return rc != KERR_OK ? rc
+                         : xfsmount_chown_path(path, (uint32_t)sysarg(tf, 2),
+                                               (uint32_t)sysarg(tf, 3));
+}
+
 static int64_t sys_eventfd2(struct trapframe *tf) {
     return fdobjects_open_eventfd(sysarg(tf, 0), (uint32_t)sysarg(tf, 1) & O_NONBLOCK);
 }
@@ -1392,6 +1427,30 @@ int64_t syscall_clone_thread(struct trapframe *tf) {
      * rather than inherited. Getting this wrong makes the child re-execute
      * the clone, which forks threads until the table is full. */
     child.sepc = tf->sepc + 4u;
+    /* **Where the child is being sent, and what is under its stack.**
+     *
+     * A thread in an exec'd process faults inside `runtime.sysargs` with
+     * zeroed arguments, which it cannot reach by running: either the kernel
+     * resumes it at the wrong address, or it starts correctly and jumps to
+     * a garbage `fn`. Go's riscv64 clone child reads that `fn` from below
+     * the stack pointer it was given, so printing both the resume address
+     * and those words separates the two — and they want opposite fixes. */
+    {
+        static uint32_t said;
+        if (said < 14u) {
+            uint64_t below[3] = {0, 0, 0};
+            said++;
+            (void)uspace_copy_in(below, stack - 24u, 24u);
+            /* The pid, because the first three of these came from init and
+             * the question is about the processes it exec'd — a cap that
+             * hides the subject is a cap that answers the wrong question. */
+            kprintf("clone-thread: pid %u sepc %llx sp %llx; below: %llx %llx %llx\n",
+                    uspace_current() != NULL ? uspace_current()->pid : 0u,
+                    (unsigned long long)child.sepc, (unsigned long long)stack,
+                    (unsigned long long)below[0], (unsigned long long)below[1],
+                    (unsigned long long)below[2]);
+        }
+    }
     rc = sched_spawn(&child, stack, &tid);
     return rc == KERR_OK ? (int64_t)tid : rc;
 }
@@ -1721,6 +1780,8 @@ static const struct syscall_entry table[] = {
     {37u, "linkat", sys_linkat},
     {78u, "readlinkat", sys_readlinkat},
     {276u, "renameat2", sys_renameat2},
+    {53u, "fchmodat", sys_fchmodat},
+    {54u, "fchownat", sys_fchownat},
     {SYS_RISCV_HWPROBE, "riscv_hwprobe", sys_riscv_hwprobe},
     {SYS_NANOSLEEP, "nanosleep", sys_nanosleep},
     {SYS_RSEQ, "rseq", sys_ok},

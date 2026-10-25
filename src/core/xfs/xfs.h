@@ -706,6 +706,19 @@ int xfs_symlink(struct xfs *fs, const struct xfs_inode *dir, const char *name, u
  * the inode size, so a caller that must refuse one can say by how much. */
 uint32_t xfs_symlink_max(const struct xfs *fs);
 
+/* The sentinel `chown(2)` uses for "leave this one alone". */
+#define XFS_OWNER_UNCHANGED 0xffffffffu
+
+/* Sets an inode's permission bits. The file-type bits are preserved from
+ * disk and the caller's are masked away, which is what chmod(2) means — a
+ * caller passing a whole mode word cannot turn a directory into a file. */
+int xfs_chmod(struct xfs *fs, const struct xfs_inode *ip, uint32_t mode, uint64_t now_s);
+
+/* Sets an inode's owner and group. `XFS_OWNER_UNCHANGED` for either leaves
+ * that one as it is, which is chown(2)'s convention (core/xfs/xfs_attrs.c). */
+int xfs_chown(struct xfs *fs, const struct xfs_inode *ip, uint32_t uid, uint32_t gid,
+              uint64_t now_s);
+
 int xfs_rename(struct xfs *fs, const struct xfs_inode *olddir, const char *from, uint32_t fromlen,
                const struct xfs_inode *newdir, const char *to, uint32_t tolen, uint64_t now_s);
 

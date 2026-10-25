@@ -118,6 +118,14 @@
  * obvious. */
 #define PROC_MAX 16u
 
+/* How many supplementary groups a process may hold.
+ *
+ * Sixteen: enough for any plausible service account, and a fixed array
+ * rather than an allocation because the one thing a credential must never do
+ * is fail to be set for want of memory. A request for more is refused with
+ * EINVAL, which `setgroups(2)` already defines for exactly this. */
+#define PROC_MAX_GROUPS 16u
+
 struct uproc {
     /* ── identity ──────────────────────────────────────────────────────── */
     uint32_t pid;
@@ -141,6 +149,14 @@ struct uproc {
     uint32_t gid;
     uint32_t euid;
     uint32_t egid;
+    /* **The supplementary groups, so that dropping privilege actually
+     * drops it.** `setuid` and `setgid` move the primary identity and leave
+     * these behind, which is the classic incomplete privilege drop: a
+     * process that was root keeps root's groups and the access they carry.
+     * QuokkaOS's init had to log that its drop was weaker than it looked
+     * because the kernel had nowhere to put them. */
+    uint32_t groups[PROC_MAX_GROUPS];
+    uint32_t ngroups;
     /* **Resource limits, soft and hard.**
      *
      * Only the ones this kernel can actually enforce are kept: descriptors,
