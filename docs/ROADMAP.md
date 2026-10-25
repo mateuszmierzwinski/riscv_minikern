@@ -3487,9 +3487,21 @@ Asking the questions this file kept calling "the next step", in one sitting.
 | Can the harts take a timer interrupt at all? | **Yes.** `clock: hart 1 armed at 20486403250; sie 222, timer ENABLED` and `hart 2 ... sie 22, timer ENABLED` |
 
 So the deadline is armed, the hart can take the interrupt, nothing stops the
-clock deliberately, and the interrupt still does not arrive. What is left is
-`timer_arm_at` itself — the value it writes, or where it writes it — and that
-is the next measurement rather than another candidate.
+clock deliberately, and the interrupt still does not arrive.
+
+**`timer_arm_at` was the last named candidate and it is sound.** It early-outs
+when `per_hart[me].armed == at`, skipping the firmware call — which would be a
+trap if `armed` could hold a deadline that has already fired, because the
+comparator would then sit in the past with its interrupt masked and nothing
+would ever re-arm it. It cannot: `timer_on_tick` calls `set_hart_timer(me, 0)`
+on every interrupt, which clears `armed` and masks the interrupt in the one
+place that owns the pair, and arming again unmasks it. Checked by reading, and
+the comment there already explains the invariant it maintains.
+
+So the list of named candidates is empty, which is the honest state. The next
+step is **not** another candidate: it is to fix the fork defect so the
+reproducer can run with live children, and then watch `armed`, the comparator
+and `sstatus`/`sie` across the exact window where the tick stops.
 
 **One asymmetry found and explained rather than filed as a bug.** Hart 1
 reads `sie 0x222` and hart 2 `0x22`: bit 9, `SEIE`, is set on one and not the
