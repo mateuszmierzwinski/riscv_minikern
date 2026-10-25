@@ -153,7 +153,18 @@ static int share_kernel_mappings(struct pgtable *pt) {
             continue;
         }
         if (pt->root[i] == 0) {
-            pt->root[i] = theirs; /* no collision: share the subtree whole */
+            /* **Shared whole, which is a known hazard rather than a
+             * decision.** `pgtable_map` walks to whatever table the root
+             * entry names and has no idea it belongs to the kernel, so a
+             * page mapped into such a gigapage afterwards — by demand
+             * paging, say — is written into the kernel's own level-1 table.
+             * That is how a device window's entry gets displaced and the
+             * thermal sampler faults on the housekeeping beat.
+             *
+             * Giving the process its own copy instead was tried and
+             * regressed the board from green: the embedded program stopped
+             * running at all. See docs/ROADMAP.md. */
+            pt->root[i] = theirs;
             continue;
         }
         /* A collision. Both must be tables for this to be resolvable: a

@@ -150,6 +150,21 @@ static uint64_t *walk_to(struct pgtable *pt, virt_t va, uint32_t level, bool cre
     return table;
 }
 
+/* A root- or mid-level entry pointing at `table`, published safely.
+ *
+ * **Exported because one caller outside this file has to build one.**
+ * `share_kernel_mappings` gives a process its own level-1 table for a
+ * gigapage it may still map into, rather than letting it share the kernel's
+ * — and a table entry's encoding, and the barrier that must precede it, are
+ * this file's business rather than something to duplicate there. The barrier
+ * is the same one `pgtable_map` uses, for the same reason: another hart's
+ * MMU must not be able to see the entry before the table it points at.
+ */
+uint64_t pgtable_table_entry(phys_t table) {
+    publish_barrier();
+    return pte_make(table, PTE_V);
+}
+
 int pgtable_map(struct pgtable *pt, virt_t va, phys_t pa, uint64_t size, uint64_t prot) {
     uint32_t level = level_for_size(size);
     uint64_t *table;

@@ -129,6 +129,11 @@ void pgtable_destroy(struct pgtable *pt);
  * matters. Returns KERR_INVAL for a bad size, a misaligned address, a
  * virtual address that is not sign-extended, or an attempt to replace an
  * existing mapping; KERR_NOMEM when a table cannot be allocated. */
+/* A table entry pointing at `table`, with the publish barrier already done.
+ * For a caller that has to install a level-1 table of its own — giving a
+ * process its own table for a gigapage instead of sharing the kernel's. */
+uint64_t pgtable_table_entry(phys_t table);
+
 int pgtable_map(struct pgtable *pt, virt_t va, phys_t pa, uint64_t size, uint64_t prot);
 
 /* Maps a range, using the largest pages that fit and align. This is how the

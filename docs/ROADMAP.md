@@ -3397,3 +3397,50 @@ unrepresentable; short of that, the mappings a process shares have to be a
 *view* of the kernel's rather than a copy taken at one instant.
 
 Reverted again, so the tree is green and the reproducer is one line from on.
+
+### `pgtable_map` can write a process's mapping into the kernel's own table
+
+**The mechanism behind the thermal-sampler fault, confirmed by reading the
+code rather than by inference** — and an attempted fix that regressed the
+board and was backed out.
+
+`share_kernel_mappings` has two cases, and the fast one hands the process the
+kernel's **own** level-1 table: `pt->root[i] = theirs`. `pgtable_map` then
+calls `walk_to`, which returns whatever table the root entry names and has no
+notion of ownership — so a page mapped into that gigapage afterwards is
+written **into the kernel's address space**, where the kernel and every other
+process can see it. Nothing in `pgtable.c` can detect this; there is no
+"this table is not mine" anywhere in the type.
+
+It is reachable by **demand paging alone**: a fault backs a page after
+`share_kernel_mappings` has run. On this board the device windows and user
+text share gigapage 0, which makes the collision ordinary rather than exotic,
+and the observed symptom is a kernel load page fault in `temp_jh7110_sample`
+— the thermal sampler, on the ownerless housekeeping beat, reaching a device
+window whose entry has been displaced.
+
+**The fix attempted, and why it is not in the tree.** Give the process its own
+level-1 table, pre-populated with the kernel's entries, for any gigapage that
+overlaps user space — the same resolution the collision case performs, taken
+in advance rather than waiting for a collision `pgtable_map` cannot see.
+`pgtable_table_entry` was exported for it (that part is kept: the encoding and
+its publish barrier belong in `pgtable.c`, not duplicated).
+
+It regressed the board from green: the embedded program stopped running at
+all, with no `uspace:` line, the kernel going straight to "boot complete".
+Reverted on the spot, because **a change that takes a green board to silence
+is not a candidate, whatever its argument**. Two things to check before trying
+again:
+
+1. `pgtable_map` returns `KERR_EXIST` for an entry that is already valid, and
+   a table pre-filled with the kernel's entries has many. The load path's
+   first segment map may now be refused where before it found an empty table.
+2. The copy is still a snapshot. A kernel mapping made *after* a process is
+   built is invisible to it — which is the same bug one level down, and the
+   reason the real answer is the top-half move, where user space and the
+   kernel cannot share a root entry at all.
+
+That makes **five** costs of the bottom-half workaround now: a teardown
+corruption, two pointer-check security holes, a device mapping a process can
+be missing, and a process able to write into the kernel's page tables. The
+item above is no longer a tidiness exercise.
