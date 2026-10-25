@@ -3013,7 +3013,7 @@ this file already records from the XFS entries that named sparse inodes and
 | SPI, I²C, PWM, watchdog | `spi_pl022.c`, `i2c_dw.c`, `pwm_jh7110.c`, `wdt_jh7110.c` | **Implemented.** RTC is **not written**, and the operator's instruction was that thermals are the focus and the rest can be mocked and roadmapped |
 | USB | `xhci.c` | **Partial**: the port never reaches PED, so nothing enumerates behind it |
 | A routing table | `net_route.c` (`add`/`del`/`at`/`lookup`, longest prefix), `route_test` | **Implemented and wired**: the IPv4 send path consults it at `net_ipv4.c:186` |
-| TCP SACK | `net_tcp_in.c`, `net_tcp_out.c` | **Built, against the list**, which marks it deliberately not planned. Worth an explicit decision to keep or revert rather than leaving it ambiguous |
+| TCP SACK | `net_tcp_in.c`, `net_tcp_out.c` | **Built and kept — the operator's decision, 2026-10-25.** The list said "deliberately not planned" and the work was done anyway; asked whether to keep or revert it, the answer was keep. The question is closed, and the list entry is the thing that was out of date rather than the code |
 | Unix-domain sockets | `sock_unix.c` | **Implemented.** The `.bss` mask anomaly recorded against it is open |
 | netlink | `sock_netlink.c` | **Implemented** |
 | DNS | `/etc/resolv.conf` synthesised in `fdobjects.c:226` from the DHCP lease, `minikern.dns=` to override, and `src/userland/resolve` | **Implemented**: user space can resolve a name, which is what the item asked for |
