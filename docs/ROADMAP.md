@@ -3444,3 +3444,33 @@ That makes **five** costs of the bottom-half workaround now: a teardown
 corruption, two pointer-check security holes, a device mapping a process can
 be missing, and a process able to write into the kernel's page tables. The
 item above is no longer a tidiness exercise.
+
+**The invariant is now checked on every boot**, which is what this should
+have had from the start. `struct pgtable` marks the root slots whose level-1
+table it borrowed, `pgtable_map` counts a write that walks through one, and
+the board says so:
+
+    pgtable: no process wrote into the kernel's tables
+
+Counted rather than refused, deliberately: refusing changes behaviour the
+board is currently green with, and the attempt to avoid the borrowing
+altogether took it from green to silence. A count makes the next occurrence
+a line in the log instead of a fault somewhere unrelated — which is the whole
+difference between this being a defect and being the session it cost.
+
+Reported from the **housekeeping beat** as well as at boot, and that detail
+is the point: the boot's last line is never reached by a run that hangs, and
+a run that hangs is the one worth measuring. The beat keeps going — the board
+was still answering pings while the case under investigation sat stuck — so
+it is the one place that reports in both outcomes. This file has recorded the
+same mistake four times in one session; this is the first instrument written
+with it in mind rather than against it.
+
+**And it refuted the inference it was built to confirm.** With the segment
+recording back on, the counter stayed **zero** and the machine stayed alive
+— pings still answered — where the earlier run had faulted in
+`temp_jh7110_sample`. So the mechanism written above is *consistent with* the
+code and is **not** what happened in that run: the fault was intermittent, or
+had another cause entirely. The confirmed part is narrower and still worth
+having: `pgtable_map` genuinely cannot tell a borrowed table from its own,
+and nothing had ever checked whether it was being written through.

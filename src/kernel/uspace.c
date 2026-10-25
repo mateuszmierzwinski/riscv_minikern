@@ -165,6 +165,7 @@ static int share_kernel_mappings(struct pgtable *pt) {
              * regressed the board from green: the embedded program stopped
              * running at all. See docs/ROADMAP.md. */
             pt->root[i] = theirs;
+            pgtable_mark_borrowed(pt, i);
             continue;
         }
         /* A collision. Both must be tables for this to be resolvable: a
@@ -1169,11 +1170,10 @@ static int load_segment(struct uproc *p, const struct elf_load *l, const uint8_t
         }
         (void)want;
     }
-    /* **The segments are deliberately NOT recorded here.** It is the right
-     * fix for a forked child that dies on its own text, and it makes the
-     * kernel take a load page fault — see docs/ROADMAP.md, which records
-     * what that round eliminated. `fork_bystanders` in
-     * `src/userland/waitloop` is the one-line reproducer. */
+    /* **The segments are deliberately NOT recorded here.** Recording them is
+     * the right fix for a forked child that dies on its own text, and it has
+     * twice taken the board out of green — see docs/ROADMAP.md.
+     * `fork_bystanders` in `src/userland/waitloop` is the reproducer. */
 
     return KERR_OK;
 }

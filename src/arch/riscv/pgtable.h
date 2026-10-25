@@ -112,7 +112,36 @@ struct pgtable {
     uint64_t *root;
     phys_t root_phys;
     struct pt_mem mem;
+    /* Root slots whose level-1 table belongs to somebody else.
+     *
+     * **A page table cannot otherwise tell.** `share_kernel_mappings` hands
+     * a process the kernel's own level-1 table for a gigapage the kernel
+     * has mappings in, and `walk_to` then returns that table like any
+     * other — so a mapping made afterwards is written into the kernel's
+     * address space, where the kernel and every other process can see it.
+     * One page's worth of entries displaced that way cost a session: the
+     * thermal sampler faulted on the housekeeping beat, reaching a device
+     * window whose entry a process's text had taken.
+     *
+     * Marked rather than refused, for now. Refusing changes behaviour that
+     * the board is currently green with, and an attempt to avoid the
+     * sharing altogether took it from green to silence. Counting makes the
+     * event visible on every boot, which is the difference between a defect
+     * and a mystery. */
+    uint64_t borrowed[PT_ENTRIES / 64u];
 };
+
+/* Says that this slot's level-1 table is the kernel's, not this table's. */
+void pgtable_mark_borrowed(struct pgtable *pt, uint32_t slot);
+
+/* How many mappings have been written into a table the process borrowed —
+ * which is to say, into the kernel's own address space. Zero is the
+ * invariant; anything else is the bug above, happening now. */
+uint32_t pgtable_writes_into_borrowed(void);
+
+/* The address of the first mapping that went into a borrowed table, which is
+ * what identifies the region responsible. Meaningless when the count is 0. */
+virt_t pgtable_first_borrowed_va(void);
 
 /* An empty address space. KERR_OK or KERR_NOMEM. */
 int pgtable_create(struct pgtable *pt, const struct pt_mem *mem);

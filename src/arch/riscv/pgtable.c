@@ -160,6 +160,31 @@ static uint64_t *walk_to(struct pgtable *pt, virt_t va, uint32_t level, bool cre
  * is the same one `pgtable_map` uses, for the same reason: another hart's
  * MMU must not be able to see the entry before the table it points at.
  */
+/* How many times a mapping has gone into a borrowed table. */
+static uint32_t borrowed_writes;
+/* Where the first such mapping went, which is the useful half of the count. */
+static virt_t first_borrowed_va;
+
+void pgtable_mark_borrowed(struct pgtable *pt, uint32_t slot) {
+    if (pt != NULL && slot < PT_ENTRIES) {
+        pt->borrowed[slot / 64u] |= 1ull << (slot % 64u);
+    }
+}
+
+uint32_t pgtable_writes_into_borrowed(void) {
+    return borrowed_writes;
+}
+
+virt_t pgtable_first_borrowed_va(void) {
+    return first_borrowed_va;
+}
+
+/* Whether the level-1 table this address walks through is the kernel's. */
+static bool walks_through_borrowed(const struct pgtable *pt, virt_t va) {
+    uint32_t slot = index_at(va, PT_LEVELS - 1u);
+    return (pt->borrowed[slot / 64u] & (1ull << (slot % 64u))) != 0;
+}
+
 uint64_t pgtable_table_entry(phys_t table) {
     publish_barrier();
     return pte_make(table, PTE_V);
@@ -190,6 +215,21 @@ int pgtable_map(struct pgtable *pt, virt_t va, phys_t pa, uint64_t size, uint64_
      * or filled it from a file, and another hart's MMU may see the entry
      * first and read what the frame held when it belonged to something
      * else. */
+    /* **Counted, not refused.** See `struct pgtable`'s `borrowed`: a write
+     * here lands in the kernel's own tables. The invariant is zero and the
+     * boot reports it, so the next occurrence is a line in the log rather
+     * than a fault somewhere else entirely. */
+    if (level < PT_LEVELS - 1u && walks_through_borrowed(pt, va)) {
+        /* **Recorded, not printed.** This module depends on `core_boot`
+         * alone and is linked into host tests where there is no console;
+         * reaching for `kprintf` here would trade that layering for a line.
+         * The address of the first one is kept so whoever does have a
+         * console can say where it was. */
+        if (borrowed_writes == 0u) {
+            first_borrowed_va = va;
+        }
+        borrowed_writes++;
+    }
     publish_barrier();
     table[index_at(va, level)] = pte_make(pa, prot | PTE_V | PTE_A | PTE_D);
     return KERR_OK;

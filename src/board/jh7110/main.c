@@ -923,6 +923,44 @@ static void report_the_network_after_everything(void);
  * hart could not identify itself at all, which means two harts sharing one
  * scheduler's state and is a correctness bug.
  */
+/* Says whether any process wrote a mapping into the kernel's own tables.
+ *
+ * **The invariant is zero**, and until the kernel moves to the top half it
+ * is an invariant that can be violated: `share_kernel_mappings` lends a
+ * process the kernel's level-1 table for a gigapage the kernel has mappings
+ * in, and `pgtable_map` cannot tell a borrowed table from its own. One
+ * displaced device entry cost a session — the thermal sampler faulting on
+ * the housekeeping beat, reported as a fault in user code, for a window
+ * whose entry a process's text had taken.
+ *
+ * Reported on every boot, so that the next occurrence is this line rather
+ * than a fault somewhere unrelated. It is the cheap general instrument this
+ * project keeps relearning the value of. */
+static void report_borrowed_table_writes(void) {
+    uint32_t n = pgtable_writes_into_borrowed();
+    if (n == 0u) {
+        kprintf("pgtable: no process wrote into the kernel's tables\n");
+        return;
+    }
+    kprintf("pgtable: **%u mapping(s) went into the kernel's own tables**, first at %016llx\n", n,
+            (unsigned long long)pgtable_first_borrowed_va());
+}
+
+/* The same check from the housekeeping beat, said once.
+ *
+ * **Because the boot's last line is not reached by a run that hangs**, and a
+ * run that hangs is the one worth measuring. The beat keeps going — the board
+ * was still answering pings while the case under investigation sat stuck — so
+ * this is the one place that reports in both outcomes. One `if` on a
+ * once-a-second hook. */
+static void watch_for_borrowed_writes_from_beat(void) {
+    static bool said;
+    if (!said && pgtable_writes_into_borrowed() != 0u) {
+        said = true;
+        report_borrowed_table_writes();
+    }
+}
+
 static void report_the_hart_index(void) {
     uint32_t scans = smp_index_scans();
     uint32_t misses = smp_hart_misses();
@@ -1566,6 +1604,7 @@ static void bring_up_thermal(uint64_t dtb) {
      * first attached to: the range is only the boot's range if it begins
      * where the readings begin. */
     (void)timer_add_housekeeping_hook(sample_thermal_from_beat);
+    (void)timer_add_housekeeping_hook(watch_for_borrowed_writes_from_beat);
     {
         int32_t mdeg = temp_jh7110_millidegrees(&soc_temp);
         if (mdeg == TEMP_UNREADABLE) {
@@ -4159,6 +4198,7 @@ static void kmain_after_devices(uint64_t hart, uint64_t dtb) {
      * taken. */
     report_the_thermal_range();
     report_the_hart_index();
+    report_borrowed_table_writes();
     kprintf("minikern: boot complete\n");
     if (halt_requested()) {
         kprintf("minikern: powering off\n");
