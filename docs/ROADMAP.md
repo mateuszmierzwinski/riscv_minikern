@@ -2951,3 +2951,43 @@ the problem. Printing from the deadline sweep put thousands of lines through
 a console that holds the kernel lock, and the case then failed in a *third*
 place. **An instrument that changes the timing of the thing it measures is
 measuring itself.**
+
+### `me()` is a load, and the item asking for it was already satisfied
+
+The list said: *"`me()` scans the hart table on every call. (S) A cached
+index in `sscratch` would make it a load."* Checking before implementing
+found the table already there — `index_by_id[]`, built when the harts are
+enumerated, with the scan kept only as a fallback. The board says what it
+cost nothing to ask:
+
+    smp: hart index is a load (0 scans, 0 unidentified)
+
+Two things about the entry were wrong rather than stale, and both are worth
+keeping straight:
+
+- **Not in `sscratch`.** That register carries the kernel stack top, which
+  the trap path needs on every entry from user mode; `smp.c` already has the
+  comment saying so. The suggestion in the item would have broken the trap
+  path to save a bounds check.
+- **The existing counter could not be read.** `smp_hart_misses` counts the
+  case that matters — a hart that cannot identify itself, which used to be
+  given index 0 and so another hart's scheduler state — and **no caller
+  printed it**. A counter nobody reads is indistinguishable from a counter
+  that reads zero, which is this project's own lesson about detectors
+  printed before the run they measure, met a third time.
+
+So what this closes is not the optimisation but the **evidence**: "the fast
+path exists" and "the fast path is taken" are different claims, and only the
+second is worth anything. `smp_index_scans` counts a scan after the table is
+built and is reported beside the misses at the end of every boot, where a
+regression becomes a line rather than a mystery. The two fail differently —
+a scan costs time, a miss is a correctness bug — so they are reported as two
+numbers rather than one.
+
+One process note, because it happened twice in ten minutes while doing this:
+a Python `str.replace` that matches nothing writes the file back unchanged
+and reports success. The first one silently did not declare the function;
+the second invented `smp_index_misses` for something called
+`smp_hart_misses` and only the linker caught it. **This file's oldest lesson
+is that a textual edit matching nothing is a silent no-op**, and the fix is
+mechanical: assert the text changed.

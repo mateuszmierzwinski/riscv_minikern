@@ -119,9 +119,25 @@ int smp_enumerate(const struct fdt *fdt, uint64_t boot_hart) {
  * Counted rather than assumed away, because the fallback used to be silent
  * and a silent wrong answer here is the most expensive kind. */
 static uint32_t index_misses;
+/* How often the index was built and the scan ran anyway.
+ *
+ * **The list item this closes asked for a load rather than a scan**, and the
+ * table above is that load — but "implemented" and "taken" are different
+ * claims, and only one of them is worth anything. A hart id at or past
+ * `SMP_MAX_HARTS`, or an id the enumeration did not record, still falls
+ * through to the loop; on this board the ids are 1 to 4 and it should never
+ * happen, which is exactly the kind of should that wants a number beside it.
+ * Zero on the board means every `me()` in the boot was a bounds check and a
+ * byte load. */
+static uint32_t index_scans;
 
 uint32_t smp_hart_misses(void) {
     return index_misses;
+}
+
+/* How many times the hart-index lookup scanned after the table was built. */
+uint32_t smp_index_scans(void) {
+    return index_scans;
 }
 
 /* An id's index, so the common case is a load rather than a scan.
@@ -164,6 +180,9 @@ uint32_t smp_hart_index(void) {
         if (at != INDEX_UNKNOWN) {
             return at;
         }
+    }
+    if (index_built) {
+        __atomic_add_fetch(&index_scans, 1u, __ATOMIC_RELAXED);
     }
     for (uint32_t i = 0; i < count; i++) {
         if (harts[i].id == me) {

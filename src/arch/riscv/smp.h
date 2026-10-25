@@ -70,6 +70,13 @@ void smp_secondary_arrived(uint64_t hart);
  * boot hart's slot before `smp_enumerate` has run. */
 uint32_t smp_hart_index(void);
 
+/* How many hart-index lookups scanned the table after the index was built.
+ *
+ * Expected zero, and it is the difference between the fast path existing and
+ * the fast path being taken — which are the two things "a cached index would
+ * make it a load" can mean. */
+uint32_t smp_index_scans(void);
+
 /* The id of the hart this is running on, which is kept in `sscratch`'s
  * sibling — a per-hart register — rather than worked out, because there is
  * no instruction that asks "which hart am I" from S-mode. */

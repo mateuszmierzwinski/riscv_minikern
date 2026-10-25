@@ -906,6 +906,30 @@ static void bring_up_other_harts(uint64_t dtb, uint64_t boot_hart) {
 static void report_lock_contention(void);
 static void report_the_buses(uint64_t dtb);
 static void report_the_network_after_everything(void);
+/* Says whether `me()` was a load or a scan for the whole of this boot.
+ *
+ * **Reported because the counter existed and nothing read it.** The hart
+ * index has had a direct-mapped table for as long as it has had the scan it
+ * replaced, and `smp_index_misses` was already counting the case where a
+ * hart cannot identify itself — but no caller printed either number, so the
+ * tree carried an instrument that could not be consulted. A counter nobody
+ * reads is indistinguishable from a counter that reads zero, and this
+ * project has paid for that distinction twice already: once for detectors
+ * printed before the run they measured, once for a diagnostic the ordinary
+ * case flooded.
+ *
+ * Both are expected to be zero, and they fail differently. A scan means the
+ * fast path exists and is not being taken, which costs time; a miss means a
+ * hart could not identify itself at all, which means two harts sharing one
+ * scheduler's state and is a correctness bug.
+ */
+static void report_the_hart_index(void) {
+    uint32_t scans = smp_index_scans();
+    uint32_t misses = smp_hart_misses();
+    kprintf("smp: hart index %s (%u scans, %u unidentified)\n",
+            scans == 0u && misses == 0u ? "is a load" : "FELL BACK", scans, misses);
+}
+
 static void report_the_thermal_range(void);
 
 static void report_detectors(void) {
@@ -4134,6 +4158,7 @@ static void kmain_after_devices(uint64_t hart, uint64_t dtb) {
      * boot's last line is the one place every reading has already been
      * taken. */
     report_the_thermal_range();
+    report_the_hart_index();
     kprintf("minikern: boot complete\n");
     if (halt_requested()) {
         kprintf("minikern: powering off\n");
