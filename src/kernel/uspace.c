@@ -816,6 +816,46 @@ static void trace_handled_fault(const struct trapframe *tf, const char *how) {
             (unsigned long long)tf->sepc, (unsigned long long)tf->stval, how);
 }
 
+/* Whether an address is one no user program could have been executing.
+ *
+ * **Not a comparison against a constant.** This kernel is identity-mapped in
+ * the bottom half, so its own text is *below* `USER_TOP` and passes every
+ * naive range test — the roadmap's top-half item exists partly because of
+ * that, and two security holes came from the same place. The question that
+ * can be answered correctly today is the one the hardware asks: is this
+ * address mapped as user-executable? A pc that is not cannot have been
+ * fetched in user mode, whatever its numeric value.
+ *
+ * Unmapped counts as the kernel's too, which is deliberate: the case this
+ * was written for is an instruction fetch from kernel text whose mapping has
+ * gone, and treating "no mapping" as a user fault is how that was misread as
+ * a program producing no output.
+ */
+static bool pc_outside_user_space(virt_t pc) {
+    const struct pgtable *kernel = mmu_kernel_table();
+    phys_t phys = 0;
+    uint64_t flags = 0, size = 0;
+    if (kernel == NULL) {
+        return false;
+    }
+    /* **Asked of the kernel's table, not the faulting process's.**
+     *
+     * The first version asked the process and called anything unmapped the
+     * kernel's — which is every instruction page fault there is, since an
+     * instruction page fault *means* the page is not mapped. It turned a
+     * correct user fault into "the kernel itself faulted" and would have
+     * sent the next reader exactly as far wrong as the heading it replaced.
+     *
+     * The kernel's own table answers without depending on the mapping that
+     * just failed: kernel text is in it without `PTE_U`, and a user
+     * program's text is not in it at all — this board loads programs at
+     * 0x10000, below the DRAM the bottom-half identity map covers. */
+    if (!pgtable_lookup(kernel, pc, &phys, &flags, &size)) {
+        return false;
+    }
+    return (flags & PTE_U) == 0;
+}
+
 static bool on_user_trap(struct trapframe *tf) {
     if ((tf->scause & SCAUSE_INTERRUPT) != 0) {
         return false; /* an interrupt: the trap layer deals with those */
@@ -870,8 +910,30 @@ static bool on_user_trap(struct trapframe *tf) {
      * happened somewhere in this program" is not something anyone can act
      * on — and the thread's own stack is usually the first thing to compare
      * the faulting address against. */
-    kprintf("\nuspace: fault in user code (pid %u tid %llu, sp %016llx): %s at sepc %016llx, "
+    /* **A fault whose pc is the kernel's is not a fault in user code**, and
+     * saying so cost a session.
+     *
+     * This path is reached for any fault the handlers above did not resolve,
+     * and it headed every one of them "fault in user code" — which is true
+     * of almost all of them and badly false of the rest. A kernel that
+     * faults fetching its own instruction prints a line blaming the program,
+     * the board goes quiet, and the program looks as though it produced
+     * nothing: `rc` exec'd and silent was that, not a userland bug. The
+     * misreport is what made the two indistinguishable for a whole session.
+     *
+     * The test is the pc against the kernel's own load address, which is
+     * where this kernel still lives — the bottom-half identity map the
+     * roadmap wants to leave. A user program cannot execute there, so a pc
+     * inside it is the kernel's. */
+    bool pc_is_the_kernels = pc_outside_user_space(tf->sepc);
+    if (pc_is_the_kernels) {
+        kprintf("\nuspace: **the kernel itself faulted** — pc %016llx is not user-executable "
+                "memory\n",
+                (unsigned long long)tf->sepc);
+    }
+    kprintf("\nuspace: fault in %s (pid %u tid %llu, sp %016llx): %s at sepc %016llx, "
             "stval %016llx\n",
+            pc_is_the_kernels ? "the kernel" : "user code",
             uspace_current() != NULL ? uspace_current()->pid : 0u,
             (unsigned long long)sched_current_tid(), (unsigned long long)tf->x[2],
             trap_cause_name(tf->scause), (unsigned long long)tf->sepc,

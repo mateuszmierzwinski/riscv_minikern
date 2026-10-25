@@ -3128,3 +3128,53 @@ useless.
 Still unknown: whether a parent with several live children behaves the same.
 That is the shape a real init has, and it needs `nanosleep` fixed first so
 the siblings can stay alive to be company.
+
+### A forked child dies on an instruction page fault on its own text
+
+**The likely identity of QuokkaOS variant B**, and a fork bug rather than
+anything about waiting or about exec.
+
+Four children forked from one parent — pids 2, 3 and 4, every boot, the same
+fault — take an **instruction page fault** and die. They never reach their
+first instruction, so they produce no output, and that is exactly what
+variant B looks like from outside: `rc` exec'd and silent. For a whole
+session that was read as a program that ran and said nothing.
+
+What is ruled out already: the regions are copied (`child->vmas =
+parent->vmas` in `uspace_fork`), and the demand pager does handle
+`EXC_INSN_PAGE_FAULT` and asks the region for `PROT_EXEC`. So it is not the
+fifth instance of "a path that builds an address space and forgets to record
+it", which was the obvious guess.
+
+`src/userland/waitloop`'s `fork_bystanders` is the reproducer and is left in
+the tree, deliberately not called: it would fail a test whose subject is
+`wait4`, and a test that fails for something other than its subject is worse
+than no test. Changing the `(void)` to a call puts the fault three lines into
+the log.
+
+### "Fault in user code" was printed for every fault, including the kernel's
+
+The report that made the above take as long as it did. Every unresolved fault
+was headed **"fault in user code"** — true of almost all of them and badly
+false of the rest. A kernel that faults fetching its own instruction printed
+a line blaming the program, the board went quiet, and the program looked as
+though it produced nothing.
+
+It now names the faulting party, and getting that test right took two goes
+worth recording:
+
+- The first version asked the **faulting process's** tables whether the pc
+  was user-executable and called anything unmapped the kernel's. That is
+  every instruction page fault there is, since such a fault *means* the page
+  is not mapped — so it turned a correct user fault into "the kernel itself
+  faulted" and would have sent the next reader as far wrong as the heading it
+  replaced. Caught on the board, by a user fault reported as the kernel's.
+- The second asks the **kernel's own** table, which answers without
+  depending on the mapping that just failed: kernel text is in it without
+  `PTE_U`, and a program's text is not in it at all, this board loading
+  programs at 0x10000 below the DRAM the identity map covers.
+
+A comparison against a constant would not do, and the reason is the
+roadmap's own top-half item: this kernel is identity-mapped in the bottom
+half, so its text is *below* `USER_TOP` and passes every naive range test.
+Two security holes came from that same place.

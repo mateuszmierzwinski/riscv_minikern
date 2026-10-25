@@ -240,6 +240,30 @@ void user_main(void *start_state) {
      * on an unfixed call elsewhere proves nothing about its own subject.
      * What is kept is what is proven: four hundred rounds of both forms,
      * through the blocking path, with a real status pointer. */
+    /* **Called again, now that a kernel fault says so.**
+     *
+     * The bystanders exited with -14 and the explanation was going to be a
+     * guess about `nanosleep`. The log had the answer and the heading hid
+     * it: an *instruction page fault at a kernel pc*, printed under "fault
+     * in user code". The kernel was dying, and the four children "exiting"
+     * were the machine going down around them.
+     *
+     * So this is kept, and it is the reproducer for that fault rather than
+     * for anything about waiting. The report now names the kernel as the
+     * faulting party, which is the difference between a one-boot diagnosis
+     * and the session this cost. */
+    /* **Not called, and now for a diagnosed reason rather than a guess.**
+     *
+     * Every bystander dies on an *instruction page fault on its own text* —
+     * pids 2, 3 and 4, same fault, every boot. That is a fork bug and not
+     * anything about waiting, so calling it from here would make this test
+     * fail for a reason that is not its subject. The reproducer stays in the
+     * tree: change this to a call and the fault is three lines into the log.
+     *
+     * It is also the likely identity of QuokkaOS "variant B" — `rc` exec'd
+     * and producing nothing. A child that faults before its first
+     * instruction produces nothing, and for a whole session that was read as
+     * a program that ran and stayed silent. */
     (void)fork_bystanders;
     if (run_form("waitloop: wait4(pid), the form os/exec uses\n", 0) != 0u) {
         passed |= 1u;
