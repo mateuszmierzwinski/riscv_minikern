@@ -3356,23 +3356,44 @@ overflow; and `pmm_share` bounds-checks its frame index and returns
 `KERR_INVAL` for a frame it does not own, so sharing a page from outside the
 managed range cannot fault either.
 
-**The capability this is now blocked on is symbolisation.** The pc is
-precise and useless: nothing here can turn `0xffffffc00020a754` into a
-function name. `nm` reports "file format not recognized" for the linked
-kernel — the note in `CLAUDE.md` that GNU `ar` and `nm` read RV64 objects
-holds for objects and not for this ELF — and there is no `llvm-nm` on this
-machine. So the next step is a **linker map**: `ld.lld` will emit one with
-`-Map`, which resolves an address offline with no new host tool and no root.
-That is worth doing before the next attempt, because a kernel fault whose
-function cannot be named is the most expensive kind of evidence this project
-has: every previous one cost a session of elimination.
+**Symbolisation was never missing — I did not look.** The claim written here
+first, that nothing could turn `0xffffffc00020a754` into a name, was wrong in
+the most embarrassing way available: `minikern_board_elf` has existed in this
+`BUILD` for a long time, is the symbol-bearing twin of the board kernel
+linked at the same address, and its own comment says it is there to resolve
+an address the running board printed. `eu-readelf` (elfutils, installed)
+reads it: 1203 functions. One translation is needed — the symbols are at the
+kernel's link address, so a direct-map pc has its base swapped,
+`0xffffffc00020a754` → `0x4020a754`.
 
-**Attempted and backed out, so the next person does not repeat it:** adding
-`-Wl,-Map,$(RULEDIR)/<name>.map` to the kernel's `linkopts` fails analysis.
-`cc_binary` does not expand `$(RULEDIR)` there, and more fundamentally a map
-file is an *output*, which `cc_binary` has no way to declare — so it needs a
-small custom rule (or a `genrule` that re-links), not a one-line `linkopts`
-addition. That is the shape of the work; it was left undone rather than
-half-built.
+And then:
+
+| pc | function |
+|---|---|
+| `0x4020a754` | **`temp_jh7110_sample` (+14)** |
+| `0x4023b0b0` | `trap_handle` (+86) — the earlier kernel fault |
+
+**So the fault is not in `fork` at all.** It is in the **thermal sampler**,
+which runs from the ownerless housekeeping beat, under whatever address space
+happens to be loaded. The sensor's registers are a *device* mapping, made
+into the **kernel's** table with `mmu_map_device`; a process reaches them
+only because `share_kernel_mappings` copied the kernel's entries into its
+tables. That function has two cases, and the comment on its undo already
+names the dangerous one: a root-level entry shared **whole**, or a
+**collision** resolved by copying the kernel's level-1 entries one at a time.
+
+A copy is a snapshot. Recording the segments gives `fork` text pages to map
+into the child, and mapping them populates the level-1 table for the
+gigapage those addresses live in — after the child's
+`share_kernel_mappings` has already run. The beat then fires with the
+child's `satp` loaded, the thermal sampler dereferences a device address its
+table does not have, and the kernel takes a load page fault.
+
+That makes this the **fourth** bug from the bottom-half workaround, which
+the top-half item above already predicts: a memory corruption in teardown,
+two pointer-check security holes, and now a device mapping that a process
+can be missing. Moving the kernel to the top half makes the class
+unrepresentable; short of that, the mappings a process shares have to be a
+*view* of the kernel's rather than a copy taken at one instant.
 
 Reverted again, so the tree is green and the reproducer is one line from on.
