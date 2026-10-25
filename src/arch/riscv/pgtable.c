@@ -81,6 +81,55 @@ static void free_table(struct pgtable *pt, uint64_t *table, uint32_t level) {
     pt->mem.free(pt->mem.self, table);
 }
 
+/* Visits every leaf mapping below `below`, deepest-first within a table.
+ *
+ * **Because the page tables are the authority on what a process has.** The
+ * region record is the authority on what it is *entitled* to, and the two
+ * are not the same list: a program's text and data are mapped by the ELF
+ * loader and were never recorded, so anything that walks the regions — most
+ * importantly `fork` — does not see them. A child built that way dies on an
+ * instruction page fault at its own entry point, before its first
+ * instruction, producing no output at all.
+ *
+ * Recording the segments is the other way to fix that and it changes four
+ * things at once: placement, demand paging, reclaim and `fork`. This changes
+ * one. A visitor that returns anything but `KERR_OK` stops the walk and that
+ * value is returned.
+ */
+static int walk_leaves(const struct pgtable *pt, const uint64_t *table, uint32_t level, virt_t base,
+                       virt_t below, pgtable_leaf_fn fn, void *ctx) {
+    uint64_t span = 1ull << (12u + 9u * level);
+    for (uint32_t i = 0; i < PT_ENTRIES; i++) {
+        virt_t va = base + (virt_t)i * span;
+        int rc;
+        if (table[i] == 0 || va >= below) {
+            continue;
+        }
+        if (pte_is_table(table[i])) {
+            const uint64_t *next = pt->mem.to_virt(pt->mem.self, pte_phys(table[i]));
+            rc = walk_leaves(pt, next, level - 1u, va, below, fn, ctx);
+        } else {
+            /* The permission and status bits, which is what a caller means
+             * by a mapping's rights; the address is reported separately. */
+            rc = fn(ctx, va, pte_phys(table[i]),
+                    table[i] & (PTE_V | PTE_R | PTE_W | PTE_X | PTE_U | PTE_G | PTE_A | PTE_D |
+                                PTE_COW),
+                    span);
+        }
+        if (rc != KERR_OK) {
+            return rc;
+        }
+    }
+    return KERR_OK;
+}
+
+int pgtable_for_each_leaf(const struct pgtable *pt, virt_t below, pgtable_leaf_fn fn, void *ctx) {
+    if (pt == NULL || pt->root == NULL || fn == NULL) {
+        return KERR_INVAL;
+    }
+    return walk_leaves(pt, pt->root, PT_LEVELS - 1u, 0, below, fn, ctx);
+}
+
 void pgtable_destroy(struct pgtable *pt) {
     if (pt->root != NULL) {
         free_table(pt, pt->root, PT_LEVELS - 1u);

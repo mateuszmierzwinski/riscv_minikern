@@ -2858,6 +2858,51 @@ static void published_removal(void);
  * The parent's entry changes, which is a *removal* of rights, so it has to
  * reach every hart before either process runs again — the caller does that
  * once for the whole address space rather than once per page. */
+/* What `give_every_mapped_page` carries through the page-table walk. */
+struct handing_over {
+    struct uproc *child;
+    struct uproc *parent;
+};
+
+static int give_page_cow(struct uproc *child, struct uproc *parent, virt_t va);
+
+/* One leaf of the parent's tables, given to the child if it has none there.
+ *
+ * Skips a page the region pass has already handed over — `give_page_cow`
+ * would map it a second time and `pgtable_map` refuses an existing entry,
+ * which would fail the whole fork rather than the page. */
+static int give_this_leaf(void *ctx, virt_t va, phys_t pa, uint64_t prot, uint64_t size) {
+    struct handing_over *h = ctx;
+    phys_t already = 0;
+    uint64_t flags = 0, span = 0;
+    (void)pa;
+    if ((prot & PTE_U) == 0 || size != PAGE_SIZE) {
+        return KERR_OK; /* the kernel's own, or a large page the regions own */
+    }
+    if (pgtable_lookup(&h->child->pt, va, &already, &flags, &span)) {
+        return KERR_OK;
+    }
+    return give_page_cow(h->child, h->parent, va);
+}
+
+/* Gives the child every user page the parent has mapped.
+ *
+ * **Because the regions are not the whole truth.** A program's segments are
+ * mapped by the loader and never recorded, so the region pass above hands
+ * over the stack and the heap and silently omits the text — and the child
+ * then dies on an instruction page fault at its own entry point, before its
+ * first instruction, with no output at all. The page tables know what is
+ * really there, so this walks them.
+ *
+ * It runs *after* the region pass rather than instead of it, because that
+ * pass also takes the file references a region carries and handles the
+ * megapage case; this one is only concerned with pages nobody gave.
+ */
+static int give_every_mapped_page(struct uproc *child, struct uproc *parent) {
+    struct handing_over h = {.child = child, .parent = parent};
+    return pgtable_for_each_leaf(&parent->pt, USER_TOP, give_this_leaf, &h);
+}
+
 static int give_page_cow(struct uproc *child, struct uproc *parent, virt_t va) {
     phys_t phys = 0;
     uint64_t prot = 0, size = 0;
@@ -2941,6 +2986,12 @@ static int give_address_space(struct uproc *child, struct uproc *parent) {
     }
     /* The break is not an `mmap` region and is not recorded as one, so it
      * is walked explicitly. */
+    {
+        int rc = give_every_mapped_page(child, parent);
+        if (rc != KERR_OK) {
+            return rc;
+        }
+    }
     for (virt_t at = parent->brk_floor; at < parent->brk; at += PAGE_SIZE) {
         int rc = give_page_cow(child, parent, at);
         if (rc != KERR_OK) {

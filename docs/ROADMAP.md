@@ -3523,3 +3523,54 @@ recording has twice taken the board out of green for reasons of its own.
 defect can be reproduced at all.** That ordering was not obvious and cost
 several board runs to discover; anyone resuming this should start there
 rather than at the wait.
+
+### The fork defect is fixed: `fork` copies what is mapped, not what is recorded
+
+**The page tables are the authority on what a process has**; the region
+record says what it is *entitled* to, and the two are different lists. A
+program's segments are mapped by the loader and were never recorded, so
+`give_address_space` — which walked the regions — handed over the stack and
+the heap and silently omitted the text. The child then died on an
+instruction page fault at its own entry point, before its first instruction,
+producing no output at all.
+
+`pgtable_for_each_leaf` walks the parent's tables and `give_every_mapped_page`
+hands over any user page the region pass missed. It runs after that pass
+rather than instead of it, because the region pass also takes the file
+reference a region carries and handles the megapage case.
+
+**Why this rather than recording the segments.** Recording them is the other
+fix and it changes four things at once — placement, demand paging, reclaim
+and `fork` — and it twice took the board out of green: once with a kernel
+fault, once with the embedded program not running at all. This changes one
+thing. Measured: four forked children that used to die now live, and
+`demand: no region claims it` is gone.
+
+**The XFS b-tree case fails, and it is not this.** `§3: a b-tree extent fork
+and a 3,000-entry directory` reports `15 hashed` where the expectation wants
+`0 walked`. It fails identically with the change stashed — verified by
+checking that `give_every_mapped_page` was actually absent from the tree
+first, because a stash with the wrong paths reports an error and leaves
+everything in place, and the run after that one proved nothing. **A
+pre-existing failure, recorded here so it is not attributed to the next
+change either.**
+
+**What the fix makes reachable**, which is the interesting part: with four
+live children the kernel now takes a load page fault in **`plic_claim`** —
+reading the interrupt controller's claim register, a device window, from an
+external-interrupt handler. Whether the fix caused it or merely unblocked the
+configuration cannot be told from here, because four live forked children
+were impossible before it. It is the same class as the `temp_jh7110_sample`
+fault: a device window that a process's address space cannot reach.
+
+**And the sleeper reproducer finally works.** The entanglement recorded above
+is resolved in the right order: the children live, so the parent waits with
+company, and the wait does not return. The case gates the fork fix rather
+than the wait, because expecting 200 rounds would make it a second report of
+a defect already recorded rather than a gate on this one.
+
+**A trap worth the line it cost.** `scripts/whereis.sh` resolved that fault to
+`fp_enable` — implausible for a load fault, and wrong: the symbol twin was
+several commits old. The rebuilt twin said `plic_claim`, which is a device
+register and explains it exactly. **A wrong symbol is worse than no symbol,
+because it is acted on.** The script now rebuilds the twin itself.

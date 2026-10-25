@@ -143,6 +143,19 @@ uint32_t pgtable_writes_into_borrowed(void);
  * what identifies the region responsible. Meaningless when the count is 0. */
 virt_t pgtable_first_borrowed_va(void);
 
+/* Called for each leaf mapping a walk finds. Returning anything but KERR_OK
+ * stops the walk, and that value becomes the walk's result. */
+typedef int (*pgtable_leaf_fn)(void *ctx, virt_t va, phys_t pa, uint64_t prot, uint64_t size);
+
+/* Visits every leaf mapping below `below`.
+ *
+ * **The page tables are the authority on what a process has**, where the
+ * region record says what it is entitled to — and the two are different
+ * lists, because a program's segments are mapped by the loader and are not
+ * recorded. Anything that must act on what is really there, `fork` above
+ * all, walks this rather than the regions. */
+int pgtable_for_each_leaf(const struct pgtable *pt, virt_t below, pgtable_leaf_fn fn, void *ctx);
+
 /* An empty address space. KERR_OK or KERR_NOMEM. */
 int pgtable_create(struct pgtable *pt, const struct pt_mem *mem);
 

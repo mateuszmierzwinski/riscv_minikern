@@ -25,8 +25,20 @@ if [ $# -eq 0 ]; then
     echo "usage: $(basename "$0") <address> [address...]" >&2
     exit 2
 fi
+# **Rebuilt every time, because a stale twin answers confidently and wrongly.**
+#
+# The symbol table has to come from the same sources as the kernel that
+# printed the address. Resolving one pc against a twin built a few commits
+# earlier gave `fp_enable` for a load fault — implausible on its face, and the
+# rebuilt twin said `plic_claim`, which is a device register and explains the
+# fault exactly. A wrong symbol is worse than no symbol, because it is acted
+# on. Bazel makes this nearly free when nothing has changed.
+if ! bazel build //:minikern_board_elf >/dev/null 2>&1; then
+    echo "whereis: could not build the symbol twin" >&2
+    exit 1
+fi
 if [ ! -e "$elf" ]; then
-    echo "whereis: build it first: bazel build //:minikern_board_elf" >&2
+    echo "whereis: no symbol twin at $elf" >&2
     exit 1
 fi
 command -v eu-readelf >/dev/null 2>&1 || { echo "whereis: eu-readelf (elfutils) is required" >&2; exit 1; }
