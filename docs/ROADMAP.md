@@ -3178,3 +3178,58 @@ A comparison against a constant would not do, and the reason is the
 roadmap's own top-half item: this kernel is identity-mapped in the bottom
 half, so its text is *below* `USER_TOP` and passes every naive range test.
 Two security holes came from that same place.
+
+### No program's text was ever in its own address-space record
+
+**Fixed, and it is the fifth instance of this file's standing lesson.**
+
+`record_fixed_regions` recorded the stack and the trampoline. It knew nothing
+about **segments**, so for the whole life of this kernel a program's text and
+data were mapped and never recorded. Nothing noticed while a program only
+ever *ran*: the pages are mapped, so execution is fine, and the record is
+consulted by placement and by `fork`.
+
+`fork` is where it showed. `give_address_space` walks the regions, so a page
+no region claims is a page the child never gets — and the child then died on
+an **instruction page fault at its own entry point**, before its first
+instruction, producing no output at all. Measured rather than reasoned:
+`demand: pid 2 fault at 00000000000101ee: no region claims it`, for pids 2
+through 5, every boot.
+
+That is almost certainly QuokkaOS **variant B** — `rc` exec'd and silent. A
+child that cannot reach its first instruction produces nothing, and for a
+session that was read as a program which ran and said nothing.
+
+The recording now happens in `load_segment`, the function that does the
+mapping, which is where this file has said four times before that it belongs:
+not in a shared epilogue a path can forget to call, and `record_fixed_regions`
+was exactly such an epilogue. The union with any region already covering the
+page matters at a segment boundary — the linker can put the end of a
+read-only segment and the start of a writable one on one page, and the
+mapping widens the page's permissions to both, so a region claiming less
+would refuse a store the hardware permits.
+
+### `clone` returns a pid the parent cannot yet find
+
+What the fix above uncovered, and the reason a parent with several children
+is slow rather than broken.
+
+With the bystanders alive, every `wait4` costs the **full one-second
+deadline**:
+
+    w4: pid 1 wants 6: absent, zombie 0, children 5
+
+`uspace_by_pid(6)` answers *absent* for the child whose pid `clone` has just
+returned, while `uspace_count_children` already counts five. So the parent's
+first look finds nothing, it sleeps, and only the deadline rescues it — after
+which the child has not merely appeared but already exited. The wait is
+correct and a thousand times slower than it should be.
+
+With one child the timing happens to work, which is why the committed test
+passes four hundred rounds: **the window is the gap between `clone`
+publishing its return value and the child's process slot becoming visible**,
+and four live siblings widen it enough to lose every time.
+
+So the test ships in the configuration that is proven, with one line to turn
+the reproducer on. A case that is correct and twenty times too slow times out
+rather than failing, which is the least useful way for a gate to break.

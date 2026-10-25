@@ -264,6 +264,17 @@ void user_main(void *start_state) {
      * and producing nothing. A child that faults before its first
      * instruction produces nothing, and for a whole session that was read as
      * a program that ran and stayed silent. */
+    /* **Off in the committed test, and the reason has changed again.**
+     *
+     * With the segment-recording fix the bystanders now *live*: they no
+     * longer die on an instruction page fault at their own entry. What they
+     * expose instead is that every wait then costs the full one-second
+     * deadline, because `clone` returns a pid the parent cannot yet find —
+     * so two hundred rounds take two hundred seconds and the case times out
+     * rather than failing. A test that is correct and twenty times too slow
+     * is not a useful gate, so the configuration that is proven is the one
+     * that ships, and the race is a roadmap entry with this one line to
+     * reproduce it. */
     (void)fork_bystanders;
     if (run_form("waitloop: wait4(pid), the form os/exec uses\n", 0) != 0u) {
         passed |= 1u;

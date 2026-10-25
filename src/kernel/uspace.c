@@ -658,6 +658,22 @@ static bool back_on_demand(struct trapframe *tf) {
     }
     region = vma_find(&me->vmas, tf->stval);
     if (region == NULL || region->prot == 0) {
+        /* **Which address, and whether there was a region at all.**
+         *
+         * A forked child dying on an instruction fetch at its own entry is
+         * either a page that was never given to it or an address it has no
+         * claim on, and the region record is what separates those. If this
+         * says "no region" for the program's entry point, the parent's text
+         * is mapped but unrecorded — so `give_address_space`, which walks
+         * the regions, never copied it. Capped, because a reservation is
+         * *supposed* to keep faulting and would otherwise flood this. */
+        static uint32_t said;
+        if (said < 5u) {
+            said++;
+            kprintf("demand: pid %u fault at %016llx: %s\n", me->pid,
+                    (unsigned long long)tf->stval,
+                    region == NULL ? "no region claims it" : "a reservation with no rights");
+        }
         return false; /* not ours, or a reservation that must keep faulting */
     }
     want = code == EXC_INSN_PAGE_FAULT ? PROT_EXEC
@@ -1141,6 +1157,37 @@ static int load_segment(struct uproc *p, const struct elf_load *l, const uint8_t
             }
         }
         (void)want;
+    }
+    /* **Recorded here, in the function that mapped it.**
+     *
+     * A segment was mapped and never recorded, so for the whole life of this
+     * kernel no program's text appeared in its own address-space record.
+     * Nothing noticed while a program only ever *ran*: the pages are mapped,
+     * so execution is fine, and the record is consulted by placement and by
+     * `fork`.
+     *
+     * `fork` is where it showed. `give_address_space` walks the regions, so
+     * a page no region claims is a page the child never gets — and the child
+     * then dies on an instruction page fault at its own entry point, before
+     * its first instruction, producing no output at all. That is what a
+     * silent exec'd program had been for a whole session.
+     *
+     * This file's standing lesson is that the recording belongs **with the
+     * mapping**, in the same function, not in a shared epilogue a path can
+     * forget to call — and `record_fixed_regions` was exactly such an
+     * epilogue, recording the stack and the trampoline and knowing nothing
+     * about segments. Fifth instance of the same shape; the first four each
+     * looked like an isolated slip.
+     *
+     * The union with whatever is already there matters at a segment
+     * boundary: the linker can put the end of a read-only segment and the
+     * start of a writable one on one page, and the mapping above already
+     * widens the page's permissions to both. A region that claimed less
+     * than the page allows would refuse a store the hardware permits. */
+    {
+        const struct vma *already = vma_find(&p->vmas, start);
+        uint32_t prot = l->prot | (already != NULL ? already->prot : 0u);
+        (void)vma_insert(&p->vmas, start, end, prot, 0);
     }
     return KERR_OK;
 }

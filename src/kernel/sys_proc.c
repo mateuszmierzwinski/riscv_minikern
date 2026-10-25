@@ -586,6 +586,23 @@ static int64_t sys_wait4(struct trapframe *tf) {
         if ((options & WNOHANG) != 0) {
             return 0; /* nothing finished, and the caller does not want to wait */
         }
+        /* **What the loop sees each time round**, for the per-pid form.
+         *
+         * A C reproducer hangs here when the parent has four other live
+         * children and passes four hundred rounds when it has none, so the
+         * question is which of the loop's three answers changes: no child
+         * found, a child found but not a zombie, or never waking at all.
+         * Capped tight, because the answer is in the first few rounds. */
+        if (want > 0) {
+            static uint32_t said;
+            if (said < 8u) {
+                said++;
+                kprintf("w4: pid %u wants %lld: %s, zombie %u, children %u\n", me->pid,
+                        (long long)want, child == NULL ? "absent" : "found",
+                        child != NULL && child->zombie ? 1u : 0u,
+                        uspace_count_children(me->pid));
+            }
+        }
         if (uspace_count_children(me->pid) == 0) {
             return KERR_CHILD;
         }
