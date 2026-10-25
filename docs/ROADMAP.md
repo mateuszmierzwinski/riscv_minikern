@@ -3233,3 +3233,146 @@ and four live siblings widen it enough to lose every time.
 So the test ships in the configuration that is proven, with one line to turn
 the reproducer on. A case that is correct and twenty times too slow times out
 rather than failing, which is the least useful way for a gate to break.
+
+### The clock stops with everything asleep, and that is the sleeper bug
+
+**Characterised, with a deterministic reproducer, and not yet fixed.** This is
+the defect behind the `irqwait` sleeper that "never returns" — and therefore
+behind the spin-with-the-lock-released fallback in the SD and NVMe drivers —
+and behind variant A of the QuokkaOS case.
+
+The reproducer is one line in `src/userland/waitloop`: give the parent four
+children that sleep, then have it `wait4` for a fifth. Measured, in order:
+
+| Question | Answer |
+|---|---|
+| Is the parent's thread blocked properly? | **Yes.** `tick: tid 1 chan 0xffffffc0003371c8 deadline 21727736250 now 20733049250` — blocked on a real channel with a deadline one second out |
+| Does the timer tick run? | **Yes, at first** — every ~18 ms, up to about 20.8 s |
+| Does the sweep ever find that thread due? | **Never** |
+| Does the tick run near the deadline? | **No.** With the cap aimed at the window — fire only once a channel-waiter is within 100 ms of its deadline — there is *nothing*. The clock has stopped before the deadline arrives |
+
+So the machine goes fully idle at about 20.8 s and never wakes: every
+deadline anything is waiting on, including the one second that is a `wait4`'s
+only guarantee of progress, simply never arrives.
+
+**One real defect found on the way and fixed**, though it was not sufficient:
+an idle hart armed the timer for an instant **already past** —
+`arm: sleeper 20769933500, arming 20671982250, now 20683907000`, twelve
+milliseconds behind the clock. `next_deadline` can return a slice or
+housekeeping deadline computed earlier and since gone by, which is ordinary.
+Arming behind the clock loses the interrupt. `sched_arm_timer` now never arms
+for a past instant; the hang survives it, so there is more than one way to
+lose the clock here.
+
+**The next measurement** is `stop_the_clock` and `timer_arm_at`: print the
+last arming each hart performs before the silence, and whether
+`earliest_deadline()` was zero at that moment. `when == 0` is the one path
+that deliberately stops the clock, and whether it is taken while a sleeper
+exists is a yes-or-no question.
+
+**Four instrument mistakes in this one hunt**, all the same shape and all
+worth the space:
+
+1. A filter on `futex_addr == 0` that excluded the subject as well as the
+   noise, so "nothing printed" could not be read.
+2. A cap of four spent on ticks from early boot where nothing was blocked.
+3. A cap of six spent on the four sleeping siblings, which wake every 100 ms.
+4. A trace printed *after* the guard that nulls `child` for a live process,
+   which read "absent" for a pid plainly in the table — and produced a
+   confident wrong conclusion about `clone` that had to be withdrawn.
+
+The rule each one teaches is the same and this file has now stated it five
+ways: **aim the cap at the window that matters, and make silence mean one
+thing.** The version that finally answered the question prints only when a
+waiter is within 100 ms of its deadline, so nothing is itself the finding.
+
+### The segment-recording fix is reverted: it broke a passing test
+
+Recording a program's segments is the **right** fix for the forked child that
+dies on an instruction page fault at its own entry — `give_address_space`
+walks the regions, and a page no region claims is a page the child never
+gets. That part is measured and certain.
+
+Adding the record made the `wait4` case, which had passed **four hundred
+rounds**, hang at the first one. So it is reverted, and the reason is a rule
+rather than a preference: **a fix that breaks a passing test is not a fix
+yet.**
+
+The likely cause is the second half of what recording changes. With the text
+recorded, `fork` shares those pages and takes a reference on each — a path
+that was previously unreachable, because text was never copied into a child
+at all. Something in the sharing or the release of those pages is wrong, and
+it only became reachable when the record appeared.
+
+**How to resume**, in order, because this was nearly fixed twice by guessing:
+
+1. Put the recording back and confirm the single-child case still hangs —
+   that is the whole basis for the attribution and it is one boot.
+2. Watch what happens to a text page's reference count across the child's
+   exit: `mem_page_shares` on the parent's entry point before the fork,
+   after it, and after the child is reaped. A parent whose text page is
+   freed under it explains a hang with no output exactly.
+3. Only then look at `give_page_cow`'s read-only branch, which shares
+   without marking copy-on-write and is where a count would go astray.
+
+Two things were tried and reverted with it, both wrong:
+
+- **Clamping `sched_arm_timer` away from past instants.** The measurement
+  behind it is real — an idle hart armed for twelve milliseconds behind the
+  clock — but arming 50 us ahead instead invites the comparator to re-fire
+  immediately, and the case still hung. A real defect with a fix that is not
+  obviously safe is worse than the defect until it is measured; the
+  measurement is in the entry above and the fix is not.
+- The per-tick diagnostics, which scanned 256 thread slots twice on every
+  timer interrupt with the kernel lock held. An instrument on the clock path
+  changes the clock.
+
+### What the segment-recording round eliminated, and the capability it lacks
+
+Taking the measurement the previous entry prescribed, in one boot, rather
+than guessing again. Recording was put back and the reference count watched
+across the fork:
+
+    shares (before the fork): pid 1 entry 00000000000101c8 held by 1
+    shares (after the fork):  pid 1 entry 00000000000101c8 held by 2
+
+**The counts are right**, so the hypothesis the previous entry recommended —
+a text page freed under the parent by a mis-count — is **out**. "After the
+reap" never printed, because the parent never gets there.
+
+What actually happens is in the log, now that the fault report names the
+faulting party:
+
+    uspace: **the kernel itself faulted** — pc ffffffc00020a754 is not
+    user-executable memory
+    uspace: fault in the kernel (pid 1 tid 0, sp ffffffc000647780): load
+    page fault
+
+So recording the segments makes the **kernel** dereference something bad, on
+a kernel stack, three times over. Two more candidates are eliminated by
+reading rather than by booting: `vma_insert` bounds-checks against
+`VMA_MAX` (128) and returns `KERR_NOMEM`, so the region array cannot
+overflow; and `pmm_share` bounds-checks its frame index and returns
+`KERR_INVAL` for a frame it does not own, so sharing a page from outside the
+managed range cannot fault either.
+
+**The capability this is now blocked on is symbolisation.** The pc is
+precise and useless: nothing here can turn `0xffffffc00020a754` into a
+function name. `nm` reports "file format not recognized" for the linked
+kernel — the note in `CLAUDE.md` that GNU `ar` and `nm` read RV64 objects
+holds for objects and not for this ELF — and there is no `llvm-nm` on this
+machine. So the next step is a **linker map**: `ld.lld` will emit one with
+`-Map`, which resolves an address offline with no new host tool and no root.
+That is worth doing before the next attempt, because a kernel fault whose
+function cannot be named is the most expensive kind of evidence this project
+has: every previous one cost a session of elimination.
+
+**Attempted and backed out, so the next person does not repeat it:** adding
+`-Wl,-Map,$(RULEDIR)/<name>.map` to the kernel's `linkopts` fails analysis.
+`cc_binary` does not expand `$(RULEDIR)` there, and more fundamentally a map
+file is an *output*, which `cc_binary` has no way to declare — so it needs a
+small custom rule (or a `genrule` that re-links), not a one-line `linkopts`
+addition. That is the shape of the work; it was left undone rather than
+half-built.
+
+Reverted again, so the tree is green and the reproducer is one line from on.

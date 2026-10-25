@@ -260,6 +260,16 @@ void uspace_release(struct uproc *p);
 /* The process with this pid, or NULL. */
 struct uproc *uspace_by_pid(uint32_t pid);
 
+/* Prints the pids the process table holds, capped at a few calls. For a
+ * lookup that answered absent for a process the caller had just been
+ * handed: the answer and the evidence then come from one instant. */
+void uspace_report_pids(const char *why);
+
+/* How many processes hold the frame behind a process's entry point, for the
+ * question of whether recording the segments makes `fork` mis-count the
+ * text pages it then shares. Capped at a few calls. */
+void uspace_report_entry_shares(const char *when, const struct uproc *p);
+
 /* A zombie child of `parent`, or NULL when it has none. */
 struct uproc *uspace_reapable_child(uint32_t parent_pid);
 

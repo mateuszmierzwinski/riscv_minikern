@@ -23,6 +23,7 @@
 
 #include "core/console.h"
 #include "arch/riscv/sbi.h"
+#include "arch/riscv/timer.h"
 #include "core/errno.h"
 #include "kernel/file.h"
 #include "core/access.h"
@@ -548,6 +549,8 @@ static int64_t sys_wait4(struct trapframe *tf) {
     int64_t want = (int64_t)sysarg(tf, 0);
     virt_t status_at = sysarg(tf, 1);
     uint64_t options = sysarg(tf, 2);
+    bool found_it = false;
+    uint64_t began = 0;
     struct uproc *me = uspace_current();
     struct uproc *child;
     uint32_t pid;
@@ -572,8 +575,17 @@ static int64_t sys_wait4(struct trapframe *tf) {
                     uspace_count_children(me->pid));
         }
     }
+    began = timer_ns();
     for (;;) {
         child = want > 0 ? uspace_by_pid((uint32_t)want) : uspace_reapable_child(me->pid);
+        /* **The lookup's own answer, kept before the guard below can change
+         * it.** That guard nulls `child` for a child that is not yet a
+         * zombie, which is correct and is also how a diagnostic printed
+         * after it came to read "absent" for a process plainly in the table
+         * — and that misreading cost a wrong conclusion about `clone`. A
+         * trace must report the thing it names, at the point that thing is
+         * decided. */
+        found_it = child != NULL;
         if (child != NULL && want > 0 && (child->parent_pid != me->pid || !child->zombie)) {
             child = child->parent_pid == me->pid ? NULL : child;
             if (child != NULL) {
@@ -597,10 +609,9 @@ static int64_t sys_wait4(struct trapframe *tf) {
             static uint32_t said;
             if (said < 8u) {
                 said++;
-                kprintf("w4: pid %u wants %lld: %s, zombie %u, children %u\n", me->pid,
-                        (long long)want, child == NULL ? "absent" : "found",
-                        child != NULL && child->zombie ? 1u : 0u,
-                        uspace_count_children(me->pid));
+                kprintf("w4: pid %u wants %lld: lookup %s, round %u, waited %llu ms\n", me->pid,
+                        (long long)want, found_it ? "found it" : "absent", rounds,
+                        (unsigned long long)((timer_ns() - began) / 1000000ull));
             }
         }
         if (uspace_count_children(me->pid) == 0) {

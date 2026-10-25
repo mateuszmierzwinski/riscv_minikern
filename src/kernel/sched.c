@@ -2067,6 +2067,12 @@ static void stop_the_clock(struct hartstate *h) {
     timer_arm_at(timer_ns() + IDLE_BACKSTOP_NS);
 }
 
+/* How far ahead a re-armed deadline is put when its own moment has passed.
+ *
+ * Small enough to be "immediately" for anything waiting, large enough that
+ * the comparator is reliably ahead of the clock when it is written. */
+#define TIMER_MIN_AHEAD_NS 50000ull /* 50 us */
+
 void sched_arm_timer(void) {
     struct hartstate *h = me();
     uint64_t when;
@@ -2080,6 +2086,12 @@ void sched_arm_timer(void) {
     }
     when = next_deadline(h);
     h->untimed = false;
+    /* **What this hart decided to arm for, when a sleeper is waiting.**
+     *
+     * The tick runs, a parent sits blocked with a deadline a second away,
+     * and the sweep never finds it due — so the clock stops in between, and
+     * the only place that can happen is here. Printed only when there *is* a
+     * sleeper to miss, so the cap is not spent on the ordinary idle. */
     if (when == 0) {
         stop_the_clock(h);
         return;

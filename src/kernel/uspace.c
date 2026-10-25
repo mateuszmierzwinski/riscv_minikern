@@ -1158,37 +1158,12 @@ static int load_segment(struct uproc *p, const struct elf_load *l, const uint8_t
         }
         (void)want;
     }
-    /* **Recorded here, in the function that mapped it.**
-     *
-     * A segment was mapped and never recorded, so for the whole life of this
-     * kernel no program's text appeared in its own address-space record.
-     * Nothing noticed while a program only ever *ran*: the pages are mapped,
-     * so execution is fine, and the record is consulted by placement and by
-     * `fork`.
-     *
-     * `fork` is where it showed. `give_address_space` walks the regions, so
-     * a page no region claims is a page the child never gets — and the child
-     * then dies on an instruction page fault at its own entry point, before
-     * its first instruction, producing no output at all. That is what a
-     * silent exec'd program had been for a whole session.
-     *
-     * This file's standing lesson is that the recording belongs **with the
-     * mapping**, in the same function, not in a shared epilogue a path can
-     * forget to call — and `record_fixed_regions` was exactly such an
-     * epilogue, recording the stack and the trampoline and knowing nothing
-     * about segments. Fifth instance of the same shape; the first four each
-     * looked like an isolated slip.
-     *
-     * The union with whatever is already there matters at a segment
-     * boundary: the linker can put the end of a read-only segment and the
-     * start of a writable one on one page, and the mapping above already
-     * widens the page's permissions to both. A region that claimed less
-     * than the page allows would refuse a store the hardware permits. */
-    {
-        const struct vma *already = vma_find(&p->vmas, start);
-        uint32_t prot = l->prot | (already != NULL ? already->prot : 0u);
-        (void)vma_insert(&p->vmas, start, end, prot, 0);
-    }
+    /* **The segments are deliberately NOT recorded here.** It is the right
+     * fix for a forked child that dies on its own text, and it makes the
+     * kernel take a load page fault — see docs/ROADMAP.md, which records
+     * what that round eliminated. `fork_bystanders` in
+     * `src/userland/waitloop` is the one-line reproducer. */
+
     return KERR_OK;
 }
 
@@ -1668,6 +1643,7 @@ void uspace_wait_for_vfork(struct uproc *child) {
 
 void uspace_wait_for_child(struct uproc *parent) {
     (void)sched_wait_on(parent, timer_ns() + 1000000000ull);
+
 }
 
 /* Where an `execve` assembles the new address space before adopting it.
@@ -2147,6 +2123,52 @@ void uspace_release(struct uproc *p) {
     if (p != NULL) {
         *p = (struct uproc){0};
     }
+}
+
+/* The pids the table holds, for a lookup that answered absent for a child
+ * the caller had just been given. One call, so the answer and the evidence
+ * for it come from the same instant rather than from two different ones. */
+void uspace_report_pids(const char *why) {
+    static uint32_t said;
+    if (said >= 3u) {
+        return;
+    }
+    said++;
+    kprintf("pids (%s):", why);
+    for (uint32_t i = 0; i < PROC_MAX; i++) {
+        if (procs[i].used) {
+            kprintf(" %u%s", procs[i].pid, procs[i].zombie ? "Z" : "");
+        }
+    }
+    kprintf("\n");
+}
+
+/* How many processes hold the frame behind a process's entry point.
+ *
+ * **The measurement that decides whether recording the segments is safe.**
+ * Recording them makes `fork` share the text pages and take a reference on
+ * each — a path that was unreachable while text was never copied at all. If
+ * that count does not come back down when the child is reaped, or comes down
+ * twice, the parent's own text is freed under it, which is a hang with no
+ * output and nothing to see afterwards.
+ *
+ * Three calls answer it: before the fork, after it, and after the reap.
+ */
+void uspace_report_entry_shares(const char *when, const struct uproc *p) {
+    static uint32_t said;
+    phys_t phys = 0;
+    uint64_t flags = 0, size = 0;
+    if (p == NULL || said >= 8u) {
+        return;
+    }
+    said++;
+    if (!pgtable_lookup(&p->pt, p->entry, &phys, &flags, &size)) {
+        kprintf("shares (%s): pid %u entry %016llx is NOT MAPPED\n", when, p->pid,
+                (unsigned long long)p->entry);
+        return;
+    }
+    kprintf("shares (%s): pid %u entry %016llx held by %u\n", when, p->pid,
+            (unsigned long long)p->entry, mem_page_shares(phys & ~(phys_t)(PAGE_SIZE - 1u)));
 }
 
 struct uproc *uspace_by_pid(uint32_t pid) {
