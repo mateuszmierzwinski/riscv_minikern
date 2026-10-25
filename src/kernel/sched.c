@@ -2093,11 +2093,44 @@ void sched_arm_timer(void) {
      * the only place that can happen is here. Printed only when there *is* a
      * sleeper to miss, so the cap is not spent on the ordinary idle. */
     if (when == 0) {
+        /* **The one branch that deliberately stops the clock**, and whether
+         * it is taken while something is waiting on a deadline is a yes-or-no
+         * question I kept describing as the next step without asking it.
+         *
+         * If it fires with a sleeper outstanding, that sleeper's deadline can
+         * never arrive — which is exactly the observed hang: a parent blocked
+         * in `wait4` with a one-second deadline, ticks running and then not,
+         * and nothing within 100 ms of the deadline. */
         stop_the_clock(h);
         return;
     }
     h->backstop = false;
     timer_arm_at(when);
+    /* **Whether this hart can actually take the interrupt it just armed.**
+     *
+     * Eliminated already: the clock is never deliberately stopped with a
+     * sleeper waiting, and the lost-deadline invariant — which asks whether
+     * the soonest deadline is armed *somewhere* — reads zero in every
+     * hanging run. So the deadline is armed and the interrupt does not
+     * arrive, and what is left is the hart's own enable bit.
+     *
+     * This tree has had exactly this bug once before, the other way round:
+     * software interrupts were enabled on the secondaries and not on the
+     * boot hart, and it cost nothing until the first poke aimed at a busy
+     * hart. `SIE_STIE` is bit 5 of `sstatus`'s companion. Said once per
+     * hart, because the answer cannot change after boot. */
+    {
+        static uint64_t told;
+        uint32_t me_index = smp_hart_index();
+        if ((told & (1ull << (me_index & 63u))) == 0) {
+            uint64_t sie = 0;
+            __asm__ volatile("csrr %0, sie" : "=r"(sie));
+            told |= 1ull << (me_index & 63u);
+            kprintf("clock: hart %u armed at %llu; sie %llx, timer %s\n", me_index,
+                    (unsigned long long)when, (unsigned long long)sie,
+                    (sie & (1ull << 5)) != 0 ? "ENABLED" : "**DISABLED**");
+        }
+    }
     check_deadline_is_armed(h->current == SCHED_NO_THREAD ? "idle" : "running");
 }
 

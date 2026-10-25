@@ -3474,3 +3474,40 @@ code and is **not** what happened in that run: the fault was intermittent, or
 had another cause entirely. The confirmed part is narrower and still worth
 having: `pgtable_map` genuinely cannot tell a borrowed table from its own,
 and nothing had ever checked whether it was being written through.
+
+### The sleeper hang: four more eliminations, and the entanglement that blocks it
+
+Asking the questions this file kept calling "the next step", in one sitting.
+
+| Question | Answer |
+|---|---|
+| Is `stop_the_clock` taken while a sleeper is waiting? | **No.** Instrumented that exact branch; it never fires with `earliest_deadline() != 0` |
+| Does the lost-deadline invariant fire? | **No.** `sched: LOST DEADLINE` is **0** in every hanging run — so the soonest deadline *is* armed somewhere |
+| Does the overdue-sleeper check fire? | **No**, also 0 — consistent with the clock having stopped, since that check needs it |
+| Can the harts take a timer interrupt at all? | **Yes.** `clock: hart 1 armed at 20486403250; sie 222, timer ENABLED` and `hart 2 ... sie 22, timer ENABLED` |
+
+So the deadline is armed, the hart can take the interrupt, nothing stops the
+clock deliberately, and the interrupt still does not arrive. What is left is
+`timer_arm_at` itself — the value it writes, or where it writes it — and that
+is the next measurement rather than another candidate.
+
+**One asymmetry found and explained rather than filed as a bug.** Hart 1
+reads `sie 0x222` and hart 2 `0x22`: bit 9, `SEIE`, is set on one and not the
+other. That is by design — `csrs sie, 1<<9` lives in the PLIC's init, which
+runs once on the boot hart, and the PLIC has a single context, that hart's.
+An external interrupt is routed to exactly the hart that can take it. Worth
+writing down because it looks like the bug this tree has already had once (
+software interrupts enabled on the secondaries and not the boot hart) and is
+not.
+
+**The entanglement is the real obstacle, and it is worth stating plainly.**
+The reproducer for the sleeper hang needs a parent with several *live*
+children. Without the segment recording those children die on an instruction
+page fault at their own entry — so the test measures a parent with no
+children and never reaches the hang. With the recording they live, and the
+recording has twice taken the board out of green for reasons of its own.
+
+**So the fork defect has to be fixed first, properly, before the sleeper
+defect can be reproduced at all.** That ordering was not obvious and cost
+several board runs to discover; anyone resuming this should start there
+rather than at the wait.
