@@ -157,6 +157,10 @@ struct uproc {
      * because the kernel had nowhere to put them. */
     uint32_t groups[PROC_MAX_GROUPS];
     uint32_t ngroups;
+    /* The bits a create must not grant. Inherited by a fork and **kept
+     * across an execve**, which is what the ABI says: a shell sets it once
+     * and every program it runs is meant to honour it. */
+    uint32_t umask;
     /* **Resource limits, soft and hard.**
      *
      * Only the ones this kernel can actually enforce are kept: descriptors,
@@ -516,6 +520,15 @@ uint64_t uspace_syscalls(void);
  * hart whose cached translations had not caught up. It is the price of not
  * broadcasting a fence on every mapping, and worth being able to see: if it
  * ever grew large, the trade would be the wrong way round. */
+/* The running process's umask, for the filesystem's installed reader. A
+ * function rather than the field, so that nothing outside this module needs
+ * a `struct uproc` to ask. */
+uint32_t uspace_current_umask(void);
+
+/* Sets the running process's umask, for the board self-test — which runs in
+ * the kernel and has no syscall layer to go through. */
+void uspace_set_umask_for_test(uint32_t mask);
+
 uint64_t uspace_stale_faults(void);
 
 /* Makes a *new* mapping reach every hart, not just this one.

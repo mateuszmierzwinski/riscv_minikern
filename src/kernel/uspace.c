@@ -3596,3 +3596,15 @@ virt_t uspace_brk(struct uproc *p, virt_t want) {
     published_addition();
     return p->brk;
 }
+
+uint32_t uspace_current_umask(void) {
+    const struct uproc *me = uspace_current();
+    return me == NULL ? 0u : me->umask;
+}
+
+void uspace_set_umask_for_test(uint32_t mask) {
+    struct uproc *me = uspace_current();
+    if (me != NULL) {
+        me->umask = mask & 07777u;
+    }
+}

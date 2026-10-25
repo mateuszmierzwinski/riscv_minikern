@@ -197,6 +197,36 @@ int xfsmount_hash_file(const char *path, uint8_t digest[32], uint64_t *size) {
  * filesystem by hand (`minikern.disk=`, the self-tests) still resolves
  * through it. Dropping the fallback would be tidier and would break the
  * board tests, which mount a RAM disk directly. */
+/* The permission bits a new file gets, with the caller's umask applied.
+ *
+ * **This exists so that `umask` is a setting rather than a stored number.**
+ * A per-process field nothing consults is the failure this tree has recorded
+ * seven times — a mechanism complete, commented and never read — so the
+ * syscall and the create path went in together rather than the syscall
+ * first.
+ *
+ * `0666` is the base for a file, which is what every Unix grants before the
+ * mask: the execute bit is never given by a create, because a program that
+ * wants one says so. A process with no `umask` set has zero, which grants
+ * all six bits and is what this kernel did before the field existed — so
+ * nothing changes for a caller that never asks.
+ */
+/* **Installed, not called.** This file must not learn what a process is:
+ * `uspace` depends on it for `execve`, so an include the other way would
+ * invert the layering — which is why the wall clock arrived here the same
+ * way. The composition root installs a reader; until it does, the mask is
+ * zero and a create grants what it always did. */
+static uint32_t (*umask_source)(void);
+
+void xfsmount_set_umask_source(uint32_t (*source)(void)) {
+    umask_source = source;
+}
+
+static uint32_t create_permissions(uint32_t base) {
+    uint32_t mask = umask_source == NULL ? 0u : umask_source();
+    return base & ~mask & 07777u;
+}
+
 static struct xfs *owner_of(const char *path, const char **within) {
     struct xfs *v = volumes_resolve(path, within);
     if (v != NULL) {
@@ -838,7 +868,8 @@ __attribute__((noinline)) static int find_or_make_leaf(struct xfs *vol, const ch
     }
     rc = xfs_dir_lookup(vol, &parent, leaf, leaflen, ino);
     if (rc == KERR_NOENT) {
-        rc = xfs_create(vol, &parent, leaf, leaflen, 0100644u, now_seconds(), ino);
+        rc = xfs_create(vol, &parent, leaf, leaflen, 0100000u | create_permissions(0666u),
+                        now_seconds(), ino);
     }
     return rc;
 }
@@ -891,7 +922,8 @@ int xfsmount_write_into(const char *dir, const char *leaf, const void *bytes, ui
     }
     rc = xfs_dir_lookup(vol, &parent, leaf, leaflen, &ino);
     if (rc == KERR_NOENT) {
-        rc = xfs_create(vol, &parent, leaf, leaflen, 0100644u, 0, &ino);
+        rc = xfs_create(vol, &parent, leaf, leaflen, 0100000u | create_permissions(0666u), 0,
+                        &ino);
     }
     if (rc != KERR_OK) {
         return rc;
@@ -1170,4 +1202,39 @@ int xfsmount_owner_of(const char *path, uint32_t *uid, uint32_t *gid) {
     *uid = ip.uid;
     *gid = ip.gid;
     return KERR_OK;
+}
+
+int xfsmount_flush(void) {
+    struct xfs *vol = NULL;
+    const char *within = "/";
+    vol = owner_of("/", &within);
+    if (vol == NULL) {
+        return KERR_NODEV;
+    }
+    /* **The whole cache, not one file's blocks.** A per-file flush would
+     * need to know which buffers belong to which inode, which this cache
+     * does not record — and a sync that silently missed the inode while
+     * writing the data back is worse than one that writes more than it had
+     * to. Flushing everything is slower and correct. */
+    return bcache_flush(vol->cache);
+}
+
+int xfsmount_counters(const char *path, struct xfs_counters *out) {
+    const char *within = path;
+    struct xfs *vol = owner_of(path, &within);
+    return vol == NULL ? KERR_NODEV : xfs_counters(vol, out);
+}
+
+int xfsmount_utimes_path(const char *path, uint64_t atime_s, uint64_t mtime_s) {
+    struct xfs *vol = NULL;
+    struct xfs_inode ip;
+    int rc = resolve_for_attrs(path, &vol, &ip);
+    return rc != KERR_OK ? rc : xfs_utimes(vol, &ip, atime_s, mtime_s);
+}
+
+int xfsmount_truncate_path(const char *path, uint64_t size) {
+    struct xfs *vol = NULL;
+    struct xfs_inode ip;
+    int rc = resolve_for_attrs(path, &vol, &ip);
+    return rc != KERR_OK ? rc : xfs_truncate(vol, &ip, size, now_seconds());
 }

@@ -204,6 +204,30 @@ int xfsmount_chown_path(const char *path, uint32_t uid, uint32_t gid);
 /* Reads a path's owner and group, which `stat` does not report here. */
 int xfsmount_owner_of(const char *path, uint32_t *uid, uint32_t *gid);
 
+/* Writes every dirty buffer to the device. What `fsync` reaches: the cache
+ * does not record which buffers belong to which inode, and a sync that
+ * missed the inode while writing the data back would be worse than one that
+ * writes more than it had to. */
+int xfsmount_flush(void);
+
+/* Makes a path's file `size` bytes, freeing the blocks it no longer needs. */
+int xfsmount_truncate_path(const char *path, uint64_t size);
+
+/* Installs the reader for the creating process's umask.
+ *
+ * Installed rather than called, because this module must not learn what a
+ * process is: `uspace` depends on it for `execve`, so an include the other
+ * way would invert the layering. The wall clock arrived here the same way.
+ * Until one is installed the mask is zero and a create grants what it
+ * always did. */
+void xfsmount_set_umask_source(uint32_t (*source)(void));
+
+/* The volume holding `path`, as block and inode counts. */
+int xfsmount_counters(const char *path, struct xfs_counters *out);
+
+/* Sets a path's access and modification times. */
+int xfsmount_utimes_path(const char *path, uint64_t atime_s, uint64_t mtime_s);
+
 /* Moves a name within one volume. KERR_XDEV across two, because a rename is
  * not a copy. This is the mechanism a bounded log file rotates with: there
  * is no ftruncate either, so moving the file aside is the only option. */

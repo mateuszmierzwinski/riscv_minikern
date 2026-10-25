@@ -49,6 +49,32 @@ static void test_pointer_is_full_width(void) {
     KTEST_CHECK_STR(out, want);
 }
 
+/* **Octal, compared against C's own.** It was missing, and the way that
+ * showed is the point: `%o` fell through to the unknown-conversion case and
+ * printed itself, so every message in this kernel that reported a file's
+ * mode said "%o" with the number absent. The board printed `gave mode %o,
+ * want 644` from inside a diagnostic — which is the one place a formatting
+ * gap is least likely to be noticed, because it only prints when something
+ * else has already gone wrong.
+ *
+ * The widths and the zero-padding are here because a mode is almost always
+ * printed as `%04o`, and that is the form that would have been wrong in a
+ * subtler way.
+ *
+ * **`%#o` is deliberately not here**, because the `#` flag is not
+ * implemented either — and the way it fails is worth knowing: it falls to
+ * the unknown-conversion case, which prints `%#o` and **does not consume the
+ * argument**, so every conversion after it reads the wrong one. The first
+ * version of this test included it and the following `%o` printed 0 instead
+ * of 7777, which is how that was found. A test for a flag nothing
+ * implements would be a test of a wish. */
+static void test_octal_matches_c_printf(void) {
+    char want[64];
+    kfmt_snprintf(out, sizeof out, "%o|%04o|%o|%o", 0644u, 0755u, 0u, 07777u);
+    snprintf(want, sizeof want, "%o|%04o|%o|%o", 0644u, 0755u, 0u, 07777u);
+    KTEST_CHECK_STR(out, want);
+}
+
 static void test_unknown_conversion_is_echoed(void) {
     unchecked_snprintf(out, sizeof out, "a%qb");
     KTEST_CHECK_STR(out, "a%qb");
@@ -90,6 +116,7 @@ int main(void) {
     KTEST_RUN(test_strings_and_chars);
     KTEST_RUN(test_null_string_does_not_fault);
     KTEST_RUN(test_pointer_is_full_width);
+    KTEST_RUN(test_octal_matches_c_printf);
     KTEST_RUN(test_unknown_conversion_is_echoed);
     KTEST_RUN(test_trailing_percent_stops);
     KTEST_RUN(test_truncation_reports_full_length);

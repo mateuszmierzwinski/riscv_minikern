@@ -1221,3 +1221,118 @@ bool fdobjects_epoll_has_events(int32_t epfd) {
     struct file *f = fd_get(epfd);
     return f != NULL && f->ops == &epoll_ops && epoll_poll(f) != 0;
 }
+
+/* ── seeking ──────────────────────────────────────────────────────────────
+ *
+ * **Why this is one function rather than an op on every object.** Only two
+ * kinds of descriptor here have a position at all — a file opened for
+ * reading, which holds its contents and an offset into them, and one opened
+ * for writing, which remembers where the next byte goes. Everything else is
+ * a stream: a console, a pipe, a socket, an eventfd. `lseek` on a stream is
+ * `ESPIPE`, which is what a program checks for to find out whether it may
+ * seek at all — so answering it correctly matters as much as seeking does.
+ */
+int fdobjects_seek(int32_t fd, int64_t offset, uint32_t whence, uint64_t *result) {
+    struct file *f = fdobjects_file_of(fd);
+    uint64_t base = 0;
+    uint64_t size = 0;
+    if (f == NULL) {
+        return KERR_BADF;
+    }
+    if (f->ops == &diskfile_ops) {
+        struct diskfile *d = f->priv;
+        base = d->offset;
+        size = d->size;
+    } else if (f->ops == &writefile_ops) {
+        struct writefile *w = f->priv;
+        base = w->offset;
+        size = w->offset; /* a write file's end is wherever it has reached */
+    } else {
+        return KERR_SPIPE;
+    }
+    switch (whence) {
+    case SEEK_SET:
+        base = 0;
+        break;
+    case SEEK_CUR:
+        break;
+    case SEEK_END:
+        base = size;
+        break;
+    default:
+        return KERR_INVAL;
+    }
+    /* **A negative result is refused, not clamped.** Clamping to zero would
+     * let a program that computed an offset wrongly carry on reading from
+     * the start of the file and get plausible data from the wrong place. */
+    if (offset < 0 && (uint64_t)(-offset) > base) {
+        return KERR_INVAL;
+    }
+    base = offset < 0 ? base - (uint64_t)(-offset) : base + (uint64_t)offset;
+    if (f->ops == &diskfile_ops) {
+        ((struct diskfile *)f->priv)->offset = (uint32_t)base;
+    } else {
+        ((struct writefile *)f->priv)->offset = base;
+    }
+    *result = base;
+    return KERR_OK;
+}
+
+/* Two thin wrappers the board self-test uses.
+ *
+ * The test runs in the kernel, where there is no syscall layer to go
+ * through, so it needs the same operations a program would get from `lseek`
+ * and `read`. They return the seek result as a signed value because that is
+ * what the test compares against `KERR_SPIPE`, and a separate out-parameter
+ * would make every call site three lines.
+ */
+int64_t fdobjects_seek_for_test(int32_t fd, int64_t offset, uint32_t whence) {
+    uint64_t where = 0;
+    int rc = fdobjects_seek(fd, offset, whence, &where);
+    return rc != KERR_OK ? rc : (int64_t)where;
+}
+
+int32_t fdobjects_read_for_test(int32_t fd, void *buf, uint32_t n) {
+    struct file *f = fdobjects_file_of(fd);
+    if (f == NULL || f->ops->read == NULL) {
+        return KERR_BADF;
+    }
+    return f->ops->read(f, buf, n);
+}
+
+/* The path a descriptor was opened from, when it remembers one.
+ *
+ * **Only a descriptor opened for writing does.** One opened for reading
+ * holds the file's bytes rather than its name, which is what makes reads
+ * cheap and what makes this return NULL for them. That is a real limit and
+ * `ftruncate` names it: a read-only descriptor cannot be truncated here,
+ * and a file unlinked while open cannot be truncated by name because the
+ * name is gone.
+ *
+ * The path is assembled into a static buffer because the two halves are
+ * stored separately and there is nowhere else to join them. One buffer is
+ * enough: the caller uses it immediately and the kernel lock is held across
+ * the syscall, so a second call cannot be in flight.
+ */
+const char *fdobjects_path_of(int32_t fd) {
+    static char joined[WRITEFILE_PATH_MAX * 2u];
+    struct file *f = fdobjects_file_of(fd);
+    const struct writefile *w;
+    uint32_t at = 0;
+    if (f == NULL || f->ops != &writefile_ops) {
+        return NULL;
+    }
+    w = f->priv;
+    while (w->dir[at] != '\0' && at + 2u < sizeof joined) {
+        joined[at] = w->dir[at];
+        at++;
+    }
+    if (at > 0 && joined[at - 1u] != '/') {
+        joined[at++] = '/';
+    }
+    for (uint32_t i = 0; w->leaf[i] != '\0' && at + 1u < sizeof joined; i++) {
+        joined[at++] = w->leaf[i];
+    }
+    joined[at] = '\0';
+    return joined;
+}

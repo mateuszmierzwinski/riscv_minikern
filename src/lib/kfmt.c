@@ -158,6 +158,14 @@ static void put_conversion(struct kfmt_out *o, va_list *ap, const struct kfmt_sp
     case 'd':
     case 'i': put_signed(o, ap, s); break;
     case 'u': put_number(o, unsigned_arg(ap, s->length), 0, 10, s); break;
+    /* **Octal, because a Unix mode is octal and nothing else is.** Without
+     * it `%o` fell to the default below and printed itself — so every
+     * message in this kernel that reported a file's mode said "%o" and the
+     * number was simply absent. The board said `gave mode %o, want 644`,
+     * which is the formatter failing in the one place it would be least
+     * noticed: inside a diagnostic that only prints when something else is
+     * already wrong. */
+    case 'o': put_number(o, unsigned_arg(ap, s->length), 0, 8, s); break;
     case 'x':
     case 'X': put_number(o, unsigned_arg(ap, s->length), 0, 16, s); break;
     case 's': put_string(o, va_arg(*ap, const char *), s); break;

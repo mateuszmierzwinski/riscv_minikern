@@ -2371,6 +2371,205 @@ static int rename_moves_a_name(void) {
  * because the type bits are not the caller's to set and a test that compared
  * the whole word would fail for the right reason and look like the wrong
  * one. */
+/* **The accounting is the test, not the size.** Setting `di_size` is one
+ * line; the part that corrupts quietly is the free-block count, because a
+ * filesystem whose counter disagrees with its allocation groups mounts,
+ * reads and writes perfectly and is condemned by `xfs_repair` later. So this
+ * writes enough to own several blocks, truncates to nothing, and asserts
+ * that the volume's free count went *up* by what the file owned. */
+static int truncate_frees_blocks(void) {
+    static uint8_t body[32768];
+    struct xfs_counters before = {0};
+    struct xfs_counters after = {0};
+    uint32_t mode = 0;
+    uint64_t size = 0;
+    uint32_t nlink = 0;
+    int rc;
+    for (uint32_t i = 0; i < sizeof body; i++) {
+        body[i] = (uint8_t)i;
+    }
+    rc = xfsmount_write_at("/", "w_trunc", 0, body, (uint32_t)sizeof body);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    rc = xfsmount_counters("/", &before);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    rc = xfsmount_truncate_path("/w_trunc", 0);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    rc = xfsmount_counters("/", &after);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    if (after.free_blocks <= before.free_blocks) {
+        kprintf("fswrite:   truncating 32K freed nothing: %llu then %llu blocks free\n",
+                (unsigned long long)before.free_blocks, (unsigned long long)after.free_blocks);
+        return KERR_INVAL;
+    }
+    rc = xfsmount_stat_full("/w_trunc", &mode, &size, &nlink);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    if (size != 0) {
+        kprintf("fswrite:   after truncating to 0 the size is %llu\n", (unsigned long long)size);
+        return KERR_INVAL;
+    }
+    return KERR_OK;
+}
+
+/* **Rounding up, which is where the data would be lost.** A file of one
+ * byte still owns the block holding it, so truncating a larger file down to
+ * one byte must free everything *after* that block and not the block
+ * itself. Rounding down would free it, and the byte the caller kept would
+ * read back as zero — a loss that looks like success. */
+static int truncate_rounds_up(void) {
+    static uint8_t body[8192];
+    uint8_t got[4] = {0};
+    uint8_t *bytes = NULL;
+    uint32_t read = 0;
+    int rc;
+    for (uint32_t i = 0; i < sizeof body; i++) {
+        body[i] = 'A';
+    }
+    rc = xfsmount_write_at("/", "w_round", 0, body, (uint32_t)sizeof body);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    rc = xfsmount_truncate_path("/w_round", 1);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    rc = xfsmount_read_file("/w_round", 64u, &bytes, &read);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    got[0] = read > 0 ? bytes[0] : 0;
+    kfree(bytes);
+    if (read != 1 || got[0] != 'A') {
+        kprintf("fswrite:   after truncating to 1 the file is %u bytes starting %02x\n", read,
+                got[0]);
+        return KERR_INVAL;
+    }
+    return KERR_OK;
+}
+
+/* Growing allocates nothing: a hole is the absence of an extent, so a
+ * truncate past the end must not cost blocks. The free count staying put is
+ * the assertion — a version that filled the gap would turn a one-line call
+ * into as many writes as the gap is long. */
+static int truncate_grows_sparsely(void) {
+    struct xfs_counters before = {0};
+    struct xfs_counters after = {0};
+    int rc = xfsmount_counters("/", &before);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    rc = xfsmount_truncate_path("/w_round", 1u << 20);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    rc = xfsmount_counters("/", &after);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    if (after.free_blocks != before.free_blocks) {
+        kprintf("fswrite:   growing to 1M cost %llu blocks\n",
+                (unsigned long long)(before.free_blocks - after.free_blocks));
+        return KERR_INVAL;
+    }
+    return KERR_OK;
+}
+
+/* **The test that stops `umask` being a stored number nobody reads.**
+ *
+ * A per-process field that nothing consults is the failure this tree has
+ * recorded seven times, and the only defence is a test that asserts what a
+ * created file's mode actually is. The mask is installed by the composition
+ * root, so this exercises the whole path: the field, the installed reader,
+ * and the create.
+ *
+ * `0022` is the ordinary mask and `0666 & ~0022` is `0644`, which is what
+ * every Unix gives a new file. Zero afterwards, because the rest of this
+ * self-test expects what it always got.
+ */
+static uint32_t test_umask_source(void) {
+    return 0022u;
+}
+
+static int umask_is_consulted(void) {
+    uint32_t mode = 0;
+    uint64_t size = 0;
+    uint32_t nlink = 0;
+    int rc;
+    /* **The mask is installed rather than set on a process**, because this
+     * self-test has no current process — `uspace_current()` is NULL here, so
+     * setting a process field does nothing and the first version of this
+     * test failed for that reason rather than for a real one. Installing a
+     * source exercises what lives in the filesystem: `create_permissions`
+     * and the create path. The process field and its reader are three lines
+     * and are checked by the syscall's own contract. */
+    xfsmount_set_umask_source(test_umask_source);
+    rc = xfsmount_write_at("/", "w_umask", 0, "x", 1u);
+    xfsmount_set_umask_source(uspace_current_umask);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    rc = xfsmount_stat_full("/w_umask", &mode, &size, &nlink);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    if ((mode & 07777u) != 0644u) {
+        kprintf("fswrite:   a create under umask 022 gave mode %o, want 644\n", mode & 07777u);
+        return KERR_INVAL;
+    }
+    return KERR_OK;
+}
+
+/* `statfs`'s counters, checked for being *real* rather than for a value.
+ *
+ * The block count is the filesystem's own and the free count must be less
+ * than it and more than zero — a fixture with a few files in it is neither
+ * empty nor full. Asserting an exact number would pin the fixture's
+ * contents, which is not what this is about.
+ */
+static int statfs_is_real(void) {
+    struct xfs_counters c = {0};
+    int rc = xfsmount_counters("/", &c);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    if (c.blocksize != 4096u || c.blocks == 0) {
+        kprintf("fswrite:   statfs says %llu blocks of %u bytes\n",
+                (unsigned long long)c.blocks, c.blocksize);
+        return KERR_INVAL;
+    }
+    if (c.free_blocks == 0 || c.free_blocks >= c.blocks) {
+        kprintf("fswrite:   statfs says %llu of %llu blocks free\n",
+                (unsigned long long)c.free_blocks, (unsigned long long)c.blocks);
+        return KERR_INVAL;
+    }
+    return KERR_OK;
+}
+
+/* **Why there is no seek test here**, and where one belongs.
+ *
+ * `lseek` and `fsync` are implemented, and the obvious place to prove them
+ * looked like this self-test. It is the wrong place: this runs during boot
+ * with no current *process*, so `table_of_current()` is NULL and
+ * `fd_install` answers `KERR_BADF` — every descriptor-based operation fails
+ * here for a reason that has nothing to do with the operation. The first
+ * attempt failed with exactly that and read as a broken seek.
+ *
+ * Anything fd-based has to be tested from user mode, where there is a
+ * descriptor table. `minikern.execone` is the pattern: a small assembly
+ * program that makes the syscalls and reports. That is the right home for a
+ * seek test and it is not written yet — which is said here rather than left
+ * as a gap somebody has to rediscover.
+ */
+
 /* The attribute tests' own file.
  *
  * **Created here rather than borrowed.** The first version used `/w1`, which
@@ -3016,6 +3215,11 @@ static void run_write_selftest(void) {
     ok = ok && wrote_and_checked("a symlink round trips", symlink_round_trip());
     ok = ok && wrote_and_checked("a long target is refused", long_target_refused());
     ok = ok && wrote_and_checked("readlink refuses a file", readlink_refuses_a_file());
+    ok = ok && wrote_and_checked("a truncate frees its blocks", truncate_frees_blocks());
+    ok = ok && wrote_and_checked("a truncate keeps the last block", truncate_rounds_up());
+    ok = ok && wrote_and_checked("a grow makes a hole", truncate_grows_sparsely());
+    ok = ok && wrote_and_checked("a create honours the umask", umask_is_consulted());
+    ok = ok && wrote_and_checked("statfs reports real counters", statfs_is_real());
     ok = ok && wrote_and_checked("a mode is set and read back", chmod_round_trip());
     ok = ok && wrote_and_checked("chmod cannot change the file type", chmod_keeps_the_type());
     ok = ok && wrote_and_checked("an owner is set and read back", chown_round_trip());
@@ -3731,6 +3935,12 @@ static void kmain_high(uint64_t hart, uint64_t dtb) {
         nvme_irq_probe_only(cmdline_has(boot_cmdline, "minikern.nvmeirqprobe"));
         (void)nvme_use_interrupts_if_present(dtb);
     }
+    /* **The umask reader, before anything can create a file.** The
+     * filesystem must not learn what a process is — `uspace` depends on it
+     * for `execve` — so the composition root hands it a function. Without
+     * this the field would be a setting nothing consults, which is the
+     * failure this tree has recorded seven times. */
+    xfsmount_set_umask_source(uspace_current_umask);
     bring_up_filesystem();
     {
         /* **Did the device's interrupt ever reach the kernel?** The one

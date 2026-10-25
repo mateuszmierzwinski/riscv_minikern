@@ -89,3 +89,61 @@ int xfs_chown(struct xfs *fs, const struct xfs_inode *ip, uint32_t uid, uint32_t
                         uid == XFS_OWNER_UNCHANGED ? ip->uid : uid,
                         gid == XFS_OWNER_UNCHANGED ? ip->gid : gid, now_s);
 }
+
+/* The counters `statfs` reports, read from the superblock each time.
+ *
+ * **Read rather than cached.** The allocator keeps `sb_fdblocks` current on
+ * every allocation and free, so the superblock is the truth; a copy on
+ * `struct xfs` would be a second place to forget to update, and the
+ * difference would show as a filesystem that appears full or empty for no
+ * reason a user could see. One block read on a `statfs` is not worth a
+ * synchronisation bug.
+ */
+int xfs_counters(struct xfs *fs, struct xfs_counters *out) {
+    struct bbuf *b;
+    int rc = bcache_get(fs->cache, 0, &b);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    out->blocks = fs->dblocks;
+    out->free_blocks = xfs_be64(b->data + XFS_SB_FDBLOCKS);
+    out->inodes = xfs_be64(b->data + XFS_SB_ICOUNT);
+    out->free_inodes = xfs_be64(b->data + XFS_SB_IFREE);
+    out->blocksize = fs->blocksize;
+    bcache_put(fs->cache, b);
+    return KERR_OK;
+}
+
+int xfs_utimes(struct xfs *fs, const struct xfs_inode *ip, uint64_t atime_s, uint64_t mtime_s) {
+    uint64_t block;
+    uint32_t boffset;
+    struct bbuf *b;
+    uint8_t *di;
+    int rc;
+    if (ip == NULL) {
+        return KERR_INVAL;
+    }
+    if (!xfs_writable(fs)) {
+        return KERR_ROFS;
+    }
+    xfs_inode_place(fs, ip->ino, &block, &boffset);
+    rc = bcache_get(fs->cache, block, &b);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    di = b->data + boffset;
+    /* **The three timestamps are eight bytes apart and only two are the
+     * caller's.** `atime` at 32, `mtime` at 40, `ctime` at 48 — and `ctime`
+     * is not settable by anyone: it records when the inode last changed,
+     * which is *now*, because this call is a change to it. A `utimensat`
+     * that let a caller backdate `ctime` would let a modified file claim it
+     * had not been touched. */
+    xfs_put_be32(di + XFS_DI_ATIME, (uint32_t)atime_s);
+    xfs_put_be32(di + XFS_DI_MTIME, (uint32_t)mtime_s);
+    xfs_put_be32(di + XFS_DI_CTIME, (uint32_t)atime_s > (uint32_t)mtime_s ? (uint32_t)atime_s
+                                                                          : (uint32_t)mtime_s);
+    xfs_reseal(fs, di, fs->inodesize, XFS_DI_CRC);
+    bcache_dirty(b);
+    bcache_put(fs->cache, b);
+    return KERR_OK;
+}

@@ -74,6 +74,34 @@ int fdobjects_file_of_object(void *object, const uint8_t **bytes, uint32_t *size
  * descriptors of its own to speak through. */
 int fdobjects_open_pipe(int32_t out[2], uint32_t flags);
 
+/* The three `whence` values, which are the ABI's and not ours to choose. */
+#define SEEK_SET 0u
+#define SEEK_CUR 1u
+#define SEEK_END 2u
+
+/* Moves a descriptor's position and reports where it landed.
+ *
+ * `KERR_SPIPE` for anything without a position — a console, a pipe, a
+ * socket — which is what a program tests to find out whether it may seek at
+ * all, so answering it correctly matters as much as seeking does. A result
+ * that would be negative is refused rather than clamped: clamping would let
+ * a program that computed an offset wrongly read plausible data from the
+ * wrong place. */
+int fdobjects_seek(int32_t fd, int64_t offset, uint32_t whence, uint64_t *result);
+
+/* The same two operations a program gets from `lseek` and `read`, for the
+ * board self-test, which runs inside the kernel and has no syscall layer to
+ * go through. The seek returns its result signed so a caller can compare it
+ * against `KERR_SPIPE` directly. */
+/* The path a descriptor was opened from, or NULL when it does not remember
+ * one — which is every descriptor opened for reading, because those hold the
+ * file's bytes rather than its name. `ftruncate` depends on this and names
+ * the limit. */
+const char *fdobjects_path_of(int32_t fd);
+
+int64_t fdobjects_seek_for_test(int32_t fd, int64_t offset, uint32_t whence);
+int32_t fdobjects_read_for_test(int32_t fd, void *buf, uint32_t n);
+
 /* One registration in an epoll instance, as user space passes it.
  *
  * **Not packed.** `struct epoll_event` carries `__attribute__((packed))` in

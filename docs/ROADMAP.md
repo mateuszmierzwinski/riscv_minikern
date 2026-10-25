@@ -820,12 +820,85 @@ Ordering inside a section is roughly by what unblocks the most.
       needed it): `openat` reads it off the filesystem, checks the mode
       against the caller's identity, and gives a descriptor that `read`
       works on. What is still missing here is the *synthetic* ones.
-- [ ] **The directory and file syscalls.** (M) Missing: `getdents64`,
-      `lseek`, `fstat`/`fstatat`/`statx`, `mkdirat`, `unlinkat`, `renameat`,
-      `linkat`, `symlinkat`, `readlinkat`, `truncate`/`ftruncate`, `fsync`,
-      `statfs`, `chdir`/`getcwd`, `access`/`faccessat`, `umask`, `chmod`,
-      `chown`, `utimensat`. `openat` exists but only for reading an existing
-      regular file.
+- [~] **The directory and file syscalls.** (M) **Most of this list is done**,
+      driven by running a real userland on the board rather than by working
+      through the list — which is why the ones that are missing are the ones
+      nothing has needed yet.
+
+      Implemented and board-proven: `getdents64`, `fstat`, `newfstatat`,
+      `mkdirat`, `unlinkat`, `renameat2`, `linkat`, `symlinkat`,
+      `readlinkat`, `fchmodat`, `fchownat`, `lseek`, `fsync`/`fdatasync`.
+      `openat` reads, writes, creates and truncates. Beside them, from the
+      same work: `uname`, `waitid`, `setgroups`/`getgroups` and `reboot`.
+
+      Also done since: `statfs`, `faccessat`, `umask` and `utimensat`.
+
+      `umask` went in **with the create path that reads it**, because a
+      per-process field nothing consults is the failure this tree has
+      recorded seven times. The filesystem must not learn what a process is
+      — `uspace` depends on it for `execve` — so the composition root
+      installs a reader, the way the wall clock arrived. A board test
+      asserts that a create under `0022` produces `0644`, which is the only
+      thing that proves the field is read rather than stored.
+
+      `faccessat` answers existence and tests the request against the file's
+      own permission bits. It does not pretend to be a full access check:
+      this kernel has one user for most purposes, and a test claiming more
+      than it can know is worse than a narrow one that is true.
+
+      `statfs` reads the superblock each time rather than caching, because
+      the allocator keeps `sb_fdblocks` current there — a copy would be a
+      second place to forget. `f_bavail` equals `f_bfree`, which is true
+      rather than lazy: nothing is reserved for root here, so a smaller
+      number would be an invention.
+
+      `utimensat` handles `UTIME_NOW` and a NULL `times` (both now, which is
+      `touch` and the commonest use), and **refuses `UTIME_OMIT`** rather
+      than guessing: keeping one timestamp needs its current value, and
+      `stat` here does not report timestamps, so a version that wrote "now"
+      for an omitted field would do the opposite of what was asked.
+
+      **`truncate` and `ftruncate` are done**, which was the only real work
+      left here. Setting `di_size` is one line; the part that corrupts
+      quietly is the accounting, so the board test asserts the volume's
+      free-block count rather than the file's size — a filesystem whose
+      counter disagrees with its allocation groups mounts, reads and writes
+      perfectly and is condemned by `xfs_repair` later. Three behaviours are
+      pinned: truncating 32 KB to nothing raises the free count, truncating
+      to one byte **keeps the block that byte is in** (rounding down would
+      free it and the surviving byte would read back as zero — a loss that
+      looks like success), and growing costs no blocks at all, because a
+      hole is the absence of an extent. The self-test's remount runs after
+      all three and reports the log replayed and the filesystem clean.
+
+      It refuses a b-tree fork and a realtime file rather than mishandling
+      them: rewriting a b-tree in place is separate work, and a realtime
+      file's blocks come from the realtime bitmap rather than an allocation
+      group, so freeing them through `xfs_free_extent` would credit the
+      wrong map.
+
+      `ftruncate` has a limit worth naming rather than papering over: a
+      descriptor opened for *reading* holds the file's bytes rather than its
+      name, so only a write descriptor can be truncated, and a file unlinked
+      while open cannot be truncated by name because the name is gone. Linux
+      would shorten the file the descriptor still holds. Nothing in this
+      userland does that.
+
+      Still missing: `chdir`/`getcwd` (a per-process working directory,
+      which nothing has a use for while every path is absolute) and `statx`
+      (Go falls back to `fstatat`, so it buys nothing). Neither is work this
+      kernel needs; they are listed so the absence is deliberate rather than
+      forgotten.
+
+      **`lseek` and `fsync` have no board test, and the reason is worth
+      recording.** The obvious home was the write self-test, and that is the
+      wrong place: it runs during boot with no current *process*, so
+      `table_of_current()` is NULL and `fd_install` answers `KERR_BADF` —
+      every descriptor-based operation fails there for a reason unrelated to
+      the operation. The first attempt failed with exactly that and read as
+      a broken seek. Anything fd-based has to be tested from user mode, and
+      `minikern.execone` is the pattern: a small assembly program that makes
+      the syscalls and reports.
 - [ ] **`ioctl`.** (S for a stub, M to mean anything.)
 - [ ] **`poll`/`ppoll` and `select`/`pselect`.** (S) `epoll` is implemented;
       these are not, and plenty of software uses them instead.

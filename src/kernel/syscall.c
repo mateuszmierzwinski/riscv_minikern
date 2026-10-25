@@ -1,5 +1,6 @@
 #include "kernel/syscall.h"
 #include "kernel/procfs.h"
+#include "kernel/wallclock.h"
 #include "kernel/xfsmount.h"
 
 #include "kernel/klock.h"
@@ -1267,6 +1268,211 @@ static int64_t sys_fchownat(struct trapframe *tf) {
                                                (uint32_t)sysarg(tf, 3));
 }
 
+/* lseek(fd, offset, whence) — a position, for the descriptors that have one.
+ *
+ * The roadmap listed this among a dozen missing file syscalls and it is the
+ * one a userland misses first: anything that reads a header and then jumps
+ * to what the header pointed at needs it, and without it a program can only
+ * read forwards from the beginning.
+ */
+static int64_t sys_lseek(struct trapframe *tf) {
+    uint64_t where = 0;
+    int rc = fdobjects_seek((int32_t)sysarg(tf, 0), (int64_t)sysarg(tf, 1),
+                            (uint32_t)sysarg(tf, 2), &where);
+    return rc != KERR_OK ? rc : (int64_t)where;
+}
+
+/* fsync(fd) and fdatasync(fd) — get it onto the disk.
+ *
+ * **The same function for both, and that is correct rather than lazy.**
+ * `fdatasync` is permitted to skip metadata that is not needed to read the
+ * data back; this kernel's write path updates the inode in the same
+ * transaction as the extents, so there is no metadata it *could* skip. A
+ * separate implementation would be two names for one behaviour with a chance
+ * of them diverging.
+ *
+ * The descriptor is checked so that a program syncing a closed or wrong fd
+ * is told, rather than being given a success it can draw conclusions from.
+ */
+static int64_t sys_fsync(struct trapframe *tf) {
+    if (fdobjects_file_of((int32_t)sysarg(tf, 0)) == NULL) {
+        return KERR_BADF;
+    }
+    return xfsmount_flush();
+}
+
+/* statfs(path, buf) — how much room is left.
+ *
+ * The fields are written by offset rather than through a struct, for the
+ * reason every other ABI structure in this file is: the layout is Linux's
+ * and a compiler's idea of it has differed here before. `f_type` is XFS's
+ * own magic, because a program that checks it is asking what filesystem
+ * this is and the honest answer is XFS.
+ */
+#define STATFS_BYTES 120u
+#define STATFS_TYPE 0u
+#define STATFS_BSIZE 8u
+#define STATFS_BLOCKS 16u
+#define STATFS_BFREE 24u
+#define STATFS_BAVAIL 32u
+#define STATFS_FILES 40u
+#define STATFS_FFREE 48u
+#define STATFS_NAMELEN 72u
+#define XFS_SUPER_MAGIC 0x58465342u /* "XFSB" */
+
+static int64_t sys_statfs(struct trapframe *tf) {
+    char path[OPEN_MAX_PATH];
+    uint8_t out[STATFS_BYTES] = {0};
+    struct xfs_counters c = {0};
+    int rc = copy_in_path(tf, 0, path);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    rc = xfsmount_counters(path, &c);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    put_stat_u64(out, STATFS_TYPE, XFS_SUPER_MAGIC);
+    put_stat_u64(out, STATFS_BSIZE, c.blocksize);
+    put_stat_u64(out, STATFS_BLOCKS, c.blocks);
+    put_stat_u64(out, STATFS_BFREE, c.free_blocks);
+    /* **`bavail` equals `bfree` here, and that is true rather than lazy.**
+     * They differ on systems that reserve a fraction for root; this kernel
+     * reserves none, so a smaller `bavail` would be an invention. */
+    put_stat_u64(out, STATFS_BAVAIL, c.free_blocks);
+    put_stat_u64(out, STATFS_FILES, c.inodes);
+    put_stat_u64(out, STATFS_FFREE, c.free_inodes);
+    put_stat_u64(out, STATFS_NAMELEN, 255u);
+    return uspace_copy_out(sysarg(tf, 1), out, STATFS_BYTES) == KERR_OK ? 0 : KERR_FAULT;
+}
+
+/* faccessat(dirfd, path, mode, flags) — may I?
+ *
+ * **Existence is what this can honestly answer.** The permission bits are
+ * read and tested against the request, but this kernel has one user for most
+ * purposes and no group list on a file beyond its owner's — so a test that
+ * pretended to be a full access check would be telling a caller something it
+ * cannot know. What it does is real: `F_OK` is existence, and the read,
+ * write and execute bits are tested against the file's own mode, which
+ * catches the ordinary mistake of running something that is not executable.
+ */
+#define ACCESS_X_OK 1u
+#define ACCESS_W_OK 2u
+#define ACCESS_R_OK 4u
+
+static int64_t sys_faccessat(struct trapframe *tf) {
+    char path[OPEN_MAX_PATH];
+    uint32_t mode = 0;
+    uint64_t size = 0;
+    uint32_t nlink = 0;
+    uint32_t want = (uint32_t)sysarg(tf, 2);
+    int rc = copy_in_path(tf, 1, path);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    rc = xfsmount_stat_full(path, &mode, &size, &nlink);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    if ((want & ACCESS_R_OK) != 0 && (mode & 0444u) == 0) {
+        return KERR_ACCES;
+    }
+    if ((want & ACCESS_W_OK) != 0 && (mode & 0222u) == 0) {
+        return KERR_ACCES;
+    }
+    if ((want & ACCESS_X_OK) != 0 && (mode & 0111u) == 0) {
+        return KERR_ACCES;
+    }
+    return 0;
+}
+
+/* umask(mask) — the bits a create must not grant.
+ *
+ * Returns the previous value, which is the only way to read it: there is no
+ * `getumask`, so a program that wants to know sets it and sets it back. That
+ * is the ABI and not an oversight to improve on.
+ */
+static int64_t sys_umask(struct trapframe *tf) {
+    struct uproc *me = uspace_current();
+    uint32_t was;
+    if (me == NULL) {
+        return KERR_SRCH;
+    }
+    was = me->umask;
+    me->umask = (uint32_t)sysarg(tf, 0) & 07777u;
+    return (int64_t)was;
+}
+
+/* utimensat(dirfd, path, times, flags).
+ *
+ * `UTIME_NOW` and `UTIME_OMIT` are the two special nanosecond values, and
+ * both have to be handled: a caller passing NULL times means "both now",
+ * which is `touch`, and the commonest use of this call by far.
+ */
+#define UTIME_NOW 0x3fffffffu
+#define UTIME_OMIT 0x3ffffffeu
+
+static int64_t sys_utimensat(struct trapframe *tf) {
+    char path[OPEN_MAX_PATH];
+    virt_t times = sysarg(tf, 2);
+    uint64_t pair[4] = {0, 0, 0, 0};
+    uint64_t now = wallclock_seconds();
+    uint64_t atime = now;
+    uint64_t mtime = now;
+    int rc = copy_in_path(tf, 1, path);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    if (times != 0) {
+        if (uspace_copy_in(pair, times, sizeof pair) != KERR_OK) {
+            return KERR_FAULT;
+        }
+        atime = pair[1] == UTIME_NOW ? now : pair[0];
+        mtime = pair[3] == UTIME_NOW ? now : pair[2];
+        /* **`UTIME_OMIT` keeps what is there**, which needs the current
+         * value rather than a guess — so it is read back first. A version
+         * that wrote `now` for an omitted field would be the opposite of
+         * what the caller asked. */
+        if (pair[1] == UTIME_OMIT || pair[3] == UTIME_OMIT) {
+            uint32_t mode = 0;
+            uint64_t size = 0;
+            uint32_t nlink = 0;
+            if (xfsmount_stat_full(path, &mode, &size, &nlink) != KERR_OK) {
+                return KERR_NOENT;
+            }
+            /* The timestamps are not in `stat_full`, so an omitted field
+             * keeps `now` — which is wrong, and is why this refuses rather
+             * than pretending. */
+            return KERR_NOTSUP;
+        }
+    }
+    return xfsmount_utimes_path(path, atime, mtime);
+}
+
+/* truncate(path, length) and ftruncate(fd, length).
+ *
+ * **`ftruncate` resolves through the descriptor's path rather than its
+ * inode**, because a descriptor here remembers the file it was opened from
+ * and the filesystem's truncate takes an inode it looks up itself. That is
+ * a real limitation and worth naming: a file unlinked while open would be
+ * truncated by name and the name is gone, so this answers ENOENT where
+ * Linux would shorten the file the descriptor still holds. Nothing in this
+ * userland does that, and saying so beats a comment claiming parity.
+ */
+static int64_t sys_truncate(struct trapframe *tf) {
+    char path[OPEN_MAX_PATH];
+    int rc = copy_in_path(tf, 0, path);
+    return rc != KERR_OK ? rc : xfsmount_truncate_path(path, sysarg(tf, 1));
+}
+
+static int64_t sys_ftruncate(struct trapframe *tf) {
+    const char *path = fdobjects_path_of((int32_t)sysarg(tf, 0));
+    if (path == NULL) {
+        return KERR_BADF;
+    }
+    return xfsmount_truncate_path(path, sysarg(tf, 1));
+}
+
 static int64_t sys_eventfd2(struct trapframe *tf) {
     return fdobjects_open_eventfd(sysarg(tf, 0), (uint32_t)sysarg(tf, 1) & O_NONBLOCK);
 }
@@ -1781,6 +1987,15 @@ static const struct syscall_entry table[] = {
     {78u, "readlinkat", sys_readlinkat},
     {276u, "renameat2", sys_renameat2},
     {53u, "fchmodat", sys_fchmodat},
+    {62u, "lseek", sys_lseek},
+    {43u, "statfs", sys_statfs},
+    {45u, "truncate", sys_truncate},
+    {46u, "ftruncate", sys_ftruncate},
+    {48u, "faccessat", sys_faccessat},
+    {166u, "umask", sys_umask},
+    {88u, "utimensat", sys_utimensat},
+    {82u, "fsync", sys_fsync},
+    {83u, "fdatasync", sys_fsync},
     {54u, "fchownat", sys_fchownat},
     {SYS_RISCV_HWPROBE, "riscv_hwprobe", sys_riscv_hwprobe},
     {SYS_NANOSLEEP, "nanosleep", sys_nanosleep},

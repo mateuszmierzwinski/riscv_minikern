@@ -706,6 +706,43 @@ int xfs_symlink(struct xfs *fs, const struct xfs_inode *dir, const char *name, u
  * the inode size, so a caller that must refuse one can say by how much. */
 uint32_t xfs_symlink_max(const struct xfs *fs);
 
+/* What `statfs` reports: blocks and inodes, total and free.
+ *
+ * A struct rather than six out-parameters because they are read together
+ * from one superblock and a caller wanting one of them still pays for the
+ * block read. */
+struct xfs_counters {
+    uint64_t blocks;
+    uint64_t free_blocks;
+    uint64_t inodes;
+    uint64_t free_inodes;
+    uint32_t blocksize;
+};
+
+/* Reads those counters from the superblock, which is where the allocator
+ * keeps them current (core/xfs/xfs_attrs.c). */
+int xfs_counters(struct xfs *fs, struct xfs_counters *out);
+
+/* Sets an inode's access and modification times. `ctime` is set to the later
+ * of the two rather than taken from the caller: it records when the inode
+ * last changed, and letting it be backdated would let a modified file claim
+ * it had not been touched. */
+int xfs_utimes(struct xfs *fs, const struct xfs_inode *ip, uint64_t atime_s, uint64_t mtime_s);
+
+/* Makes a regular file `size` bytes long, freeing whatever it no longer
+ * needs.
+ *
+ * Growing makes a hole rather than allocating: a hole in XFS is the absence
+ * of an extent, so `truncate(f, 1 << 30)` writes one number instead of a
+ * gigabyte. Shrinking frees the blocks past the new end, rounded **up** to a
+ * block — truncating a 100-byte file to 1 byte must not free the block the
+ * surviving byte is in.
+ *
+ * KERR_NOTSUP for a b-tree fork, because rewriting one in place is separate
+ * work, and for a realtime file, whose blocks come from the realtime bitmap
+ * rather than an allocation group (core/xfs/xfs_truncate.c). */
+int xfs_truncate(struct xfs *fs, struct xfs_inode *ip, uint64_t size, uint64_t now_s);
+
 /* The sentinel `chown(2)` uses for "leave this one alone". */
 #define XFS_OWNER_UNCHANGED 0xffffffffu
 
