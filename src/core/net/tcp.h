@@ -30,6 +30,11 @@
 
 #define TCP_MAX_CONNS   16u
 #define TCP_HELD_SEGMENTS 4u
+/* How many SACK blocks fit in a segment's options: the area is 40 bytes, a
+ * block is eight, and the option's header plus the two NOPs that keep it
+ * aligned take four. Four blocks is also no fewer than the held segments
+ * they describe, so nothing is lost by the limit. */
+#define TCP_SACK_BLOCKS 4u
 #define TCP_BACKLOG     8u      /* established connections one listener may hold */
 #define TCP_RX_BUF      8192u
 #define TCP_TX_BUF      8192u
@@ -92,6 +97,19 @@ struct tcp_conn {
     uint32_t ssthresh;
     uint32_t dup_acks;      /* repeats of the same ACK: three mean a loss */
     uint32_t recover_to;    /* snd_nxt when fast recovery began */
+    /* **Whether the peer offered SACK**, from its SYN. Blocks are only sent
+     * to a peer that said it understands them: sending the option to one
+     * that did not is a protocol violation, and some stacks drop the
+     * segment rather than ignore the option. */
+    bool sack_ok;
+    /* What the peer has told us it holds beyond `snd_una`, so a
+     * retransmission can skip it. Kept as the blocks last reported rather
+     * than as a merged set: a SACK option is a complete statement of what
+     * the receiver holds above the cumulative acknowledgement, so the newest
+     * one replaces the previous and there is nothing to merge. */
+    uint32_t sacked_blocks;
+    uint32_t sacked_left[TCP_SACK_BLOCKS];
+    uint32_t sacked_right[TCP_SACK_BLOCKS];
     bool in_recovery;
     uint32_t rcv_nxt;   /* next byte expected */
     uint32_t irs;       /* the peer's initial sequence number */
@@ -150,6 +168,13 @@ struct tcp_conn {
 #define TCP_POLL_HUP 0x010u
 
 struct tcp_stats {
+    /* **Both directions counted separately**, because "we sent blocks" and
+     * "we understood blocks" are different claims and a stack can do the
+     * first while silently ignoring the second — which is the shape SACK
+     * fails in, since emitting options nobody parses changes nothing and
+     * looks correct on the wire. */
+    uint32_t sack_blocks_sent;
+    uint32_t sack_blocks_received;
     uint32_t segments_in;
     uint32_t segments_out;
     uint32_t drop_checksum;

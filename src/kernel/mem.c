@@ -1,5 +1,7 @@
 #include "kernel/mem.h"
 
+#include "arch/riscv/mmu.h"
+
 #include <stddef.h>
 
 #include "arch/riscv/pgtable.h"
@@ -79,10 +81,12 @@ static int heap_alloc_page(void *self, uint32_t npages, void **virt) {
         return rc;
     }
     heap_pages_taken += npages;
-    /* The kernel's map is an identity map, so a frame's physical address is
-     * also its address. When the kernel moves to the top half this becomes
-     * an addition, and it is the only line that has to change. */
-    *virt = (void *)(uintptr_t)phys;
+    /* **The direct map, which is the addition that comment predicted.** It
+     * was not quite "the only line": the drivers that hand memory to
+     * hardware had the same assumption baked in, each in its own way, and
+     * the compiler could not see any of them because an identity map makes
+     * a physical address and a pointer the same number. */
+    *virt = mmu_phys_to_virt(phys);
     return KERR_OK;
 }
 
@@ -103,7 +107,7 @@ static void heap_free_page(void *self, void *virt, uint32_t npages) {
          * answer to that question. */
         return;
     }
-    (void)pmm_free(&frames, (phys_t)(uintptr_t)virt, npages);
+    (void)pmm_free(&frames, mmu_virt_to_phys(virt), npages);
 }
 
 struct page_port mem_page_port(void) {
@@ -132,8 +136,26 @@ struct page_port mem_page_port(void) {
  * it. */
 static void reserve_what_is_in_use(const struct bootinfo *info, phys_t arena_base,
                                    uint64_t arena_bytes) {
-    phys_t kernel_lo = (phys_t)(uintptr_t)__kernel_start;
-    phys_t kernel_hi = (phys_t)(uintptr_t)__kernel_end;
+    /* **The physical bounds, asked for rather than taken from the linker
+     * symbols.** Those read as the load address while the kernel executes
+     * there and as its own high address afterwards — and this runs
+     * afterwards. Reserving the high range left every physical page looking
+     * taken: "0 of 2097152 pages free", on a machine with eight gigabytes.
+     *
+     * That the first symptom was total rather than partial was luck. A
+     * reservation that had merely been the wrong *size* would have handed
+     * the kernel's own pages to a process. */
+    phys_t kernel_lo = 0;
+    uint64_t kernel_bytes = 0;
+    phys_t kernel_hi;
+    mmu_kernel_phys_range(&kernel_lo, &kernel_bytes);
+    if (kernel_lo == 0) {
+        /* Translation never came up, so the symbols still mean the load
+         * address and are the only answer there is. */
+        kernel_lo = (phys_t)(uintptr_t)__kernel_start;
+        kernel_bytes = (uint64_t)((uintptr_t)__kernel_end - (uintptr_t)__kernel_start);
+    }
+    kernel_hi = kernel_lo + kernel_bytes;
     if (info->mem_base < kernel_lo) {
         pmm_reserve(&frames, info->mem_base, kernel_lo - info->mem_base);
     }

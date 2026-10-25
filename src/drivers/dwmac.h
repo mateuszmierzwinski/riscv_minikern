@@ -33,6 +33,36 @@ void dwmac_set_sink(const struct frame_sink *sink);
  * what is ready and returns how many frames it passed on. */
 uint32_t dwmac_poll(void);
 
+/* Arms the controller's receive interrupt. Without it this device is only
+ * looked at when something else happens, which cannot complete a blocking
+ * read: the waiting thread has no deadline, so nothing is scheduled to poll
+ * on its behalf. */
+void dwmac_enable_rx_interrupt(void);
+
+/* The PLIC source this controller raises, from its own node's `interrupts`.
+ * Zero when there is no device or the tree named none. */
+uint32_t dwmac_irq(void);
+
+/* Takes every frame on the wire. A diagnostic: it separates "the frame is
+ * not arriving" from "the frame arrives and the address filter drops it". */
+void dwmac_set_promiscuous(bool on);
+
+/* The receive filter and address registers as the controller holds them. */
+void dwmac_report_filter(void);
+
+/* Logs each accepted frame's destination address. Diagnostic. */
+void dwmac_trace_destinations(bool on);
+
+/* Keeps the strict receive filter — match this interface's address, accept
+ * broadcast — which is what the filter is documented to do and which on this
+ * board receives no unicast at all. Call it before `dwmac_init` to reproduce
+ * that in one boot; see the comment on `set_the_receive_filter`. */
+void dwmac_use_strict_filter(bool on);
+
+/* Acknowledges at the device and drains the ring; the count is how many
+ * frames were delivered. */
+uint32_t dwmac_handle_interrupt(void);
+
 /* The link, as the PHY reports it: whether it is up, and at what speed in
  * megabits. Both are what the MAC must be configured to match, so they are
  * read rather than assumed. */

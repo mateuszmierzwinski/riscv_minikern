@@ -1,5 +1,7 @@
 #include "kernel/xfsmount.h"
 
+#include "kernel/wallclock.h"
+
 #include "lib/sha256.h"
 
 #include <stddef.h>
@@ -14,6 +16,11 @@
 #include "kernel/volumes.h"
 
 static struct xfs fs;
+
+/* The wall-clock port, defined below beside the functions it holds. The
+ * mount runs above them, and a forward declaration is cheaper than moving a
+ * port's definition away from its documentation. */
+const struct xfs_clock *xfsmount_clock(void);
 static bool mounted;
 
 /* **Policy, which must survive a re-mount; the filesystem's state must
@@ -37,6 +44,10 @@ int xfsmount_attach(void) {
         return KERR_NODEV;
     }
     rc = xfs_mount(&fs, cache);
+    /* **Installed right after the mount**, before anything can charge a
+     * quota — a port installed late is a port that was not installed, which
+     * this tree has paid for twice. */
+    xfs_set_clock(&fs, xfsmount_clock());
     if (rc != KERR_OK) {
         return rc;
     }
@@ -226,6 +237,43 @@ int xfsmount_show_file(const char *path) {
     return rc;
 }
 
+int xfsmount_stat_full(const char *path, uint32_t *mode, uint64_t *size, uint32_t *nlink) {
+    struct xfs_inode ip;
+    const char *within = path;
+    struct xfs *vol = owner_of(path, &within);
+    int rc;
+    if (vol == NULL) {
+        return KERR_NODEV;
+    }
+    rc = xfs_path_lookup(vol, within[0] == '\0' ? "/" : within, &ip);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    *mode = ip.mode;
+    *size = ip.size;
+    *nlink = ip.nlink;
+    return KERR_OK;
+}
+
+int xfsmount_list(const char *path, xfs_dirent_fn fn, void *self) {
+    struct xfs_inode dir;
+    const char *within = path;
+    struct xfs *vol = owner_of(path, &within);
+    int rc;
+    if (vol == NULL) {
+        return KERR_NODEV;
+    }
+    rc = xfs_path_lookup(vol, within[0] == '\0' ? "/" : within, &dir);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    if (!xfs_is_dir(&dir)) {
+        return KERR_NOTDIR;
+    }
+    return xfs_dir_list(vol, &dir, fn, self);
+}
+
+
 /* Who owns a path and what its mode is.
  *
  * Reported rather than enforced **here**, deliberately. This layer is the
@@ -384,14 +432,53 @@ uint64_t xfsmount_attrs_to_leaf(void) {
 
 /* What goes in a timestamp, given that this board has no clock.
  *
- * **Seconds since boot, and files will look dated 1970.** There is no RTC
- * (`ROADMAP.md` §4), so there is no epoch to count from; the alternative is
- * writing zero, which claims the same wrong thing less informatively. A
- * timestamp that at least orders two writes correctly is worth more than
- * one that does not, and when a clock arrives this is the one line that
- * changes. */
+ * **The clock arrived, and this is the line that changed.** It used to read
+ * seconds since boot, with a note that the board has no RTC and that files
+ * would therefore be dated 1970 — true, and it stopped being the only
+ * option. The board has no clock of its own, but the network has one, and
+ * `minikern.time=<unix seconds>` sets the epoch at boot; the monotonic
+ * counter carries it from there. Without that option this still returns
+ * seconds since boot, and `wallclock_is_real()` is how a caller that must
+ * not act on a guessed date tells which it has. */
 static uint64_t now_seconds(void) {
-    return timer_ns() / 1000000000ull;
+    return wallclock_seconds();
+}
+
+/* The filesystem's wall-clock port.
+ *
+ * Two functions rather than one, because the filesystem needs to know not
+ * only what time it is but **whether to believe it**: a quota's grace
+ * deadline is a wall-clock time written to disk, and comparing it against
+ * seconds-since-boot would expire every grace period instantly on a board
+ * with no real clock. */
+static uint64_t clock_seconds(void *self) {
+    (void)self;
+    return wallclock_seconds();
+}
+
+static bool clock_is_real(void *self) {
+    (void)self;
+    return wallclock_is_real();
+}
+
+static const struct xfs_clock the_clock = {
+    .seconds = clock_seconds,
+    .is_real = clock_is_real,
+    .self = NULL,
+};
+
+const struct xfs_clock *xfsmount_clock(void) {
+    return &the_clock;
+}
+
+/* The mounted filesystem, for reporting things only it knows. Read-only to
+ * the caller by convention: nothing outside this file mounts or unmounts.
+ *
+ * (This was inserted between `now_seconds` and its own documentation, which
+ * left that comment describing the wrong function. Comments belong to the
+ * thing below them, and an insertion has to look at what it is splitting.) */
+const struct xfs *xfsmount_fs(void) {
+    return &fs;
 }
 
 /* The root directory, which is what the write operations act in.
@@ -543,6 +630,54 @@ int xfsmount_unlink(const char *name) {
     return rc != KERR_OK ? rc : xfs_flush(&fs);
 }
 
+/* Removes a name anywhere, not only in the root.
+ *
+ * `xfsmount_unlink` takes a name and resolves it in `/`, which is all the
+ * write self-test ever needed. A path needs its parent found first, so the
+ * final component is split off and the rest is looked up — and the split is
+ * on the **last** separator, because every component before it is the
+ * directory.
+ *
+ * **It removes a broken directory too.** `/var` on the operator's card has
+ * mode 0 — the inode's mode was never written while its parent's entry says
+ * it is a directory — so `xfs_is_dir` says no and `xfs_unlink` will take it,
+ * which is exactly what is wanted for clearing it. A *correct* directory is
+ * refused by `xfs_unlink` with `EISDIR`, which is right: removing one is
+ * `rmdir`, and this is not it. */
+int xfsmount_unlink_path(const char *path) {
+    struct xfs_inode dir;
+    const char *within = path;
+    struct xfs *vol = owner_of(path, &within);
+    char parent[128];
+    uint32_t cut = 0, n = 0;
+    int rc;
+    if (vol == NULL) {
+        return KERR_NODEV;
+    }
+    for (uint32_t i = 0; within[i] != '\0'; i++) {
+        if (within[i] == '/') {
+            cut = i;
+        }
+        n = i + 1u;
+    }
+    if (n == 0 || within[n - 1u] == '/') {
+        return KERR_INVAL; /* no final component to remove */
+    }
+    if (cut + 1u >= sizeof parent) {
+        return KERR_NAMETOOLONG;
+    }
+    for (uint32_t i = 0; i < cut; i++) {
+        parent[i] = within[i];
+    }
+    parent[cut] = '\0';
+    rc = xfs_path_lookup(vol, cut == 0 ? "/" : parent, &dir);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    rc = xfs_unlink(vol, &dir, within + cut + 1u, n - cut - 1u, now_seconds());
+    return rc != KERR_OK ? rc : xfs_flush(vol);
+}
+
 int xfsmount_inode_of(const char *name, uint64_t *ino, uint32_t *nlink) {
     struct xfs_inode root, ip;
     int rc = root_inode(&root);
@@ -564,4 +699,210 @@ void xfsmount_root_shape(void) {
     kprintf("xfs: root mode %u format %u size %llu nextents %u nblocks %llu\n", root.mode,
             root.format, (unsigned long long)root.size, root.nextents,
             (unsigned long long)root.nblocks);
+}
+
+/* Creates `leaf` inside the directory `dir` names, and writes `bytes` into
+ * it — the operation the kernel log needs to put a boot on disk.
+ *
+ * **It will not make the directory.** This writer creates files, and
+ * `mkdir` is not implemented: a directory needs its own shortform fork
+ * written, its parent's link count raised and `..` pointed back, and that
+ * is a separate piece of work from what is here. So a missing `/var/log` is
+ * reported rather than worked around — writing the log to the root
+ * directory instead would put kernel files where a user's are, which is a
+ * worse answer than saying where it would have gone.
+ */
+/* Makes `path` a directory, and every directory above it.
+ *
+ * **Each component in turn, because `mkdir` makes one.** `/var/log` on a
+ * filesystem with neither needs two, and a caller that had to know that
+ * would be doing this loop itself. An existing component is not an error —
+ * that is what makes this safe to call on every boot. */
+int xfsmount_mkdir_p(const char *path) {
+    struct xfs_inode here;
+    const char *within = path;
+    struct xfs *vol = owner_of(path, &within);
+    char so_far[128];
+    uint32_t at = 0;
+    int rc;
+    if (vol == NULL) {
+        return KERR_NODEV;
+    }
+    while (within[at] != '\0') {
+        uint32_t start;
+        uint32_t n = 0;
+        uint64_t ino = 0;
+        while (within[at] == '/') {
+            at++;
+        }
+        start = at;
+        while (within[at + n] != '\0' && within[at + n] != '/') {
+            n++;
+        }
+        if (n == 0) {
+            break;
+        }
+        at += n;
+        if (start + n >= sizeof so_far) {
+            return KERR_NAMETOOLONG;
+        }
+        /* The path so far, so that the parent can be looked up by name
+         * rather than carried as an inode across a creation that may have
+         * rewritten it. */
+        for (uint32_t i = 0; i < n; i++) {
+            so_far[i] = within[start + i];
+        }
+        so_far[n] = '\0';
+        {
+            char full[160];
+            uint32_t k = 0;
+            for (uint32_t i = 0; i < start && k + 1u < sizeof full; i++) {
+                full[k++] = within[i];
+            }
+            for (uint32_t i = 0; i < n && k + 1u < sizeof full; i++) {
+                full[k++] = within[start + i];
+            }
+            full[k] = '\0';
+            if (xfs_path_lookup(vol, full, &here) == KERR_OK) {
+                /* **Already there — but it has to be a directory.** This
+                 * said "already there, which is not a failure" and did not
+                 * look at *what* was there, so a regular file in the place
+                 * of a directory was skipped over and the next component
+                 * failed with `ENOTDIR` — an error about the parent,
+                 * reported against the child. */
+                if (!xfs_is_dir(&here)) {
+                    return KERR_NOTDIR;
+                }
+                continue;
+            }
+            /* The parent is everything before this component, **without the
+             * separator**.
+             *
+             * The NUL went *at* `start`, which is the first character of the
+             * component — so the separator before it survived and the parent
+             * of `/var/log` was looked up as `"/var/"`. The root case has to
+             * stay `"/"`, which is why the index is clamped at 1 rather than
+             * simply decremented: a path's leading slash is the only one
+             * that is part of the name. */
+            full[start > 1u ? start - 1u : 1u] = '\0';
+            rc = xfs_path_lookup(vol, start == 0 ? "/" : full, &here);
+            if (rc != KERR_OK) {
+                return rc;
+            }
+            rc = xfs_mkdir(vol, &here, so_far, n, 0, &ino);
+            if (rc != KERR_OK) {
+                /* **Which component, and what the parent looked like.** The
+                 * caller only ever saw the whole path and one errno, so
+                 * three board runs went into narrowing "`/var/log` cannot
+                 * be made (rc -20)" by elimination. The parent's mode and
+                 * format are what the refusal is actually about. */
+                kprintf("mkdir: \"%s\" under parent mode %06o format %u: rc %d\n", so_far,
+                        here.mode, here.format, rc);
+                return rc;
+            }
+        }
+    }
+    return xfs_flush(vol);
+}
+
+/* Writes `len` bytes at `off` into `dir/leaf`, creating the file if it is
+ * not there.
+ *
+ * **Write-through, so a descriptor does not have to hold the whole file.**
+ * The first writable `openat` buffered everything and committed on close,
+ * which meant a 16 MiB allocation per open descriptor — absurd for pushing a
+ * binary, and it wedged the service after one file. An offset-taking writer
+ * already existed; it was only root-relative, which is why it was not used.
+ *
+ * `put != len` is reported as an I/O error **with the numbers**, because a
+ * short write that says only "it failed" leaves the next reader unable to
+ * tell a full disk from a bad offset. */
+/* The leaf's inode number inside `dir`, created if it is not there.
+ *
+ * **Its own frame, never inlined**, because it holds the directory's inode
+ * and its caller holds the file's: two on one frame is 960 bytes before any
+ * locals, and the limit every function here is held to is 1 KiB. This is the
+ * fourth place in this tree where that split was needed, and the rule has
+ * settled into a shape — a function holds *one* inode and hands its caller a
+ * number. */
+__attribute__((noinline)) static int find_or_make_leaf(struct xfs *vol, const char *within,
+                                                        const char *leaf, uint32_t leaflen,
+                                                        uint64_t *ino) {
+    struct xfs_inode parent;
+    int rc = xfs_path_lookup(vol, within[0] == '\0' ? "/" : within, &parent);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    if (!xfs_is_dir(&parent)) {
+        return KERR_NOTDIR;
+    }
+    rc = xfs_dir_lookup(vol, &parent, leaf, leaflen, ino);
+    if (rc == KERR_NOENT) {
+        rc = xfs_create(vol, &parent, leaf, leaflen, 0100644u, now_seconds(), ino);
+    }
+    return rc;
+}
+
+int xfsmount_write_at(const char *dir, const char *leaf, uint64_t off, const void *bytes,
+                      uint32_t len) {
+    struct xfs_inode file;
+    uint64_t ino = 0;
+    uint32_t put = 0;
+    const char *within = dir;
+    struct xfs *vol = owner_of(dir, &within);
+    int rc;
+    if (vol == NULL) {
+        return KERR_NODEV;
+    }
+    rc = find_or_make_leaf(vol, within, leaf, name_length(leaf), &ino);
+    rc = rc != KERR_OK ? rc : xfs_inode_read(vol, ino, &file);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    if (len == 0) {
+        return xfs_flush(vol); /* an empty file still exists */
+    }
+    rc = xfs_file_write(vol, &file, off, bytes, len, &put);
+    if (rc == KERR_OK && put != len) {
+        kprintf("xfs: short write to %s/%s: %u of %u byte(s) at %llu\n", dir, leaf, put, len,
+                (unsigned long long)off);
+        return KERR_IO;
+    }
+    return rc != KERR_OK ? rc : xfs_flush(vol);
+}
+
+int xfsmount_write_into(const char *dir, const char *leaf, const void *bytes, uint32_t len) {
+    struct xfs_inode parent, file;
+    uint64_t ino = 0;
+    uint32_t put = 0;
+    const char *within = dir;
+    struct xfs *vol = owner_of(dir, &within);
+    uint32_t leaflen = name_length(leaf);
+    int rc;
+    if (vol == NULL) {
+        return KERR_NODEV;
+    }
+    rc = xfs_path_lookup(vol, within, &parent);
+    if (rc != KERR_OK) {
+        return rc; /* the directory is not there: the caller says so */
+    }
+    if (!xfs_is_dir(&parent)) {
+        return KERR_NOTDIR;
+    }
+    rc = xfs_dir_lookup(vol, &parent, leaf, leaflen, &ino);
+    if (rc == KERR_NOENT) {
+        rc = xfs_create(vol, &parent, leaf, leaflen, 0100644u, 0, &ino);
+    }
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    rc = xfs_inode_read(vol, ino, &file);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    rc = xfs_file_write(vol, &file, 0, bytes, len, &put);
+    if (rc == KERR_OK && put != len) {
+        return KERR_IO;
+    }
+    return rc != KERR_OK ? rc : xfs_flush(vol);
 }

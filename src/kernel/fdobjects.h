@@ -43,6 +43,12 @@ int fdobjects_open_epoll(uint32_t flags);
  *
  * KERR_NOENT for anything else, which is the right answer and one a runtime
  * handles — it is what a probe for an optional file expects. */
+/* Fills `buf` with `struct linux_dirent64` records from an open directory,
+ * returning the bytes written or -errno. A short answer with room left means
+ * the directory is finished; a full buffer means there is more, and the next
+ * call resumes where this one stopped. */
+int32_t fdobjects_getdents(struct file *f, void *buf, uint32_t room);
+
 int fdobjects_open_path(const char *path, uint32_t flags);
 
 /* The bytes behind a descriptor that is a regular file, for a mapping to be

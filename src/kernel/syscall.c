@@ -1,4 +1,8 @@
 #include "kernel/syscall.h"
+#include "kernel/procfs.h"
+#include "kernel/xfsmount.h"
+
+#include "kernel/klock.h"
 
 /* `setpriority`'s first argument. Only the process one is meaningful here:
  * there are no process groups and one user. */
@@ -851,10 +855,189 @@ static int64_t sys_openat(struct trapframe *tf) {
             return KERR_FAULT;
         }
         if (path[i] == '\0') {
-            return fdobjects_open_path(path, (uint32_t)sysarg(tf, 2) & (O_NONBLOCK | O_CLOEXEC));
+            /* **The access mode has to get through.** This masked the flags
+             * down to `O_NONBLOCK | O_CLOEXEC`, so `flags & 3` was always
+             * `O_RDONLY` whatever the caller asked for — and the descriptor
+             * layer's write path, which reads exactly that, could never be
+             * reached. A mechanism wired up and unreachable is the shape
+             * this project keeps paying for; here it made a tool able to
+             * read the board and unable to replace anything on it.
+             *
+             * `O_CREAT` and `O_TRUNC` come through for the same reason: the
+             * layer below decides what they mean, and it cannot if it
+             * cannot see them. */
+            return fdobjects_open_path(path, (uint32_t)sysarg(tf, 2) &
+                                                 (O_ACCMODE | O_CREAT | O_TRUNC | O_APPEND |
+                                                  O_NONBLOCK | O_CLOEXEC));
         }
     }
     return KERR_NAMETOOLONG;
+}
+
+/* `struct stat` as the generic ABI lays it out — which is what riscv64 uses,
+ * so these offsets are the ones a Go binary reads.
+ *
+ * **Written field by field at fixed offsets rather than as a C struct.**
+ * This kernel's own `struct` would have to match the ABI's padding exactly,
+ * and the one time that was done by declaring a struct — `epoll_event` — it
+ * was packed on the assumption that x86-64's layout is everyone's, and a Go
+ * runtime dereferenced half a pointer inside `runtime.netpoll`. Offsets in
+ * one place, copied out once, cannot drift from a declaration somewhere
+ * else. */
+#define STAT_BYTES 128u
+#define STAT_DEV 0u
+#define STAT_INO 8u
+#define STAT_MODE 16u
+#define STAT_NLINK 20u
+#define STAT_UID 24u
+#define STAT_GID 28u
+#define STAT_SIZE 48u
+#define STAT_BLKSIZE 56u
+#define STAT_BLOCKS 64u
+
+/* The block size reported. A program that divides a size by this to size a
+ * buffer gets a sensible answer, and `st_blocks` is in 512-byte units
+ * whatever it says — a detail that has nothing to do with it and is the
+ * usual mistake. */
+#define STAT_REPORTED_BLKSIZE 4096u
+
+static void put_stat_u32(uint8_t *at, uint32_t off, uint32_t v) {
+    for (uint32_t i = 0; i < 4u; i++) {
+        at[off + i] = (uint8_t)(v >> (i * 8u));
+    }
+}
+
+static void put_stat_u64(uint8_t *at, uint32_t off, uint64_t v) {
+    for (uint32_t i = 0; i < 8u; i++) {
+        at[off + i] = (uint8_t)(v >> (i * 8u));
+    }
+}
+
+/* `newfstatat(dirfd, path, statbuf, flags)`.
+ *
+ * Only an absolute path is served: this kernel has no per-process working
+ * directory to resolve a relative one against, so `dirfd` is accepted and
+ * ignored for `AT_FDCWD` and a relative path is refused rather than guessed
+ * at. Guessing would make `os.Stat("x")` answer about some other file.
+ */
+static int64_t sys_newfstatat(struct trapframe *tf) {
+    char path[OPEN_MAX_PATH];
+    uint8_t out[STAT_BYTES] = {0};
+    uint32_t mode = 0, nlink = 0;
+    uint64_t size = 0;
+    virt_t at = sysarg(tf, 1);
+    int rc;
+    for (uint32_t i = 0;; i++) {
+        if (i == OPEN_MAX_PATH) {
+            return KERR_NAMETOOLONG;
+        }
+        if (uspace_copy_in(&path[i], at + i, 1) != KERR_OK) {
+            return KERR_FAULT;
+        }
+        if (path[i] == '\0') {
+            break;
+        }
+    }
+    if (path[0] != '/') {
+        return KERR_NOENT; /* no working directory to resolve against */
+    }
+    if (procfs_has(path)) {
+        /* **`/proc` has to answer a stat as well as an open.**
+         *
+         * The generated files were wired into the open path only, so
+         * anything that stats before reading — which is what Go's
+         * `os.ReadFile` and every sensible client does — got `ENOENT` from
+         * the filesystem and never tried to open them. A synthesised file
+         * consulted in one place and not the other is the same shape as
+         * every other half-wired mechanism this tree has paid for.
+         *
+         * The size is the file's own current length, taken by generating
+         * it: these are a few hundred bytes and the content is the only
+         * thing that knows how long it is. A guessed size would make a
+         * reader stop short or wait for bytes that never come. */
+        static char sizing[PROCFS_MAX_BYTES];
+        uint32_t wrote = 0;
+        if (procfs_generate(path, sizing, PROCFS_MAX_BYTES, &wrote) != KERR_OK) {
+            return KERR_NOENT;
+        }
+        mode = 0100444u; /* a regular file, read-only to everyone */
+        size = wrote;
+        nlink = 1u;
+    } else {
+        rc = xfsmount_stat_full(path, &mode, &size, &nlink);
+        if (rc != KERR_OK) {
+            return rc;
+        }
+    }
+    put_stat_u32(out, STAT_MODE, mode);
+    put_stat_u32(out, STAT_NLINK, nlink);
+    put_stat_u64(out, STAT_SIZE, size);
+    put_stat_u32(out, STAT_BLKSIZE, STAT_REPORTED_BLKSIZE);
+    /* `st_blocks` is in 512-byte units by definition, regardless of
+     * `st_blksize`. Rounded up, because a file of one byte occupies a block
+     * and reporting zero would have `du` call it empty. */
+    put_stat_u64(out, STAT_BLOCKS, (size + 511u) / 512u);
+    put_stat_u64(out, STAT_INO, 0u);
+    put_stat_u64(out, STAT_DEV, 1u);
+    return uspace_copy_out(sysarg(tf, 2), out, STAT_BYTES) == KERR_OK ? 0 : KERR_FAULT;
+}
+
+/* `getdents64(fd, buf, count)`.
+ *
+ * The buffer is checked writable before the filesystem is walked, not after:
+ * a walk that filled a bad pointer would have already touched the pages it
+ * is not allowed to. This is the same rule every other syscall here follows
+ * and the reason `uspace_can_write` exists — a bound against a constant is
+ * not a permission check, which cost this kernel two security holes. */
+static int64_t sys_getdents64(struct trapframe *tf) {
+    struct file *f = fd_get((int32_t)sysarg(tf, 0));
+    void *to = (void *)(uintptr_t)sysarg(tf, 1);
+    uint64_t room = sysarg(tf, 2);
+    if (f == NULL) {
+        return KERR_BADF;
+    }
+    if (room == 0 || room > (1u << 20)) {
+        return KERR_INVAL;
+    }
+    if (!may_write(to, (uint32_t)room)) {
+        return KERR_FAULT;
+    }
+    return fdobjects_getdents(f, to, (uint32_t)room);
+}
+
+/* `mkdirat(dirfd, path, mode)` and `unlinkat(dirfd, path, flags)`.
+ *
+ * Absolute paths only, for the same reason as `newfstatat`: there is no
+ * per-process working directory to resolve a relative one against, and
+ * guessing would act on a different file than the caller named. The mode is
+ * accepted and ignored — this filesystem writer sets 0755 on a directory
+ * itself, and pretending to honour a mode it does not store would be a
+ * worse answer than visibly not taking one. */
+static int copy_in_path(struct trapframe *tf, uint32_t argno, char *path) {
+    virt_t at = sysarg(tf, argno);
+    for (uint32_t i = 0;; i++) {
+        if (i == OPEN_MAX_PATH) {
+            return KERR_NAMETOOLONG;
+        }
+        if (uspace_copy_in(&path[i], at + i, 1) != KERR_OK) {
+            return KERR_FAULT;
+        }
+        if (path[i] == '\0') {
+            return path[0] == '/' ? KERR_OK : KERR_NOENT;
+        }
+    }
+}
+
+static int64_t sys_mkdirat(struct trapframe *tf) {
+    char path[OPEN_MAX_PATH];
+    int rc = copy_in_path(tf, 1, path);
+    return rc != KERR_OK ? rc : xfsmount_mkdir_p(path);
+}
+
+static int64_t sys_unlinkat(struct trapframe *tf) {
+    char path[OPEN_MAX_PATH];
+    int rc = copy_in_path(tf, 1, path);
+    return rc != KERR_OK ? rc : xfsmount_unlink_path(path);
 }
 
 static int64_t sys_eventfd2(struct trapframe *tf) {
@@ -1336,6 +1519,10 @@ static const struct syscall_entry table[] = {
     {SYS_DUP3, "dup3", sys_dup3},
     {SYS_PIPE2, "pipe2", sys_pipe2},
     {SYS_OPENAT, "openat", sys_openat},
+    {79u, "newfstatat", sys_newfstatat},
+    {61u, "getdents64", sys_getdents64},
+    {34u, "mkdirat", sys_mkdirat},
+    {35u, "unlinkat", sys_unlinkat},
     {SYS_RISCV_HWPROBE, "riscv_hwprobe", sys_riscv_hwprobe},
     {SYS_NANOSLEEP, "nanosleep", sys_nanosleep},
     {SYS_RSEQ, "rseq", sys_ok},
@@ -1401,6 +1588,11 @@ bool syscall_dispatch(struct trapframe *tf) {
     uint64_t nr = tf->x[17]; /* a7 */
     bool tracing = trace_budget > 0;
     calls++;
+    /* **Which call is holding the lock.** The trap path tags the cause, which
+     * for every syscall is the same number; the number of the call is what
+     * says *which* critical section ran long. Offset so that a tag can never
+     * be confused with a trap cause, which is a small number too. */
+    klock_tag(KLOCK_TAG_SYSCALL + nr);
     if (tracing) {
         trace_budget--;
         kprintf("call: tid %llu %s(%llu) %llx %llx %llx\n",

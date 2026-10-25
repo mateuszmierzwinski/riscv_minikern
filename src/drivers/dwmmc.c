@@ -1,10 +1,13 @@
 #include "drivers/dwmmc.h"
 
+#include "kernel/irqwait.h"
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
 #include "arch/riscv/mmu.h"
+#include "arch/riscv/timer.h"
 #include "core/console.h"
 #include "core/errno.h"
 #include "drivers/crg_jh7110.h"
@@ -90,7 +93,31 @@ static struct {
     char path[64];
     bool up;
     bool trace;
+    /* **The end-of-transfer interrupt**, armed only once the interrupt
+     * controller exists — which is after this card has already been read,
+     * because the root filesystem is on it. */
+    struct irqwait done;
+    bool irq_armed;
+    bool arm_only;
+    uint64_t interrupts_missed;
+    /* Set once the card has been asked why a write failed, so the answer is
+     * printed once per boot rather than once per refused block. */
+    bool asked_why;
 } mmc;
+
+/* How long a transfer may take before the wait gives up. Generous, because
+ * a card that is slow is not a card that is broken — and the number only
+ * matters when the interrupt does not come, which is the case it exists to
+ * make debuggable rather than silent. */
+#define DATA_OVER_TIMEOUT_NS 2000000000ull
+
+uint64_t dwmmc_interrupts_missed(void) {
+    return mmc.interrupts_missed;
+}
+
+void dwmmc_arm_only(bool on) {
+    mmc.arm_only = on;
+}
 
 void dwmmc_set_trace(bool on) {
     mmc.trace = on;
@@ -281,7 +308,59 @@ static int dw_move_block(void *self, bool reading, void *buf) {
  * however many blocks it carried — so it is waited for after the last block
  * and not between them. Waiting between blocks of a multi-block read waits
  * for something that will not happen until the read is over. */
+/* The controller's pending-interrupt word — read **and acknowledged**.
+ *
+ * `RINTSTS` is write-one-to-clear, so a handler that only reads it leaves
+ * the controller asserting its line: the PLIC completes the interrupt, the
+ * device immediately raises it again, and the hart never leaves the
+ * handler. The machine does nothing else, with nothing printed, which is
+ * exactly what happened the first time this was armed — the boot log stops
+ * at the line announcing it.
+ *
+ * `irq.h` warns about this in general terms ("an interrupt nobody handles
+ * will otherwise fire for ever"); the specific shape is that *handling* it
+ * is not enough, the device has to be told. */
+static uint32_t data_over_status(void) {
+    uint32_t status = get(DW_RINTSTS);
+    put(DW_RINTSTS, status);
+    return status;
+}
+
 static int wait_for_data_over(void) {
+    /* **Waited for, not watched, when the interrupt is wired.** The spin
+     * below holds the kernel lock for the whole of a transfer, and one hart
+     * is inside the kernel at a time — so the cost is not the spinning, it
+     * is that nothing else can happen until a card has finished. With the
+     * interrupt armed the hart sleeps or releases the lock and `wfi`s, and
+     * the controller's completion is what ends the wait.
+     *
+     * The spin stays as the fallback, and is *reached* rather than kept for
+     * tidiness: this driver runs before the interrupt controller is up — the
+     * root filesystem is mounted from this card — so the first transfers of
+     * every boot have no interrupt to wait for. A driver that assumed
+     * otherwise would not be able to read the disk it was being loaded
+     * from. */
+    if (mmc.irq_armed) {
+        int rc = irqwait_wait(&mmc.done, DATA_OVER_TIMEOUT_NS);
+        uint32_t status = mmc.done.status;
+        irqwait_rearm(&mmc.done);
+        if (rc == KERR_OK) {
+            return (status & INT_ERRORS) != 0 ? KERR_IO : KERR_OK;
+        }
+        /* A timeout falls through to one polled look, which distinguishes
+         * "the controller never finished" from "the interrupt never
+         * arrived" — and those want opposite investigations. */
+        /* **The polled look is for the case where the interrupt never
+         * came**, so it reads the register the handler would have cleared.
+         * If the handler ran, `fired` was set and the wait returned above;
+         * reaching here means it did not, so the bits are still there. */
+        if ((get(DW_RINTSTS) & INT_DATA_OVER) != 0) {
+            put(DW_RINTSTS, INT_DATA_OVER | INT_ERRORS);
+            mmc.interrupts_missed++;
+            return KERR_OK;
+        }
+        return KERR_TIMEDOUT;
+    }
     for (uint32_t spin = 0; spin < WAIT_SPINS; spin++) {
         uint32_t status = get(DW_RINTSTS);
         if ((status & INT_ERRORS) != 0) {
@@ -292,6 +371,45 @@ static int wait_for_data_over(void) {
         }
     }
     return KERR_TIMEDOUT;
+}
+
+/* Arms the end-of-transfer interrupt, once the interrupt controller exists.
+ *
+ * **Separate from the probe**, because the probe runs before the PLIC is up
+ * — this card holds the root filesystem, so it is read first. Called again
+ * later, which is why it is idempotent. */
+int dwmmc_use_interrupts(const struct fdt *fdt) {
+    uint32_t source = 0;
+    int rc;
+    if (!mmc.up || mmc.irq_armed) {
+        return mmc.up ? KERR_OK : KERR_NODEV;
+    }
+    /* The same way `virtio.c` reads its own: the first cell of
+     * `interrupts`, which on this board is the PLIC source number. */
+    source = fdt_get_u32(fdt, mmc.path, "interrupts", 0);
+    rc = source == 0u ? KERR_NOENT : KERR_OK;
+    if (rc != KERR_OK) {
+        kprintf("mmc: no interrupt in the tree for %s; transfers stay polled\n", mmc.path);
+        return KERR_NOENT;
+    }
+    rc = irqwait_arm(&mmc.done, source, data_over_status);
+    if (rc != KERR_OK) {
+        kprintf("mmc: interrupt %u could not be armed (rc %d); transfers stay polled\n", source,
+                rc);
+        return rc;
+    }
+    /* **The mask last.** With it open before the handler is installed, the
+     * first completion is an interrupt nobody claims — which the PLIC will
+     * re-raise for ever, and the machine does nothing else. */
+    put(DW_INTMASK, INT_DATA_OVER | INT_ERRORS);
+    put(DW_CTRL, get(DW_CTRL) | CTRL_INT_ENABLE);
+    /* The bisect: with `minikern.mmcirqonly` the handler is installed and
+     * the device is unmasked, but the wait stays polled — which separates
+     * "unmasking storms" from "the wait is wrong". */
+    mmc.irq_armed = !mmc.arm_only;
+    kprintf("mmc: end-of-transfer interrupt %u armed; the lock is free while a transfer runs\n",
+            source);
+    return KERR_OK;
 }
 
 /* Four-bit transfers and a faster clock, once the card has agreed to both. */
@@ -320,6 +438,69 @@ static const struct sd_transport transport = {
     .run_faster = dw_run_faster,
 };
 
+/* Asks the card what it thinks, after the controller has reported a failure.
+ *
+ * **The card's own answer, not the controller's.** A response timeout from
+ * the controller says "nothing came back"; it does not say why, and the two
+ * candidates — the card refusing a write and the host asking wrongly — want
+ * opposite fixes. R1 carries both: bit 26 is a write-protect violation, bit
+ * 25 says the card is locked, and bits 9..12 are the state it is in (4 is
+ * `tran`, which is where a write may be issued, and 5 is `data`, which means
+ * a previous transfer never ended).
+ *
+ * Issued only after a failure, so it costs a command on the path that is
+ * already broken and nothing on the one that works. */
+static void ask_the_card_why(uint8_t failed_index) {
+    uint32_t r1 = 0;
+    if (dw_command(NULL, CMD_SEND_STATUS, mmc.card.rca << 16, SD_RESP_SHORT, &r1) != KERR_OK) {
+        kprintf("mmc: CMD%u failed and the card will not report its status either\n",
+                failed_index);
+        return;
+    }
+    kprintf("mmc: after CMD%u the card says R1 %08x: state %u%s%s\n", failed_index, r1,
+            (r1 >> 9) & 0xfu, (r1 & (1u << 26)) != 0 ? ", write-protect violation" : "",
+            (r1 & (1u << 25)) != 0 ? ", locked" : "");
+}
+
+/* Waits for the card to leave the programming state.
+ *
+ * **This is what made writes fail, and the card said so.** After a write the
+ * card goes to `prg` and programs the block; it will not accept another
+ * command until it returns to `tran`. The driver issued the next one
+ * regardless, and the card answered with a response timeout — from which the
+ * host learns nothing. Asking it instead, with `CMD13`, gives:
+ *
+ *     mmc: after CMD24 the card says R1 00400e00: state 7
+ *
+ * State 7 is `prg`, and bit 22 is `ILLEGAL_COMMAND` — the card refusing a
+ * write it is not in a state to take. So the first write of a boot succeeded,
+ * left the card programming, and every write after it failed. That is
+ * exactly the shape of "writes to the SD card work sometimes".
+ *
+ * Polled with `CMD13` rather than by watching the controller's busy line,
+ * because the state is what the next command actually depends on and the
+ * card is the authority on it. The limit is generous: a card may take
+ * hundreds of milliseconds to program, and a wait that gave up early would
+ * turn a slow card into a broken one.
+ */
+#define PROGRAMMING_TIMEOUT_NS 1000000000ull
+#define CARD_STATE_TRAN 4u
+
+static int wait_until_ready_for_a_command(void) {
+    uint64_t until = timer_ns() + PROGRAMMING_TIMEOUT_NS;
+    while (timer_ns() < until) {
+        uint32_t r1 = 0;
+        if (dw_command(NULL, CMD_SEND_STATUS, mmc.card.rca << 16, SD_RESP_SHORT, &r1) != KERR_OK) {
+            continue; /* the card is too busy to answer: ask again */
+        }
+        if (((r1 >> 9) & 0xfu) == CARD_STATE_TRAN) {
+            return KERR_OK;
+        }
+    }
+    kprintf("mmc: the card did not return to the transfer state\n");
+    return KERR_TIMEDOUT;
+}
+
 static int one_block(bool reading, uint64_t lba, void *buf) {
     uint32_t argument = mmc.card.high_capacity ? (uint32_t)lba : (uint32_t)(lba * SD_BLOCK_BYTES);
     int rc;
@@ -327,8 +508,20 @@ static int one_block(bool reading, uint64_t lba, void *buf) {
     put(DW_BYTCNT, SD_BLOCK_BYTES);
     rc = dw_command(NULL, reading ? CMD_READ_SINGLE : CMD_WRITE_SINGLE, argument, SD_RESP_SHORT,
                     NULL);
+    if (rc != KERR_OK && !reading && !mmc.asked_why) {
+        /* Once per boot: the answer does not change between blocks, and a
+         * line per failed block buries it. */
+        mmc.asked_why = true;
+        ask_the_card_why(CMD_WRITE_SINGLE);
+    }
     rc = rc != KERR_OK ? rc : dw_move_block(NULL, reading, buf);
-    return rc != KERR_OK ? rc : wait_for_data_over();
+    rc = rc != KERR_OK ? rc : wait_for_data_over();
+    if (rc != KERR_OK || reading) {
+        return rc;
+    }
+    /* **Only after a write.** A read leaves the card in `tran` already, so
+     * asking would cost a command per block for nothing. */
+    return wait_until_ready_for_a_command();
 }
 
 /* Reads several blocks with **one command**.
@@ -417,11 +610,12 @@ static void remember_path(const char *path) {
  * in it. */
 static int try_controller(const struct fdt *fdt, const char *path, phys_t base, uint64_t size,
                           struct blockdev *out) {
-    int rc = mmu_map_device(base, size);
-    if (rc != KERR_OK) {
-        return rc;
+    void *at = mmu_map_device(base, size);
+    int rc;
+    if (at == NULL) {
+        return KERR_NOMEM;
     }
-    mmc.regs = (volatile uint32_t *)(uintptr_t)base;
+    mmc.regs = (volatile uint32_t *)at;
     mmc.base = base;
     remember_path(path);
     mmc.up = false;
@@ -459,7 +653,7 @@ static int try_controller(const struct fdt *fdt, const char *path, phys_t base, 
             }
         }
     }
-    put(DW_INTMASK, 0);       /* polled, so nothing is allowed to interrupt */
+    put(DW_INTMASK, 0); /* polled until `dwmmc_use_interrupts`, below */
     put(DW_TMOUT, 0xffffffffu);
     put(DW_BMOD, 0);          /* no internal DMA: the FIFO is the data path */
     put(DW_FIFOTH, (0x2u << 28) | ((8u - 1u) << 16) | 8u);

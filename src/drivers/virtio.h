@@ -74,6 +74,11 @@ struct virtq_used {
  * aligned. Allocated as whole pages so the alignment is a property of the
  * allocation rather than of arithmetic nobody checks. */
 struct virtq {
+    /* Where the device finds the three rings, as against where the kernel
+     * reaches them (`desc`, `avail`, `used` below). */
+    phys_t desc_phys;
+    phys_t avail_phys;
+    phys_t used_phys;
     struct virtq_desc *desc;
     struct virtq_avail *avail;
     struct virtq_used *used;

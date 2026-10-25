@@ -311,6 +311,13 @@ uint32_t sched_slot_aliases(void);
  * that never arrives. */
 uint32_t sched_ticks_seen(void);
 
+/* Nanoseconds summed over every hart that had nothing to run — the measured
+ * quantity behind `/proc/stat`'s idle column, accumulated at the one point
+ * where a hart's idleness starts and stops rather than sampled. Across four
+ * harts it can be four times the uptime, which is what makes it divisible
+ * into a proportion. */
+uint64_t sched_idle_ns(void);
+
 /* ── when this hart next needs the timer ───────────────────────────────── */
 
 /* Works out what this hart is waiting for and arms — or **disarms** — its

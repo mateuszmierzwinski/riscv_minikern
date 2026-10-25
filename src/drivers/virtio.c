@@ -77,9 +77,15 @@ static int build_queue(struct virtio_dev *d, uint32_t queue) {
         return rc;
     }
     struct virtq *q = &d->q[queue];
-    q->desc = (struct virtq_desc *)(uintptr_t)first;
-    q->avail = (struct virtq_avail *)(uintptr_t)(first + 2048u);
-    q->used = (struct virtq_used *)(uintptr_t)second;
+    /* **The device is given `first`/`second` and the kernel these.** The
+     * two were the same number while the kernel was identity-mapped, which
+     * is why the distinction never had to be made before. */
+    q->desc_phys = first;
+    q->avail_phys = first + 2048u;
+    q->used_phys = second;
+    q->desc = (struct virtq_desc *)mmu_phys_to_virt(first);
+    q->avail = (struct virtq_avail *)mmu_phys_to_virt(first + 2048u);
+    q->used = (struct virtq_used *)mmu_phys_to_virt(second);
     for (uint32_t i = 0; i < sizeof(struct virtq_desc) * VIRTIO_QUEUE_SIZE; i++) {
         ((volatile uint8_t *)q->desc)[i] = 0;
     }
@@ -146,13 +152,15 @@ static int probe_each(const struct fdt *fdt, uint32_t device_id, struct virtio_d
         kprintf("virtio: %s has no readable reg (rc %d)\n", path, rc);
         return KERR_NOENT;
     }
-    rc = mmu_map_device(base, size);
-    if (rc != KERR_OK) {
-        kprintf("virtio: %s at %016llx could not be mapped (rc %d)\n", path,
-                (unsigned long long)base, rc);
-        return KERR_NOMEM;
+    {
+        void *at = mmu_map_device(base, size);
+        if (at == NULL) {
+            kprintf("virtio: %s at %016llx could not be mapped\n", path,
+                    (unsigned long long)base);
+            return KERR_NOMEM;
+        }
+        out->regs = (volatile uint32_t *)at;
     }
-    out->regs = (volatile uint32_t *)(uintptr_t)base;
     out->base = base;
     if (read_reg(out, VIRTIO_MAGIC) != VIRTIO_MAGIC_VALUE) {
         kprintf("virtio: %s at %016llx reads magic %08x, not %08x\n", path,
@@ -240,7 +248,8 @@ static uint16_t chain(struct virtio_dev *d, uint32_t queue, const void *const *b
                       const uint32_t *lens, const bool *writable, uint32_t count) {
     struct virtq *q = &d->q[queue];
     for (uint32_t i = 0; i < count; i++) {
-        q->desc[i].addr = (uint64_t)(uintptr_t)bufs[i];
+        /* The device fetches from this address, so it is the bus one. */
+        q->desc[i].addr = (uint64_t)mmu_virt_to_phys(bufs[i]);
         q->desc[i].len = lens[i];
         q->desc[i].flags = (uint16_t)((writable[i] ? VIRTQ_DESC_F_WRITE : 0u) |
                                         (i + 1u < count ? VIRTQ_DESC_F_NEXT : 0u));

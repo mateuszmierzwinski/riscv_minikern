@@ -45,12 +45,16 @@ uint32_t crg_jh7110_init(const struct fdt *fdt) {
         char path[64];
         phys_t base = 0;
         uint64_t size = 0;
+        void *at;
         if (fdt_find_compatible(fdt, layouts[i].compatible, path, sizeof path) != KERR_OK ||
-            fdt_device_reg(fdt, path, 0, &base, &size) != KERR_OK ||
-            mmu_map_device(base, size) != KERR_OK) {
+            fdt_device_reg(fdt, path, 0, &base, &size) != KERR_OK) {
             continue;
         }
-        domains[i].regs = (volatile uint32_t *)(uintptr_t)base;
+        at = mmu_map_device(base, size);
+        if (at == NULL) {
+            continue;
+        }
+        domains[i].regs = (volatile uint32_t *)at;
         domains[i].base = base;
         domains[i].up = true;
         found++;
@@ -84,6 +88,10 @@ int crg_enable_clock(enum crg_domain domain, uint32_t index) {
         return KERR_NOTSUP;
     }
     return KERR_IO;
+}
+
+volatile uint32_t *crg_regs(enum crg_domain domain) {
+    return domain >= CRG_DOMAINS || !domains[domain].up ? NULL : domains[domain].regs;
 }
 
 int crg_release_reset(enum crg_domain domain, uint32_t id) {

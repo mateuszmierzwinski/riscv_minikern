@@ -81,11 +81,16 @@ uint32_t gpio_jh7110_init(const struct fdt *fdt) {
         phys_t base = 0;
         uint64_t size = 0;
         if (fdt_find_compatible(fdt, kinds[i].compatible, path, sizeof path) != KERR_OK ||
-            fdt_device_reg(fdt, path, 0, &base, &size) != KERR_OK ||
-            mmu_map_device(base, size) != KERR_OK) {
+            fdt_device_reg(fdt, path, 0, &base, &size) != KERR_OK) {
             continue;
         }
-        controllers[i].regs = (volatile uint8_t *)(uintptr_t)base;
+        {
+            void *at = mmu_map_device(base, size);
+            if (at == NULL) {
+                continue;
+            }
+            controllers[i].regs = (volatile uint8_t *)at;
+        }
         controllers[i].base = base;
         controllers[i].pins = kinds[i].pins;
         remember_path(i, path);

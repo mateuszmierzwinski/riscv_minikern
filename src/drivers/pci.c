@@ -129,6 +129,157 @@ static int read_memory_window(const struct fdt *fdt, const char *path) {
 static const char *const host_bridges[] = {"pci-host-ecam-generic", "starfive,jh7110-pcie"};
 
 /* Maps one candidate bridge's config space and adopts it. */
+/* **The bridge's own device-tree path, kept rather than discarded.**
+ *
+ * A PCIe device's interrupt does not belong to the device: `INTA`–`INTD` are
+ * the bridge's pins, routed by its `interrupt-map`, and a legacy-pin device
+ * raises the line the *bridge* owns. So the number a driver needs is on the
+ * host-bridge node, and the only place that node's path is known is where
+ * the bridge was adopted. Keeping it costs sixty-four bytes and is the
+ * difference between a driver that can wait for its device and one that has
+ * to spin. */
+static char bridge_path[64];
+
+const char *pci_bridge_path(void) {
+    return bridge_path[0] == '\0' ? NULL : bridge_path;
+}
+
+/* ── the bridge's INTx demultiplexer ───────────────────────────────────── */
+
+/* **Why a PCIe device's interrupt needs code here at all.**
+ *
+ * The JH7110's controller does not give each device a line. `INTA`-`INTD`
+ * and MSI are aggregated into one PLIC source — 57, the single cell the node
+ * declares — and the controller latches which of them fired in its own
+ * status register. So the PLIC line stays asserted until *that* is cleared,
+ * and a driver that acknowledges only its own device leaves the bridge
+ * asserting: the trap re-enters for ever and the machine does nothing else.
+ * Two boots were spent discovering that from the outside.
+ *
+ * **The offsets below are assumed, and that is the open question.** They are
+ * the PLDA XpressRICH set as Linux's driver for the same IP uses them, and
+ * with them the demultiplexer maps and the interrupt arms cleanly — but the
+ * first command then hangs with the hart inside the trap handler, which is
+ * what an uncleared latch looks like: `irqwait_wait` spins against a
+ * deadline and cannot hang, so the hang is re-entry rather than waiting.
+ * Either `ISTATUS_LOCAL` is not at `0x184` on this variant, or its bits are
+ * not write-1-to-clear, or `INTA` is not at bit 24.
+ *
+ * This tree has guessed a register map wrong four times — the SD
+ * controller, the GMAC generation, the watchdog and the temperature sensor —
+ * and each time the answer came from dumping the window on the board rather
+ * than from a document. That is the next step here, and it is why
+ * `minikern.nvmeirq` stays off by default: the polled path is correct and
+ * the root filesystem is on this drive.
+ *
+ * The registers are the PLDA XpressRICH set, at offsets within the window
+ * the node calls `apb` — read by name rather than by index, because the
+ * order of a `reg` list is not a promise. On this board that is
+ * `0x2c000000`, and `cfg` is the ECAM window the rest of this file uses.
+ *
+ * **The order in the handler is the whole trick.** The device must be
+ * quieted first and the latch cleared second: clearing a latch while the
+ * device still asserts simply sets it again. That is why this is two
+ * functions and not one, and why `nvme.c` calls them in that order. */
+#define PLDA_IMASK_LOCAL 0x180u
+#define PLDA_ISTATUS_LOCAL 0x184u
+/* `INTA`-`INTD` occupy bits 24-27 of both registers. */
+#define PLDA_INTX_SHIFT 24u
+#define PLDA_INTX_MASK (0xfu << PLDA_INTX_SHIFT)
+
+static volatile uint32_t *plda_apb;
+
+/* Whether `n` bytes at `here` are exactly the string `want`. */
+static bool same_name(const char *here, uint32_t n, const char *want) {
+    uint32_t i = 0;
+    while (i < n) {
+        if (want[i] == '\0' || here[i] != want[i]) {
+            return false;
+        }
+        i++;
+    }
+    return want[i] == '\0';
+}
+
+/* The index in `reg` of the window named `want`, or -1.
+ *
+ * `reg-names` is a run of NUL-terminated strings in the order the `reg`
+ * entries appear, which is the only thing that ties a name to a window. */
+static int reg_index_named(const struct fdt *fdt, const char *path, const char *want) {
+    struct fdt_prop names;
+    uint32_t at = 0;
+    int which = 0;
+    if (fdt_get_prop(fdt, path, "reg-names", &names) != KERR_OK) {
+        return -1;
+    }
+    while (at < names.len) {
+        const char *here = (const char *)names.value + at;
+        uint32_t n = 0;
+        while (at + n < names.len && here[n] != '\0') {
+            n++;
+        }
+        if (same_name(here, n, want)) {
+            return which;
+        }
+        at += n + 1u;
+        which++;
+    }
+    return -1;
+}
+
+int pci_bridge_intx_init(const struct fdt *fdt) {
+    const char *path = pci_bridge_path();
+    phys_t base = 0;
+    uint64_t size = 0;
+    int which;
+    if (path == NULL) {
+        return KERR_NODEV;
+    }
+    if (plda_apb != NULL) {
+        return KERR_OK;
+    }
+    which = reg_index_named(fdt, path, "apb");
+    if (which < 0) {
+        kprintf("pci: %s has no apb window; its INTx cannot be demultiplexed\n", path);
+        return KERR_NOENT;
+    }
+    if (fdt_device_reg(fdt, path, (uint32_t)which, &base, &size) != KERR_OK ||
+        size < PLDA_ISTATUS_LOCAL + 4u) {
+        kprintf("pci: %s apb window is unusable\n", path);
+        return KERR_INVAL;
+    }
+    /* **`mmu_map_device`, not `mmu_phys_to_virt`.** The apb window is at
+     * `0x2c000000`, below DRAM: it is not in the direct map, so converting
+     * it as if it were yields an address that faults on the first load. The
+     * ECAM window twenty lines below has always been mapped this way; this
+     * is the same kind of memory and wants the same treatment. The first
+     * attempt used the direct map and the boot ended in a register dump. */
+    plda_apb = (volatile uint32_t *)mmu_map_device(base, size);
+    if (plda_apb == NULL) {
+        kprintf("pci: %s apb window could not be mapped\n", path);
+        return KERR_NOMEM;
+    }
+    /* **Cleared before unmasked.** Anything latched from before the kernel
+     * was looking would otherwise arrive the moment the mask opens, as an
+     * interrupt for a completion nobody is waiting for. */
+    plda_apb[PLDA_ISTATUS_LOCAL / 4u] = PLDA_INTX_MASK;
+    plda_apb[PLDA_IMASK_LOCAL / 4u] = plda_apb[PLDA_IMASK_LOCAL / 4u] | PLDA_INTX_MASK;
+    kprintf("pci: %s INTx demultiplexer at %016llx\n", path, (unsigned long long)base);
+    return KERR_OK;
+}
+
+uint32_t pci_bridge_intx_clear(void) {
+    uint32_t status;
+    if (plda_apb == NULL) {
+        return 0;
+    }
+    status = plda_apb[PLDA_ISTATUS_LOCAL / 4u] & PLDA_INTX_MASK;
+    if (status != 0) {
+        plda_apb[PLDA_ISTATUS_LOCAL / 4u] = status;
+    }
+    return status >> PLDA_INTX_SHIFT;
+}
+
 static int adopt_bridge(const struct fdt *fdt, const char *path) {
     phys_t base = 0;
     uint64_t size = 0;
@@ -145,11 +296,13 @@ static int adopt_bridge(const struct fdt *fdt, const char *path) {
     /* Only the buses this kernel walks are mapped: the whole ECAM region is
      * 256 MiB of address space for 256 buses, and mapping it all would be
      * 65536 pages of page tables for devices that are not there. */
-    rc = mmu_map_device(base, (uint64_t)MAX_BUSES << ECAM_BUS_SHIFT);
-    if (rc != KERR_OK) {
-        return rc;
+    {
+        void *at = mmu_map_device(base, (uint64_t)MAX_BUSES << ECAM_BUS_SHIFT);
+        if (at == NULL) {
+            return KERR_NOMEM;
+        }
+        pci.ecam = (volatile uint8_t *)at;
     }
-    pci.ecam = (volatile uint8_t *)(uintptr_t)base;
     pci.ecam_base = base;
     pci.ecam_size = size;
     pci.up = true;
@@ -183,14 +336,22 @@ static struct host_bridge {
 static uint32_t bridge_count;
 
 /* Points the config-space accessors at one of the bridges found. */
-static void select_bridge(uint32_t i) {
-    pci.ecam = (volatile uint8_t *)(uintptr_t)bridges[i].ecam_base;
+static bool select_bridge(uint32_t i) {
+    /* **Remapped rather than cast**, and so able to fail — which is why
+     * this returns something now. The stored base is what the bridge
+     * decodes; reaching it needs a mapping of its own, and an earlier call
+     * for the same window is reused rather than mapped twice. */
+    pci.ecam = mmu_map_device(bridges[i].ecam_base, (uint64_t)MAX_BUSES << ECAM_BUS_SHIFT);
+    if (pci.ecam == NULL) {
+        return false;
+    }
     pci.ecam_base = bridges[i].ecam_base;
     pci.ecam_size = bridges[i].ecam_size;
     pci.mem_base = bridges[i].mem_base;
     pci.mem_size = bridges[i].mem_size;
     pci.mem_used = 0;
     pci.up = true;
+    return true;
 }
 
 int pci_init(const struct fdt *fdt) {
@@ -215,6 +376,14 @@ int pci_init(const struct fdt *fdt) {
                                                            .ecam_size = pci.ecam_size,
                                                            .mem_base = pci.mem_base,
                                                            .mem_size = pci.mem_size};
+            {
+                uint32_t n = 0;
+                while (n + 1u < sizeof bridge_path && path[n] != '\0') {
+                    bridge_path[n] = path[n];
+                    n++;
+                }
+                bridge_path[n] = '\0';
+            }
             kprintf("pci: %s at %016llx\n", path, (unsigned long long)pci.ecam_base);
         }
     }
@@ -222,7 +391,7 @@ int pci_init(const struct fdt *fdt) {
         kprintf("pci: no usable host bridge\n");
         return KERR_NOENT;
     }
-    select_bridge(0);
+    (void)select_bridge(0);
     return KERR_OK;
 }
 
@@ -270,7 +439,8 @@ static int assign_bar0(struct pci_device *d) {
         kprintf("pci: %02x:%02x.%u keeping its BAR0 at %016llx, %llu KiB\n", d->bus, d->slot,
                 d->function, (unsigned long long)d->bar0,
                 (unsigned long long)(d->bar0_size / 1024u));
-        return mmu_map_device(d->bar0, d->bar0_size);
+        d->bar0_virt = mmu_map_device(d->bar0, d->bar0_size);
+        return d->bar0_virt == NULL ? KERR_NOMEM : KERR_OK;
     }
     pci_config_write32(d, PCI_BAR0, 0xffffffffu);
     probe = pci_config_read32(d, PCI_BAR0);
@@ -291,7 +461,8 @@ static int assign_bar0(struct pci_device *d) {
     pci.mem_used = at + size - pci.mem_base;
     d->bar0 = at;
     d->bar0_size = size;
-    return mmu_map_device(at, size);
+    d->bar0_virt = mmu_map_device(at, size);
+    return d->bar0_virt == NULL ? KERR_NOMEM : KERR_OK;
 }
 
 /* Lets the device decode memory **and master the bus**. The second is the
@@ -432,7 +603,7 @@ int pci_find_class(uint32_t class_code, uint32_t mask, struct pci_device *out) {
     }
     pci.functions = 0;
     for (uint32_t i = 0; i < bridge_count; i++) {
-        select_bridge(i);
+        (void)select_bridge(i);
         if (find_class_here(class_code, mask, out) == KERR_OK) {
             return KERR_OK;
         }

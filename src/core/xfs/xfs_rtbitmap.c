@@ -46,23 +46,24 @@ static int bitmap_byte(struct xfs *fs, struct xfs_inode *bmp, uint64_t n, uint8_
 }
 
 /* Opens the bitmap file, which every operation here starts by doing. */
-static int open_bitmap(struct xfs *fs, struct xfs_inode *bmp) {
+static int open_bitmap(struct xfs *fs, struct xfs_inode **bmp) {
     if (fs->rblocks == 0 || fs->rextents == 0) {
         return KERR_NOTSUP; /* no realtime subvolume */
     }
     if (fs->rbmino == 0) {
         return KERR_NODEV; /* there is one, but its bitmap was never made */
     }
-    return xfs_inode_read(fs, fs->rbmino, bmp);
+    *bmp = &fs->rbm_inode;
+    return xfs_inode_read(fs, fs->rbmino, &fs->rbm_inode);
 }
 
 bool xfs_rt_extent_is_free(struct xfs *fs, uint64_t n) {
-    struct xfs_inode bmp;
+    struct xfs_inode *bmp = NULL;
     uint8_t byte = 0;
     if (n >= fs->rextents || open_bitmap(fs, &bmp) != KERR_OK) {
         return false;
     }
-    if (bitmap_byte(fs, &bmp, n, &byte) != KERR_OK) {
+    if (bitmap_byte(fs, bmp, n, &byte) != KERR_OK) {
         return false;
     }
     return (byte & (uint8_t)(1u << (n % 8u))) != 0;
@@ -77,7 +78,7 @@ bool xfs_rt_extent_is_free(struct xfs *fs, uint64_t n) {
  * not. */
 int xfs_rt_free_extents(struct xfs *fs, uint64_t *out) {
     static const uint8_t NIBBLE[16] = {0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4};
-    struct xfs_inode bmp;
+    struct xfs_inode *bmp = NULL;
     uint64_t total = 0, at = 0, end = bitmap_bytes(fs);
     int rc = open_bitmap(fs, &bmp);
     *out = 0;
@@ -88,7 +89,7 @@ int xfs_rt_free_extents(struct xfs *fs, uint64_t *out) {
         uint8_t chunk[64];
         uint32_t want = (uint32_t)(end - at < sizeof chunk ? end - at : sizeof chunk);
         uint32_t got = 0;
-        rc = xfs_file_read(fs, &bmp, at, chunk, want, &got);
+        rc = xfs_file_read(fs, bmp, at, chunk, want, &got);
         if (rc != KERR_OK || got == 0) {
             return rc != KERR_OK ? rc : KERR_IO;
         }
@@ -164,7 +165,7 @@ static int find_run(struct xfs *fs, struct xfs_inode *bmp, uint64_t count, uint6
 }
 
 int xfs_rt_alloc(struct xfs *fs, uint64_t count, uint64_t *start) {
-    struct xfs_inode bmp;
+    struct xfs_inode *bmp = NULL;
     int rc;
     if (count == 0) {
         return KERR_INVAL;
@@ -176,12 +177,12 @@ int xfs_rt_alloc(struct xfs *fs, uint64_t count, uint64_t *start) {
     if (rc != KERR_OK) {
         return rc;
     }
-    rc = find_run(fs, &bmp, count, start);
-    return rc != KERR_OK ? rc : mark_run(fs, &bmp, *start, count, false);
+    rc = find_run(fs, bmp, count, start);
+    return rc != KERR_OK ? rc : mark_run(fs, bmp, *start, count, false);
 }
 
 int xfs_rt_release(struct xfs *fs, uint64_t start, uint64_t count) {
-    struct xfs_inode bmp;
+    struct xfs_inode *bmp = NULL;
     int rc;
     if (count == 0 || start + count > fs->rextents) {
         return KERR_INVAL;
@@ -190,5 +191,5 @@ int xfs_rt_release(struct xfs *fs, uint64_t start, uint64_t count) {
         return KERR_ROFS;
     }
     rc = open_bitmap(fs, &bmp);
-    return rc != KERR_OK ? rc : mark_run(fs, &bmp, start, count, true);
+    return rc != KERR_OK ? rc : mark_run(fs, bmp, start, count, true);
 }

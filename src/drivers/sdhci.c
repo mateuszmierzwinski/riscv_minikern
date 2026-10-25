@@ -358,15 +358,20 @@ static int find_controller(const struct fdt *fdt) {
         phys_t base = 0;
         uint64_t size = 0;
         if (fdt_find_compatible(fdt, compatibles[i], path, sizeof path) != KERR_OK ||
-            fdt_device_reg(fdt, path, 0, &base, &size) != KERR_OK ||
-            mmu_map_device(base, size) != KERR_OK) {
+            fdt_device_reg(fdt, path, 0, &base, &size) != KERR_OK) {
             continue;
         }
-        sd.regs = (volatile uint8_t *)(uintptr_t)base;
+        {
+            void *at = mmu_map_device(base, size);
+            if (at == NULL) {
+                continue;
+            }
+            sd.regs = (volatile uint8_t *)at;
+        }
         return KERR_OK;
     }
     if (pci_find_class(SDHCI_PCI_CLASS, SDHCI_PCI_CLASS_MASK, &pcidev) == KERR_OK) {
-        sd.regs = (volatile uint8_t *)(uintptr_t)pcidev.bar0;
+        sd.regs = (volatile uint8_t *)pcidev.bar0_virt;
         return KERR_OK;
     }
     return KERR_NOENT;

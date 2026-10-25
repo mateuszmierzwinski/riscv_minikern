@@ -527,6 +527,17 @@
 #define XFS_DQ_INO_SOFT      32u  /* be64 */
 #define XFS_DQ_BCOUNT        40u  /* be64: blocks in use */
 #define XFS_DQ_ICOUNT        48u  /* be64: inodes in use */
+/* **The grace-period deadlines.** A soft limit does not refuse; it starts a
+ * clock, and these are where that clock's expiry is written — seconds since
+ * the Unix epoch, as a big-endian 32-bit value. Zero means "no grace period
+ * is running", which is the state of every record on a filesystem that has
+ * never been over its soft limit.
+ *
+ * They are what made soft limits unenforceable here for so long: a deadline
+ * is a *wall-clock* time, and a board with no real-time clock has nothing to
+ * compare one against. */
+#define XFS_DQ_ITIMER        56u  /* be32: when the inode grace period ends */
+#define XFS_DQ_BTIMER        60u  /* be32: when the block grace period ends */
 #define XFS_DQ_RTB_HARD      72u  /* be64, the realtime subvolume's */
 #define XFS_DQ_RTB_SOFT      80u  /* be64 */
 #define XFS_DQ_RTBCOUNT      88u  /* be64 */

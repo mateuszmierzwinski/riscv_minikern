@@ -1,5 +1,9 @@
 #include "kernel/fdobjects.h"
 
+#include "core/klog.h"
+#include "kernel/net.h"
+#include "kernel/procfs.h"
+
 #include <stddef.h>
 
 #include "core/console.h"
@@ -171,6 +175,158 @@ int fdobjects_open_eventfd(uint64_t initial, uint32_t flags) {
 
 /* ── the few paths that exist ───────────────────────────────────────────── */
 
+/* `/dev/virtual/kernel_logger`: the log's last lines, as a file.
+ *
+ * **A snapshot taken at open, not a stream.** The log keeps moving, and a
+ * reader that got whatever happened to be in the ring between its two
+ * `read` calls would see a line twice or not at all. Taking the tail once
+ * means two reads of one descriptor return one consistent document, which
+ * is what a program expects of a file.
+ *
+ * Read-only: a write would be a program claiming the kernel said something.
+ */
+struct klog_file {
+    char text[KLOG_TAIL_LINES * (KLOG_LINE_MAX + 1u)];
+    uint32_t len;
+    uint32_t offset;
+};
+
+static struct klog_file klog_open_snapshot;
+
+static int32_t klog_read(struct file *f, void *buf, uint32_t n) {
+    uint32_t left;
+    uint32_t take;
+    (void)f;
+    if (klog_open_snapshot.offset >= klog_open_snapshot.len) {
+        return 0; /* the end of the snapshot, as a file ends */
+    }
+    left = klog_open_snapshot.len - klog_open_snapshot.offset;
+    take = n < left ? n : left;
+    for (uint32_t i = 0; i < take; i++) {
+        ((uint8_t *)buf)[i] = (uint8_t)klog_open_snapshot.text[klog_open_snapshot.offset + i];
+    }
+    klog_open_snapshot.offset += take;
+    return (int32_t)take;
+}
+
+static int32_t klog_write_refused(struct file *f, const void *buf, uint32_t n) {
+    (void)f;
+    (void)buf;
+    (void)n;
+    /* Not `EBADF`, which would say the descriptor is wrong. The descriptor
+     * is fine; the file is the kernel's account of itself. */
+    return KERR_PERM;
+}
+
+static const struct file_ops klog_ops = {
+    .read = klog_read,
+    .write = klog_write_refused,
+};
+
+/* `/etc/resolv.conf`, synthesised from what DHCP learned.
+ *
+ * **The kernel has no resolver and should not have one** — resolving a name
+ * means a UDP exchange, a cache and a policy, none of which belong in here.
+ * What the kernel does have is the only copy of the resolver's address: it
+ * arrived in a DHCP option and was stored on the interface, where nothing in
+ * user space could reach it. So a program could not resolve a name, not for
+ * want of a resolver but for want of the one line that says where to ask.
+ *
+ * This is that line, in the file every resolver already looks in — so a
+ * stock Go binary's `net.LookupHost` works with nothing ported.
+ *
+ * **A real file wins.** The filesystem is tried first and this is the
+ * fallback, because an operator who wrote their own `/etc/resolv.conf` meant
+ * it, and a kernel that shadowed it would be overriding a decision it cannot
+ * see. Synthesising only when the file is absent is also what makes this
+ * safe on a read-only root. */
+struct resolv_file {
+    char text[64];
+    uint32_t len;
+    uint32_t offset;
+};
+
+static struct resolv_file resolv_snapshot;
+
+/* "nameserver a.b.c.d\n", built without a formatter: this runs under the
+ * kernel lock on the open path and `ip4_format` is already here. */
+static void fill_resolv_snapshot(void) {
+    char ip[16];
+    const char *prefix = "nameserver ";
+    struct netif *nif = knet_interface();
+    uint32_t at = 0;
+    resolv_snapshot.offset = 0;
+    resolv_snapshot.len = 0;
+    if (nif == NULL || nif->dns == 0) {
+        return; /* nothing learned: an empty file, which is a true answer */
+    }
+    while (prefix[at] != '\0') {
+        resolv_snapshot.text[at] = prefix[at];
+        at++;
+    }
+    (void)ip4_format(nif->dns, ip);
+    for (uint32_t i = 0; ip[i] != '\0' && at < sizeof resolv_snapshot.text - 2u; i++) {
+        resolv_snapshot.text[at++] = ip[i];
+    }
+    resolv_snapshot.text[at++] = '\n';
+    resolv_snapshot.len = at;
+}
+
+static int32_t resolv_read(struct file *f, void *buf, uint32_t n) {
+    uint32_t left;
+    uint32_t take;
+    (void)f;
+    if (resolv_snapshot.offset >= resolv_snapshot.len) {
+        return 0;
+    }
+    left = resolv_snapshot.len - resolv_snapshot.offset;
+    take = n < left ? n : left;
+    for (uint32_t i = 0; i < take; i++) {
+        ((char *)buf)[i] = resolv_snapshot.text[resolv_snapshot.offset + i];
+    }
+    resolv_snapshot.offset += take;
+    return (int32_t)take;
+}
+
+/* A `/proc` file, generated whole at open.
+ *
+ * **A snapshot, not a stream**, for the same reason the kernel log's is: a
+ * file read in two `read` calls must not change between them, or a program
+ * parsing it sees one line from before and the next from after. Shared by
+ * every `/proc` path because only one can be being opened at a time — the
+ * kernel lock is held across an open — and the alternative is a buffer per
+ * descriptor for files that are a few hundred bytes. */
+static struct {
+    char text[PROCFS_MAX_BYTES];
+    uint32_t len;
+    uint32_t offset;
+} proc_open_snapshot;
+
+static int32_t procfile_read(struct file *f, void *buf, uint32_t n) {
+    uint32_t left, take;
+    (void)f;
+    if (proc_open_snapshot.offset >= proc_open_snapshot.len) {
+        return 0;
+    }
+    left = proc_open_snapshot.len - proc_open_snapshot.offset;
+    take = n < left ? n : left;
+    for (uint32_t i = 0; i < take; i++) {
+        ((char *)buf)[i] = proc_open_snapshot.text[proc_open_snapshot.offset + i];
+    }
+    proc_open_snapshot.offset += take;
+    return (int32_t)take;
+}
+
+static const struct file_ops procfile_ops = {
+    .read = procfile_read,
+    .write = klog_write_refused,
+};
+
+static const struct file_ops resolv_ops = {
+    .read = resolv_read,
+    .write = klog_write_refused,
+};
+
 /* `/dev/null`: reads end immediately, writes vanish. */
 static int32_t null_read(struct file *f, void *buf, uint32_t n) {
     (void)f;
@@ -299,8 +455,50 @@ int fdobjects_file_of_object(void *object, const uint8_t **bytes, uint32_t *size
  * asked them anything: there was no file to be denied. Opening one by name
  * is exactly where the owner/group/other bits mean something, and the mode
  * comes from the filesystem's own inode rather than from a guess. */
+static int open_directory(const char *path);
+static int open_for_writing(const char *path);
+
 static int open_regular(const char *path, uint32_t flags) {
     uint32_t uid = 0, gid = 0, mode = 0;
+    if ((flags & O_ACCMODE) != O_RDONLY) {
+        /* **Re-enabled, and the evidence is worth keeping.**
+         *
+         * This was switched off after the operator's SD card went from 8
+         * root entries to 1116 with names that are not text. The suspicion
+         * fell here, on the zero-length create at open and the chunked
+         * writes at increasing offsets that a Go `io.Copy` produces, because
+         * no other caller does either.
+         *
+         * Both are clean. `minikern.chunked` does exactly that sequence
+         * against a disposable fixture image and the root gains **one**
+         * entry for one file, with every call returning success — so the
+         * pattern is not what corrupted anything.
+         *
+         * What did: the fixture runs over a RAM disk and the card runs
+         * through `dwmmc`, and those pushes happened while **CMD24 was
+         * timing out and the driver was issuing commands to a card still in
+         * its programming state**. That is the defect `CMD13` polling now
+         * prevents, and with it the whole write suite passes on the card.
+         * The damage was done before the fix, by the driver, not by this.
+         *
+         * **Decided before the file is looked for**, because the stat below
+         * would otherwise fail with `ENOENT` on a file that does not exist
+         * yet — the one case `O_CREAT` is for. */
+        return open_for_writing(path);
+    }
+    {
+        /* **A directory is a different kind of descriptor.** It used to fall
+         * through to the file path and be refused as unreadable, so
+         * `os.ReadDir` failed at the open and never reached `getdents64` —
+         * which made a listing impossible for a reason that had nothing to
+         * do with listing. */
+        uint32_t dmode = 0, dnlink = 0;
+        uint64_t dsize = 0;
+        if (xfsmount_stat_full(path, &dmode, &dsize, &dnlink) == KERR_OK &&
+            (dmode & 0170000u) == 0040000u) {
+            return open_directory(path);
+        }
+    }
     uint8_t *bytes = NULL;
     uint32_t size = 0;
     struct diskfile *d;
@@ -312,9 +510,7 @@ static int open_regular(const char *path, uint32_t flags) {
     if (!uspace_may_access(uid, gid, mode, ACCESS_READ)) {
         return KERR_ACCES;
     }
-    if ((flags & 3u) != O_RDONLY) {
-        return KERR_ROFS; /* nothing here can write a file yet */
-    }
+
     d = diskfile_alloc();
     rc = d == NULL ? KERR_NOMEM : xfsmount_read_file(path, DISKFILE_MAX_BYTES, &bytes, &size);
     if (rc != KERR_OK) {
@@ -331,6 +527,349 @@ static int open_regular(const char *path, uint32_t flags) {
     return fd_install(f);
 }
 
+/* ── a file opened for writing ─────────────────────────────────────────── */
+
+/* A file being written: its directory, its name, and the bytes so far.
+ *
+ * **Buffered and committed on close**, which is the same trade `diskfile`
+ * makes in the other direction — it reads a whole file into memory and hands
+ * it out. The writer the filesystem exposes takes a complete file rather
+ * than an offset and a length, so a descriptor that wrote through on every
+ * `write` would rewrite the whole file per call: a Go `io.Copy` moves 32 KiB
+ * at a time, so pushing a 3.5 MB binary would write 120 MB.
+ *
+ * What that costs, said plainly: a file is not on the card until the
+ * descriptor is closed, so a crash in between loses it, and a file larger
+ * than the buffer is refused rather than truncated. Both are acceptable for
+ * what this is — a way to put a binary on the board — and neither is a
+ * surprise a caller discovers from corrupt data.
+ *
+ * The path is split once, at open, because the filesystem wants a directory
+ * and a leaf; splitting per write would do the same work repeatedly and
+ * give two chances to disagree about where the separator is. */
+/* A path split once, and how far the writer has got. **No buffer at all**:
+ * each `write` goes straight to the filesystem at its offset.
+ *
+ * The first version held the whole file and committed on close, which meant
+ * a 16 MiB allocation per open descriptor and wedged the service after one
+ * file. An offset-taking writer already existed in the mount layer; it was
+ * only root-relative, which is the single reason it was not used. */
+#define WRITEFILE_PATH_MAX 128u
+
+struct writefile {
+    char dir[WRITEFILE_PATH_MAX];
+    char leaf[WRITEFILE_PATH_MAX];
+    uint64_t offset;
+    bool used;
+};
+
+static struct writefile writefiles[FD_MAX];
+
+/* Splits a path into its directory and its final component. */
+static int split_path(const char *path, char *dir, char *leaf) {
+    uint32_t cut = 0, n = 0;
+    for (uint32_t i = 0; path[i] != '\0'; i++) {
+        if (path[i] == '/') {
+            cut = i;
+        }
+        n = i + 1u;
+    }
+    if (n == 0 || path[n - 1u] == '/' || n - cut - 1u >= WRITEFILE_PATH_MAX ||
+        cut + 1u >= WRITEFILE_PATH_MAX) {
+        return KERR_INVAL;
+    }
+    for (uint32_t i = 0; i < cut; i++) {
+        dir[i] = path[i];
+    }
+    dir[cut] = '\0';
+    /* A file directly in the root has an empty directory part, which the
+     * filesystem spells "/" and not "". Getting this wrong produced
+     * `//pushed.txt` in a diagnostic, which was the clue that the two
+     * halves disagreed about who owns the separator. */
+    if (cut == 0) {
+        dir[0] = '/';
+        dir[1] = '\0';
+    }
+    for (uint32_t i = 0; i < n - cut - 1u; i++) {
+        leaf[i] = path[cut + 1u + i];
+    }
+    leaf[n - cut - 1u] = '\0';
+    return KERR_OK;
+}
+
+static int32_t writefile_write(struct file *f, const void *buf, uint32_t n) {
+    struct writefile *w = f->priv;
+    int rc;
+    if (w == NULL) {
+        return KERR_BADF;
+    }
+    rc = xfsmount_write_at(w->dir, w->leaf, w->offset, buf, n);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    w->offset += n;
+    return (int32_t)n;
+}
+
+static int32_t writefile_read(struct file *f, void *buf, uint32_t n) {
+    (void)f;
+    (void)buf;
+    (void)n;
+    return KERR_BADF; /* opened for writing */
+}
+
+static void writefile_release(struct file *f) {
+    struct writefile *w = f->priv;
+    if (w != NULL) {
+        w->used = false;
+    }
+}
+
+static const struct file_ops writefile_ops = {
+    .read = writefile_read,
+    .write = writefile_write,
+    .release = writefile_release,
+};
+
+/* Opens a path for writing, creating the file at once.
+ *
+ * **Created on open rather than on the first write**, so that a program
+ * which opens a file and writes nothing still leaves an empty file — which
+ * is what `O_CREAT` means and what every caller assumes. */
+static int open_for_writing(const char *path) {
+    struct writefile *w = NULL;
+    struct file *f;
+    for (uint32_t i = 0; i < FD_MAX; i++) {
+        if (!writefiles[i].used) {
+            w = &writefiles[i];
+            break;
+        }
+    }
+    if (w == NULL) {
+        return KERR_NOMEM;
+    }
+    if (split_path(path, w->dir, w->leaf) != KERR_OK) {
+        return KERR_INVAL;
+    }
+    {
+        int rc = xfsmount_write_at(w->dir, w->leaf, 0, NULL, 0);
+        if (rc != KERR_OK) {
+            return rc;
+        }
+    }
+    w->offset = 0;
+    w->used = true;
+    f = file_new(&writefile_ops, w, O_WRONLY);
+    if (f == NULL) {
+        w->used = false;
+        return KERR_NOMEM;
+    }
+    return fd_install(f);
+}
+
+/* ── a directory, as a descriptor ──────────────────────────────────────── */
+
+/* An open directory: the path it names and how far a reader has got.
+ *
+ * **The cursor is a count of entries handed over, not a byte offset.** A
+ * `getdents64` reply is a sequence of variable-length records, so a byte
+ * offset into one reply means nothing on the next call — and the filesystem
+ * walks a directory by callback rather than by index, which is why each call
+ * re-walks and skips. That is O(n²) over a directory read in full, and the
+ * right trade here: directories on this board are tens of entries, and the
+ * alternative is holding a snapshot of every open directory in kernel memory
+ * for as long as a descriptor lives.
+ *
+ * The path is kept because the filesystem resolves by name; there is no
+ * inode handle to hold, and holding one would have to be invalidated by
+ * every write. */
+#define DIRFILE_PATH_MAX 128u
+
+struct dirfile {
+    char path[DIRFILE_PATH_MAX];
+    uint32_t handed_over;
+    bool used;
+};
+
+static struct dirfile dirfiles[FD_MAX];
+
+static struct dirfile *dirfile_alloc(const char *path) {
+    for (uint32_t i = 0; i < FD_MAX; i++) {
+        if (dirfiles[i].used) {
+            continue;
+        }
+        {
+            uint32_t n = 0;
+            while (path[n] != '\0' && n + 1u < DIRFILE_PATH_MAX) {
+                dirfiles[i].path[n] = path[n];
+                n++;
+            }
+            if (path[n] != '\0') {
+                return NULL; /* too long to remember; refused rather than cut */
+            }
+            dirfiles[i].path[n] = '\0';
+        }
+        dirfiles[i].handed_over = 0;
+        dirfiles[i].used = true;
+        return &dirfiles[i];
+    }
+    return NULL;
+}
+
+/* `struct linux_dirent64`, by offset rather than as a struct — the same
+ * reasoning as `struct stat` in `syscall.c`: a declaration here would have
+ * to match the ABI's padding exactly, and the one time that was assumed
+ * rather than laid out, a Go runtime read a field half a field late. */
+#define DIRENT_INO 0u
+#define DIRENT_OFF 8u
+#define DIRENT_RECLEN 16u
+#define DIRENT_TYPE 18u
+#define DIRENT_NAME 19u
+#define DIRENT_FIXED 19u
+#define DT_DIR 4u
+#define DT_REG 8u
+#define DT_UNKNOWN 0u
+
+/* What one `getdents64` call is filling. */
+struct dirent_fill {
+    uint8_t *at;
+    uint32_t room;
+    uint32_t used;
+    uint32_t skip;
+    uint32_t seen;
+    bool full;
+};
+
+static void put_le16(uint8_t *at, uint16_t v) {
+    at[0] = (uint8_t)v;
+    at[1] = (uint8_t)(v >> 8);
+}
+
+static void put_le64(uint8_t *at, uint64_t v) {
+    for (uint32_t i = 0; i < 8u; i++) {
+        at[i] = (uint8_t)(v >> (i * 8u));
+    }
+}
+
+/* Appends one entry, or marks the buffer full.
+ *
+ * **A record that does not fit is not written at all**, and the entry is not
+ * counted as handed over — so the next call starts with it. A partial record
+ * would be read as a complete one with a wrong length, which is how a reader
+ * walks off the end of its own buffer. */
+static int add_dirent(void *self, const struct xfs_dirent *entry) {
+    struct dirent_fill *f = self;
+    uint32_t reclen;
+    uint32_t namelen = entry->name_len;
+    f->seen++;
+    if (f->seen <= f->skip) {
+        return 0; /* already handed to an earlier call */
+    }
+    if (namelen > 255u) {
+        return 0; /* a name this reader cannot represent: skipped, not fatal */
+    }
+    /* Rounded up to eight, which the ABI requires: a reader steps by
+     * `d_reclen` and an unaligned record misaligns every one after it. */
+    reclen = (DIRENT_FIXED + namelen + 1u + 7u) & ~7u;
+    if (f->used + reclen > f->room) {
+        f->full = true;
+        return 1; /* stop the walk; the rest is for the next call */
+    }
+    {
+        uint8_t *rec = f->at + f->used;
+        for (uint32_t i = 0; i < reclen; i++) {
+            rec[i] = 0;
+        }
+        put_le64(rec + DIRENT_INO, entry->ino);
+        /* `d_off` is "where to resume", and a count of entries is exactly
+         * that for this implementation. A reader that seeks by it gets the
+         * same place back. */
+        put_le64(rec + DIRENT_OFF, f->seen);
+        put_le16(rec + DIRENT_RECLEN, (uint16_t)reclen);
+        /* The filesystem's own type byte, mapped. A filesystem without
+         * `ftype` reports UNKNOWN for everything, and passing that through
+         * is right: a caller then stats what it cares about, which is what
+         * `os.ReadDir` does anyway. Inventing `DT_REG` would make every
+         * directory on such a filesystem look like a file. */
+        rec[DIRENT_TYPE] = entry->type == XFS_DIR3_FT_DIR
+                               ? (uint8_t)DT_DIR
+                               : (entry->type == XFS_DIR3_FT_REG ? (uint8_t)DT_REG
+                                                                      : (uint8_t)DT_UNKNOWN);
+        for (uint32_t i = 0; i < namelen; i++) {
+            rec[DIRENT_NAME + i] = (uint8_t)entry->name[i];
+        }
+    }
+    f->used += reclen;
+    return 0;
+}
+
+static int32_t dirfile_read(struct file *f, void *buf, uint32_t n) {
+    (void)f;
+    (void)buf;
+    (void)n;
+    /* A directory is read with `getdents64`, not with `read`. Linux answers
+     * `EISDIR` here and so does this: a program that reads a directory as
+     * bytes is doing something that has not worked since the 1980s. */
+    return KERR_ISDIR;
+}
+
+static int32_t dirfile_write_refused(struct file *f, const void *buf, uint32_t n) {
+    (void)f;
+    (void)buf;
+    (void)n;
+    return KERR_ISDIR;
+}
+
+static void dirfile_release(struct file *f) {
+    struct dirfile *d = f->priv;
+    if (d != NULL) {
+        d->used = false;
+    }
+}
+
+static const struct file_ops dirfile_ops = {
+    .read = dirfile_read,
+    .write = dirfile_write_refused,
+    .release = dirfile_release,
+};
+
+int32_t fdobjects_getdents(struct file *f, void *buf, uint32_t room) {
+    struct dirfile *d = f == NULL ? NULL : f->priv;
+    struct dirent_fill fill = {0};
+    int rc;
+    if (f == NULL || f->ops != &dirfile_ops || d == NULL) {
+        return KERR_NOTDIR;
+    }
+    fill.at = buf;
+    fill.room = room;
+    fill.skip = d->handed_over;
+    rc = xfsmount_list(d->path, add_dirent, &fill);
+    /* A walk stopped by a full buffer is not a failure: `add_dirent`
+     * returning non-zero is how `xfs_dir_list` is told to stop, and that is
+     * the same signal a real error uses — so the buffer's own flag is what
+     * distinguishes them. */
+    if (rc != KERR_OK && !fill.full) {
+        return rc;
+    }
+    d->handed_over = fill.seen - (fill.full ? 1u : 0u);
+    return (int32_t)fill.used;
+}
+
+/* Opens a directory, for `getdents64`. */
+static int open_directory(const char *path) {
+    struct dirfile *d = dirfile_alloc(path);
+    struct file *f;
+    if (d == NULL) {
+        return KERR_NOMEM;
+    }
+    f = file_new(&dirfile_ops, d, O_RDONLY);
+    if (f == NULL) {
+        d->used = false;
+        return KERR_NOMEM;
+    }
+    return fd_install(f);
+}
+
 static bool same_path(const char *a, const char *b) {
     uint32_t i = 0;
     while (a[i] != '\0' && a[i] == b[i]) {
@@ -341,6 +880,13 @@ static bool same_path(const char *a, const char *b) {
 
 int fdobjects_open_path(const char *path, uint32_t flags) {
     const struct file_ops *ops = NULL;
+    if (same_path(path, "/dev/virtual/kernel_logger")) {
+        /* Taken before the descriptor exists, so the snapshot and the
+         * descriptor cannot disagree about which lines are in it. */
+        klog_open_snapshot.len = klog_tail(klog_open_snapshot.text,
+                                          (uint32_t)sizeof klog_open_snapshot.text);
+        klog_open_snapshot.offset = 0;
+    }
     struct file *f;
     if (same_path(path, "/dev/null")) {
         ops = &null_ops;
@@ -348,6 +894,31 @@ int fdobjects_open_path(const char *path, uint32_t flags) {
         ops = &zero_ops;
     } else if (same_path(path, "/dev/console") || same_path(path, "/dev/tty")) {
         ops = &console_ops;
+    } else if (same_path(path, "/dev/virtual/kernel_logger")) {
+        ops = &klog_ops;
+    }
+    if (ops == NULL && procfs_has(path)) {
+        /* Generated before the descriptor exists, so the snapshot and the
+         * descriptor cannot disagree about what the file said. */
+        uint32_t wrote = 0;
+        if (procfs_generate(path, proc_open_snapshot.text, PROCFS_MAX_BYTES, &wrote) != KERR_OK) {
+            return KERR_NOENT;
+        }
+        proc_open_snapshot.len = wrote;
+        proc_open_snapshot.offset = 0;
+        ops = &procfile_ops;
+    }
+    if (ops == NULL && same_path(path, "/etc/resolv.conf")) {
+        /* **The filesystem first.** An operator's own file is a decision
+         * this kernel cannot see and must not override; the synthesised one
+         * exists for the case where there is none, which on a DHCP-
+         * configured machine with a read-only root is every boot. */
+        int real = open_regular(path, flags);
+        if (real >= 0) {
+            return real;
+        }
+        fill_resolv_snapshot();
+        ops = &resolv_ops;
     }
     if (ops == NULL) {
         /* Not one of the kernel's own objects, so it is a name on the

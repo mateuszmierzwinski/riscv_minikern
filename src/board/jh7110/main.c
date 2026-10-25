@@ -34,6 +34,11 @@
 #include "core/bootinfo.h"
 #include "core/cmdline.h"
 #include "core/console.h"
+#include "core/klog.h"
+#include "kernel/irqwait.h"
+#include "kernel/file.h"
+#include "kernel/fdobjects.h"
+#include "lib/kfmt.h"
 #include "core/errno.h"
 #include "core/fdt.h"
 #include "kernel/disk.h"
@@ -54,6 +59,14 @@
 #include "kernel/uspace.h"
 #include "kernel/probe.h"
 #include "drivers/dwmac.h"
+#include "kernel/procfs.h"
+#include "kernel/wallclock.h"
+#include "drivers/temp_jh7110.h"
+#include "drivers/xhci.h"
+#include "drivers/wdt_jh7110.h"
+#include "drivers/pwm_jh7110.h"
+#include "drivers/i2c_dw.h"
+#include "drivers/spi_pl022.h"
 #include "drivers/dwmac_probe.h"
 #include "kernel/volumes.h"
 #include "lib/sha256.h"
@@ -204,7 +217,16 @@ static bool find_a_loaded_range(const char *key, phys_t *at, uint64_t *bytes) {
 }
 
 static void bring_up_memory(const struct bootinfo *info) {
-    uint64_t arena = ((uint64_t)(uintptr_t)__kernel_end + PAGE_SIZE - 1u) & ~(PAGE_SIZE - 1u);
+    /* **The physical end of the image, asked for rather than computed.**
+     * `__kernel_end` reads as a high address once the kernel is running in
+     * its own half, and an arena placed from it is nowhere near RAM. */
+    phys_t image_at = 0;
+    uint64_t image_size = 0;
+    uint64_t arena;
+    mmu_kernel_phys_range(&image_at, &image_size);
+    arena = image_at == 0
+                ? (((uint64_t)(uintptr_t)__kernel_end + PAGE_SIZE - 1u) & ~(PAGE_SIZE - 1u))
+                : ((image_at + image_size + PAGE_SIZE - 1u) & ~(PAGE_SIZE - 1u));
     if (mem_init(info, arena, TABLE_ARENA_BYTES) != KERR_OK) {
         kprintf("mem: no usable memory map\n");
         return;
@@ -222,6 +244,142 @@ static void bring_up_memory(const struct bootinfo *info) {
     }
     kprintf("mem: %u of %u pages free (%u MiB of %u MiB)\n", mem_free_pages_count(),
             mem_total_pages(), mem_free_pages_count() / 256u, mem_total_pages() / 256u);
+}
+
+/* Arms the SD controller's interrupt, if that is the disk in use.
+ *
+ * A wrapper rather than a direct call, because the disk may be the NVMe
+ * drive or a RAM image — and arming an interrupt for a controller nothing
+ * is reading would install a handler for a device that will never raise. */
+static int dwmmc_use_interrupts_if_present(uint64_t dtb) {
+    const char *kind = disk_present() ? disk_kind() : NULL;
+    /* `disk_kind` is the probe's own word for what it attached, which is
+     * the only thing that distinguishes the card from the NVMe drive or a
+     * RAM image here. */
+    if (kind == NULL || kind[0] != 's' || kind[1] != 'd') {
+        return KERR_NODEV;
+    }
+    {
+        struct fdt fdt;
+        if (fdt_open(&fdt, (const void *)(uintptr_t)dtb, FDT_MAX_BYTES) != KERR_OK) {
+            return KERR_INVAL;
+        }
+        return dwmmc_use_interrupts(&fdt);
+    }
+}
+
+/* The same for the NVMe drive, which is a separate call because the two
+ * devices are never both the attached disk and each reads its interrupt from
+ * a different place: the card's is its own node's, the drive's is the PCIe
+ * host bridge's. */
+static int nvme_use_interrupts_if_present(uint64_t dtb) {
+    const char *kind = disk_present() ? disk_kind() : NULL;
+    if (kind == NULL || kind[0] != 'n') {
+        return KERR_NODEV;
+    }
+    {
+        struct fdt fdt;
+        if (fdt_open(&fdt, (const void *)(uintptr_t)dtb, FDT_MAX_BYTES) != KERR_OK) {
+            return KERR_INVAL;
+        }
+        return nvme_use_interrupts(&fdt);
+    }
+}
+
+/* Writes the boot's log to `/var/log/kernel.0.log`, rotating what is there.
+ *
+ * **Why the kernel does this itself.** Everything interesting about a boot
+ * happens before there is a program to read a log, and on a board whose
+ * console is a serial cable the only record is whoever was watching. Keeping
+ * the lines in memory and writing them once there is a filesystem is the
+ * difference between a log and a transcript.
+ *
+ * **Right after the root filesystem is mounted and before init**, which is
+ * the only window where it is both possible and complete: before the mount
+ * there is nowhere to write, and after init the log would be missing
+ * whatever init did to earn the attention of whoever is reading it.
+ *
+ * Rotation runs **downwards from the oldest**: `kernel.8.log` becomes
+ * `kernel.9.log`, then 7 becomes 8, and so on to 0 becoming 1, so that
+ * nothing is overwritten before it has been copied. This boot is always
+ * `.0`. Ten boots is enough to compare a failure against the last time it
+ * worked, which is what anybody actually does with these.
+ *
+ * **Each move is logged**, which is not ceremony: the log that records the
+ * rotation is the log being rotated, so those lines are the only evidence
+ * afterwards of which boot went where. A reader looking at `kernel.3.log`
+ * can see it was once `.2` and when.
+ *
+ * `/var/log` is **not created** if it is missing, because this writer has no
+ * `mkdir`. The log then stays in memory and says so — a kernel that wrote
+ * its log into the root directory instead would be putting its files among
+ * a user's, which is worse than a clear refusal.
+ */
+static void put_the_boot_log_on_disk(void) {
+    static char text[KLOG_BYTES];
+    char name[24];
+    uint32_t n;
+    int rc;
+    if (klog_entries() == 0) {
+        return;
+    }
+    /* Rotate downwards from the oldest, so that nothing is overwritten
+     * before it has been copied. Reading each one back costs a little and
+     * means the rotation cannot lose a boot to a failed write halfway. */
+    {
+        uint32_t moved = 0;
+        for (uint32_t i = KLOG_KEEP_BOOTS; i-- > 1u;) {
+            uint8_t *older = NULL;
+            uint32_t size = 0;
+            char from[32], to[24];
+            kfmt_snprintf(from, sizeof from, "/var/log/kernel.%u.log", i - 1u);
+            kfmt_snprintf(to, sizeof to, "kernel.%u.log", i);
+            if (xfsmount_read_file(from, (uint32_t)sizeof text, &older, &size) != KERR_OK) {
+                continue; /* that boot was never written; nothing to move */
+            }
+            rc = xfsmount_write_into("/var/log", to, older, size);
+            kfree(older);
+            if (rc != KERR_OK) {
+                /* Said rather than skipped: a rotation that half happened
+                 * leaves two boots claiming the same number, and the next
+                 * reader needs to know which one lied. */
+                klog(KLOG_WARN, "klog: kernel.%u.log could not become kernel.%u.log (rc %d)\n",
+                     i - 1u, i, rc);
+                continue;
+            }
+            klog(KLOG_INFO, "klog: rotated kernel.%u.log to kernel.%u.log, %u bytes\n", i - 1u, i,
+                 size);
+            moved++;
+        }
+        klog(KLOG_NOTICE, "klog: %u earlier boot%s rotated; this one becomes kernel.0.log\n",
+             moved, moved == 1u ? "" : "s");
+    }
+    /* **Made if it is not there**, rather than reported as missing: a log
+     * the kernel keeps and cannot store is a log nobody reads. Every
+     * component, because a fresh filesystem has neither `/var` nor
+     * `/var/log`, and an existing one is not an error. */
+    rc = xfsmount_mkdir_p("/var/log");
+    if (rc != KERR_OK) {
+        kprintf("klog: /var/log could not be made (rc %d); the log stays in memory\n", rc);
+        return;
+    }
+    /* **The snapshot is taken after the rotation**, so that this boot's
+     * own file contains the lines describing where the others went. Taken
+     * before, `kernel.0.log` would be the one file that cannot say what the
+     * rotation did. */
+    n = klog_all(text, (uint32_t)sizeof text);
+    kfmt_snprintf(name, sizeof name, "kernel.0.log");
+    rc = xfsmount_write_into("/var/log", name, text, n);
+    if (rc != KERR_OK) {
+        /* Named, with the reason, because "could not write the log" sends
+         * the reader to guess between a missing directory, a read-only
+         * mount and a full disk. */
+        kprintf("klog: /var/log/%s could not be written (rc %d); the log stays in memory\n", name,
+                rc);
+        return;
+    }
+    kprintf("klog: %u bytes of this boot written to /var/log/%s%s\n", n, name,
+            klog_dropped() > 0 ? " (the start was dropped: the buffer filled)" : "");
 }
 
 /* Takes the board's own UART over from the firmware's console.
@@ -537,6 +695,14 @@ static void bring_up_filesystem(void) {
         return;
     }
     kprintf("xfs: mounted read-only, %d entries in /\n", entries);
+    if (xfs_quota_soft_exceeded(xfsmount_fs()) != 0) {
+        /* **Reported, since it cannot be enforced.** A soft limit's grace
+         * period needs a wall clock and this board has no real-time clock,
+         * so the crossings are counted instead of timed — and a count
+         * nobody prints is a count nobody reads. */
+        kprintf("xfs: %u charge(s) went past a soft quota limit\n",
+                xfs_quota_soft_exceeded(xfsmount_fs()));
+    }
     /* **After** `xfsmount_attach`, because that is when the root
      * filesystem enters the table: listing before it would report every
      * volume except the one the machine is running from. */
@@ -697,13 +863,30 @@ static void bring_up_other_harts(uint64_t dtb, uint64_t boot_hart) {
         return;
     }
     __asm__ volatile("csrr %0, satp" : "=r"(satp));
-    want = smp_start_others((phys_t)(uintptr_t)_secondary_start, satp);
+    /* **A physical entry point, because the firmware starts a hart with
+     * translation off.** `&_secondary_start` reads as the kernel's own high
+     * address now that this runs after the jump, and handing SBI that
+     * address starts a hart at a number it cannot fetch from: all three
+     * were started and none arrived — "0 of 3 started harts reached the
+     * kernel", with nothing to say why, because the hart died before it
+     * could reach a console. */
+    want = smp_start_others(mmu_virt_to_phys((const void *)_secondary_start), satp);
     /* Bounded, because a hart the firmware accepted and that then never
      * arrives must cost one core rather than the whole boot. */
     for (waited = 0; harts_arrived < want && waited < 50000000u; waited++) {
     }
     kprintf("smp: %u of %u started harts reached the kernel, %u running in total\n",
             harts_arrived, want, smp_running_count());
+    /* **The miss counter, said out loud.** `smp_hart_misses` existed and
+     * nothing ever called it — so the one number that says whether a hart
+     * failed to find its own index, and silently became hart 0, was being
+     * kept and never read. It is also the check on the id-to-index table
+     * that replaced the scan: a wrong table shows up here and nowhere
+     * else, because every other symptom of it is a hart doing another
+     * hart's work. */
+    if (smp_hart_misses() != 0u) {
+        kprintf("smp: **%u hart(s) could not find their own index**\n", smp_hart_misses());
+    }
 }
 
 /* Everything the kernel noticed that it should not have.
@@ -719,6 +902,12 @@ static void bring_up_other_harts(uint64_t dtb, uint64_t boot_hart) {
  * `trap:` is printed unconditionally, because "one hart inside the kernel"
  * is the assumption every other argument in this kernel rests on and a
  * number nobody has ever seen is not a measurement. */
+/* Defined below, beside the other reporting. */
+static void report_lock_contention(void);
+static void report_the_buses(uint64_t dtb);
+static void report_the_network_after_everything(void);
+static void report_the_thermal_range(void);
+
 static void report_detectors(void) {
     /* `trap:` counts traps in flight rather than harts holding the lock —
      * a trap that yields is still counted until it is resumed, so more than
@@ -751,6 +940,8 @@ static void report_detectors(void) {
     if (klock_breaches() != 0) {
         kprintf("klock: **the kernel lock was not exclusive %u times**\n", klock_breaches());
     }
+    report_lock_contention();
+    report_the_network_after_everything();
     if (uspace_backed_twice() != 0) {
         kprintf("uspace: **%u pages were backed twice** by two harts at once\n",
                 uspace_backed_twice());
@@ -852,8 +1043,545 @@ static void poll_tty_from_beat(void) {
     ktty_poll();
 }
 
+/* Which device the stack is running over. The poll differs, so the tick
+ * hook has to know — and a hook that polled the wrong one would leave every
+ * received frame in a ring nobody reads, which looks exactly like a network
+ * that is not answering. */
+static bool net_over_gmac;
+
+/* The GMAC raised its receive interrupt: acknowledge at the device and drain
+ * the ring into the stack. */
+static void on_gmac_interrupt(void *self) {
+    (void)self;
+    (void)dwmac_handle_interrupt();
+}
+
 static void poll_net_from_tick(void) {
+    if (net_over_gmac) {
+        (void)dwmac_poll();
+        return;
+    }
     virtio_net_poll(knet_interface());
+}
+
+/* **What the big kernel lock costs**, which is the question its roadmap
+ * entry poses: it says splitting the lock "should wait until something is
+ * actually measured to be blocked on it", and nothing had ever measured it.
+ *
+ * The share of acquisitions that waited says how often four harts wanted the
+ * kernel at once; the average and worst waits say whether that mattered. The
+ * two are reported together because either alone is misleading — a kernel
+ * where every acquisition waits twenty cycles is not blocked on its lock,
+ * and one where a thousandth of them wait a millisecond is. */
+/* The network's counters **after the programs have run**, which is the only
+ * moment they answer anything.
+ *
+ * They were already reported — at the end of bringing the interface up, when
+ * the only traffic that had happened was the DHCP exchange. So a question
+ * like "did the resolver's query get an answer" read the counts from before
+ * the resolver existed, and this file has now paid for the same mistake
+ * three times in one session: a detector read at the wrong moment is not a
+ * weak instrument, it is a misleading one. The moment a number is taken is
+ * part of the number. */
+static void report_the_network_after_everything(void) {
+    struct netif *nif = knet_interface();
+    if (nif == NULL || nif->ip == 0) {
+        return;
+    }
+    kprintf("net: at the end of boot: rx %u tx %u; irq %llu dispatched, %llu unclaimed\n",
+            nif->stats.rx_frames, nif->stats.tx_frames, (unsigned long long)irq_count(),
+            (unsigned long long)irq_spurious());
+    if (net_over_gmac) {
+        uint64_t sent = 0, received = 0, dropped = 0;
+        dwmac_counters(&sent, &received, &dropped);
+        kprintf("net: the GMAC sent %llu, received %llu, dropped %llu\n",
+                (unsigned long long)sent, (unsigned long long)received,
+                (unsigned long long)dropped);
+    }
+}
+
+static void report_lock_contention(void) {
+    uint64_t acquires = 0, waited = 0, cycles = 0, worst = 0;
+    klock_contention(&acquires, &waited, &cycles, &worst);
+    if (acquires == 0u) {
+        return;
+    }
+    /* Per mille rather than per cent: on a workload that is not syscall-bound
+     * the share rounds to zero as a percentage, and "0%" and "nothing
+     * measured" must not read the same. */
+    kprintf("klock: %llu acquisitions, %llu waited (%llu per mille)\n",
+            (unsigned long long)acquires, (unsigned long long)waited,
+            (unsigned long long)(waited * 1000u / acquires));
+    if (waited != 0u) {
+        kprintf("klock: %llu cycles waiting, %llu average, %llu worst (%llu us at 1 GHz)\n",
+                (unsigned long long)cycles, (unsigned long long)(cycles / waited),
+                (unsigned long long)worst, (unsigned long long)(worst / 1000u));
+    }
+    {
+        /* **The holder's side**, which is what makes the wait actionable: a
+         * hart cannot wait longer than somebody else held. */
+        uint64_t total = 0, worst_held = 0;
+        klock_held_times(&total, &worst_held);
+        kprintf("klock: held %llu cycles total, %llu average, %llu worst (%llu us at 1 GHz)\n",
+                (unsigned long long)total, (unsigned long long)(total / acquires),
+                (unsigned long long)worst_held, (unsigned long long)(worst_held / 1000u));
+        kprintf("klock: the longest hold was taken at %016llx, doing %llu\n",
+                (unsigned long long)klock_worst_caller(),
+                (unsigned long long)klock_worst_tag());
+    }
+}
+
+/* What the board's tree says about the buses this kernel has no driver for.
+ *
+ * **Measured before a line of driver code is written.** This tree has
+ * already cost three wrong guesses that each took a board run: the SD
+ * controller was documented as Cadence SDHCI and is a DesignWare MSHC, the
+ * GMAC's generation had to be read from a version register, and the GMAC's
+ * interrupt is in `interrupts-extended` rather than `interrupts`. A
+ * compatible string guessed from the SoC's documentation is a guess; the one
+ * in the tree is a fact. */
+static void report_one_bus(const struct fdt *fdt, const char *compat) {
+    char path[96];
+    for (uint32_t i = 0; i < 8u; i++) {
+        phys_t base = 0;
+        uint64_t size = 0;
+        struct fdt_prop p;
+        uint64_t irq = 0;
+        if (fdt_find_compatible_nth(fdt, compat, i, path, sizeof path) != KERR_OK) {
+            return;
+        }
+        (void)fdt_device_reg(fdt, path, 0, &base, &size);
+        if (fdt_get_prop(fdt, path, "interrupts", &p) == KERR_OK) {
+            (void)fdt_prop_cells(&p, 0, 1, &irq);
+        } else if (fdt_get_prop(fdt, path, "interrupts-extended", &p) == KERR_OK) {
+            (void)fdt_prop_cells(&p, 1, 1, &irq);
+        }
+        kprintf("bus: %s at %016llx (%llu bytes), irq %llu, \"%s\"\n", path,
+                (unsigned long long)base, (unsigned long long)size, (unsigned long long)irq,
+                compat);
+    }
+}
+
+static void report_the_buses(uint64_t dtb) {
+    /* Every spelling worth trying for the five the roadmap names, SoC-specific
+     * first because that is what a vendor tree carries. */
+    static const char *const want[] = {
+        "starfive,jh7110-spi",  "snps,dw-apb-ssi",       "arm,pl022",
+        "starfive,jh7110-i2c",  "snps,designware-i2c",   "starfive,jh7110-pwm",
+        "opencores,pwm",        "starfive,pwm0",         "starfive,jh7110-rtc",
+        "starfive,jh7110-wdt",  "starfive,wdt",          "snps,dw-wdt",
+        "starfive,jh7110-temp", "starfive,jh7110-pwmdac",
+    };
+    struct fdt fdt;
+    if (fdt_open(&fdt, (const void *)(uintptr_t)dtb, FDT_MAX_BYTES) != KERR_OK) {
+        return;
+    }
+    for (uint32_t i = 0; i < sizeof want / sizeof want[0]; i++) {
+        report_one_bus(&fdt, want[i]);
+    }
+    kprintf("bus: that is every spelling asked about\n");
+}
+
+/* ── the buses: SPI, I2C, PWM and the watchdog ──────────────────────────── */
+
+/* Brings up one of each and proves it, in the only way available on a board
+ * with nothing wired to its header.
+ *
+ * **Each check is something that cannot pass if the driver is wrong.** A
+ * driver that maps the wrong window, or whose block is unclocked, reads
+ * zeroes — so every one of these reads a value that is *not* zero and not
+ * constant:
+ *
+ *   - SPI reports the PrimeCell identifier, which must be ARM's 0x41 and
+ *     part 0x022, and then sends a byte through **internal loopback** and
+ *     gets it back. The GMAC was proved the same way before a cable existed.
+ *   - I2C reports its DesignWare component type, which is the ASCII
+ *     "DW" signature every one of these blocks carries.
+ *   - PWM and the watchdog are read **twice** with their counters running:
+ *     a value that has moved is a block that is clocked, and nothing else
+ *     demonstrates that without an instrument on a pin.
+ *
+ * The watchdog's reset is never armed (`wdt_jh7110.h` says why). */
+static void prove_the_spi(const struct fdt *fdt) {
+    struct spi_pl022 bus;
+    uint8_t back = 0;
+    if (spi_pl022_init(&bus, fdt, "/soc/spi@10060000") != KERR_OK) {
+        kprintf("spi: /soc/spi@10060000 did not bind\n");
+        return;
+    }
+    {
+        uint32_t id = spi_pl022_part(&bus);
+        /* The low twelve bits are the part number and the next eight the
+         * designer. Printed whole so that a wrong answer is diagnosable
+         * rather than just a failure. */
+        kprintf("spi: PrimeCell id %08x (part %03x, designer %02x)\n", id, id & 0xfffu,
+                (id >> 12) & 0xffu);
+        if ((id & 0xfffu) != 0x022u) {
+            kprintf("spi: **not a PL022 at that address**\n");
+            return;
+        }
+    }
+    if (spi_pl022_configure(&bus, 1000000u, true) != KERR_OK) {
+        return;
+    }
+    if (spi_pl022_transfer(&bus, 0xa5u, &back) == KERR_OK) {
+        kprintf("spi: loopback sent a5, received %02x%s\n", back,
+                back == 0xa5u ? " — the data path works" : " — **wrong byte**");
+    } else {
+        kprintf("spi: **the transfer timed out**\n");
+    }
+}
+
+static void prove_the_i2c(const struct fdt *fdt) {
+    struct i2c_dw bus;
+    if (i2c_dw_init(&bus, fdt, "/soc/i2c@10030000") != KERR_OK) {
+        kprintf("i2c: /soc/i2c@10030000 did not bind\n");
+        return;
+    }
+    /* `0x44570140` is "DW" and a version: the signature every DesignWare I2C
+     * carries, and the thing that says this is the right register map. */
+    kprintf("i2c: component type %08x, version %08x\n", i2c_dw_component_type(&bus),
+            i2c_dw_component_version(&bus));
+}
+
+static void prove_a_counter_moves(const char *what, uint32_t first, uint32_t second) {
+    kprintf("%s: counter %u then %u%s\n", what, first, second,
+            first != second ? " — it is clocked and running" : " — **it did not move**");
+}
+
+static void prove_the_pwm(const struct fdt *fdt) {
+    struct pwm_jh7110 pwm;
+    uint32_t first, second;
+    if (pwm_jh7110_init(&pwm, fdt, "/soc/pwm@120d0000") != KERR_OK) {
+        kprintf("pwm: /soc/pwm@120d0000 did not bind\n");
+        return;
+    }
+    /* A long period so that two reads fall inside one cycle rather than
+     * aliasing to the same value by landing a whole period apart. */
+    if (pwm_jh7110_start(&pwm, 0, 0x00ffffffu, 0x00800000u) != KERR_OK) {
+        return;
+    }
+    first = pwm_jh7110_counter(&pwm, 0);
+    for (volatile uint32_t i = 0; i < 20000u; i++) {
+    }
+    second = pwm_jh7110_counter(&pwm, 0);
+    prove_a_counter_moves("pwm", first, second);
+    (void)pwm_jh7110_stop(&pwm, 0);
+}
+
+static void prove_the_watchdog(const struct fdt *fdt) {
+    struct wdt_jh7110 wdt;
+    uint32_t first, second;
+    if (wdt_jh7110_init(&wdt, fdt, "/soc/watchdog@13070000") != KERR_OK) {
+        kprintf("wdt: /soc/watchdog@13070000 did not bind\n");
+        return;
+    }
+    if (wdt_jh7110_start_counting(&wdt, 0x40000000u) != KERR_OK) {
+        return;
+    }
+    first = wdt_jh7110_counter(&wdt);
+    for (volatile uint32_t i = 0; i < 20000u; i++) {
+    }
+    second = wdt_jh7110_counter(&wdt);
+    prove_a_counter_moves("wdt", first, second);
+    /* **The window and the search, only when the counter did not move.**
+     * They are how this driver's offsets were found — the published ones are
+     * wrong for this board — and leaving them on every boot would be noise;
+     * leaving them out would mean the next person rediscovers the method.
+     * So they run exactly when they are needed. */
+    if (second == first) {
+        wdt_jh7110_dump(&wdt, 16u);
+        if (wdt_jh7110_find_enable(&wdt) == 0) {
+            kprintf("wdt: **no candidate register started the counter**\n");
+        }
+    }
+    /* **Stopped again.** It cannot reset the board — the bit is never set —
+     * but leaving a counter running that nothing feeds is still a mechanism
+     * with no owner, which this file's rules are against. */
+    (void)wdt_jh7110_stop(&wdt);
+}
+
+/* USB: the VL805 the PCIe work has been enumerating and ignoring.
+ *
+ * Reported in stages because each is provable on its own — the controller's
+ * own description of itself first, then whether it reached its running
+ * state, then what is attached. A version and a port count that are
+ * plausible say the register window is right; a controller that runs says
+ * the rings and the DMA are right; a port that enables says it can see the
+ * operator's flash drive. */
+static void bring_up_usb(void) {
+    uint32_t version = 0, ports = 0, slots = 0;
+    int rc;
+    xhci_trace_ports(cmdline_has(boot_cmdline, "minikern.usbtrace"));
+    rc = xhci_init();
+    if (rc == KERR_NOENT) {
+        kprintf("usb: no XHCI controller on the bus\n");
+        return;
+    }
+    xhci_describe(&version, &ports, &slots);
+    kprintf("usb: xhci %x.%x, %u ports, %u device slots\n", (version >> 8) & 0xffu,
+            version & 0xffu, ports, slots);
+    if (rc != KERR_OK || !xhci_running()) {
+        kprintf("usb: **the controller did not reach its running state** (rc %d)\n", rc);
+        return;
+    }
+    kprintf("usb: the controller is running\n");
+    {
+        uint32_t attached = xhci_scan_ports();
+        kprintf("usb: %u port(s) with something attached, contexts %u bytes\n", attached,
+                xhci_context_bytes());
+    }
+    {
+        struct xhci_device dev = {0};
+        int rc = xhci_enumerate_first_port(&dev);
+        if (rc == KERR_OK) {
+            /* **The vendor and product the device reports**, which is the
+             * assertion: those bytes came out of the device over a control
+             * transfer, so the slot, both contexts, the Address Device
+             * command, the transfer ring and the event ring all worked. A
+             * plausible-looking driver that had any of them wrong would time
+             * out or return zeroes here. */
+            kprintf("usb: port %u slot %u speed %u: %04x:%04x, class %02x, ep0 packet %u\n",
+                    dev.port, dev.slot, dev.speed, dev.vendor, dev.product, dev.device_class,
+                    dev.max_packet0);
+            kprintf("usb: a device descriptor was read over a control transfer\n");
+        } else {
+            kprintf("usb: no device could be enumerated (rc %d)\n", rc);
+        }
+    }
+}
+
+/* ── the SoC's temperature, through /proc ──────────────────────────────── */
+
+/* The sensor, kept for as long as the kernel runs: `/proc/thermal` is read
+ * whenever somebody asks, so the block stays clocked and converting rather
+ * than being brought up per read. */
+static struct temp_jh7110 soc_temp;
+
+/* Writes a signed millidegree value as degrees with three decimals.
+ *
+ * By hand because the formatter has no `%f` and should not grow one for this
+ * — and because a temperature rendered by integer division has to handle a
+ * negative value without the sign being lost from the fraction, which is the
+ * one thing that goes wrong here. `-500` is `-0.500`, not `0.-500`. */
+static uint32_t write_degrees(char *out, uint32_t room, int32_t mdeg) {
+    uint32_t at = 0;
+    int32_t whole = mdeg / 1000;
+    int32_t frac = mdeg % 1000;
+    if (frac < 0) {
+        frac = -frac;
+    }
+    if (mdeg < 0 && whole == 0) {
+        /* The sign lives on the whole part, and a whole part of zero has
+         * nowhere to put it. */
+        at += (uint32_t)kfmt_snprintf(out + at, room - at, "-");
+    }
+    at += (uint32_t)kfmt_snprintf(out + at, room - at, "%d.%03d", whole, frac);
+    return at;
+}
+
+/* `/proc/thermal`: the die temperature, in the two forms anybody wants.
+ *
+ * The millidegree line is first and is named the way Linux's thermal
+ * interface names it, so a script that already reads
+ * `/sys/class/thermal/thermal_zone0/temp` needs one path changed and no
+ * parsing changed. The human line is for a person reading it over the
+ * network, which on this board is the usual case.
+ *
+ * The **raw** conversion is reported too. It is what separates a wrong
+ * answer from a wrong sensor: the arithmetic is one multiply and a subtract,
+ * so if the degrees look implausible the raw value says immediately whether
+ * the block is returning nonsense or the formula is. */
+/* **What the cooling actually did, once the board has been busy.**
+ *
+ * One reading at bring-up says the sensor works and nothing about whether
+ * the heatsink is coping: the die is coldest at the moment the kernel first
+ * looks at it. The range over the whole boot is the number that answers the
+ * question, and it is free because the housekeeping beat has been sampling
+ * all along.
+ *
+ * The reading count is printed with it because a range drawn from a handful
+ * of samples is not a range — if the beat was not running, this says so by
+ * reporting a small number rather than by looking plausible. */
+static void report_the_thermal_range(void) {
+    int32_t lowest;
+    int32_t highest;
+    uint64_t readings;
+    temp_jh7110_extremes(&soc_temp, &lowest, &highest, &readings);
+    if (readings == 0) {
+        return; /* no sensor, or it never gave a plausible reading */
+    }
+    {
+        char low[16];
+        char high[16];
+        low[write_degrees(low, sizeof low - 1, lowest)] = '\0';
+        high[write_degrees(high, sizeof high - 1, highest)] = '\0';
+        kprintf("temp: %s to %s over %llu readings\n", low, high,
+                (unsigned long long)readings);
+    }
+}
+
+static uint32_t thermal_file(char *out, uint32_t room) {
+    int32_t mdeg = temp_jh7110_millidegrees(&soc_temp);
+    uint32_t at = 0;
+    if (mdeg == TEMP_UNREADABLE) {
+        return (uint32_t)kfmt_snprintf(out, room,
+                                   "temp_millidegrees: unreadable\nraw: %u\nsensor: %s\n",
+                                   temp_jh7110_raw(&soc_temp),
+                                   soc_temp.up ? "out of range" : "not bound");
+    }
+    at += (uint32_t)kfmt_snprintf(out + at, room - at, "temp_millidegrees: %d\n", mdeg);
+    at += (uint32_t)kfmt_snprintf(out + at, room - at, "temp_celsius: ");
+    at += write_degrees(out + at, room - at, mdeg);
+    at += (uint32_t)kfmt_snprintf(out + at, room - at, "\n");
+    at += (uint32_t)kfmt_snprintf(out + at, room - at, "raw: %u\n", temp_jh7110_raw(&soc_temp));
+    at += (uint32_t)kfmt_snprintf(out + at, room - at, "sensor: starfive,jh7110-temp\n");
+    {
+        int32_t lowest;
+        int32_t highest;
+        uint64_t readings;
+        temp_jh7110_extremes(&soc_temp, &lowest, &highest, &readings);
+        if (readings != 0) {
+            at += (uint32_t)kfmt_snprintf(out + at, room - at, "lowest_millidegrees: %d\n",
+                                          lowest);
+            at += (uint32_t)kfmt_snprintf(out + at, room - at, "highest_millidegrees: %d\n",
+                                          highest);
+            at += (uint32_t)kfmt_snprintf(out + at, room - at, "highest_celsius: ");
+            at += write_degrees(out + at, room - at, highest);
+            at += (uint32_t)kfmt_snprintf(out + at, room - at, "\n");
+            at += (uint32_t)kfmt_snprintf(out + at, room - at, "readings: %llu\n",
+                                          (unsigned long long)readings);
+        }
+    }
+    return at;
+}
+
+/* `/proc/meminfo`, in the two fields anything reading it actually wants.
+ *
+ * **The units are the file's, not the kernel's.** `MemTotal: N kB` is the
+ * format every reader of this file has been written against, and its `kB` is
+ * 1024 bytes however it is spelled; reporting pages here, or bytes with a
+ * `kB` suffix, is the kind of mistake that reads as a working file with a
+ * thousand-fold wrong number in it.
+ *
+ * `MemAvailable` is the free-page count rather than an estimate of what
+ * could be reclaimed: this kernel reclaims nothing, so the two are the same
+ * number and the honest one is the one it can measure. */
+static uint32_t meminfo_file(char *out, uint32_t room) {
+    uint64_t total_kb = (uint64_t)mem_total_pages() * (PAGE_SIZE / 1024ull);
+    uint64_t free_kb = (uint64_t)mem_free_pages_count() * (PAGE_SIZE / 1024ull);
+    uint32_t at = 0;
+    at += (uint32_t)kfmt_snprintf(out + at, room - at, "MemTotal:       %llu kB\n",
+                                  (unsigned long long)total_kb);
+    at += (uint32_t)kfmt_snprintf(out + at, room - at, "MemFree:        %llu kB\n",
+                                  (unsigned long long)free_kb);
+    at += (uint32_t)kfmt_snprintf(out + at, room - at, "MemAvailable:   %llu kB\n",
+                                  (unsigned long long)free_kb);
+    return at;
+}
+
+/* `/proc/stat`'s `cpu` line, from the one quantity this kernel measures.
+ *
+ * **Four columns, and two of them are honestly zero.** The format is
+ * `cpu user nice system idle`, and this kernel has no user/kernel time
+ * split: every nanosecond a hart is not idle is spent on behalf of a
+ * program, in a kernel that programs enter by trapping. So the busy time
+ * goes in `system`, where it is true, rather than being divided between
+ * `user` and `system` by a guess — a reader computing utilisation adds the
+ * three busy columns and gets the right answer either way, and a reader
+ * showing them separately is told something measured rather than invented.
+ *
+ * The unit is the file's: USER_HZ ticks of 10 ms, which is what every reader
+ * of this file assumes regardless of the kernel's own tick.
+ *
+ * **What is deliberately not here**: `ctxt`, `processes`, the per-hart `cpuN`
+ * lines, and the rest of the file. The thermal reading is what this is for
+ * at the moment, and a `cpu` line computed from a quantity the scheduler
+ * actually measures is worth more than a fuller file with guessed columns in
+ * it. The roadmap carries the remainder. */
+static uint32_t stat_file(char *out, uint32_t room) {
+    uint64_t harts = smp_hart_count() == 0 ? 1u : smp_hart_count();
+    uint64_t idle_ticks = sched_idle_ns() / 10000000ull;
+    uint64_t wall_ticks = (timer_ns() / 10000000ull) * harts;
+    uint64_t busy_ticks = wall_ticks > idle_ticks ? wall_ticks - idle_ticks : 0;
+    uint32_t at = 0;
+    at += (uint32_t)kfmt_snprintf(out + at, room - at, "cpu  0 0 %llu %llu\n",
+                                  (unsigned long long)busy_ticks,
+                                  (unsigned long long)idle_ticks);
+    at += (uint32_t)kfmt_snprintf(out + at, room - at, "harts %llu\n",
+                                  (unsigned long long)harts);
+    return at;
+}
+
+/* Keeps the extremes current when nobody is reading.
+ *
+ * **The peak is the number the operator wants**, and it happens while the
+ * board is busy rather than while something is asking about it. A reader
+ * that samples every few seconds sees neither the spike nor the recovery,
+ * so the kernel takes the readings and the reader collects the extremes. */
+static void sample_thermal_from_beat(void) {
+    temp_jh7110_sample(&soc_temp);
+}
+
+static void bring_up_thermal(uint64_t dtb) {
+    struct fdt fdt;
+    if (fdt_open(&fdt, (const void *)(uintptr_t)dtb, FDT_MAX_BYTES) != KERR_OK) {
+        return;
+    }
+    if (temp_jh7110_init(&soc_temp, &fdt, "/soc/temperature-sensor@120e0000") != KERR_OK) {
+        kprintf("temp: /soc/temperature-sensor@120e0000 did not bind\n");
+        return;
+    }
+    /* **Registered before anything can open it**, which is this file's own
+     * rule: a port installed late is a port that was not installed, and that
+     * has cost this tree two bugs. */
+    (void)procfs_add("/proc/thermal", thermal_file);
+    (void)procfs_add("/proc/meminfo", meminfo_file);
+    (void)procfs_add("/proc/stat", stat_file);
+    /* **Sampling starts with the sensor**, not with the terminal it was
+     * first attached to: the range is only the boot's range if it begins
+     * where the readings begin. */
+    (void)timer_add_housekeeping_hook(sample_thermal_from_beat);
+    {
+        int32_t mdeg = temp_jh7110_millidegrees(&soc_temp);
+        if (mdeg == TEMP_UNREADABLE) {
+            kprintf("temp: the sensor is bound but its reading is out of range (raw %u)\n",
+                    temp_jh7110_raw(&soc_temp));
+            temp_jh7110_dump(&soc_temp);
+            return;
+        }
+        /* **A plausibility verdict, not just a number**, so that a board
+         * case can assert something a broken sensor would fail. The range
+         * is deliberately wide — the operator has a radiator and a fan, but
+         * a hot day in a case is a different number — and what it excludes
+         * is the failure modes this driver actually had: a raw zero reading
+         * as -81 C, and a wrong register offset reading as something
+         * absurd. A test that asserted a temperature would fail on a cold
+         * morning; one that asserts "plausible" fails only when it should. */
+        bool plausible = mdeg > 10000 && mdeg < 90000;
+        kprintf("temp: the die is at %d millidegrees (raw %u), which is %s; /proc/thermal "
+                "reports it\n",
+                mdeg, temp_jh7110_raw(&soc_temp),
+                plausible ? "a plausible die temperature" : "**not a plausible temperature**");
+    }
+}
+
+static void bring_up_the_buses(uint64_t dtb) {
+    struct fdt fdt;
+    if (fdt_open(&fdt, (const void *)(uintptr_t)dtb, FDT_MAX_BYTES) != KERR_OK) {
+        return;
+    }
+    prove_the_spi(&fdt);
+    prove_the_i2c(&fdt);
+    prove_the_pwm(&fdt);
+    prove_the_watchdog(&fdt);
+    /* **And the one that is not there.** The roadmap asks for an RTC; this
+     * board's tree names none, and `minikern.buses` is the evidence — every
+     * spelling tried, nothing found. The VisionFive 2 has no battery-backed
+     * clock fitted, so there is no device to drive rather than a driver
+     * missing. Said out loud, because "no RTC driver" and "no RTC" are
+     * different facts and only one of them is work. */
+    kprintf("rtc: the tree names no real-time clock on this board\n");
 }
 
 static void bring_up_network(uint64_t dtb) {
@@ -869,15 +1597,74 @@ static void bring_up_network(uint64_t dtb) {
     if (fdt_open(&fdt, (const void *)(uintptr_t)dtb, FDT_MAX_BYTES) != KERR_OK) {
         return;
     }
+    /* **virtio first, then the board's own Ethernet.** virtio is what the
+     * emulator offers and the tests run against; the GMAC is what the
+     * board has. Trying virtio first keeps every existing case behaving
+     * identically, and a board with no virtio falls through to real
+     * hardware instead of reporting that it has no network — which is what
+     * it did, with the driver sitting right there working. */
     rc = virtio_net_init(&fdt, &port, mac);
     if (rc != KERR_OK) {
-        kprintf("net: no network device in the tree (rc %d)\n", rc);
-        return;
+        /* Before probing: the filter is written while the address is taken. */
+        dwmac_use_strict_filter(cmdline_has(boot_cmdline, "minikern.netfilter"));
+        rc = dwmac_init(&fdt, &port);
+        if (rc != KERR_OK) {
+            kprintf("net: no network device in the tree (rc %d)\n", rc);
+            return;
+        }
+        dwmac_address(mac);
+        net_over_gmac = true;
     }
-    (void)knet_init(mac, port);
     {
+        /* **The sink is what the driver hands received frames to**, and it
+         * comes back from `knet_init` — so it has to be captured, not
+         * discarded as the virtio path could afford to. A GMAC with no sink
+         * receives into its ring and delivers nothing. */
+        static struct frame_sink sink;
+        sink = knet_init(mac, port);
+        if (net_over_gmac) {
+            dwmac_set_sink(&sink);
+        }
+    }
+    if (!net_over_gmac) {
         static const struct irq_handler handler = {.handle = on_net_interrupt, .self = NULL};
         (void)irq_register(virtio_net_irq(), &handler);
+    } else {
+        /* **The GMAC's own interrupt, which this device cannot do without.**
+         * Polling from the housekeeping beat is enough for DHCP and not
+         * enough for a blocking read: a thread in `recvfrom` has no
+         * deadline, so under dynamic ticks nothing is scheduled, nothing
+         * polls, and the reply sits in the ring while the only thread that
+         * wants it waits for ever. Found exactly that way — the deadlock
+         * detector fired on a user-space resolver that had already sent its
+         * query. */
+        static const struct irq_handler gmac = {.handle = on_gmac_interrupt, .self = NULL};
+        uint32_t source = dwmac_irq();
+        dwmac_report_filter();
+        if (cmdline_has(boot_cmdline, "minikern.nettrace")) {
+            dwmac_trace_destinations(true);
+        }
+        if (source != 0 && irq_register(source, &gmac) == KERR_OK) {
+            dwmac_enable_rx_interrupt();
+            kprintf("net: receive interrupt %u armed\n", source);
+        } else {
+            kprintf("net: **no interrupt for the GMAC (source %u); reads will only "
+                    "complete while something else keeps the tick alive**\n",
+                    source);
+        }
+    }
+    if (net_over_gmac) {
+        uint32_t mbit = 0;
+        bool full = false;
+        /* **Said before DHCP is attempted**, because a link that is down
+         * makes every answer below a timeout, and "no lease" with no
+         * mention of the cable is the least useful way to report that. */
+        if (dwmac_link_up(&mbit, &full)) {
+            kprintf("net: over the board's Ethernet, link up at %u Mbit %s duplex\n", mbit,
+                    full ? "full" : "half");
+        } else {
+            kprintf("net: over the board's Ethernet, **link down** — DHCP will time out\n");
+        }
     }
     (void)timer_add_housekeeping_hook(poll_net_from_tick);
     random_fill(&xid, sizeof xid);
@@ -1313,6 +2100,8 @@ extern const char user_pgrp_start[], user_pgrp_end[];
 extern const char user_term_start[], user_term_end[];
 extern const char user_uid_start[], user_uid_end[];
 extern const char user_privsep_start[], user_privsep_end[];
+extern const char user_aslr_start[], user_aslr_end[];
+extern const char user_klogdev_start[], user_klogdev_end[];
 extern const char user_rlimit_start[], user_rlimit_end[];
 extern const char user_mremap_start[], user_mremap_end[];
 extern const char user_mapflags_start[], user_mapflags_end[];
@@ -1888,6 +2677,62 @@ static int attributes_round_trip(void) {
     return rc;
 }
 
+/* Reproduces exactly what the writable descriptor did, against whatever
+ * filesystem is mounted.
+ *
+ * **Written because that path corrupted a real card**: the operator's root
+ * filesystem went from 8 entries to 1116 with names that are not text, and
+ * the files themselves still read — so the damage is in the root
+ * directory's own blocks. The descriptor layer did two things no other
+ * caller does, and this does both in the same order so that a fixture image
+ * can say which one is at fault:
+ *
+ *   1. a **zero-length create** at open, `write_at(dir, leaf, 0, NULL, 0)`;
+ *   2. **chunked writes at increasing offsets**, 32 KiB at a time, which is
+ *      what a Go `io.Copy` produces.
+ *
+ * It then lists the root and counts, because the corruption's signature is
+ * the entry count rather than any one failure — every individual call
+ * returned success on the card. A test that only checked return codes would
+ * have passed on the run that did the damage. */
+#define CHUNK_PROBE_BYTES 32768u
+#define CHUNK_PROBE_CHUNKS 3u
+
+static int32_t count_root_entries(void) {
+    return xfsmount_list_root();
+}
+
+static void run_chunked_write_probe(void) {
+    static uint8_t chunk[CHUNK_PROBE_BYTES];
+    int32_t before, after;
+    int rc;
+    if (!xfsmount_writable()) {
+        kprintf("chunked: this filesystem may not be written\n");
+        return;
+    }
+    for (uint32_t i = 0; i < CHUNK_PROBE_BYTES; i++) {
+        chunk[i] = (uint8_t)(i ^ 0x5au);
+    }
+    before = count_root_entries();
+    /* The zero-length create the descriptor layer does at open. */
+    rc = xfsmount_write_at("/", "chunky", 0, NULL, 0);
+    kprintf("chunked: the zero-length create said rc %d\n", rc);
+    for (uint32_t c = 0; c < CHUNK_PROBE_CHUNKS && rc == KERR_OK; c++) {
+        rc = xfsmount_write_at("/", "chunky", (uint64_t)c * CHUNK_PROBE_BYTES, chunk,
+                               CHUNK_PROBE_BYTES);
+        kprintf("chunked: chunk %u at offset %u said rc %d\n", c, c * CHUNK_PROBE_BYTES, rc);
+    }
+    after = count_root_entries();
+    /* **The count is the assertion.** Every call above can return success
+     * while the directory grows by hundreds of entries, which is exactly
+     * what happened on the card. */
+    kprintf("chunked: the root had %d entries and now has %d\n", before, after);
+    if (after != before + 1) {
+        kprintf("chunked: **the directory gained %d entries for one file**\n", after - before);
+    }
+    (void)xfsmount_unlink_path("/chunky");
+}
+
 static void run_write_selftest(void) {
     static const char text[] = "a file this kernel wrote";
     const uint32_t len = (uint32_t)(sizeof text - 1u);
@@ -1898,6 +2743,15 @@ static void run_write_selftest(void) {
         kprintf("fswrite: this filesystem may not be written\n");
         return;
     }
+    /* **Cleared first, so the test can be run twice.** It left `/w1` and
+     * `/w2` on the card, and the second run then failed at its first step
+     * with `EEXIST` — which reads as "writing is broken" when it means "it
+     * worked last time". A test that only passes on a fresh disk is a test
+     * that stops being runnable the moment it passes. Failures here are
+     * ignored on purpose: the files are usually absent, and that is not an
+     * error. */
+    (void)xfsmount_unlink_path("/w2");
+    (void)xfsmount_unlink_path("/w1");
     ok = ok && wrote_and_checked("create /w1", xfsmount_create("w1", 0100644u));
     ok = ok && wrote_and_checked("write /w1", xfsmount_write("w1", 0, text, len));
     ok = ok && wrote_and_checked("read /w1 back", read_back("w1", text, len));
@@ -2166,6 +3020,24 @@ static void run_pressure_selftest(void) {
 }
 
 static void run_user_programs(void) {
+    /* **The address-space switch goes on before any program runs.**
+     *
+     * `minikern.noaslr` was applied *below* most of the self-tests — twenty
+     * eight lines below `wait` — so every program before that point ran
+     * with randomisation on however the operator asked. Making a
+     * layout-sensitive failure reproducible is the only thing the option
+     * exists for, and it could not do it for the tests that needed it most.
+     *
+     * That is the **fourth** silent no-op recorded in this tree: a textual
+     * edit that matched nothing, twice; a hex value a decimal-only parser
+     * read as zero; and now a switch applied after its subject. They share
+     * a shape — the operator asked, the kernel agreed, and nothing
+     * happened — and the only defence is to apply a switch where nothing
+     * can run before it. */
+    if (cmdline_has(boot_cmdline, "minikern.noaslr")) {
+        uspace_set_aslr(false);
+        kprintf("aslr: off, by request\n");
+    }
     /* Set before anything runs, not between the programs: a trace that
      * starts half way through is worse than none, because the first half
      * looks quiet. */
@@ -2291,8 +3163,23 @@ static void run_user_programs(void) {
      * raised again after dropping privilege. */
     /* Capabilities and `seccomp`: 0 means every step held, 151..160 name
      * the one that did not. */
+    /* **Address randomisation is on unless this says otherwise.** A fixed
+     * layout is what makes a crash address mean the same thing in two runs,
+     * which is the first thing anybody debugging a fault wants. */
     if (cmdline_has(boot_cmdline, "minikern.privsep")) {
         run_one_user_program("privsep", user_privsep_start, user_privsep_end);
+    }
+    /* Prints its stack, heap and mapping addresses. One run proves nothing;
+     * the harness runs it twice and compares. */
+    if (cmdline_has(boot_cmdline, "minikern.aslr")) {
+        run_one_user_program("aslr", user_aslr_start, user_aslr_end);
+    }
+    /* Reads `/dev/virtual/kernel_logger` as a program would — from a
+     * process, because a descriptor needs one. The kernel-side version of
+     * this check was refused with `EBADF`, correctly: there is no table to
+     * install into at boot. */
+    if (cmdline_has(boot_cmdline, "minikern.klogdev")) {
+        run_one_user_program("klogdev", user_klogdev_start, user_klogdev_end);
     }
     if (cmdline_has(boot_cmdline, "minikern.rlimit")) {
         run_one_user_program("rlimit", user_rlimit_start, user_rlimit_end);
@@ -2382,6 +3269,9 @@ static void run_user_programs(void) {
     /* Roadmap §3: the write path, on a filesystem in memory. */
     if (cmdline_has(boot_cmdline, "minikern.fswrite")) {
         run_write_selftest();
+    }
+    if (cmdline_has(boot_cmdline, "minikern.chunked")) {
+        run_chunked_write_probe();
     }
     /* Automount's decision: a labelled volume where its label says. */
     if (cmdline_has(boot_cmdline, "minikern.volumes")) {
@@ -2539,6 +3429,124 @@ static bool halt_requested(void) {
     return cmdline_equals(boot_cmdline, "minikern.halt", "poweroff");
 }
 
+static void kmain_after_devices(uint64_t hart, uint64_t dtb);
+static void enter_the_kernels_own_half(uint64_t hart, uint64_t dtb);
+
+/* The boot, from the point where the kernel is running at its own address.
+ *
+ * **Everything registered before the jump is registered again here**,
+ * because each of those registrations stored a *low* address: the console's
+ * function pointers, the kernel lock's two entry points, and this hart's
+ * trap vector. They still work while the identity map is there — which is
+ * why the jump can be verified before that map is dropped — but a missed
+ * one is a fault the moment it goes. Re-registering is cheaper than keeping
+ * a list of pointers to relocate, and cannot go stale. */
+static void kmain_high(uint64_t hart, uint64_t dtb) {
+    struct console_port con = jh7110_sbi_console();
+    struct bootinfo info = {0};
+    console_attach(&con);
+    trap_set_lock(klock_enter, klock_exit);
+    /* The tag port, beside the lock itself: a port installed late is a port
+     * that was not installed, and this file has paid for that twice. */
+    trap_set_lock_tag(klock_tag);
+    trap_init_cpu();
+    kprintf("mmu: the kernel runs at %llx, its own half\n",
+            (unsigned long long)(uintptr_t)&kmain_high);
+    /* Read again rather than carried over: the old struct lived on the old
+     * stack, and a pointer to it is exactly the kind of low address this
+     * function exists to stop using. */
+    read_bootinfo(dtb, &info);
+    adopt_the_real_uart(dtb);
+    bring_up_memory(&info);
+    bring_up_interrupts(dtb, hart);
+    bring_up_clocks(dtb);
+    bring_up_storage(dtb);
+    /* **After the interrupt controller and the storage probe, both.** The
+     * root filesystem is on the card, so the card is read before the PLIC
+     * exists; arming its interrupt is therefore a second step rather than
+     * part of the probe. The scheduler's sleep goes in here too — before it
+     * does, a wait releases the lock and `wfi`s, which is all the boot path
+     * can do and all it needs. */
+    irqwait_set_sleeper(sched_wait_on, sched_wake_on);
+    /* **`minikern.mmcpoll` keeps it polled**, so that the same build can be
+     * measured both ways. Without it the only available comparison is
+     * against a different binary, and "it is no slower than something else
+     * I built" is not a measurement. */
+    /* **Opt-in, for now.** Reads through the interrupt are proven — twenty
+     * dispatched, nineteen waits woken, none timed out — but a *write*
+     * through the same path does not complete, and a disk that cannot be
+     * written is worse than one that is read by polling. So the default
+     * stays polled and `minikern.mmcirq` turns it on, which keeps the
+     * finished part usable and the unfinished part visible.
+     *
+     * The primitive itself and the `sie` fix below it are not opt-in: they
+     * are what made any of this reachable. */
+    if (cmdline_has(boot_cmdline, "minikern.mmcirq")) {
+        dwmmc_arm_only(cmdline_has(boot_cmdline, "minikern.mmcirqonly"));
+        (void)dwmmc_use_interrupts_if_present(dtb);
+    }
+    /* **The drive has its own switch**, because it is its own device: it
+     * reads its interrupt from the PCIe host bridge rather than from its own
+     * node, it is the attached disk on this board where the card is not, and
+     * the card's write path through the interrupt is the unfinished part
+     * above — none of which is a reason to leave the drive polling. */
+    if (cmdline_has(boot_cmdline, "minikern.nvmeirq") ||
+        cmdline_has(boot_cmdline, "minikern.nvmeirqprobe")) {
+        nvme_irq_probe_only(cmdline_has(boot_cmdline, "minikern.nvmeirqprobe"));
+        (void)nvme_use_interrupts_if_present(dtb);
+    }
+    bring_up_filesystem();
+    {
+        /* **Did the device's interrupt ever reach the kernel?** The one
+         * question that separates "the wait is wrong" from "the source,
+         * the mask or the enable is wrong", and it cannot be answered from
+         * outside. */
+        uint64_t dispatched = 0, unclaimed = 0, woken = 0, timed_out = 0;
+        dispatched = irq_count();
+        unclaimed = irq_spurious();
+        irqwait_counts(&woken, &timed_out);
+        klog(KLOG_DEBUG, "irq: %llu dispatched, %llu unclaimed; waits %llu woken, %llu timed out\n",
+             (unsigned long long)dispatched, (unsigned long long)unclaimed,
+             (unsigned long long)woken, (unsigned long long)timed_out);
+    }
+    put_the_boot_log_on_disk();
+    /* **Rotation needs two boots to show itself**, and a RAM disk is
+     * re-staged on every one — so there is no way to watch it except to
+     * run the real path again. Three times, because the interesting case is
+     * not "0 became 1" but a chain of moves not treading on each other. */
+    if (cmdline_has(boot_cmdline, "minikern.klogrotate")) {
+        put_the_boot_log_on_disk();
+        put_the_boot_log_on_disk();
+    }
+    run_disk_benchmark();
+    bring_up_gpio(dtb);
+    if (cmdline_has(boot_cmdline, "minikern.gmac")) {
+        probe_the_ethernet(dtb);
+    }
+    if (cmdline_has(boot_cmdline, "minikern.gmacup")) {
+        bring_up_the_ethernet(dtb);
+    }
+    kmain_after_devices(hart, dtb);
+}
+
+/* Jumps into `kmain_high` at its high address, on this hart's boot stack at
+ * its high alias. Does not return. */
+static void enter_the_kernels_own_half(uint64_t hart, uint64_t dtb) {
+    uint64_t shift = mmu_high_offset();
+    void *fn = (void *)((uint64_t)(uintptr_t)&kmain_high + shift);
+    uint64_t sp;
+    if (!mmu_enabled()) {
+        /* Translation never came up, so there is no high mapping to jump
+         * to and the boot carries on where it is. Saying so, because a
+         * kernel that silently stayed low would look identical. */
+        kprintf("mmu: translation is off, so the kernel stays at its load address\n");
+        kmain_high(hart, dtb);
+        return;
+    }
+    __asm__ volatile("mv %0, sp" : "=r"(sp));
+    mmu_enter_high(fn, hart, dtb, sp + shift);
+}
+
 void kmain(uint64_t hart, uint64_t dtb) {
     /* The hart id into `tp`, first thing: every per-hart array is indexed
      * through it, and the kernel lock asks who holds it. The firmware passed
@@ -2565,25 +3573,60 @@ void kmain(uint64_t hart, uint64_t dtb) {
      * per hart, and a hart that skips it sends its first exception to
      * address zero. */
     trap_init_cpu();
+    /* **The log's clock, as soon as the timer can answer.** Every line
+     * before this reads `[00:00:00.000]`, which is the truth about them:
+     * they happened before the kernel could tell how long it had been
+     * alive. */
+    klog_time_source(timer_ns);
     bring_up_translation(&info);
-    adopt_the_real_uart(dtb);
-    bring_up_memory(&info);
-    bring_up_interrupts(dtb, hart);
-    bring_up_clocks(dtb);
-    bring_up_storage(dtb);
-    bring_up_filesystem();
-    run_disk_benchmark();
-    bring_up_gpio(dtb);
-    if (cmdline_has(boot_cmdline, "minikern.gmac")) {
-        probe_the_ethernet(dtb);
-    }
-    if (cmdline_has(boot_cmdline, "minikern.gmacup")) {
-        bring_up_the_ethernet(dtb);
-    }
+    /* **From here on, at the kernel's own address.** `mmu_init` mapped the
+     * image both where it is linked and where it was loaded, so the jump is
+     * safe and the identity half is still there for anything that has not
+     * been re-registered yet — which is what lets this be verified on its
+     * own, before that half is taken away.
+     *
+     * It does not return: the rest of the boot runs on the other side. */
+    /* **Does not return**: the rest of the boot is `kmain_high`, running at
+     * the kernel's own address. Nothing may be added below this line. */
+    enter_the_kernels_own_half(hart, dtb);
+}
+
+/* The boot from the point where the devices are up — shared, because
+ * `kmain_high` is where it is reached from and `kmain` only gets here when
+ * translation never came up at all. */
+static void kmain_after_devices(uint64_t hart, uint64_t dtb) {
     bring_up_other_harts(dtb, hart);
     /* **After the harts are up**, because half of what it measures is about
      * them: how many are schedulable, and what an interrupt between two of
      * them costs. */
+    if (cmdline_has(boot_cmdline, "minikern.buses")) {
+        report_the_buses(dtb);
+    }
+    if (cmdline_has(boot_cmdline, "minikern.busprobe")) {
+        bring_up_the_buses(dtb);
+    }
+    if (cmdline_has(boot_cmdline, "minikern.usb")) {
+        bring_up_usb();
+    }
+    /* **On by default**, unlike the probes above: the operator fitted a
+     * radiator and a fan to keep iterations fast and wants to see what the
+     * die is doing, so a temperature nobody asked for is still the answer to
+     * the next question. It costs one register read per `/proc` open. */
+    {
+        /* **The epoch, before anything timestamps anything.** The board has
+         * no real-time clock; the harness passes this workstation's time on
+         * the command line and the monotonic counter carries it. A boot
+         * without it says so, because a wrong date that looks right is how a
+         * quota's grace period expires fifty years early. */
+        wallclock_set_epoch(cmdline_number(boot_cmdline, "minikern.time", 0u));
+        if (wallclock_is_real()) {
+            kprintf("time: the epoch is %llu, from the command line\n",
+                    (unsigned long long)wallclock_seconds());
+        } else {
+            kprintf("time: **no epoch given**; timestamps are seconds since boot\n");
+        }
+    }
+    bring_up_thermal(dtb);
     if (cmdline_has(boot_cmdline, "minikern.probe")) {
         struct fdt probe_tree;
         if (fdt_open(&probe_tree, (const void *)(uintptr_t)dtb, FDT_MAX_BYTES) == KERR_OK) {
@@ -2595,6 +3638,14 @@ void kmain(uint64_t hart, uint64_t dtb) {
     wait_for_ticks();
     run_user_programs();
     (void)selftest_run(boot_cmdline);
+    /* **After everything, because that is when the range means something.**
+     *
+     * The first attempt put this in `report_detectors`, which runs fourteen
+     * hundred lines before `bring_up_thermal` binds the sensor — so it
+     * reported nothing, correctly, and looked like a broken sampler. The
+     * boot's last line is the one place every reading has already been
+     * taken. */
+    report_the_thermal_range();
     kprintf("minikern: boot complete\n");
     if (halt_requested()) {
         kprintf("minikern: powering off\n");

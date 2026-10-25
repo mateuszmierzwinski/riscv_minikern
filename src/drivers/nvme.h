@@ -44,6 +44,21 @@
  * ever. */
 int nvme_init(struct blockdev *out);
 
+/* Moves completions from spinning to sleeping, once there is an interrupt
+ * controller to deliver through. Safe to call when there is no NVMe device
+ * and safe to skip entirely: the driver polls correctly either way, and must,
+ * because it is used before this can be called. */
+int nvme_use_interrupts(const struct fdt *fdt);
+
+/* Reports what the device tree says about the drive's interrupt and arms
+ * nothing. For reading a source number without risking the storm that
+ * enabling the wrong one causes. */
+void nvme_irq_probe_only(bool on);
+
+/* Waits that timed out rather than being woken — the number that says
+ * whether arming actually helped. */
+uint64_t nvme_interrupts_missed_count(void);
+
 /* What it found, for the boot log: the model as the drive reports it, and
  * its geometry. */
 const char *nvme_model(void);

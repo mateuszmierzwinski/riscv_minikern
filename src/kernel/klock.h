@@ -57,4 +57,35 @@ void klock_idle_wait(void);
  * exclusive, and every "the lock prevents that" argument is void. */
 uint32_t klock_breaches(void);
 
+/* **What the lock costs**, for the question its roadmap entry poses: is
+ * anything actually blocked on it?
+ *
+ * `acquires` is how syscall-heavy the workload was, `waited` how many
+ * acquisitions had to wait at all, and `cycles`/`worst` whether that
+ * waiting mattered. The last pair is what decides: many short waits are a
+ * busy kernel, a few long ones are a ceiling. */
+void klock_contention(uint64_t *acquires, uint64_t *waited, uint64_t *cycles, uint64_t *worst);
+
+/* How long the lock is *held*, which is why it is waited for. A hart cannot
+ * wait longer than another held, so a worst wait of milliseconds is evidence
+ * about a long critical section rather than about syscall throughput. */
+void klock_held_times(uint64_t *total, uint64_t *worst);
+
+/* The return address of whoever held the lock longest, to be resolved against
+ * the image with `nm`. An address is a fact where "some critical section is
+ * long" is a hypothesis. */
+uint64_t klock_worst_caller(void);
+
+/* **What this hart is doing while it holds the lock**, recorded for whichever
+ * hold turns out to be the longest. Set by whoever knows — the trap path puts
+ * the cause in, the syscall layer the number — because the return address
+ * only ever says "a trap". */
+/* A syscall's tag is its number plus this, so that it cannot be read as a
+ * trap cause — those are small numbers too, and a tag that is ambiguous
+ * between "an interrupt" and "`read`" names nothing. */
+#define KLOCK_TAG_SYSCALL 0x1000u
+
+void klock_tag(uint64_t what);
+uint64_t klock_worst_tag(void);
+
 #endif

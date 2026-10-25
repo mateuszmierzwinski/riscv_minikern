@@ -38,6 +38,11 @@ static struct {
     struct inflight q[WIRE_MAX];
     uint32_t n;
     uint32_t drop_every;   /* lose every n-th frame */
+    /* Loses exactly one frame, the n-th data-carrying one. A single early
+     * loss is what leaves a receiver holding a run above a gap, which is the
+     * only state SACK has anything to say about — `drop_every` keeps losing
+     * and the hole never stays still long enough to be reported. */
+    uint32_t drop_once_at;
     uint32_t dup_every;    /* deliver every n-th frame twice */
     bool reorder;          /* deliver each pair back to front */
     uint32_t carried;
@@ -55,6 +60,15 @@ static int wire_send(void *self, const uint8_t *frame, uint32_t len) {
     if (wire.drop_every != 0 && wire.carried % wire.drop_every == 0) {
         wire.dropped++;
         return KERR_OK;
+    }
+    if (wire.drop_once_at != 0 && len > 60u) {
+        /* Longer than a bare header, so the one lost frame carries data
+         * rather than being the handshake's own acknowledgement. */
+        wire.drop_once_at--;
+        if (wire.drop_once_at == 0) {
+            wire.dropped++;
+            return KERR_OK;
+        }
     }
     if (wire.n >= WIRE_MAX) {
         return KERR_AGAIN;
@@ -234,6 +248,96 @@ static void test_stream_survives_loss(void) {
     }
     KTEST_CHECK(received == sizeof out && memcmp(in, out, sizeof out) == 0);
     KTEST_CHECK(host_a.tcp.stats.retransmits > 0 && wire.dropped > 0);
+}
+
+/* ── selective acknowledgement ─────────────────────────────────────────── */
+
+/* Both ends must come out of the handshake agreeing that SACK is available.
+ * This is the gate on everything else: blocks are only ever sent to a peer
+ * that offered the option, so if this is false the rest is silently inert
+ * and every other SACK test would pass by doing nothing. */
+static void test_sack_is_negotiated_both_ways(void) {
+    struct tcp_conn *c, *s, *l;
+    fresh();
+    connect_pair(&c, &s, &l);
+    KTEST_CHECK(c->sack_ok);
+    KTEST_CHECK(s != NULL && s->sack_ok);
+}
+
+/* A receiver holding data above a gap must report it as blocks.
+ *
+ * Driven by dropping one segment and then sending more: the receiver holds
+ * what follows the hole, and its acknowledgements must carry blocks
+ * describing it. The assertion is on the sender's recorded blocks rather
+ * than on bytes on the wire, because that is the thing the retransmission
+ * path actually consults — a stack that emitted perfect options and never
+ * parsed them back would pass a wire-level check and change nothing. */
+static void test_a_gap_is_reported_as_blocks(void) {
+    struct tcp_conn *c, *s, *l;
+    static uint8_t out[6000], in[6000];
+    uint32_t sent = 0, received = 0;
+    fresh();
+    connect_pair(&c, &s, &l);
+    /* One drop, early, so that everything after it is held out of order. */
+    wire.drop_once_at = 1;
+    for (uint32_t i = 0; i < sizeof out; i++) {
+        out[i] = (uint8_t)i;
+    }
+    for (uint32_t round = 0; round < 400 && received < sizeof out; round++) {
+        if (sent < sizeof out) {
+            int32_t n = tcp_send(c, out + sent, sizeof out - sent);
+            sent += n > 0 ? (uint32_t)n : 0u;
+        }
+        run_ms(10);
+        for (int32_t n = tcp_recv(s, in + received, sizeof in - received, false); n > 0;
+             n = tcp_recv(s, in + received, sizeof in - received, false)) {
+            received += (uint32_t)n;
+        }
+    }
+    /* **The counters, not the live field.** `c->sacked_blocks` holds what
+     * the *last* acknowledgement reported, and a SACK option is a complete
+     * statement — so the moment the hole is filled it is correctly empty
+     * again. Sampling it between rounds therefore catches it only by luck,
+     * which is this project's "a detector read at the wrong moment" lesson
+     * for the fourth time. The counters are cumulative and say the same
+     * thing without the race.
+     *
+     * Both directions, named separately, because a stack can emit perfect
+     * options and silently never parse them back — and that failure looks
+     * right on the wire. */
+    KTEST_CHECK(host_b.tcp.stats.sack_blocks_sent > 0);
+    KTEST_CHECK(host_a.tcp.stats.sack_blocks_received > 0);
+    /* And the stream is still correct, which is the point: SACK is an
+     * improvement on recovery, never a change to what arrives. */
+    KTEST_CHECK(received == sizeof out && memcmp(in, out, sizeof out) == 0);
+}
+
+/* A block the sender never sent must be discarded.
+ *
+ * A peer can claim anything, and a block above `snd_nxt` accepted literally
+ * would shorten a retransmission — potentially to nothing, which is a stall
+ * a remote host could cause on purpose. Checked by hand rather than over the
+ * wire, because no cooperating peer produces it. */
+static void test_a_block_beyond_what_was_sent_is_ignored(void) {
+    struct tcp_conn *c, *s, *l;
+    fresh();
+    connect_pair(&c, &s, &l);
+    KTEST_CHECK(tcp_send(c, (const uint8_t *)"hello", 5) == 5);
+    run_ms(100);
+    {
+        /* Three blocks: one entirely in the future, one inverted, and one
+         * already covered by the cumulative acknowledgement. None may
+         * survive. */
+        struct tcp_seg seg = {.flags = TCP_ACK, .ack = c->snd_una, .wnd = 4096u, .sack_blocks = 3u};
+        seg.sack_left[0] = c->snd_nxt + 1000u;
+        seg.sack_right[0] = c->snd_nxt + 2000u;
+        seg.sack_left[1] = c->snd_nxt;
+        seg.sack_right[1] = c->snd_una; /* right at or below left: inverted */
+        seg.sack_left[2] = c->snd_una - 100u;
+        seg.sack_right[2] = c->snd_una;
+        tcp_take_sack_blocks(c, &seg);
+        KTEST_CHECK(c->sacked_blocks == 0);
+    }
 }
 
 /* Duplicates and reordering must not corrupt the stream. */
@@ -475,6 +579,9 @@ int main(void) {
     KTEST_RUN(test_data_both_ways);
     KTEST_RUN(test_stream_larger_than_the_buffer);
     KTEST_RUN(test_stream_survives_loss);
+    KTEST_RUN(test_sack_is_negotiated_both_ways);
+    KTEST_RUN(test_a_gap_is_reported_as_blocks);
+    KTEST_RUN(test_a_block_beyond_what_was_sent_is_ignored);
     KTEST_RUN(test_duplicates_and_reordering);
     KTEST_RUN(test_early_segments_are_held);
     KTEST_RUN(test_the_window_grows_and_a_loss_halves_it);

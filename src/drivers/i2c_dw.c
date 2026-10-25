@@ -49,7 +49,7 @@
 #define POLL_LIMIT 2000000u
 
 static volatile uint32_t *reg_at(const struct i2c_dw *bus, uint32_t off) {
-    return (volatile uint32_t *)(uintptr_t)(bus->base + off);
+    return (volatile uint32_t *)((uint8_t *)bus->regs + off);
 }
 
 static uint32_t rd(const struct i2c_dw *bus, uint32_t off) {
@@ -102,9 +102,9 @@ int i2c_dw_init(struct i2c_dw *bus, const struct fdt *fdt, const char *path) {
      * every peripheral here is switched on — a complete driver that was
      * never clocked reads zeroes and looks like it works. */
     (void)crg_enable_device(fdt, path);
-    rc = mmu_map_device(base, size);
-    if (rc != KERR_OK) {
-        return rc;
+    bus->regs = mmu_map_device(base, size);
+    if (bus->regs == NULL) {
+        return KERR_NOMEM;
     }
     bus->base = base;
     bus->up = true;

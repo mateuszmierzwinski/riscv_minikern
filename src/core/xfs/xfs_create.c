@@ -526,6 +526,84 @@ int xfs_create(struct xfs *fs, const struct xfs_inode *dir, const char *name, ui
     return rc;
 }
 
+/* Gives a freshly created inode the shape of an empty directory.
+ *
+ * **A directory is not a file with a different mode.** It needs a
+ * shortform fork holding its parent's inode number and a count of zero
+ * entries — `.` and `..` are not stored, they are synthesised by the reader
+ * from the inode's own number and that parent field — and it needs a link
+ * count of two, because a directory is named by its own `.` as well as by
+ * its parent's entry for it. An inode with a directory's mode and a file's
+ * link count is what `xfs_repair` calls a corrupt directory. */
+static int make_it_a_directory(struct xfs *fs, uint64_t ino, uint64_t parent, uint64_t now_s) {
+    uint64_t block;
+    uint32_t boffset;
+    struct bbuf *b;
+    uint8_t *di, *sf;
+    int rc;
+    if (parent > 0xffffffffull) {
+        /* An eight-byte parent needs `i8count` set and every entry widened
+         * with it; refused rather than written half-way. */
+        return KERR_NOTSUP;
+    }
+    xfs_inode_place(fs, ino, &block, &boffset);
+    rc = bcache_get(fs->cache, block, &b);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    di = b->data + boffset;
+    sf = di + fs->dinode_size;
+    di[XFS_DI_FORMAT] = XFS_DINODE_FMT_LOCAL;
+    sf[XFS_DIR_SF_COUNT] = 0u;
+    sf[XFS_DIR_SF_I8COUNT] = 0u;
+    xfs_put_be32(sf + XFS_DIR_SF_PARENT, (uint32_t)parent);
+    /* The size is the header alone: six bytes, and no entries yet. */
+    xfs_put_be64(di + XFS_DI_SIZE, XFS_DIR_SF_PARENT + 4u);
+    xfs_put_be32(di + XFS_DI_NLINK, 2u);
+    xfs_put_be32(di + XFS_DI_MTIME, (uint32_t)now_s);
+    xfs_put_be32(di + XFS_DI_CTIME, (uint32_t)now_s);
+    xfs_reseal(fs, di, fs->inodesize, XFS_DI_CRC);
+    bcache_dirty(b);
+    bcache_put(fs->cache, b);
+    return KERR_OK;
+}
+
+int xfs_mkdir(struct xfs *fs, const struct xfs_inode *dir, const char *name, uint32_t namelen,
+              uint64_t now_s, uint64_t *ino_out) {
+    uint64_t ino = 0;
+    int rc;
+    if (!xfs_writable(fs)) {
+        return KERR_ROFS;
+    }
+    if (!xfs_is_dir(dir)) {
+        return KERR_NOTDIR;
+    }
+    if (!name_is_allowed(name, namelen)) {
+        return KERR_INVAL;
+    }
+    rc = xfs_quota_charge_ids(fs, 0, 0, 0, 1);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    rc = take_inode(fs, xfs_fsb_ag(fs, dir->ino >> fs->inopblog), &ino);
+    if (rc != KERR_OK) {
+        (void)xfs_quota_charge_ids(fs, 0, 0, 0, -1);
+        return rc;
+    }
+    rc = xfs_count_inodes_free(fs, -1);
+    rc = rc != KERR_OK ? rc : write_new_inode(fs, ino, 0040755u, now_s);
+    rc = rc != KERR_OK ? rc : make_it_a_directory(fs, ino, dir->ino, now_s);
+    rc = rc != KERR_OK ? rc
+                       : xfs_dir_add(fs, dir, name, namelen, ino, XFS_DIR3_FT_DIR, now_s);
+    /* **The parent gains a link**, because the new directory's `..` names
+     * it. A parent whose count does not rise is a parent `xfs_repair` will
+     * "fix" by deleting something. */
+    rc = rc != KERR_OK ? rc : xfs_inode_adjust_nlink(fs, dir->ino, 1);
+    rc = rc != KERR_OK ? rc : log_create(fs, ino, dir->ino);
+    *ino_out = ino;
+    return rc;
+}
+
 /* Adds an entry, growing the directory if it has to.
  *
  * **The one place that knows a directory can change shape.** Every caller —

@@ -238,8 +238,18 @@ static int check_features(struct xfs *fs, const uint8_t *sb) {
     }
     fs->big_extent_counts = (in & XFS_FEAT_IN_NREXT64) != 0;
     if ((in & ~XFS_FEAT_IN_SUPPORTED) != 0) {
-        kprintf("xfs: unsupported features %08x (sparse inodes, nrext64 or needsrepair: refused)\n",
+        /* **The message named features that are supported.** Sparse inodes
+         * and `nrext64` were refused once, then reviewed one at a time and
+         * accepted — and this line went on naming them, so the only flag it
+         * can actually be reporting, `NEEDSREPAIR`, was the one it did not
+         * emphasise. A diagnostic that lists the wrong cause is worse than
+         * one that lists none: it sends the reader to look at the wrong
+         * thing. */
+        kprintf("xfs: unsupported incompat features %08x; refused\n",
                 in & ~XFS_FEAT_IN_SUPPORTED);
+        if ((in & XFS_FEAT_IN_NEEDSREPAIR) != 0) {
+            kprintf("xfs: the filesystem says it needs repair\n");
+        }
         return KERR_NOTSUP;
     }
     if (log != 0) {

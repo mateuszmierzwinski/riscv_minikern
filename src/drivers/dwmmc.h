@@ -43,6 +43,24 @@ int dwmmc_init(const struct fdt *fdt, struct blockdev *out);
  * faults that an `EIO` makes indistinguishable. */
 void dwmmc_set_trace(bool on);
 
+/* Installs the handler and unmasks the device but keeps the wait polled —
+ * for telling "unmasking storms" apart from "the wait is wrong". */
+void dwmmc_arm_only(bool on);
+
+/* Arms the controller's end-of-transfer interrupt, so that a transfer
+ * releases the kernel lock instead of spinning on a status bit.
+ *
+ * **Called after the interrupt controller is up**, not from the probe: this
+ * card holds the root filesystem, so it is read before the PLIC exists.
+ * Until then — and if the device tree names no interrupt — transfers stay
+ * polled, which is correct rather than a fallback nobody reaches. */
+int dwmmc_use_interrupts(const struct fdt *fdt);
+
+/* How many transfers ended on the polled look rather than the interrupt.
+ * Nonzero means the interrupt is not arriving and the driver is slower than
+ * the polling it replaced, which is invisible from outside. */
+uint64_t dwmmc_interrupts_missed(void);
+
 /* Where it was found, and how big the card is, for a report. */
 const char *dwmmc_path(void);
 uint64_t dwmmc_blocks(void);

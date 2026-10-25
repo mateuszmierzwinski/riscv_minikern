@@ -133,6 +133,11 @@ int crg_enable_device(const struct fdt *fdt, const char *path);
 
 /* Where a generator was found. */
 phys_t crg_base(enum crg_domain domain);
+
+/* **Where this kernel reaches that domain's registers.** `crg_base` is the
+ * address the hardware decodes, which stopped being usable as a pointer
+ * when the kernel left the identity map. NULL if the domain is not up. */
+volatile uint32_t *crg_regs(enum crg_domain domain);
 bool crg_present(enum crg_domain domain);
 
 #endif

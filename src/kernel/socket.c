@@ -1,4 +1,5 @@
 #include "kernel/socket.h"
+#include "kernel/netlink.h"
 
 #include "arch/riscv/timer.h"
 
@@ -51,6 +52,15 @@ struct file *socket_file(struct sock *s, uint32_t flags) {
 }
 
 static int protocol_init(struct sock *s, int type, int protocol) {
+    /* **AF_UNIX takes no protocol number.** There is one transport for a
+     * local socket, so anything but 0 is a caller asking for something that
+     * does not exist rather than for a default. */
+    if (s->domain == AF_UNIX) {
+        return protocol == 0 ? unix_sock_init(s, type) : EPROTONOSUPPORT;
+    }
+    if (s->domain == AF_NETLINK) {
+        return netlink_sock_init(s, type, protocol);
+    }
     if (type == SOCK_DGRAM && (protocol == 0 || protocol == 17)) {
         return sock_udp_init(s);
     }
@@ -63,13 +73,14 @@ static int protocol_init(struct sock *s, int type, int protocol) {
 int socket_create(int domain, int type, int protocol, struct file **out) {
     struct sock *s;
     int rc;
-    if (domain != AF_INET) {
+    if (domain != AF_INET && domain != AF_UNIX && domain != AF_NETLINK) {
         return EAFNOSUPPORT;
     }
     s = kzalloc(sizeof *s);
     if (s == NULL) {
         return KERR_NOMEM;
     }
+    s->domain = domain;
     s->type = type & SOCK_TYPE_MASK;
     rc = protocol_init(s, s->type, protocol);
     if (rc == KERR_OK && (*out = socket_file(s, (type & SOCK_NONBLOCK) ? O_NONBLOCK : 0u)) == NULL) {

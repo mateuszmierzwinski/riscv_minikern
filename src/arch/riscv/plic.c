@@ -98,16 +98,37 @@ int plic_init(const struct fdt *fdt, uint64_t hart) {
     if (rc != KERR_OK) {
         return rc;
     }
-    rc = mmu_map_device(base, size < PLIC_SPAN ? PLIC_SPAN : size);
-    if (rc != KERR_OK) {
-        return rc;
+    {
+        /* **The mapping says where the registers are**; the physical base is
+         * kept only for what has to name it to somebody else. */
+        void *at = mmu_map_device(base, size < PLIC_SPAN ? PLIC_SPAN : size);
+        if (at == NULL) {
+            return KERR_NOMEM;
+        }
+        plic.regs = (volatile uint32_t *)at;
     }
-    plic.regs = (volatile uint32_t *)(uintptr_t)base;
     plic.base = base;
     plic.context = ctx;
     /* A threshold of zero lets everything through that has a priority above
      * it, which is every source this kernel enables. */
     write_reg(PLIC_THRESHOLD(ctx), 0);
+    /* **The hart has to be willing to take an external interrupt**, and
+     * nothing here ever said so: `sie` was only ever given the timer and
+     * software bits, so bit 9 stayed clear and no external interrupt could
+     * be taken at all.
+     *
+     * Everything downstream of that bit was already written and correct —
+     * the claim-and-complete, `irq_dispatch`, the trap's `IRQ_S_EXTERNAL`
+     * case, and the one driver that registers a handler. None of it had
+     * ever run. The symptom was the quietest possible one: a device whose
+     * interrupt was armed, unmasked and never delivered, which looks
+     * exactly like hardware that does not raise.
+     *
+     * Here rather than in `timer.c` because this is the controller that
+     * makes an external interrupt mean anything, and a hart that enabled
+     * the bit before the controller existed would take an interrupt it
+     * could not claim. */
+    __asm__ volatile("csrs sie, %0" : : "r"(1ull << 9) : "memory");
     plic.up = true;
     return KERR_OK;
 }

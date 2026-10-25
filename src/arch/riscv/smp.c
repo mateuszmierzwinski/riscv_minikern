@@ -86,6 +86,8 @@ static void add_hart(const struct fdt *fdt, const char *path, uint64_t boot_hart
     running += h->running ? 1u : 0u;
 }
 
+static void build_index(void);
+
 int smp_enumerate(const struct fdt *fdt, uint64_t boot_hart) {
     char path[64];
     count = 0;
@@ -101,6 +103,10 @@ int smp_enumerate(const struct fdt *fdt, uint64_t boot_hart) {
         }
         add_hart(fdt, path, boot_hart);
     }
+    /* **Built once, after the table is complete.** Building it per `add_hart`
+     * would leave a window where a hart that asked mid-enumeration got a
+     * half-filled table, and the answer would be wrong rather than slow. */
+    build_index();
     return count == 0 ? KERR_NOENT : KERR_OK;
 }
 
@@ -118,8 +124,47 @@ uint32_t smp_hart_misses(void) {
     return index_misses;
 }
 
+/* An id's index, so the common case is a load rather than a scan.
+ *
+ * **Not a cached index in `sscratch`**, which the roadmap suggested before
+ * that register was spoken for: it carries the kernel stack top, and the
+ * trap path depends on it being zero in the kernel and non-zero in user
+ * mode. `tp` already holds the hart *id* in one instruction, so the only
+ * thing the scan was buying is the id-to-index mapping — and that is a
+ * table, not a register.
+ *
+ * Indexed by hart id, which on this board is 0..4 and is bounded by the
+ * same `SMP_MAX_HARTS` the table is. An id outside that keeps the scan,
+ * because a hart whose id does not fit must not quietly become hart 0 —
+ * the thing the counter below exists to catch.
+ *
+ * `0xff` means "no index known yet", which is how a hart asking before
+ * enumeration still gets the right answer: there is one hart then, and
+ * index 0 is correct for it. */
+#define INDEX_UNKNOWN 0xffu
+static uint8_t index_by_id[SMP_MAX_HARTS];
+static bool index_built;
+
+static void build_index(void) {
+    for (uint32_t i = 0; i < SMP_MAX_HARTS; i++) {
+        index_by_id[i] = INDEX_UNKNOWN;
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        if (harts[i].id < SMP_MAX_HARTS) {
+            index_by_id[harts[i].id] = (uint8_t)i;
+        }
+    }
+    index_built = true;
+}
+
 uint32_t smp_hart_index(void) {
     uint64_t me = smp_this_hart();
+    if (index_built && me < SMP_MAX_HARTS) {
+        uint8_t at = index_by_id[me];
+        if (at != INDEX_UNKNOWN) {
+            return at;
+        }
+    }
     for (uint32_t i = 0; i < count; i++) {
         if (harts[i].id == me) {
             return i;

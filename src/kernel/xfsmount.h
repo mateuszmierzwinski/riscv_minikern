@@ -29,6 +29,9 @@
  * accept — which includes a dirty log, a feature set it does not fully
  * understand, and something that is not XFS at all. Each of those is a
  * different diagnosis and is reported as one. */
+/* The mounted filesystem, for reporting counters only it holds. */
+const struct xfs *xfsmount_fs(void);
+
 int xfsmount_attach(void);
 
 /* True once a filesystem is mounted. */
@@ -73,6 +76,16 @@ int xfsmount_show_file(const char *path);
 /* A path's owner, group and mode. Reported, not enforced: the rule needs to
  * know who is asking, and this layer does not know about processes. */
 int xfsmount_stat(const char *path, uint32_t *uid, uint32_t *gid, uint32_t *mode);
+
+/* A path's mode, size and link count, which is what a `stat` needs and what
+ * `xfsmount_stat` leaves out: it answers the ownership question the
+ * permission checks ask, and a program wants to know how big a file is. */
+int xfsmount_stat_full(const char *path, uint32_t *mode, uint64_t *size, uint32_t *nlink);
+
+/* Lists any directory, not only the root. The callback is the filesystem's
+ * own dirent shape; stopping early is a non-zero return, as `xfs_dir_list`
+ * defines it. */
+int xfsmount_list(const char *path, xfs_dirent_fn fn, void *self);
 
 /* A page's worth, which is what the swap device moves. */
 #define XFSMOUNT_PAGE_BYTES 4096u
@@ -123,6 +136,22 @@ bool xfsmount_writable(void);
  * never been — `xfs_create` had no caller at all before this.
  */
 int xfsmount_create(const char *name, uint16_t mode);
+
+/* Writes `bytes` into `leaf` inside the directory `dir` names, creating the
+ * file if it is not there. **The directory must already exist**: this
+ * writer has no `mkdir`, so a missing one is reported rather than created
+ * (`KERR_NOENT`). */
+int xfsmount_write_into(const char *dir, const char *leaf, const void *bytes, uint32_t len);
+
+/* Writes at an offset into `dir/leaf`, creating the file if absent. This is
+ * what a writable descriptor uses, so that it writes through rather than
+ * holding a whole file in memory. */
+int xfsmount_write_at(const char *dir, const char *leaf, uint64_t off, const void *bytes,
+                      uint32_t len);
+
+/* Makes `path` a directory, and every directory above it. An existing
+ * component is not an error, which is what makes this safe on every boot. */
+int xfsmount_mkdir_p(const char *path);
 int xfsmount_write(const char *name, uint64_t off, const void *buf, uint32_t len);
 
 /* Reads a range of a file in the root directory. The whole-file reader
@@ -142,6 +171,12 @@ int xfsmount_attr_list(const char *name, xfs_attr_fn fn, void *self);
 int xfsmount_link(const char *existing, const char *newname);
 int xfsmount_rename(const char *from, const char *to);
 int xfsmount_unlink(const char *name);
+
+/* Removes a name given a full path, resolving its parent directory. Unlike
+ * `xfsmount_unlink` it is not limited to the root. A correct directory is
+ * refused (that is `rmdir`); one whose inode is broken is removed, which is
+ * how a bad entry gets cleared. */
+int xfsmount_unlink_path(const char *path);
 
 /* A name's inode and its link count, which is how a test of `link` and
  * `unlink` checks what they did rather than that they returned 0. */

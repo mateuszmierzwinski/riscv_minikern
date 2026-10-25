@@ -64,7 +64,34 @@
  * presented as "this program's headers were refused". Deriving it from the
  * two constants that define the stack means it cannot drift into it when
  * either changes. */
+/* **The un-randomised layout**, which is what a process gets when address
+ * randomisation is off. With it on, each process's own `stack_top`,
+ * `trampoline` and `mmap_floor` are these shifted by an amount chosen when
+ * the address space is built — so these are the ceiling of the ranges
+ * rather than the addresses anything actually uses.
+ *
+ * `SIGNAL_TRAMPOLINE` is kept as the un-randomised value for the same
+ * reason: it is derived from the stack, so it has to move with it, and the
+ * per-process field is `p->trampoline`. A literal address a page under the
+ * stack *top* was once inside the stack — 64 pages of it — and the mapping
+ * was refused as a collision, which presented as "this program's headers
+ * were refused". Deriving it means it cannot drift into the stack when
+ * either constant changes; making it per-process means it cannot drift when
+ * the stack itself moves. */
 #define SIGNAL_TRAMPOLINE (USER_STACK_TOP - (uint64_t)(USER_STACK_PAGES + 1u) * 4096ull)
+
+/* How far the three regions may be shifted, in pages.
+ *
+ * **Modest on purpose.** 16 MiB of stack slide and 64 MiB of heap and
+ * mapping slide is a few thousand possibilities each, which is what makes
+ * an address guess fail; going much wider starts refusing the placement
+ * *hints* a Go runtime gives for its heap, and a kernel that makes every
+ * hint fail is a kernel Go runs slowly on. The number that matters for an
+ * attacker is the number of bits, and these give about twelve each — the
+ * same order as a 32-bit Linux, on a kernel whose user half is 256 GiB. */
+#define ASLR_STACK_PAGES 4096u /* 16 MiB */
+#define ASLR_BRK_PAGES   16384u /* 64 MiB */
+#define ASLR_MMAP_PAGES  16384u /* 64 MiB */
 
 
 /* The kernel registers that must survive a trip through user mode: the
@@ -162,6 +189,13 @@ struct uproc {
     struct pgtable pt;
     virt_t entry;
     virt_t stack_top;
+    /* **Where this process's signal trampoline and mapping floor are.**
+     * Both used to be constants, and both have to move when the stack and
+     * the heap do — a trampoline left at the un-randomised address would
+     * be mapped where the stack now is, and a floor left fixed would let a
+     * mapping be placed below the randomised heap. */
+    virt_t trampoline;
+    virt_t mmap_floor;
     uint64_t context[USPACE_CONTEXT_WORDS];
     bool built;
     /* Where the reclaim clock last stopped: a **virtual address**, not an
@@ -248,6 +282,13 @@ uint32_t uspace_euid(void);
  * True when there is no current process, because then the caller is the
  * kernel's own start-up and there is nobody to deny. */
 bool uspace_capable(uint32_t cap);
+
+/* The current process's signal trampoline, and whether addresses are
+ * randomised. `minikern.noaslr` turns randomisation off, which is what
+ * makes a crash address comparable between two runs. */
+virt_t uspace_trampoline(void);
+void uspace_set_aslr(bool on);
+bool uspace_aslr(void);
 
 /* The calling process's soft limit on open descriptors, for the descriptor
  * table to enforce. `RLIM_INFINITY` when there is no process — the kernel's

@@ -13,7 +13,10 @@
  *     fully understand is one it must not touch, because misreading a btree
  *     is how a reader becomes a corrupter.
  *   - Inodes in the classic layout: 256- or 512-byte inodes, 32-bit extent
- *     counts. An inode with XFS_DIFLAG2_NREXT64 is refused.
+ *     counts. An inode with XFS_DIFLAG2_NREXT64 **is read**: the flag moves
+ *     two fields rather than widening them, and `xfs_inode.c` reads them
+ *     from where the flag puts them. (This line said "is refused" long
+ *     after that stopped being true.)
  *   - Data in **extents** (XFS_DINODE_FMT_EXTENTS) or inside the inode
  *     (LOCAL). A fork in **btree** format is refused: that is a file with
  *     more extents than fit in an inode, which this cannot yet walk.
@@ -62,7 +65,30 @@
  * 412-byte literal area on v4 against 336 on v5 — the older format leaves
  * more room, not less. This was `- 176u`, so every 512-byte v4 inode was
  * refused with "has a 412-byte fork; this reader caches 336", which is a
- * reader built for one format telling the truth about the wrong one. */
+ * reader built for one format telling the truth about the wrong one.
+ *
+ * **Why 512 and not 2048, measured rather than asserted.** This was raised
+ * to 1024 to find out, and the answer is arithmetic: a 1024-byte inode's
+ * literal area is 924 bytes, the rest of this structure is about 66 more,
+ * and a function's prologue takes the total past **1040** — against the
+ * 1 KiB frame limit every function in this tree is held to. A frame holding
+ * such an inode cannot hold anything else at all, not even its own
+ * parameters.
+ *
+ * So the ceiling is a consequence of that limit rather than an oversight,
+ * and the two ways past it are both worse than the limitation. Raising the
+ * frame limit gives up the thing that stops a kernel stack being overrun
+ * silently. Allocating inodes on the heap would work, and `src/core` uses
+ * **no dynamic allocation at all** — that is the hexagon's shape, which is
+ * why it carried over from the ARM project untouched, and spending it to
+ * read an inode size `mkfs.xfs` does not produce by default is a bad
+ * trade.
+ *
+ * What the experiment did leave behind is worth more than the ceiling: the
+ * realtime bitmap inode and the quota inode were each being read from disk
+ * onto a fresh stack frame by every function that wanted them — four times
+ * and three times respectively, for the same inode — and both now live in
+ * `struct xfs`. */
 #define XFS_INODE_MAX  512u
 #define XFS_FORK_MAX   (XFS_INODE_MAX - 100u)
 
@@ -91,13 +117,83 @@
  * inode it accepts (512 bytes, less the 176-byte core). */
 #define XFS_AFORK_MAX 336u
 
+/* One inode, parsed, with its inline fork copied out so no cached block
+ * stays pinned while a caller walks it. */
+struct xfs_inode {
+    uint64_t ino;
+    uint64_t size;
+    uint64_t nblocks;
+    uint32_t mode;
+    /* **Who owns it**, which this reader did not parse at all until there
+     * was something to check it against. The permission bits in `mode` are
+     * meaningless without them: "the owner may write" needs to know who the
+     * owner is. */
+    uint32_t uid;
+    uint32_t gid;
+    uint32_t nlink;
+    uint32_t nextents;
+    /* This inode's extent counts are 64-bit and sit at different offsets.
+     * **Per inode, not per filesystem**: the superblock feature permits the
+     * layout and each inode's `di_flags2` says whether it uses it, so an
+     * inode written before the feature was enabled still reads correctly. */
+    bool big_extent_counts;
+    uint8_t format;
+    uint8_t fork[XFS_FORK_MAX];
+    uint32_t fork_len;
+    /* **The attribute fork**, which shares the literal area with the data
+     * fork and begins where `di_forkoff` says.
+     *
+     * `forkoff` is in eight-byte units and **zero means there is no
+     * attribute fork at all** — not "it starts at the beginning", which is
+     * the reading that would make every inode appear to have one. Setting
+     * the first attribute on an inode therefore has to choose a `forkoff`,
+     * and choose it so that the data fork still fits below it.
+     *
+     * Only the two bytes that *locate* the fork are kept here; its contents
+     * are read on demand. Copying them into every inode doubled this struct
+     * and pushed three functions holding two inodes over the kernel's 1 KiB
+     * frame limit — and most inodes have no attributes at all, so it was
+     * paying for the rare case in every one of them. */
+    uint8_t aformat;
+    uint8_t forkoff;
+    /* This file's data is on the realtime device (`XFS_DIFLAG_REALTIME`).
+     * Its extent records are indistinguishable from any other file's, so
+     * this flag is the only thing that says where they point. */
+    bool realtime;
+};
+
 /* The hash pairs of a block directory under conversion: one pair per entry,
  * and an entry is at least sixteen bytes, so a third of the block is past
  * the ceiling. */
 #define XFS_DIRPAIRS_BYTES (XFS_DIRBLK_MAX / 3u)
 
+/* Where the filesystem gets the time, when it needs a *wall-clock* one.
+ *
+ * **A port, because the hexagon cannot know where time comes from.** Every
+ * write operation here already takes a `now_s` for timestamps, and that is
+ * right for a timestamp — it is an argument of the operation. A quota's
+ * grace period is different: it is checked deep inside a charge that three
+ * callers reach by different routes, and threading a parameter through all
+ * of them to be used in one place is how a signature grows for the
+ * convenience of its callee.
+ *
+ * `is_real` is the part that matters. This board has no real-time clock, so
+ * the kernel can offer seconds-since-boot or seconds-since-the-epoch and
+ * only the second kind may be compared against a deadline written to disk.
+ * A filesystem with no clock installed, or an unreal one, **counts soft
+ * limits and does not enforce them** — which is what it did before, and is
+ * the honest behaviour rather than a deadline computed from the wrong
+ * origin. */
+struct xfs_clock {
+    uint64_t (*seconds)(void *self);
+    bool (*is_real)(void *self);
+    void *self;
+};
+
 struct xfs {
     struct bcache *cache;
+    /* NULL until the composition root installs one. */
+    const struct xfs_clock *clock;
     uint64_t dblocks;     /* blocks in the filesystem */
     uint64_t rootino;
     uint64_t logstart;    /* the internal log's first block, 0 when external */
@@ -150,6 +246,30 @@ struct xfs {
     uint64_t rblocks;
     uint64_t rextents;
     uint64_t rbmino;
+    /* **The bitmap inode, read into the filesystem rather than onto a
+     * stack.** Four functions here opened it, each with its own copy on its
+     * own frame — so the same inode was read from disk four times, and with
+     * a 1024-byte inode each of those frames crossed the 1 KiB limit. One
+     * field serves all four: fewer reads, and the largest object this code
+     * handles is no longer on anybody's stack. It is refilled on every
+     * `open_bitmap`, so it is exactly as fresh as the copies it replaced. */
+    struct xfs_inode rbm_inode;
+    /* The quota file currently being read, for the same reason: three
+     * functions opened one onto their own frames. One slot is enough
+     * because a charge touches one kind at a time — `xfs_quota_charge_all`
+     * loops over the kinds rather than holding three at once — and it is
+     * refilled per call, so it is as fresh as the copies it replaced. */
+    struct xfs_inode quota_inode_buf;
+    /* **How many charges went past a soft limit.** The grace period a soft
+     * limit starts cannot be timed on this board — see `over_limit` — so the
+     * limit is not enforced; counting the crossings is what stops the
+     * information being thrown away entirely. An operator who sees this
+     * climb knows an owner is over their allowance, which is the whole
+     * purpose of a soft limit, without the kernel pretending to a deadline
+     * it cannot keep. */
+    uint32_t quota_soft_exceeded;
+    uint32_t quota_grace_started;
+    uint32_t quota_grace_expired;
     uint64_t rsumino;
     uint32_t rextsize;
     /* **Which on-disk format this is**, and the sizes that follow from it.
@@ -313,50 +433,6 @@ struct xfs {
     uint8_t *dirpairs;
 };
 
-/* One inode, parsed, with its inline fork copied out so no cached block
- * stays pinned while a caller walks it. */
-struct xfs_inode {
-    uint64_t ino;
-    uint64_t size;
-    uint64_t nblocks;
-    uint32_t mode;
-    /* **Who owns it**, which this reader did not parse at all until there
-     * was something to check it against. The permission bits in `mode` are
-     * meaningless without them: "the owner may write" needs to know who the
-     * owner is. */
-    uint32_t uid;
-    uint32_t gid;
-    uint32_t nlink;
-    uint32_t nextents;
-    /* This inode's extent counts are 64-bit and sit at different offsets.
-     * **Per inode, not per filesystem**: the superblock feature permits the
-     * layout and each inode's `di_flags2` says whether it uses it, so an
-     * inode written before the feature was enabled still reads correctly. */
-    bool big_extent_counts;
-    uint8_t format;
-    uint8_t fork[XFS_FORK_MAX];
-    uint32_t fork_len;
-    /* **The attribute fork**, which shares the literal area with the data
-     * fork and begins where `di_forkoff` says.
-     *
-     * `forkoff` is in eight-byte units and **zero means there is no
-     * attribute fork at all** — not "it starts at the beginning", which is
-     * the reading that would make every inode appear to have one. Setting
-     * the first attribute on an inode therefore has to choose a `forkoff`,
-     * and choose it so that the data fork still fits below it.
-     *
-     * Only the two bytes that *locate* the fork are kept here; its contents
-     * are read on demand. Copying them into every inode doubled this struct
-     * and pushed three functions holding two inodes over the kernel's 1 KiB
-     * frame limit — and most inodes have no attributes at all, so it was
-     * paying for the rare case in every one of them. */
-    uint8_t aformat;
-    uint8_t forkoff;
-    /* This file's data is on the realtime device (`XFS_DIFLAG_REALTIME`).
-     * Its extent records are indistinguishable from any other file's, so
-     * this flag is the only thing that says where they point. */
-    bool realtime;
-};
 
 /* The type byte a directory entry carries when the filesystem has the
  * ftype feature; XFS_DIR3_FT_UNKNOWN when it does not, and a caller must
@@ -388,6 +464,17 @@ typedef int (*xfs_dirent_fn)(void *self, const struct xfs_dirent *entry);
  * structure that failed its checksum, KERR_BUSY-shaped KERR_NOTSUP for a
  * dirty log. The filesystem is left unmounted on any failure. */
 int xfs_mount(struct xfs *fs, struct bcache *cache);
+
+/* Installs the wall clock. Called from the composition root before anything
+ * can charge a quota — a port installed late is a port that was not
+ * installed, which this tree has paid for twice. */
+void xfs_set_clock(struct xfs *fs, const struct xfs_clock *clock);
+
+/* How many charges were refused because a grace period had expired, and how
+ * many started one. Reported rather than silent: a refusal a user cannot see
+ * the reason for is a filesystem that appears broken. */
+uint32_t xfs_quota_grace_expired(const struct xfs *fs);
+uint32_t xfs_quota_grace_started(const struct xfs *fs);
 
 /* Reads one inode by number. KERR_NOENT when it is outside the
  * filesystem, KERR_IO when it fails its checks, KERR_NOTSUP for a format
@@ -457,6 +544,12 @@ struct xfs_dquot {
  * is what `-m uquota` gives until somebody sets a limit. A caller that
  * treated "accounted" as "enforced" would report limits that are not
  * applied. */
+/* How many charges went past a soft limit without reaching the hard one.
+ * Soft limits are not enforced here — the grace period needs a wall clock
+ * this board does not have — so this count is what carries the information
+ * a soft limit exists to give. */
+uint32_t xfs_quota_soft_exceeded(const struct xfs *fs);
+
 bool xfs_quota_accounted(const struct xfs *fs, uint8_t type);
 bool xfs_quota_enforced(const struct xfs *fs, uint8_t type);
 
@@ -570,6 +663,16 @@ int xfs_file_read(struct xfs *fs, const struct xfs_inode *ip, uint64_t off, void
  * half-done btree is worse than a refusal (core/xfs/xfs_create.c). */
 int xfs_create(struct xfs *fs, const struct xfs_inode *dir, const char *name, uint32_t namelen, uint16_t mode,
                uint64_t now_s, uint64_t *ino_out);
+
+/* Makes an empty directory called `name` inside `dir`.
+ *
+ * **Not `xfs_create` with a directory's mode.** A directory needs a
+ * shortform fork naming its parent, a link count of two (its own `.` as
+ * well as its parent's entry), and its parent's count raised for the `..`
+ * that now points back. An inode with the mode and none of the rest is what
+ * `xfs_repair` calls a corrupt directory and offers to delete. */
+int xfs_mkdir(struct xfs *fs, const struct xfs_inode *dir, const char *name, uint32_t namelen,
+              uint64_t now_s, uint64_t *ino_out);
 
 /* Removes a regular file called name from dir.
  *

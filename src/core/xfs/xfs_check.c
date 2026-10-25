@@ -152,7 +152,11 @@ static void check_group(struct xfs *fs, uint32_t agno, struct report *r) {
  * Worth its own step: every path this kernel resolves starts here, so a
  * sound set of groups with an unreadable root is a filesystem that would
  * fail on its first lookup instead of at mount. */
-static void check_root(struct xfs *fs, struct report *r) {
+/* `noinline` because it holds an inode, which is the largest object this
+ * code puts on a stack. Folded into `xfs_check`'s frame the two together
+ * cross the 1 KiB limit, and the limit is what stops a kernel stack being
+ * quietly overrun. */
+__attribute__((noinline)) static void check_root(struct xfs *fs, struct report *r) {
     struct xfs_inode root;
     if (xfs_inode_read(fs, fs->rootino, &root) != KERR_OK) {
         fault(r, "the root inode", 0);

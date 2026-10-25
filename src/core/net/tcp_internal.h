@@ -26,6 +26,12 @@
 #define TCP_OPT_END  0u
 #define TCP_OPT_NOP  1u
 #define TCP_OPT_MSS  2u
+/* **Selective acknowledgement.** `SACK_PERMITTED` is two bytes in a SYN and
+ * says the sender understands the other; `SACK` carries up to four
+ * (left, right) pairs of sequence numbers that the receiver holds but cannot
+ * acknowledge cumulatively, because something before them is missing. */
+#define TCP_OPT_SACK_PERMITTED 4u
+#define TCP_OPT_SACK 5u
 
 /* One parsed segment. */
 struct tcp_seg {
@@ -36,6 +42,12 @@ struct tcp_seg {
     uint16_t dport;
     uint8_t flags;
     uint32_t mss;          /* 0 when the option was absent */
+    /* Whether the peer sent SACK-permitted, and whatever SACK blocks this
+     * segment carried. */
+    bool sack_permitted;
+    uint32_t sack_blocks;
+    uint32_t sack_left[TCP_SACK_BLOCKS];
+    uint32_t sack_right[TCP_SACK_BLOCKS];
     const uint8_t *data;
     uint32_t len;          /* payload bytes */
 };
@@ -87,7 +99,20 @@ struct tcp_out {
     uint16_t remote_port;
     uint32_t ack;     /* the acknowledgement field, when TCP_ACK is set */
     uint32_t window;
+    /* The SACK blocks to report, which a receiver fills from what it is
+     * holding out of order. Zero blocks means the option is not sent at
+     * all — an empty SACK option is not legal and would be a worse answer
+     * than none. */
+    uint32_t sack_blocks;
+    uint32_t sack_left[TCP_SACK_BLOCKS];
+    uint32_t sack_right[TCP_SACK_BLOCKS];
 };
+
+/* Takes the SACK blocks a segment reported, dropping anything stale or
+ * impossible. Internal rather than static because the filtering is the part
+ * a hostile peer attacks, and a test has to be able to hand it blocks no
+ * cooperating peer would send. */
+void tcp_take_sack_blocks(struct tcp_conn *c, const struct tcp_seg *seg);
 
 /* tcp_out.c */
 int tcp_emit_out(const struct tcp_out *o, uint32_t seq, uint8_t flags, const uint8_t *data, uint32_t len,

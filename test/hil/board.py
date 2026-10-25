@@ -366,6 +366,15 @@ def main():
         program = serve_beside_the_image(args.program)
         bootargs += f" minikern.loadat={PROGRAM_AT:#x}:{program[1]:#x} minikern.runloaded"
         print(f"hil: {program[0]} is {program[1]} bytes, fetched to {PROGRAM_AT:#x}")
+    # **The board has no clock, so this one lends it ours.**
+    #
+    # The VisionFive 2 has no real-time clock fitted, so every timestamp the
+    # kernel wrote dated to 1970, and anything needing a wall-clock deadline —
+    # a quota grace period — could not be enforced at all. The epoch goes on
+    # the command line and the board's monotonic counter carries it from
+    # there. It is this workstation's time, trusted as given: there is no
+    # stratum and no authority behind it, which the kernel says out loud.
+    bootargs += f" minikern.time={int(time.time())}"
     fs = None
     if args.image:
         fs = offer_filesystem_image(args.image)

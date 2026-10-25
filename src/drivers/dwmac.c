@@ -22,10 +22,26 @@
 /* The dwmac4 registers this driver touches. */
 #define MAC_CONFIG        0x0000u
 #define MAC_PACKET_FILTER 0x0008u
+/* Receive-filter bits. `PR` takes everything on the wire, which is a
+ * diagnostic rather than a mode to run in: it answers "is this frame not
+ * arriving, or arriving and being filtered out", and those two have entirely
+ * different fixes. */
+#define MAC_FILTER_PR (1u << 0)
 #define MAC_VERSION       0x0110u
 #define MAC_MDIO_ADDR     0x0200u
 #define MAC_MDIO_DATA     0x0204u
 #define MAC_ADDR0_HIGH    0x0300u
+/* **Address Enable, and the bit this driver was clearing.** The high half of
+ * a MAC address register carries two bytes of address and, at bit 31, the
+ * flag that says the filter should compare against it. Writing the address
+ * as a bare 16-bit value therefore wrote a zero there and switched its own
+ * address off: broadcast frames still arrived, because a broadcast is not
+ * matched against an address, so DHCP worked perfectly and every **unicast**
+ * reply was dropped by the controller. From outside that is a machine that
+ * can get a lease and then reach nothing — no ARP reply from the gateway, no
+ * DNS answer — with every counter in the stack reading zero drops, because
+ * the frames never got as far as the stack. */
+#define MAC_ADDR_AE       (1u << 31)
 #define MAC_ADDR0_LOW     0x0304u
 
 #define MAC_CONFIG_RE    (1u << 0)  /* receiver enable */
@@ -71,6 +87,17 @@
 #define DMA_CH0_TXRINGLEN 0x112cu
 #define DMA_CH0_RXRINGLEN 0x1130u
 #define DMA_CH0_STATUS    0x1160u
+/* DWMAC4 per-channel interrupt enable, and the bits of it this driver wants.
+ * `NIE` is the master enable for the "normal" group — without it the
+ * individual bits are armed and nothing is ever raised, which is the same
+ * shape as the `sie` bit that left this kernel's whole PLIC path unreachable. */
+#define DMA_CH0_INTR_ENA  0x1134u
+#define DMA_INTR_RIE      (1u << 6)  /* a frame was received */
+#define DMA_INTR_NIE      (1u << 15) /* the normal-interrupt summary */
+/* Write-one-to-clear, like the SD controller's `RINTSTS`: a handler that does
+ * not acknowledge at the device leaves the PLIC re-raising for ever. */
+#define DMA_STATUS_RI     (1u << 6)
+#define DMA_STATUS_NIS    (1u << 15)
 
 #define DMA_BUS_MODE_SWR  (1u << 0)
 /* `DMA_SYSBUS_MODE`, and the one bit that decides whether a descriptor's
@@ -130,8 +157,22 @@
  * two drivers' worth of rings for a machine with one network. */
 static struct {
     volatile uint32_t *regs;
+    /* The rings' **bus** addresses, for the registers and the descriptors
+     * that name them. `txd`/`rxd` below are the same memory as this kernel
+     * reaches it. */
+    phys_t txd_phys;
+    phys_t rxd_phys;
     uint8_t mac[6];
     uint32_t phy;
+    /* The PLIC source from this node's `interrupts`, kept so that the
+     * composition root can register a handler without re-reading the tree. */
+    uint32_t irq;
+    /* Logs each accepted frame's destination address, for the one question
+     * "what is the reply addressed to". Diagnostic only. */
+    bool trace_dest;
+    uint32_t traced;
+    /* Set before probing to keep the documented-but-broken strict filter. */
+    bool strict_filter;
     bool present;
     bool noncoherent;
     uint32_t mbit;
@@ -309,25 +350,79 @@ static void configure_mac(void) {
  * there rather than inventing one means this kernel appears on the network
  * as the same machine U-Boot did. A made-up address would work and would be
  * a different host every boot. */
+/* The receive filter, set deliberately.
+ *
+ * It was never written at all, so it held whatever the firmware left — which
+ * is not a default, it is the previous program's state. Zero is what this
+ * driver wants: match unicast against the address registers, accept
+ * broadcast, drop the rest. Written explicitly so that the next person
+ * reading this knows it was chosen. */
+/* **Every frame on the wire, and this is not where that was meant to land.**
+ *
+ * The filter is supposed to be zero here: match unicast against
+ * `MAC_ADDR0`, accept broadcast, drop the rest. Measured on the board, that
+ * configuration accepts **no unicast at all** — and the registers in the
+ * failing run are byte-identical to the working one:
+ *
+ *     dwmac: filter 00000000, addr 800089b6/0039cf6c, ours 6c:cf:39:00:b6:89
+ *
+ * `AE` (bit 31) is set, the address is exactly this interface's, the mask
+ * bytes are clear, and the reply that never arrives is addressed to
+ * `6c:cf:39:00:b6:89`. With `PR` set, the same boot receives the ARP reply
+ * and the DNS answer and a name resolves. So this controller drops unicast
+ * that matches a correctly programmed address, which is not how the filter
+ * is documented to behave, and the cause is **not identified** — it wants
+ * the DWMAC 5.20 configuration detail for this SoC, which is not to hand.
+ *
+ * Why accept everything rather than leave it strict and broken: with the
+ * filter closed this board gets a DHCP lease and can then reach nothing —
+ * no ARP reply, so no gateway, so no traffic at all. A network that cannot
+ * receive a reply is not a network. The cost of `PR` on this board is that
+ * the controller hands up frames for other hosts and the stack discards
+ * them by address, which costs cycles and leaks nothing: the stack's own
+ * `not-ours` counter is where they go.
+ *
+ * `minikern.netfilter` restores the strict setting for whoever picks this
+ * up, because the next person needs to reproduce it in one boot rather than
+ * rediscover it. */
+static void set_the_receive_filter(void) {
+    wr(MAC_PACKET_FILTER, nic.strict_filter ? 0u : MAC_FILTER_PR);
+}
+
+/* Programs the address this driver decided on, with the enable bit.
+ *
+ * **Unconditionally, whichever source the address came from.** It used to be
+ * written only when the tree carried a `local-mac-address`, on the reasoning
+ * that an address read back *from* the registers is already in them — which
+ * is true of the address and false of `AE`, the bit beside it that says the
+ * filter should use it. So on a board whose tree names no address, the
+ * enable bit stayed as the firmware left it and nothing in this driver ever
+ * set it. Writing both registers in one place is what makes the two paths
+ * impossible to tell apart, which is the only way this stays fixed. */
+static void program_the_address(void) {
+    wr(MAC_ADDR0_LOW, (uint32_t)nic.mac[0] | ((uint32_t)nic.mac[1] << 8) |
+                          ((uint32_t)nic.mac[2] << 16) | ((uint32_t)nic.mac[3] << 24));
+    wr(MAC_ADDR0_HIGH, (uint32_t)nic.mac[4] | ((uint32_t)nic.mac[5] << 8) | MAC_ADDR_AE);
+}
+
 static void take_address(const struct fdt *fdt, const char *path) {
     struct fdt_prop p;
     uint32_t high = rd(MAC_ADDR0_HIGH);
     uint32_t low = rd(MAC_ADDR0_LOW);
+    set_the_receive_filter();
     if (fdt_get_prop(fdt, path, "local-mac-address", &p) == KERR_OK && p.len == 6u) {
         for (uint32_t i = 0; i < 6u; i++) {
             nic.mac[i] = p.value[i];
         }
-        wr(MAC_ADDR0_LOW, (uint32_t)nic.mac[0] | ((uint32_t)nic.mac[1] << 8) |
-                              ((uint32_t)nic.mac[2] << 16) | ((uint32_t)nic.mac[3] << 24));
-        wr(MAC_ADDR0_HIGH, (uint32_t)nic.mac[4] | ((uint32_t)nic.mac[5] << 8));
-        return;
+    } else {
+        nic.mac[0] = (uint8_t)low;
+        nic.mac[1] = (uint8_t)(low >> 8);
+        nic.mac[2] = (uint8_t)(low >> 16);
+        nic.mac[3] = (uint8_t)(low >> 24);
+        nic.mac[4] = (uint8_t)high;
+        nic.mac[5] = (uint8_t)(high >> 8);
     }
-    nic.mac[0] = (uint8_t)low;
-    nic.mac[1] = (uint8_t)(low >> 8);
-    nic.mac[2] = (uint8_t)(low >> 16);
-    nic.mac[3] = (uint8_t)(low >> 24);
-    nic.mac[4] = (uint8_t)high;
-    nic.mac[5] = (uint8_t)(high >> 8);
+    program_the_address();
 }
 
 void dwmac_address(uint8_t out[6]) {
@@ -360,7 +455,9 @@ void dwmac_set_sink(const struct frame_sink *sink) {
  * publish-last rule the page tables follow, for the same reason. */
 static void rx_publish(uint32_t i) {
     volatile uint32_t *d = nic.rxd + i * 4u;
-    phys_t buf = (phys_t)(uintptr_t)(nic.rxb + i * BUFFER);
+    /* The bus address of this slot's buffer. `nic.rxb` is where the kernel
+     * reaches it; the controller needs where it physically is. */
+    phys_t buf = mmu_virt_to_phys(nic.rxb + i * BUFFER);
     d[0] = (uint32_t)buf;
     d[1] = (uint32_t)(buf >> 32);
     d[2] = 0;
@@ -390,10 +487,17 @@ static int rings_up(void) {
     if (rc != KERR_OK) {
         return rc;
     }
-    nic.txd = (volatile uint32_t *)(uintptr_t)txd;
-    nic.rxd = (volatile uint32_t *)(uintptr_t)rxd;
-    nic.txb = (uint8_t *)(uintptr_t)txb;
-    nic.rxb = (uint8_t *)(uintptr_t)rxb;
+    /* **The allocator returns physical addresses and the device wants
+     * them; the kernel cannot use them as pointers.** Both facts were true
+     * before and invisible, because an identity-mapped kernel makes the two
+     * the same number. The physical values are kept to give to the
+     * hardware, and these are how this driver reaches the same memory. */
+    nic.txd_phys = txd;
+    nic.rxd_phys = rxd;
+    nic.txd = (volatile uint32_t *)mmu_phys_to_virt(txd);
+    nic.rxd = (volatile uint32_t *)mmu_phys_to_virt(rxd);
+    nic.txb = (uint8_t *)mmu_phys_to_virt(txb);
+    nic.rxb = (uint8_t *)mmu_phys_to_virt(rxb);
     for (uint32_t i = 0; i < RING * 4u; i++) {
         nic.txd[i] = 0;
         nic.rxd[i] = 0;
@@ -447,8 +551,15 @@ static int dwmac_send(void *self, const uint8_t *frame, uint32_t len) {
     for (uint32_t i = 0; i < len; i++) {
         buf[i] = frame[i];
     }
-    d[0] = (uint32_t)(uintptr_t)buf;
-    d[1] = (uint32_t)((uint64_t)(uintptr_t)buf >> 32);
+    {
+        /* **The address the device will fetch from.** A kernel pointer here
+         * is a DMA to whatever that number happens to be physically, which
+         * while the kernel was identity-mapped was the right page by
+         * accident. */
+        uint64_t bus = (uint64_t)mmu_virt_to_phys(buf);
+        d[0] = (uint32_t)bus;
+        d[1] = (uint32_t)(bus >> 32);
+    }
     d[2] = DESC_TX_IOC | len;
     __asm__ volatile("fence w, w" : : : "memory");
     d[3] = DESC_OWN | DESC_TX_FD | DESC_TX_LD | len;
@@ -457,12 +568,93 @@ static int dwmac_send(void *self, const uint8_t *frame, uint32_t len) {
      * starts the transfer — a descriptor published without moving the tail
      * sits there for ever, which is the commonest way a dwmac driver
      * appears to do nothing at all. */
-    wr(DMA_CH0_TXTAIL, (uint32_t)(uintptr_t)(nic.txd + nic.tx_next * 4u));
+    wr(DMA_CH0_TXTAIL, (uint32_t)(nic.txd_phys + nic.tx_next * 16u));
     nic.sent++;
     return KERR_OK;
 }
 
 static const struct netdev_port dwmac_port = {.send = dwmac_send, .self = NULL};
+
+/* Arms the receive interrupt, and says whether the tree gave us one.
+ *
+ * **Why this device needs it and the others did not.** Everything here was
+ * polled from the housekeeping beat, which is enough for DHCP — a boot-time
+ * exchange with a hart that has work to do anyway. It is not enough for a
+ * blocking `recvfrom`: the waiting thread has no deadline, so under dynamic
+ * ticks nothing is scheduled to fire, nothing polls the device, and the
+ * reply sits in the ring while the only thread that wants it waits for
+ * ever. The deadlock detector catches it, which is how it was found, and the
+ * fix is not a shorter poll interval — a device that is only looked at when
+ * something else happens cannot complete a wait that nothing else will end.
+ */
+void dwmac_enable_rx_interrupt(void) {
+    if (!nic.present) {
+        return;
+    }
+    wr(DMA_CH0_INTR_ENA, DMA_INTR_RIE | DMA_INTR_NIE);
+}
+
+/* Takes every frame on the wire, for one question only.
+ *
+ * The board received the two broadcast DHCP replies and nothing else — no
+ * ARP reply from the gateway, no DNS reply — and both of those are
+ * **unicast** to this interface's address. So either they are not arriving
+ * or the address filter is not matching them, and until that is settled
+ * every other theory is guesswork. `MAC_PACKET_FILTER` was defined in this
+ * driver and never written once, which is how a filter nobody configured
+ * came to be the suspect. */
+/* **What the filter is actually matching against**, read back rather than
+ * assumed.
+ *
+ * Printed unconditionally, which is the whole point: it was first written
+ * inside the promiscuous-mode diagnostic, so it only ever ran in the case
+ * that *worked* — three board runs were spent reasoning about whether the
+ * address and its enable bit were right in the failing case without ever
+ * once printing them there. A diagnostic that only runs on the good path
+ * answers the question nobody is asking. */
+void dwmac_use_strict_filter(bool on) {
+    nic.strict_filter = on;
+}
+
+void dwmac_trace_destinations(bool on) {
+    nic.trace_dest = on;
+}
+
+void dwmac_report_filter(void) {
+    if (!nic.present) {
+        return;
+    }
+    kprintf("dwmac: filter %08x, addr %08x/%08x, ours %02x:%02x:%02x:%02x:%02x:%02x\n",
+            rd(MAC_PACKET_FILTER), rd(MAC_ADDR0_HIGH), rd(MAC_ADDR0_LOW), nic.mac[0],
+            nic.mac[1], nic.mac[2], nic.mac[3], nic.mac[4], nic.mac[5]);
+}
+
+void dwmac_set_promiscuous(bool on) {
+    if (!nic.present) {
+        return;
+    }
+    wr(MAC_PACKET_FILTER, on ? MAC_FILTER_PR : 0u);
+    dwmac_report_filter();
+}
+
+uint32_t dwmac_irq(void) {
+    return nic.present ? nic.irq : 0u;
+}
+
+/* Acknowledges at the device and drains the ring. Returns how many frames
+ * were delivered, so a handler that fires with nothing to show says so. */
+uint32_t dwmac_handle_interrupt(void) {
+    uint32_t status;
+    if (!nic.present) {
+        return 0;
+    }
+    status = rd(DMA_CH0_STATUS);
+    /* **Acknowledged before the ring is drained**, and only the bits that
+     * were set: writing the register wholesale would clear causes this
+     * driver does not handle and has not looked at. */
+    wr(DMA_CH0_STATUS, status & (DMA_STATUS_RI | DMA_STATUS_NIS));
+    return dwmac_poll();
+}
 
 uint32_t dwmac_poll(void) {
     uint32_t delivered = 0;
@@ -485,13 +677,19 @@ uint32_t dwmac_poll(void) {
              * afterwards rather than before: giving it to the controller
              * first would let the next frame overwrite this one while the
              * stack was still reading it. */
-            nic.sink->frame(nic.sink->self, nic.rxb + nic.rx_next * BUFFER, len);
+            const uint8_t *f = nic.rxb + nic.rx_next * BUFFER;
+            if (nic.trace_dest && nic.traced < 12u && len >= 14u) {
+                nic.traced++;
+                kprintf("dwmac: frame to %02x:%02x:%02x:%02x:%02x:%02x type %02x%02x len %u\n",
+                        f[0], f[1], f[2], f[3], f[4], f[5], f[12], f[13], len);
+            }
+            nic.sink->frame(nic.sink->self, f, len);
             nic.received++;
             delivered++;
         }
         rx_publish(nic.rx_next);
         nic.rx_next = (nic.rx_next + 1u) % RING;
-        wr(DMA_CH0_RXTAIL, (uint32_t)(uintptr_t)(nic.rxd + nic.rx_next * 4u));
+        wr(DMA_CH0_RXTAIL, (uint32_t)(nic.rxd_phys + nic.rx_next * 16u));
     }
     return delivered;
 }
@@ -565,6 +763,35 @@ static const char *const CONTROLLERS[] = {
  * answer "this clock has no gate" without that counting as failure, which is
  * what refused both of these controllers until the generator learned the
  * difference. */
+/* This controller's PLIC source.
+ *
+ * **Two spellings, and this board uses the second.** `interrupts` is a list
+ * of cells interpreted by the parent controller; `interrupts-extended` is a
+ * list of (phandle, source) pairs, which a node uses when its interrupts go
+ * to more than one controller — and on the JH7110 they do, so there is no
+ * plain `interrupts` property at all. Reading only the first spelling gave
+ * source 0, and a source of 0 is indistinguishable from "no interrupt", so
+ * the handler was never registered and the failure was a silent fall back to
+ * polling.
+ *
+ * The first pair's second cell is the source for the first controller named,
+ * which is the PLIC. Printed when it is found so that the number in the log
+ * is the number the PLIC was given. */
+static uint32_t interrupt_from_tree(const struct fdt *fdt, const char *path) {
+    struct fdt_prop p;
+    uint64_t source = 0;
+    if (fdt_get_prop(fdt, path, "interrupts", &p) == KERR_OK &&
+        fdt_prop_cells(&p, 0, 1, &source) == KERR_OK && source != 0) {
+        return (uint32_t)source;
+    }
+    if (fdt_get_prop(fdt, path, "interrupts-extended", &p) == KERR_OK &&
+        fdt_prop_cells(&p, 1, 1, &source) == KERR_OK) {
+        return (uint32_t)source;
+    }
+    kprintf("dwmac: the tree names no interrupt for %s\n", path);
+    return 0;
+}
+
 static int open_controller(const struct fdt *fdt, const char *path) {
     phys_t base = 0;
     uint64_t size = 0;
@@ -572,15 +799,20 @@ static int open_controller(const struct fdt *fdt, const char *path) {
     if (rc != KERR_OK) {
         return rc;
     }
-    rc = mmu_map_device(base, size);
-    if (rc != KERR_OK) {
-        return rc;
+    {
+        void *at = mmu_map_device(base, size);
+        if (at == NULL) {
+            return KERR_NOMEM;
+        }
+        nic.regs = (volatile uint32_t *)at;
+        /* Taken here, where the node is in hand. `dwmmc.c` reads its own the
+         * same way; the number is the node's, never the driver's to know. */
+        nic.irq = interrupt_from_tree(fdt, path);
     }
     rc = crg_enable_device(fdt, path);
     if (rc != KERR_OK) {
         return rc;
     }
-    nic.regs = (volatile uint32_t *)(uintptr_t)base;
     /* The version register is read back as a cross-check that all of the
      * above worked: a block that is mapped but unclocked reads zero here,
      * and this driver would rather say so than configure a silent device. */

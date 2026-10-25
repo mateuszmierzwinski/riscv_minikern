@@ -152,3 +152,31 @@ _secondary_start:
 
 1:  wfi
     j       1b
+
+/* mmu_enter_high — leave the load address behind and never come back.
+ *
+ * `a0` is the function to enter, already converted to its high address by
+ * the caller; `a1` and `a2` are its two arguments; `a3` is the stack to use,
+ * which is this hart's boot stack at its high alias.
+ *
+ * **A new stack rather than a relocated one.** Adding an offset to `sp`
+ * would leave the frames below it full of low addresses — saved registers,
+ * pointers to locals — every one of which stops working when the identity
+ * map goes. Entering on a fresh stack abandons them, which is only safe
+ * because the caller is not coming back: it is the last thing the physical
+ * phase does.
+ *
+ * Nothing between the `csrw satp` that made the high mapping live and this
+ * jump may touch anything that will move, which is why this is five
+ * instructions and why it is written here rather than as inline assembly
+ * inside a C function whose prologue is the compiler's business.
+ */
+    .section .text
+    .globl mmu_enter_high
+mmu_enter_high:
+    mv      t0, a0
+    mv      sp, a3
+    mv      a0, a1
+    mv      a1, a2
+    jr      t0
+1:  j       1b

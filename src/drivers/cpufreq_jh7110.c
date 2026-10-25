@@ -21,8 +21,13 @@ static struct {
 static uint32_t finish_init(struct cpufreq_policy *policy, uint32_t found);
 
 static volatile uint32_t *divider_register(void) {
-    return (volatile uint32_t *)(uintptr_t)(crg_base(CRG_SYS) +
-                                            crg_clock_offset(CPU_CORE_CLOCK_INDEX));
+    volatile uint32_t *regs = crg_regs(CRG_SYS);
+    /* The clock generator's mapped registers, offset to this clock's word.
+     * `crg_base` would be the address the hardware decodes, which is not an
+     * address this kernel can load from. */
+    return regs == NULL ? NULL
+                        : (volatile uint32_t *)((uint8_t *)regs +
+                                                crg_clock_offset(CPU_CORE_CLOCK_INDEX));
 }
 
 uint32_t cpufreq_jh7110_divider(void) {

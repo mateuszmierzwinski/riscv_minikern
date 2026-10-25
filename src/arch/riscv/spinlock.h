@@ -52,6 +52,38 @@ static inline void spin_lock(struct spinlock *l) {
     }
 }
 
+/* Takes the lock and says how many cycles were spent waiting.
+ *
+ * **The ticket answers the question.** On a ticket lock there is no way to
+ * ask "would I wait?" without taking a ticket, and once taken the answer is
+ * free: if the lock is already serving our number we never waited, and the
+ * clock is not read at all. That keeps the uncontended path — nearly all of
+ * it — at one extra load over `spin_lock`, which matters because this sits
+ * on the path it measures. */
+static inline void spin_lock_counting(struct spinlock *l, uint64_t *waited_cycles) {
+    uint32_t ticket;
+    *waited_cycles = 0;
+    __asm__ volatile("amoadd.w.aq %0, %2, (%1)"
+                     : "=r"(ticket)
+                     : "r"(&l->next), "r"(1u)
+                     : "memory");
+    if (__atomic_load_n(&l->serving, __ATOMIC_ACQUIRE) == ticket) {
+        return; /* ours already: no wait, and no clock read */
+    }
+    {
+        uint64_t began;
+        __asm__ volatile("rdcycle %0" : "=r"(began));
+        while (__atomic_load_n(&l->serving, __ATOMIC_ACQUIRE) != ticket) {
+            /* As `spin_lock`: nothing but waiting. */
+        }
+        {
+            uint64_t ended;
+            __asm__ volatile("rdcycle %0" : "=r"(ended));
+            *waited_cycles = ended - began;
+        }
+    }
+}
+
 static inline void spin_unlock(struct spinlock *l) {
     __atomic_store_n(&l->serving, l->serving + 1u, __ATOMIC_RELEASE);
 }

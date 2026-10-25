@@ -177,7 +177,13 @@ static int share_kernel_mappings(struct pgtable *pt) {
     return KERR_OK;
 }
 
+/* Forward-declared: its definition sits with the randomisation it belongs
+ * to, below, and both address-space builders are above. */
+static void choose_layout(struct uproc *p);
+static uint64_t slide(uint32_t limit_pages);
+
 int uspace_build(struct uproc *p, const void *program, uint32_t bytes) {
+    choose_layout(p);
     struct pt_mem mem = {.alloc = proc_alloc, .free = proc_free, .to_virt = proc_to_virt};
     phys_t text = 0, stack = 0;
     int rc;
@@ -216,7 +222,7 @@ int uspace_build(struct uproc *p, const void *program, uint32_t bytes) {
         unrecorded_regions++;
     }
     for (uint32_t i = 0; rc == KERR_OK && i < USER_STACK_PAGES; i++) {
-        rc = pgtable_map(&p->pt, USER_STACK_TOP - (uint64_t)(i + 1u) * PAGE_SIZE,
+        rc = pgtable_map(&p->pt, p->stack_top - (uint64_t)(i + 1u) * PAGE_SIZE,
                          stack + (uint64_t)i * PAGE_SIZE, PAGE_SIZE, PT_PROT_RW | PT_PROT_USER);
     }
     /* **And the stack recorded too** — the same rule as the text page above,
@@ -244,7 +250,15 @@ int uspace_build(struct uproc *p, const void *program, uint32_t bytes) {
         return rc;
     }
     p->entry = USER_TEXT;
-    p->stack_top = USER_STACK_TOP;
+    /* **A heap for a hand-written program too.** `brk` was left at zero
+     * here, so `brk(0)` returned 0 and these programs had no usable heap at
+     * all — which the address-randomisation test found by asking for one.
+     * The ELF path derives the break from the image's last segment; there
+     * is one page of text here, so it is that page's end, randomised like
+     * everything else. */
+    p->brk = USER_TEXT + PAGE_SIZE + slide(ASLR_BRK_PAGES);
+    p->brk_floor = p->brk;
+    p->mmap_next = p->mmap_floor;
     p->built = true;
     return KERR_OK;
 }
@@ -1067,7 +1081,7 @@ static int map_signal_trampoline(struct uproc *p) {
     for (uint32_t i = 0; i < PAGE_SIZE; i++) {
         ((volatile uint8_t *)(uintptr_t)page)[i] = i < bytes ? code[i] : 0u;
     }
-    return pgtable_map(&p->pt, SIGNAL_TRAMPOLINE, page, PAGE_SIZE, PTE_R | PTE_X | PTE_U);
+    return pgtable_map(&p->pt, p->trampoline, page, PAGE_SIZE, PTE_R | PTE_X | PTE_U);
 }
 
 static void record_fixed_regions(struct uproc *p);
@@ -1122,13 +1136,13 @@ static int build_start_state(struct uproc *p, const struct elf_image *img, const
     /* The block lands at the very top of the stack, so it is built into the
      * last page's worth of the allocation. */
     record_fixed_regions(p);
-    rc = ustack_build((uint8_t *)(uintptr_t)stack, USER_STACK_PAGES * PAGE_SIZE, USER_STACK_TOP,
+    rc = ustack_build((uint8_t *)(uintptr_t)stack, USER_STACK_PAGES * PAGE_SIZE, p->stack_top,
                       &args, &sp, &used);
     if (rc != KERR_OK) {
         return rc;
     }
     for (uint32_t i = 0; rc == KERR_OK && i < USER_STACK_PAGES; i++) {
-        rc = pgtable_map(&p->pt, USER_STACK_TOP - (uint64_t)(i + 1u) * PAGE_SIZE,
+        rc = pgtable_map(&p->pt, p->stack_top - (uint64_t)(i + 1u) * PAGE_SIZE,
                          stack + (uint64_t)(USER_STACK_PAGES - 1u - i) * PAGE_SIZE, PAGE_SIZE,
                          PT_PROT_RW | PT_PROT_USER);
     }
@@ -1156,6 +1170,8 @@ int uspace_build_elf_args(struct uproc *p, const uint8_t *image, uint32_t bytes,
     p->pt = (struct pgtable){0};
     p->entry = 0;
     p->stack_top = 0;
+    p->trampoline = 0;
+    p->mmap_floor = 0;
     p->brk = 0;
     p->brk_floor = 0;
     p->mmap_next = 0;
@@ -1168,6 +1184,10 @@ int uspace_build_elf_args(struct uproc *p, const uint8_t *image, uint32_t bytes,
      * was reading from a file is a reference this process stops holding. */
     drop_every_file(p);
     p->vmas.n = 0;
+    /* **After the reset and before the first mapping.** The reset zeroes
+     * the layout, and every mapping below is placed relative to it, so this
+     * is the one point where choosing is neither undone nor too late. */
+    choose_layout(p);
     rc = elf_parse(image, bytes, USER_TOP, &img);
     if (rc != KERR_OK) {
         return rc;
@@ -1193,8 +1213,14 @@ int uspace_build_elf_args(struct uproc *p, const uint8_t *image, uint32_t bytes,
         p->brk = end > p->brk ? end : p->brk;
     }
     p->brk = (p->brk + PAGE_SIZE - 1u) & ~(PAGE_SIZE - 1u);
+    /* **The gap before the heap is part of the randomisation.** Without it
+     * the break starts at a fixed distance above the image, so a program
+     * whose load address is known has a known heap — and on a kernel with
+     * no PIE support the load address *is* known. The floor moves with it,
+     * or `brk` could be wound back into the gap and then into the image. */
+    p->brk += slide(ASLR_BRK_PAGES);
     p->brk_floor = p->brk;
-    p->mmap_next = USER_MMAP_BASE;
+    p->mmap_next = p->mmap_floor;
     return KERR_OK;
 }
 
@@ -1226,6 +1252,12 @@ int uspace_fork_shared(struct uproc *child, struct uproc *parent) {
     child->brk = parent->brk;
     child->brk_floor = parent->brk_floor;
     child->mmap_next = parent->mmap_next;
+    /* **The layout is the parent's, not a fresh one.** A fork shares its
+     * parent's address space contents, so a child with its own stack
+     * address would be told its stack is somewhere the pages are not. */
+    child->stack_top = parent->stack_top;
+    child->trampoline = parent->trampoline;
+    child->mmap_floor = parent->mmap_floor;
     child->built = true;
     child->pid = pid;
     child->parent_pid = parent->pid;
@@ -1273,6 +1305,14 @@ uint32_t uspace_count_by_uid(uint32_t uid) {
         n += procs[i].used && !procs[i].zombie && procs[i].uid == uid ? 1u : 0u;
     }
     return n;
+}
+
+virt_t uspace_trampoline(void) {
+    const struct uproc *p = uspace_current();
+    /* The un-randomised address when there is no process, which only
+     * happens before the first one is built: nothing can return through a
+     * trampoline that has not been mapped. */
+    return p == NULL ? SIGNAL_TRAMPOLINE : p->trampoline;
 }
 
 bool uspace_capable(uint32_t cap) {
@@ -1436,6 +1476,9 @@ int uspace_exec(struct uproc *p, const uint8_t *image, uint32_t bytes, const cha
     p->brk = fresh->brk;
     p->brk_floor = fresh->brk_floor;
     p->mmap_next = fresh->mmap_next;
+    p->stack_top = fresh->stack_top;
+    p->trampoline = fresh->trampoline;
+    p->mmap_floor = fresh->mmap_floor;
     p->built = true;
     p->shares_pt = false;
     /* **The capabilities are transformed here, on the process itself.**
@@ -1589,6 +1632,62 @@ int uspace_copy_out(virt_t to, const void *from, uint32_t n) {
         ((volatile uint8_t *)(uintptr_t)to)[i] = ((const uint8_t *)from)[i];
     }
     return KERR_OK;
+}
+
+/* **Address randomisation**, and the one place it is decided.
+ *
+ * On by default. `minikern.noaslr` turns it off, which exists because a
+ * fixed layout is what makes a crash address mean the same thing twice —
+ * and the first thing anybody debugging a fault wants is to compare two
+ * runs. A switch is honest about that; quietly randomising and leaving no
+ * way back would make this kernel harder to work on than it needs to be.
+ */
+static bool aslr_on = true;
+
+void uspace_set_aslr(bool on) {
+    aslr_on = on;
+}
+
+bool uspace_aslr(void) {
+    return aslr_on;
+}
+
+/* A random count of pages, `0 .. limit - 1`.
+ *
+ * Whole pages, because a shift that was not page-aligned would misalign
+ * every mapping made relative to it — and the one that matters is the
+ * stack, whose alignment the ABI fixes. The modulo is biased for a limit
+ * that is not a power of two, which is of no consequence here: a few
+ * addresses being marginally likelier does not help anybody guess one, and
+ * both limits are powers of two anyway. */
+static uint64_t slide(uint32_t limit_pages) {
+    uint64_t r = 0;
+    if (!aslr_on || limit_pages == 0u) {
+        return 0;
+    }
+    random_fill(&r, sizeof r);
+    return (r % limit_pages) * PAGE_SIZE;
+}
+
+/* Gives a process its layout. Called wherever an address space is built,
+ * which is the only place the three are allowed to be chosen — a second
+ * caller choosing them again would move the stack out from under a process
+ * that had already been told where it is. */
+static void choose_layout(struct uproc *p) {
+    p->stack_top = USER_STACK_TOP - slide(ASLR_STACK_PAGES);
+    /* **Reported, because one process cannot test its own randomness.** A
+     * program that printed its addresses and asserted they looked random
+     * would be claiming something unfalsifiable from the inside; the claim
+     * is that two runs differ, and only something outside a run can make
+     * it. One line per address space, which is a handful per boot. */
+    /* **Derived from the stack it protects, not randomised separately.**
+     * Two independent slides could put the trampoline inside the stack,
+     * which is the collision this address has already had once. */
+    p->trampoline = p->stack_top - (uint64_t)(USER_STACK_PAGES + 1u) * PAGE_SIZE;
+    p->mmap_floor = USER_MMAP_BASE + slide(ASLR_MMAP_PAGES);
+    kprintf("aslr: stack %llx, mmap floor %llx, trampoline %llx%s\n",
+            (unsigned long long)p->stack_top, (unsigned long long)p->mmap_floor,
+            (unsigned long long)p->trampoline, aslr_on ? "" : " (randomisation off)");
 }
 
 struct uproc *uspace_alloc(void) {
@@ -2248,8 +2347,8 @@ uint32_t uspace_replaced_pages(void) {
  * path asks `mmap` for it — which is exactly why it has to be recorded by
  * each of them rather than by the one that happened to be written first. */
 static void record_stack(struct uproc *p) {
-    virt_t stack_low = USER_STACK_TOP - (virt_t)USER_STACK_PAGES * PAGE_SIZE;
-    (void)vma_insert(&p->vmas, stack_low, USER_STACK_TOP, PROT_READ | PROT_WRITE, VMA_GROWSDOWN);
+    virt_t stack_low = p->stack_top - (virt_t)USER_STACK_PAGES * PAGE_SIZE;
+    (void)vma_insert(&p->vmas, stack_low, p->stack_top, PROT_READ | PROT_WRITE, VMA_GROWSDOWN);
 }
 
 /* The page signal handlers return through, which only the ELF path maps —
@@ -2258,7 +2357,7 @@ static void record_stack(struct uproc *p) {
  * touch of such a region with a blank page instead of the fault it
  * deserves. A record must describe the address space, in both directions. */
 static void record_trampoline(struct uproc *p) {
-    (void)vma_insert(&p->vmas, SIGNAL_TRAMPOLINE, SIGNAL_TRAMPOLINE + PAGE_SIZE,
+    (void)vma_insert(&p->vmas, p->trampoline, p->trampoline + PAGE_SIZE,
                      PROT_READ | PROT_EXEC, 0);
 }
 
@@ -2413,6 +2512,12 @@ int uspace_fork(struct uproc *child, struct uproc *parent) {
     child->brk = parent->brk;
     child->brk_floor = parent->brk_floor;
     child->mmap_next = parent->mmap_next;
+    /* **The layout is the parent's, not a fresh one.** A fork shares its
+     * parent's address space contents, so a child with its own stack
+     * address would be told its stack is somewhere the pages are not. */
+    child->stack_top = parent->stack_top;
+    child->trampoline = parent->trampoline;
+    child->mmap_floor = parent->mmap_floor;
     child->pid = pid;
     child->parent_pid = parent->pid;
     child->pgid = parent->pgid;
@@ -2459,7 +2564,7 @@ int uspace_fork(struct uproc *child, struct uproc *parent) {
 static virt_t place_mapping(struct uproc *p, virt_t at, uint64_t pages, virt_t align) {
     virt_t bytes = pages * PAGE_SIZE;
     virt_t chosen = 0;
-    if (vma_find_free(&p->vmas, bytes, at, USER_MMAP_BASE, USER_STACK_TOP, align, &chosen) !=
+    if (vma_find_free(&p->vmas, bytes, at, p->mmap_floor, p->stack_top, align, &chosen) !=
         KERR_OK) {
         return 0;
     }
@@ -2542,8 +2647,8 @@ static void published_addition(void) {
  * that survives. */
 static int fixed_is_allowed(struct uproc *p, const struct uspace_mapping *m, uint64_t pages) {
     uint64_t bytes = pages * PAGE_SIZE;
-    if ((m->at & (PAGE_SIZE - 1u)) != 0 || m->at == 0 || m->at >= USER_STACK_TOP ||
-        bytes > USER_STACK_TOP - m->at) {
+    if ((m->at & (PAGE_SIZE - 1u)) != 0 || m->at == 0 || m->at >= p->stack_top ||
+        bytes > p->stack_top - m->at) {
         return KERR_INVAL;
     }
     if (m->noreplace && !vma_range_free(&p->vmas, m->at, m->at + bytes)) {
@@ -2906,9 +3011,14 @@ int uspace_discard_range(struct uproc *p, virt_t at, uint64_t bytes) {
  * Reports how many pages it managed, which is not always what was asked:
  * running out of slots is ordinary and is not an error. */
 /* Whether a region's pages may be sent out at all. */
-static bool may_page_out(const struct vma *r) {
+static bool may_page_out(const struct uproc *p, const struct vma *r) {
+    /* The trampoline is excluded by **this process's** address for it: with
+     * randomisation there is no single constant to compare against, and
+     * comparing with the un-randomised one would have let the trampoline be
+     * paged out — after which a returning signal handler faults on the one
+     * page that must always be present. */
     return r->prot != 0 && r->file == NULL && (r->flags & VMA_HUGE) == 0 &&
-           r->start != SIGNAL_TRAMPOLINE;
+           r->start != p->trampoline;
 }
 
 /* One page out, reporting whether it went. */
@@ -2945,7 +3055,7 @@ uint32_t uspace_reclaim_range(struct uproc *p, virt_t at, uint64_t pages) {
     for (uint64_t i = 0; i < pages; i++) {
         virt_t va = at + i * PAGE_SIZE;
         const struct vma *r = vma_find(&p->vmas, va);
-        if (r != NULL && may_page_out(r) && page_out_one(p, va)) {
+        if (r != NULL && may_page_out(p, r) && page_out_one(p, va)) {
             done++;
         }
     }
@@ -2983,7 +3093,7 @@ static bool next_candidate(struct uproc *p, virt_t from, virt_t *va, bool *wrapp
     for (uint32_t i = 0; i < p->vmas.n; i++) {
         const struct vma *r = &p->vmas.v[i];
         virt_t at;
-        if (!may_page_out(r)) {
+        if (!may_page_out(p, r)) {
             continue;
         }
         at = r->start > from ? r->start : from;
@@ -3157,7 +3267,7 @@ static int move_frames(struct uproc *p, virt_t from, virt_t to, uint64_t pages) 
  * place the cheap case rather than merely the convenient one. */
 static int grow_in_place(struct uproc *p, virt_t at, uint64_t old_bytes, uint64_t new_bytes,
                          uint32_t prot) {
-    if (new_bytes > USER_STACK_TOP - at) {
+    if (new_bytes > p->stack_top - at) {
         return KERR_NOMEM;
     }
     return vma_insert(&p->vmas, at + old_bytes, at + new_bytes, prot, 0);
@@ -3181,7 +3291,7 @@ static int move_mapping(struct uproc *p, virt_t at, uint64_t old_bytes, uint64_t
      * into. Below it lie the program's text and its break, and the break is
      * **not** in the region record — so an overlap there is one `vma_insert`
      * cannot see, and the move would map over live memory. */
-    if (base < USER_MMAP_BASE || base >= USER_STACK_TOP || new_bytes > USER_STACK_TOP - base) {
+    if (base < p->mmap_floor || base >= p->stack_top || new_bytes > p->stack_top - base) {
         return KERR_INVAL;
     }
     rc = vma_insert(&p->vmas, base, base + new_bytes, prot, 0);
@@ -3291,7 +3401,7 @@ int uspace_protect(struct uproc *p, virt_t at, uint64_t bytes, uint32_t prot) {
 virt_t uspace_brk(struct uproc *p, virt_t want) {
     virt_t from = (p->brk + PAGE_SIZE - 1u) & ~(PAGE_SIZE - 1u);
     virt_t to = (want + PAGE_SIZE - 1u) & ~(PAGE_SIZE - 1u);
-    if (want == 0 || want < p->brk_floor || want >= USER_MMAP_BASE) {
+    if (want == 0 || want < p->brk_floor || want >= p->mmap_floor) {
         return p->brk;
     }
     for (virt_t va = from; va < to; va += PAGE_SIZE) {

@@ -25,6 +25,13 @@
 #define ETH_MTU        1500u
 #define ETH_FRAME_MAX  (ETH_HLEN + ETH_MTU)
 #define NET_ARP_ENTRIES 8u
+/* Routes beyond the interface's own subnet and the default gateway, which are
+ * rules rather than entries and are not stored here. */
+#define NET_ROUTES 8u
+/* Returned by `net_route_lookup` for "no route matched", distinct from the
+ * zero-length prefix a matched default route has. */
+#define NET_ROUTE_NONE 0xffffffffu
+
 #define NET_UDP_PORTS   32u
 #define NET_EPHEMERAL_LO 49152u  /* IANA dynamic ports: where autobind looks */
 #define NET_LOOP_QUEUE  8u   /* locally addressed packets waiting to be delivered */
@@ -68,6 +75,16 @@ struct net_events {
     void (*dhcp_bound)(void *self, const struct netif *nif);
     void (*echo_reply)(void *self, ip4_t from, uint16_t seq);
     void *self;
+};
+
+/* One route: a destination prefix and where to send what it covers. A
+ * gateway of zero means the prefix is on-link, so the destination is its own
+ * next hop — the same thing the interface's own subnet means. */
+struct route {
+    ip4_t dst;
+    ip4_t mask;
+    ip4_t gateway;
+    bool used;
 };
 
 struct arp_entry {
@@ -134,6 +151,7 @@ struct netif {
     uint32_t lease_s;
     uint64_t now_ms;
     struct arp_entry arp[NET_ARP_ENTRIES];
+    struct route route[NET_ROUTES];
     struct dhcp_client dhcp;
     uint16_t udp_port[NET_UDP_PORTS];
     struct udp_handler udp[NET_UDP_PORTS];
@@ -152,6 +170,11 @@ struct netif {
     uint32_t input_depth;  /* >0 while a frame is being processed */
     struct net_stats stats;
 };
+
+int net_route_add(struct netif *nif, ip4_t dst, ip4_t mask, ip4_t gateway);
+int net_route_del(struct netif *nif, ip4_t dst, ip4_t mask);
+const struct route *net_route_at(const struct netif *nif, uint32_t index);
+ip4_t net_route_lookup(const struct netif *nif, ip4_t dst, uint32_t *found_len);
 
 void net_init(struct netif *nif, const uint8_t mac[ETH_ALEN], const struct netdev_port *dev,
               const struct net_events *events);

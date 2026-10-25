@@ -1,5 +1,7 @@
 #include "drivers/virtio_net.h"
 
+#include "arch/riscv/mmu.h"
+
 #include "core/console.h"
 #include "core/errno.h"
 #include "drivers/virtio.h"
@@ -86,8 +88,11 @@ static int allocate_buffers(void) {
  * The header is zeroed: no checksum offload and no segmentation are
  * claimed, so the device must take the frame exactly as given. */
 static int transmit(void *self, const uint8_t *frame, uint32_t len) {
-    struct virtio_net_hdr *hdr = (struct virtio_net_hdr *)(uintptr_t)net.tx;
-    uint8_t *payload = (uint8_t *)(uintptr_t)net.tx + NET_HDR_BYTES;
+    /* `net.tx` is the **bus** address the allocator returned; these are
+     * where this kernel reaches that page. `virtio_submit` converts them
+     * back for the descriptors, so the device still gets bus addresses. */
+    struct virtio_net_hdr *hdr = (struct virtio_net_hdr *)mmu_phys_to_virt(net.tx);
+    uint8_t *payload = (uint8_t *)mmu_phys_to_virt(net.tx) + NET_HDR_BYTES;
     const void *bufs[2];
     uint32_t lens[2];
     const bool writable[2] = {false, false};
@@ -148,7 +153,7 @@ void virtio_net_poll(struct netif *nif) {
     }
     (void)virtio_ack_interrupt(&net.dev);
     while (virtio_take_completion(&net.dev, VIRTIO_QUEUE_RX, &index, &len)) {
-        const uint8_t *frame = (const uint8_t *)(uintptr_t)net.rx[index] + NET_HDR_BYTES;
+        const uint8_t *frame = (const uint8_t *)mmu_phys_to_virt(net.rx[index]) + NET_HDR_BYTES;
         /* The length the device reports **includes the header**, so the
          * frame is that much shorter. Handing the whole length up would
          * feed the stack 12 bytes of trailing rubbish on every packet. */

@@ -1190,6 +1190,17 @@ uint32_t sched_stack_overflows(void) {
 }
 
 /* Threads found to be standing on a stack that is no longer theirs. */
+/* Nanoseconds summed across all harts spent with nothing to run.
+ *
+ * It can exceed the uptime, and should: four harts idle for one second is
+ * four seconds of idleness. `/proc/stat` divides by the hart count, which is
+ * the only reading that makes it a proportion. */
+static uint64_t idle_ns;
+
+uint64_t sched_idle_ns(void) {
+    return idle_ns;
+}
+
 static uint32_t slot_aliases;
 
 uint32_t sched_slot_aliases(void) {
@@ -1305,7 +1316,19 @@ void sched_run(void) {
              * and for nothing else. */
             sched_arm_timer();
             h->idle = true;
-            klock_idle_wait();
+            {
+                /* **The one place a hart's idleness has a beginning and an
+                 * end**, which is why the accounting goes here rather than
+                 * being sampled: `klock_idle_wait` is the whole of the time
+                 * this hart had nothing to run, and anything derived from a
+                 * periodic sample of `h->idle` would miss every window
+                 * shorter than the sample. The sum across harts is what
+                 * `/proc/stat` divides into its `cpu` line, so a figure
+                 * taken any other way would be a number nobody measured. */
+                uint64_t entered = timer_ns();
+                klock_idle_wait();
+                idle_ns += timer_ns() - entered;
+            }
             h->idle = false;
             continue;
         }

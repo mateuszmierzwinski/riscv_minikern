@@ -26,20 +26,58 @@ static void write_header(uint8_t *h, const struct tcp_out *o, uint32_t seq, uint
     put16(h + TH_URGENT, 0);
 }
 
+/* Writes the options and returns how many bytes they took.
+ *
+ * **The length must be a multiple of four**, because the header length is
+ * measured in 32-bit words — so a SACK option, whose own length is 2 + 8n,
+ * is preceded by two NOPs. That is the conventional padding and it is not
+ * cosmetic: without it the data offset cannot describe the header and the
+ * peer reads the options as payload. */
+static uint32_t write_options(uint8_t *h, const struct tcp_out *o, bool with_mss) {
+    uint32_t at = TCP_HLEN;
+    if (with_mss) {
+        h[at] = TCP_OPT_MSS;
+        h[at + 1u] = 4;
+        put16(h + at + 2u, (uint16_t)TCP_MSS);
+        at += 4u;
+        /* Offered on every SYN, which is what lets a peer send us SACK
+         * blocks; whether we send any of our own is a separate question. */
+        h[at] = TCP_OPT_SACK_PERMITTED;
+        h[at + 1u] = 2;
+        h[at + 2u] = TCP_OPT_NOP;
+        h[at + 3u] = TCP_OPT_NOP;
+        at += 4u;
+    }
+    if (o->sack_blocks > 0) {
+        h[at] = TCP_OPT_NOP;
+        h[at + 1u] = TCP_OPT_NOP;
+        h[at + 2u] = TCP_OPT_SACK;
+        h[at + 3u] = (uint8_t)(2u + o->sack_blocks * 8u);
+        at += 4u;
+        for (uint32_t i = 0; i < o->sack_blocks; i++) {
+            put32(h + at, o->sack_left[i]);
+            put32(h + at + 4u, o->sack_right[i]);
+            at += 8u;
+        }
+    }
+    return at - TCP_HLEN;
+}
+
 int tcp_emit_out(const struct tcp_out *o, uint32_t seq, uint8_t flags, const uint8_t *data, uint32_t len,
                  bool with_mss) {
     uint8_t *h = net_l4_buffer(o->stack->nif);
-    uint32_t hlen = TCP_HLEN + (with_mss ? 4u : 0u);
-    uint32_t total = hlen + len;
+    uint32_t option_bytes;
+    uint32_t hlen;
+    uint32_t total;
+    /* **Written before the header**, because the header's data offset has to
+     * describe them and that is only known once they are laid out. */
+    option_bytes = write_options(h, o, with_mss);
+    hlen = TCP_HLEN + option_bytes;
+    total = hlen + len;
     if (total > NET_L4_MAX) {
         return KERR_INVAL;
     }
     write_header(h, o, seq, flags, hlen);
-    if (with_mss) {
-        h[TCP_HLEN] = TCP_OPT_MSS;
-        h[TCP_HLEN + 1] = 4;
-        put16(h + TCP_HLEN + 2, (uint16_t)TCP_MSS);
-    }
     for (uint32_t i = 0; i < len; i++) {
         h[hlen + i] = data[i];
     }
@@ -48,11 +86,58 @@ int tcp_emit_out(const struct tcp_out *o, uint32_t seq, uint8_t flags, const uin
     return net_ip_send_from(o->stack->nif, o->local_ip, o->remote_ip, IPPROTO_TCP, total);
 }
 
+/* The SACK blocks to report: what this connection holds out of order.
+ *
+ * **The held segments are the blocks**, which is why SACK became worth
+ * building here — the roadmap entry's own argument against it was that
+ * "without the queue there is nothing for a receiver to acknowledge
+ * selectively", and the queue now exists. A block is `[left, right)`, the
+ * right edge exclusive, as the specification defines it; an inclusive right
+ * edge is an off-by-one the peer resolves by retransmitting one byte for
+ * ever.
+ *
+ * Adjacent held segments are **coalesced**, because two segments that touch
+ * are one contiguous run the peer should be told about once: reporting them
+ * separately wastes a block and can hide a third run behind the limit.
+ * Reported only when the peer offered SACK. */
+static void fill_sack_blocks(struct tcp_conn *c, struct tcp_out *o) {
+    if (!c->sack_ok) {
+        return;
+    }
+    for (uint32_t i = 0; i < TCP_HELD_SEGMENTS; i++) {
+        const struct tcp_held *h = &c->held[i];
+        uint32_t left, right;
+        bool merged = false;
+        if (h->len == 0) {
+            continue;
+        }
+        left = h->seq;
+        right = h->seq + h->len;
+        for (uint32_t b = 0; b < o->sack_blocks; b++) {
+            if (o->sack_right[b] == left) {
+                o->sack_right[b] = right;
+                merged = true;
+            } else if (o->sack_left[b] == right) {
+                o->sack_left[b] = left;
+                merged = true;
+            }
+        }
+        if (!merged && o->sack_blocks < TCP_SACK_BLOCKS) {
+            o->sack_left[o->sack_blocks] = left;
+            o->sack_right[o->sack_blocks] = right;
+            o->sack_blocks++;
+            c->stack->stats.sack_blocks_sent++;
+        }
+    }
+}
+
 /* The output description of a connection. */
-static struct tcp_out out_of(const struct tcp_conn *c) {
-    return (struct tcp_out){.stack = c->stack, .local_ip = c->local_ip, .remote_ip = c->remote_ip,
-                            .local_port = c->local_port, .remote_port = c->remote_port, .ack = c->rcv_nxt,
-                            .window = tcp_rcv_wnd(c)};
+static struct tcp_out out_of(struct tcp_conn *c) {
+    struct tcp_out o = {.stack = c->stack, .local_ip = c->local_ip, .remote_ip = c->remote_ip,
+                        .local_port = c->local_port, .remote_port = c->remote_port, .ack = c->rcv_nxt,
+                        .window = tcp_rcv_wnd(c)};
+    fill_sack_blocks(c, &o);
+    return o;
 }
 
 int tcp_emit(struct tcp_conn *c, uint32_t seq, uint8_t flags, const uint8_t *data, uint32_t len, bool with_mss) {
@@ -136,6 +221,30 @@ void tcp_flush(struct tcp_conn *c) {
  * once the peer acknowledges; a middle segment that was lost is resent from
  * the head until it lands, which is slower than selective repeat and just
  * as correct. */
+/* How much of `want` bytes from `from` is **not** already held by the peer.
+ *
+ * A SACK block is `[left, right)` above the cumulative acknowledgement. If
+ * one begins inside the run about to be retransmitted, the retransmission
+ * stops there: everything from that point is data the peer has. Returns
+ * `want` unchanged when there are no blocks, which is every connection whose
+ * peer did not offer SACK and every one that has lost nothing.
+ *
+ * Only the *start* of a hole is needed, not a full scoreboard: this sender
+ * retransmits from `snd_una` forwards, so the first gap is the only one it
+ * can be working on. A scoreboard would let it skip *over* a block to the
+ * next hole, which is the rest of RFC 6675 and is not built — what is built
+ * is the part that stops the same bytes being sent twice. */
+static uint32_t sack_hole_end(const struct tcp_conn *c, uint32_t from, uint32_t want) {
+    uint32_t limit = want;
+    for (uint32_t i = 0; i < c->sacked_blocks; i++) {
+        uint32_t left = c->sacked_left[i];
+        if (seq_gt(left, from) && left - from < limit) {
+            limit = left - from;
+        }
+    }
+    return limit > 0 ? limit : want;
+}
+
 static void resend_oldest(struct tcp_conn *c) {
     if (c->state == TCP_SYN_SENT) {
         (void)tcp_emit(c, c->snd_una, TCP_SYN, NULL, 0, true);
@@ -146,8 +255,16 @@ static void resend_oldest(struct tcp_conn *c) {
         return;
     }
     if (c->tx_len > 0) {
+        /* **Shortened to stop where the peer's first SACK block begins.**
+         * The peer has told us it already holds that run, so resending into
+         * it is work whose result is discarded — and on a lossy path it is
+         * the difference between recovering one segment per round trip and
+         * resending a whole window. Without SACK this is `TCP_MSS` and
+         * behaves exactly as before, which is the property that matters:
+         * nothing changes for a peer that did not offer the option. */
         uint32_t len = c->tx_len < TCP_MSS ? c->tx_len : TCP_MSS;
-        (void)tcp_emit(c, c->snd_una, TCP_ACK | TCP_PSH, c->tx, len, false);
+        uint32_t stop = sack_hole_end(c, c->snd_una, len);
+        (void)tcp_emit(c, c->snd_una, TCP_ACK | TCP_PSH, c->tx, stop, false);
         return;
     }
     (void)tcp_emit(c, c->snd_una, TCP_FIN | TCP_ACK, NULL, 0, false);  /* only the FIN is outstanding */

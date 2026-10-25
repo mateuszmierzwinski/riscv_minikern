@@ -277,6 +277,194 @@ CASES = [
      ["uspace: privsep exited with 0"],
      120, None),
 
+    # **The unified log**: timestamped, levelled, kept, written and readable.
+    #
+    # Four claims in one run, because they only mean anything together. The
+    # prefix is asserted as exact characters, since anything that reads a
+    # log depends on its shape. The rotation is run three times in one boot
+    # — a RAM disk is re-staged on every boot, so there is otherwise no way
+    # to watch it — and the third pass is the interesting one: it must move
+    # 1 to 2 *before* 0 to 1, or a boot is overwritten before it is copied.
+    # `kernel.2.log` is then read back to prove the rotated file is the
+    # earlier boot rather than a copy of this one.
+    #
+    # The device is read by a *program*, because a descriptor needs a
+    # process: the first version of this check ran in the boot path and was
+    # refused with EBADF, which was the fd layer telling the truth.
+    ("§1: the kernel log — timestamps, levels, rotation, and its device",
+     "minikern.klogrotate minikern.klogdev minikern.cat=/var/log/kernel.2.log",
+     ["] I mmu: sv39 on",
+      "] N klog: 0 earlier boots rotated; this one becomes kernel.0.log",
+      "] I klog: rotated kernel.1.log to kernel.2.log",
+      "] I klog: rotated kernel.0.log to kernel.1.log",
+      "uspace: klogdev exited with 0",
+      "cat: /var/log/kernel.2.log is"],
+     220, None, "small"),
+
+    # **The descriptor layer's write pattern, against a disposable image.**
+    #
+    # This exists because that pattern corrupted the operator's own card: its
+    # root went from 8 entries to 1116 with names that are not text, while
+    # every individual call returned success. So the assertion is the entry
+    # count, not a return code — a test that checked only return codes would
+    # have passed on the run that did the damage.
+    #
+    # It runs against the `small` fixture, which is what should have been
+    # used for the first run of untested write code in the first place. The
+    # harness has had it all along.
+    ("§3: a zero-length create then chunked writes at offsets",
+     "minikern.chunked",
+     ["chunked: the zero-length create said rc 0",
+      "chunked: chunk 0 at offset 0 said rc 0",
+      "chunked: chunk 2 at offset 65536 said rc 0",
+      # One file is one entry. Anything else is the corruption.
+      # 4 to 5: one new entry for one file. The count includes "." and
+      # "..", which the mount message does not — so it reads two higher than
+      # the line above it, and guessing rather than measuring it is how this
+      # case failed its first run.
+      "chunked: the root had 4 entries and now has 5"],
+     220, None, "small"),
+
+    # **The USB controller, as far as it is proved.**
+    #
+    # Deliberately asserts the controller and the port map and *not* an
+    # enumerated device: the port never reaches its enabled state and the
+    # cause is not identified (docs/ROADMAP.md §6 has the register traces).
+    # A case that waited for a device would be a known-failing test, and one
+    # that asserted nothing would not notice the controller breaking — so it
+    # pins exactly what works, which is everything up to the port.
+    #
+    # The version, port count and slot count come from registers the
+    # specification fixes, so a wrong window reads as zeroes rather than as
+    # these numbers. "Running" means the controller accepted its rings and
+    # left its halted state, which is the whole of reset, DCBAA, the command
+    # ring, the event ring and the DMA fences working.
+    ("§6: the USB controller runs and maps its ports",
+     "minikern.usb",
+     ["usb: xhci 1.0, 5 ports, 32 device slots",
+      "usb: the controller is running",
+      "xhci: ports 1..1 speak USB 2",
+      "xhci: ports 2..5 speak USB 3"],
+     200, None),
+
+    # **The SoC's own temperature, and /proc.**
+    #
+    # The assertion is the kernel's plausibility verdict rather than a
+    # number, because a number would fail on a cold morning and this must
+    # fail only when the sensor is wrong. It catches both failures this
+    # driver actually had: a raw zero, which converts to a confident
+    # -81.1 C, and a wrong register offset, which reads as something absurd.
+    #
+    # `/proc/thermal` is asserted separately from the sensor, because the
+    # two are different things — the first version read the sensor correctly
+    # and could not be opened, since the generated files were wired into the
+    # open path and not into stat.
+    ("§6: the die temperature, and /proc/thermal",
+     "",
+     ["which is a plausible die temperature",
+      "/proc/thermal reports it"],
+     150, None),
+
+    # **The four buses the board actually has**, each proved by something
+    # that cannot pass if the driver is wrong.
+    #
+    # A driver that maps the wrong window, or whose block is unclocked, reads
+    # zeroes — so none of these checks is "it bound". SPI reports the
+    # PrimeCell identifier (ARM's 0x41, part 0x022) and then sends a byte
+    # through internal loopback and gets it back, which is how the GMAC was
+    # proved before a cable existed. I2C reports the DesignWare signature.
+    # PWM and the watchdog are read twice with their counters running, and a
+    # value that moved is a block that is clocked.
+    #
+    # The RTC line is asserted too, because "no driver" and "no such device
+    # on this board" are different facts and the second one is the truth
+    # here — the tree names none.
+    ("§6: SPI, I2C, PWM and the watchdog",
+     "minikern.busprobe",
+     ["spi: PrimeCell id 00041022 (part 022, designer 41)",
+      "spi: loopback sent a5, received a5 — the data path works",
+      "i2c: component type 44570140",
+      "pwm: counter",
+      "it is clocked and running",
+      "rtc: the tree names no real-time clock on this board"],
+     200, None),
+
+    # **A program asking the kernel what interfaces exist**, over netlink.
+    #
+    # The program parses the replies by stepping the lengths in the message
+    # headers, which is the point: a case that only checked bytes came back
+    # would pass against an encoder whose lengths are wrong, and a wrong
+    # length is the likeliest defect in a hand-written one. 127 is all seven.
+    ("§5: a program asks what interfaces exist, over netlink",
+     "",
+     ["netlink: the link dump ended with NLMSG_DONE",
+      "netlink: both lo and eth0 were listed",
+      "netlink: eth0's hardware address came back",
+      "netlink: the default route came back with its gateway",
+      "netlink: an unimplemented request was refused, not answered empty",
+      "exited with 127"],
+     200, "//:netlinkask.elf"),
+
+    # **Two threads talking over a unix-domain socket**, which is the
+    # roadmap's "nothing local can talk over a socket".
+    #
+    # 127 is all seven checks: a stream bound to an abstract name, connect
+    # and accept, bytes each way, a half-close seen as end of file *after*
+    # the buffered bytes, a datagram round trip, and a connect to an unbound
+    # name refused. Bit 128 is set when the guards around the cloned thread's
+    # stack were damaged, so 255 reads as a failure rather than as a better
+    # 127 — a status that only goes up would have hidden that.
+    ("§5: two threads over a unix-domain socket",
+     "",
+     ["unixsock: the client's bytes arrived byte for byte",
+      "unixsock: end of file after the buffered bytes",
+      "unixsock: a datagram arrived whole",
+      "unixsock: connecting to an unbound name was refused",
+      "unixsock: the guards around the cloned stack are intact",
+      "exited with 127"],
+     200, "//:unixsock.elf"),
+
+    # **A name resolved from user space**, which is the roadmap's DNS item.
+    #
+    # The program is the assertion: it reads /etc/resolv.conf, sends a query
+    # and walks the answer to an A record, exiting with a bitmask of the
+    # steps that passed. 31 is all five, and anything less says where it
+    # stopped — which is why the status is checked rather than the log.
+    #
+    # It needs the real network and the operator's own resolver, so it is as
+    # much a test of the GMAC, the route and the interrupt as of DNS: three
+    # defects in those showed up here before this ever returned 31.
+    ("§5: a name resolved from user space",
+     "",
+     ["resolve: nameserver read from /etc/resolv.conf",
+      "resolve: an A record was found; a name resolved from user space",
+      "exited with 31"],
+     220, "//:resolve.elf"),
+
+    # **The stack over the board's own Ethernet**, which is the whole of
+    # roadmap §5's "the board has no network".
+    #
+    # The driver had worked for a while — link, rings, frames both ways in
+    # loopback — and `bring_up_network` never tried it: it asked for a
+    # virtio device, got ENOENT, and reported that the machine had no
+    # network with a working Ethernet controller sitting next to it.
+    #
+    # A DHCP lease is the assertion rather than a link or a sent frame,
+    # because a lease is the first thing that cannot happen by accident: it
+    # needs ARP, UDP, a broadcast out, two replies in from a real router,
+    # and the stack to believe the result. The address is not pinned —
+    # it comes from the operator's router — but the mask, gateway and the
+    # word `dhcp` are.
+    ("§5: a DHCP lease over the board's own Ethernet",
+     "",
+     ["net: over the board's Ethernet, link up at 1000 Mbit full duplex",
+      "/24 gw 192.168.86.1",
+      "(dhcp, lease",
+      # And nothing was dropped on the way, which a lease alone would not
+      # show: a stack can bind while discarding most of what it receives.
+      "dropped: malformed 0 checksum 0 fragment 0 not-ours 0"],
+     150, None),
+
     ("§4: the board's own Ethernet negotiates a link",
      "minikern.gmacup",
      [# The PHY the probe identified, and a negotiated link on the
@@ -369,6 +557,42 @@ def run_case(name, bootargs, wanted, seconds, out_dir, program=None, needs_image
     return missing, log_path
 
 
+def aslr_differs(out_dir):
+    """**Two runs, because one proves nothing.**
+
+    A program cannot test its own randomness: printing an address and
+    asserting it looks random is unfalsifiable from the inside. The claim
+    is that two runs differ, and only something outside a run can make it.
+
+    This found a real defect rather than confirming a belief: the entropy
+    pool had no callers at all, so every boot hashed the same zeroed pool
+    and the addresses were *identical*. A single-run case would have passed
+    while randomisation randomised nothing.
+    """
+    seen = []
+    for n in (1, 2):
+        log = os.path.join(out_dir, f"aslr{n}.log")
+        subprocess.run([sys.executable, os.path.join(HERE, "board.py"), "minikern.aslr",
+                        "-t", "90", "-o", log, "-q", "-w", "900"], check=False)
+        text = open(log, "rb").read().decode("utf-8", "replace") if os.path.exists(log) else ""
+        got = {}
+        for line in text.splitlines():
+            for key in ("sp=", "brk=", "map="):
+                if line.startswith(key):
+                    got[key] = line[len(key):].strip()
+        seen.append(got)
+    missing = []
+    for key in ("sp=", "brk=", "map="):
+        a, b = seen[0].get(key), seen[1].get(key)
+        if a is None or b is None:
+            missing.append(f"{key} was not reported in both runs ({a!r}, {b!r})")
+        elif a == b:
+            # Named with the value, because "they matched" sends the next
+            # reader to guess which of the three and at what address.
+            missing.append(f"{key}{a} was the same in both runs")
+    return missing, os.path.join(out_dir, "aslr1.log")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Run the board suite on the VisionFive 2.")
     ap.add_argument("-o", "--out", default="/tmp/minikern-hil", help="where logs go")
@@ -378,6 +602,7 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     print(f"hil: image md5 {image.stage(PROJECT)}")
     failures = 0
+    extra = [("§1: addresses are randomised, compared across two runs", aslr_differs)]
     for case in CASES:
         name, bootargs, wanted, seconds = case[:4]
         program = case[4] if len(case) > 4 else None
@@ -386,6 +611,19 @@ def main():
             continue
         missing, log_path = run_case(name, bootargs, wanted, seconds, args.out, program,
                                      needs_image)
+        if missing:
+            failures += 1
+            print(f"FAIL  {name}")
+            for line in missing:
+                print(f"        missing: {line!r}")
+            print(f"        log: {log_path}")
+        else:
+            print(f"ok    {name}")
+    # The cases that cannot be a line match, because they compare two runs.
+    for name, runner in extra:
+        if args.only and args.only not in name:
+            continue
+        missing, log_path = runner(args.out)
         if missing:
             failures += 1
             print(f"FAIL  {name}")

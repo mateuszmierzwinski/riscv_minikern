@@ -224,7 +224,10 @@ static int clear_inode(struct xfs *fs, uint64_t ino) {
  * happens **before** the directory entry goes, so that a failure half way
  * leaves a file that still exists and still owns what it owns — a leak is
  * worse than a file that would not delete. */
-static int free_file_blocks(struct xfs *fs, const struct xfs_inode *ip) {
+/* `noinline`: its caller already holds an inode, and folding this frame into
+ * that one is what crosses the 1 KiB limit. Taking the inode by pointer was
+ * never enough on its own — the extent walk below has locals of its own. */
+__attribute__((noinline)) static int free_file_blocks(struct xfs *fs, const struct xfs_inode *ip) {
     uint32_t n = ip->nextents;
     if (ip->nblocks == 0) {
         return KERR_OK;
@@ -268,25 +271,69 @@ static int log_unlink(struct xfs *fs, uint64_t dirino) {
     return rc;
 }
 
-int xfs_unlink(struct xfs *fs, const struct xfs_inode *dir, const char *name, uint32_t namelen,
-               uint64_t now_s) {
-    struct xfs_inode ip;
+/* Takes one name away from a file whose inode this reads.
+ *
+ * **Split out so the inode has a frame to itself**, and `noinline` so it
+ * keeps one: an inode is the largest object this code puts on a stack — a
+ * 1024-byte inode's literal area is 924 bytes of it — and folded into
+ * `xfs_unlink`'s frame the pair crosses the 1 KiB limit every function here
+ * is held to. That limit is what stops a kernel stack being overrun
+ * silently, so it is not something to raise for one caller.
+ *
+ * The division is honest rather than mechanical: everything above this needs
+ * only the *directory*, and everything in here needs the file. */
+/* Removes one name from a file that has others: the entry goes, the link
+ * count drops, and the file stays.
+ *
+ * **Its own frame, so its caller's holds only the inode.** The caller reads
+ * the inode to find out which of the two cases this is, and anything else on
+ * that frame crosses the limit — this path was 32 bytes over on its own. */
+__attribute__((noinline)) static int drop_one_of_several_names(struct xfs *fs,
+                                                                const struct xfs_inode *dir,
+                                                                const char *name,
+                                                                uint32_t namelen, uint64_t now_s) {
     uint64_t ino = 0;
-    int rc;
-    if (!xfs_writable(fs)) {
-        return KERR_ROFS;
+    int rc = xfs_dir_sf_remove(fs, dir, name, namelen, now_s, &ino);
+    rc = rc != KERR_OK ? rc : xfs_inode_adjust_nlink(fs, ino, -1);
+    return rc != KERR_OK ? rc : log_unlink(fs, dir->ino);
+}
+
+/* Removes the **last** name of a file, which also removes the file: its
+ * blocks, its inode, the group's counts and the owner's quota.
+ *
+ * Takes the inode rather than reading it, so that the frame holding the
+ * inode does nothing else — this is the second split in this path and the
+ * reason is the same each time: an inode is 1 KiB-ish on its own and the
+ * limit is per frame, so every function that holds one must hold *only* it
+ * and a few words. */
+__attribute__((noinline)) static int remove_the_last_name(struct xfs *fs,
+                                                           const struct xfs_inode *dir,
+                                                           const struct xfs_inode *ip,
+                                                           const char *name, uint32_t namelen,
+                                                           uint64_t now_s) {
+    uint64_t ino = 0;
+    int rc = free_file_blocks(fs, ip);
+    rc = rc != KERR_OK ? rc : xfs_dir_remove(fs, dir, name, namelen, now_s, &ino);
+    rc = rc != KERR_OK ? rc : release_inode(fs, xfs_fsb_ag(fs, ino >> fs->inopblog), ino);
+    rc = rc != KERR_OK ? rc : xfs_count_inodes_free(fs, 1);
+    /* **The refund, after the file is actually gone.** Charging is done
+     * before taking so that a refusal costs nothing; giving back is done
+     * after releasing so that a failure part way through does not credit an
+     * owner for a file they still have. The blocks go back too: the inode's
+     * own count is what they were charged as. */
+    if (rc == KERR_OK) {
+        (void)xfs_quota_charge_all(fs, ip, -(int64_t)ip->nblocks, -1);
     }
-    if (!xfs_is_dir(dir)) {
-        return KERR_NOTDIR;
-    }
-    if (dir->format != XFS_DINODE_FMT_LOCAL && dir->format != XFS_DINODE_FMT_EXTENTS) {
-        return KERR_NOTSUP; /* a fork shape the write path cannot edit */
-    }
-    rc = xfs_dir_lookup(fs, dir, name, namelen, &ino);
-    if (rc != KERR_OK) {
-        return rc;
-    }
-    rc = xfs_inode_read(fs, ino, &ip);
+    rc = rc != KERR_OK ? rc : clear_inode(fs, ino);
+    return rc != KERR_OK ? rc : log_unlink(fs, dir->ino);
+}
+
+__attribute__((noinline)) static int take_one_name_away(struct xfs *fs,
+                                                         const struct xfs_inode *dir,
+                                                         const char *name, uint32_t namelen,
+                                                         uint64_t ino, uint64_t now_s) {
+    struct xfs_inode ip;
+    int rc = xfs_inode_read(fs, ino, &ip);
     if (rc != KERR_OK) {
         return rc;
     }
@@ -302,24 +349,26 @@ int xfs_unlink(struct xfs *fs, const struct xfs_inode *dir, const char *name, ui
      * and now that they do, removing one name from a file with two would
      * have freed the inode under the other name. */
     if (ip.nlink > 1u) {
-        rc = xfs_dir_sf_remove(fs, dir, name, namelen, now_s, &ino);
-        rc = rc != KERR_OK ? rc : xfs_inode_adjust_nlink(fs, ino, -1);
-        return rc != KERR_OK ? rc : log_unlink(fs, dir->ino);
+        return drop_one_of_several_names(fs, dir, name, namelen, now_s);
     }
-    rc = free_file_blocks(fs, &ip);
-    rc = rc != KERR_OK ? rc : xfs_dir_remove(fs, dir, name, namelen, now_s, &ino);
-    rc = rc != KERR_OK ? rc : release_inode(fs, xfs_fsb_ag(fs, ino >> fs->inopblog), ino);
-    rc = rc != KERR_OK ? rc : xfs_count_inodes_free(fs, 1);
-    /* **The refund, after the file is actually gone.** Charging is done
-     * before taking so that a refusal costs nothing; giving back is done
-     * after releasing so that a failure part way through does not credit an
-     * owner for a file they still have. The blocks go back too: the inode's
-     * own count is what they were charged as. */
-    if (rc == KERR_OK) {
-        (void)xfs_quota_charge_all(fs, &ip, -(int64_t)ip.nblocks, -1);
+    return remove_the_last_name(fs, dir, &ip, name, namelen, now_s);
+}
+
+int xfs_unlink(struct xfs *fs, const struct xfs_inode *dir, const char *name, uint32_t namelen,
+               uint64_t now_s) {
+    uint64_t ino = 0;
+    int rc;
+    if (!xfs_writable(fs)) {
+        return KERR_ROFS;
     }
-    rc = rc != KERR_OK ? rc : clear_inode(fs, ino);
-    return rc != KERR_OK ? rc : log_unlink(fs, dir->ino);
+    if (!xfs_is_dir(dir)) {
+        return KERR_NOTDIR;
+    }
+    if (dir->format != XFS_DINODE_FMT_LOCAL && dir->format != XFS_DINODE_FMT_EXTENTS) {
+        return KERR_NOTSUP; /* a fork shape the write path cannot edit */
+    }
+    rc = xfs_dir_lookup(fs, dir, name, namelen, &ino);
+    return rc != KERR_OK ? rc : take_one_name_away(fs, dir, name, namelen, ino, now_s);
 }
 
 /* Removes an entry from a directory of whatever shape.

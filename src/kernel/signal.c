@@ -371,7 +371,11 @@ bool signal_deliver(struct trapframe *tf) {
     tf->x[10] = signo;                   /* a0: which signal */
     tf->x[11] = (uint64_t)(uintptr_t)&frame->info; /* a1: the siginfo */
     tf->x[12] = (uint64_t)(uintptr_t)&frame->uc;   /* a2: the context */
-    tf->x[1] = SIGNAL_TRAMPOLINE;        /* ra: where a returning handler lands */
+    /* **This process's trampoline, not the constant.** With address
+     * randomisation the page is mapped at `p->trampoline`, and sending a
+     * handler back to the un-randomised address would return it into
+     * whatever is mapped there — which is the stack. */
+    tf->x[1] = uspace_trampoline();      /* ra: where a returning handler lands */
     tf->sepc = a->sa_handler;
     sig.delivered++;
     /* Bounded, not masked: `SIG_COUNT` is 65, so a mask would fold every

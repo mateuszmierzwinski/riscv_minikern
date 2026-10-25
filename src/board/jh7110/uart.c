@@ -152,11 +152,13 @@ int jh7110_uart_init(const struct fdt *fdt, struct console_port *out) {
     if (rc != KERR_OK) {
         return rc;
     }
-    rc = mmu_map_device(base, size);
-    if (rc != KERR_OK) {
-        return rc;
+    {
+        void *at = mmu_map_device(base, size);
+        if (at == NULL) {
+            return KERR_NOMEM;
+        }
+        uart.regs = (volatile uint8_t *)at;
     }
-    uart.regs = (volatile uint8_t *)(uintptr_t)base;
     uart.base = base;
     /* **How the registers are laid out, from the tree rather than assumed.**
      * `reg-shift` is how far apart they are as a power of two and

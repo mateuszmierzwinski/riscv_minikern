@@ -42,8 +42,17 @@
 
 /* `open`'s status flags, of which only these matter here. */
 #define O_RDONLY 0u
+/* The access mode is the low two bits, and it is a *field* rather than a
+ * set of flags: `O_RDONLY` is zero, so testing for it with a bitwise and
+ * always succeeds. The mask is named so that no caller has to remember
+ * that. */
+#define O_ACCMODE 3u
 #define O_WRONLY 1u
 #define O_RDWR 2u
+/* The generic ABI's values, which riscv64 uses. */
+#define O_CREAT 0100u
+#define O_TRUNC 01000u
+#define O_APPEND 02000u
 #define O_NONBLOCK 0x800u
 #define O_CLOEXEC 0x80000u
 

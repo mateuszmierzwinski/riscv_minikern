@@ -1195,6 +1195,118 @@ static void test_quotas_are_read(void) {
  * directly, because reading it as "nothing allowed" would refuse every
  * write on a filesystem that has quotas enabled and no limits set — which
  * is what `mkfs.xfs -m uquota` produces. */
+/* ── soft limits and their grace period ────────────────────────────────── */
+
+/* A fake clock, so a grace period can be watched expiring without waiting a
+ * week for it. `real` is separately controllable because the interesting
+ * case is a clock that answers and must *not* be believed. */
+static uint64_t fake_now;
+static bool fake_real;
+
+static uint64_t fake_clock_seconds(void *self) {
+    (void)self;
+    return fake_now;
+}
+
+static bool fake_clock_is_real(void *self) {
+    (void)self;
+    return fake_real;
+}
+
+static const struct xfs_clock fake_clock = {
+    .seconds = fake_clock_seconds,
+    .is_real = fake_clock_is_real,
+    .self = NULL,
+};
+
+/* Builds a filesystem whose id 9 has a soft block limit of 2 and no hard
+ * one, which is the shape a soft limit is actually used in: a warning
+ * threshold well under the real ceiling. */
+static void mount_with_a_soft_limit(void) {
+    mount_fresh();
+    build_a_quota_file(9u, 0u, 1u); /* no hard limit, one block used */
+    put64(block(QUOTA_FSB) + 9u * XFS_DQUOT_BYTES + XFS_DQ_BLK_SOFT, 2u);
+    seal(block(QUOTA_FSB) + 9u * XFS_DQUOT_BYTES, XFS_DQUOT_BYTES, XFS_DQ_CRC_OFF);
+    bcache_invalidate(&cache);
+    KTEST_CHECK(xfs_mount(&fs, &cache) == KERR_OK);
+    fake_now = 1700000000ull;
+    fake_real = true;
+    xfs_set_clock(&fs, &fake_clock);
+}
+
+/* Going past a soft limit is **allowed**, and starts a clock. */
+static void test_a_soft_limit_starts_a_grace_period(void) {
+    mount_with_a_soft_limit();
+    /* 1 used + 2 = 3, past the soft limit of 2. Allowed. */
+    KTEST_CHECK(xfs_quota_charge(&fs, XFS_DQTYPE_USER, 9u, 2, 0) == KERR_OK);
+    KTEST_CHECK(xfs_quota_grace_started(&fs) == 1u);
+    KTEST_CHECK(xfs_quota_grace_expired(&fs) == 0u);
+}
+
+/* And once it runs out, it refuses. */
+static void test_an_expired_grace_period_refuses(void) {
+    mount_with_a_soft_limit();
+    KTEST_CHECK(xfs_quota_charge(&fs, XFS_DQTYPE_USER, 9u, 2, 0) == KERR_OK);
+    /* A day past the week the grace period lasts. */
+    fake_now += 604800ull + 86400ull;
+    KTEST_CHECK(xfs_quota_charge(&fs, XFS_DQTYPE_USER, 9u, 1, 0) == KERR_DQUOT);
+    KTEST_CHECK(xfs_quota_grace_expired(&fs) == 1u);
+}
+
+/* Inside the period it still allows, which is the whole difference between a
+ * soft limit and a hard one. */
+static void test_inside_the_grace_period_it_still_allows(void) {
+    mount_with_a_soft_limit();
+    KTEST_CHECK(xfs_quota_charge(&fs, XFS_DQTYPE_USER, 9u, 2, 0) == KERR_OK);
+    fake_now += 3600ull; /* an hour of a week */
+    KTEST_CHECK(xfs_quota_charge(&fs, XFS_DQTYPE_USER, 9u, 1, 0) == KERR_OK);
+    KTEST_CHECK(xfs_quota_grace_expired(&fs) == 0u);
+}
+
+/* **Coming back under the limit stops the clock.** A stale deadline left
+ * behind would refuse the next excursion immediately rather than granting a
+ * fresh week, which is the subtle half of this and the part a test has to
+ * pin. */
+static void test_coming_back_under_the_limit_clears_the_deadline(void) {
+    mount_with_a_soft_limit();
+    KTEST_CHECK(xfs_quota_charge(&fs, XFS_DQTYPE_USER, 9u, 2, 0) == KERR_OK);
+    /* Give the blocks back: 3 - 2 = 1, under the soft limit of 2. */
+    KTEST_CHECK(xfs_quota_charge(&fs, XFS_DQTYPE_USER, 9u, -2, 0) == KERR_OK);
+    /* Long past the original deadline, and over the limit again. A cleared
+     * deadline means a new grace period rather than an instant refusal. */
+    fake_now += 604800ull * 2ull;
+    KTEST_CHECK(xfs_quota_charge(&fs, XFS_DQTYPE_USER, 9u, 2, 0) == KERR_OK);
+    KTEST_CHECK(xfs_quota_grace_started(&fs) == 2u);
+    KTEST_CHECK(xfs_quota_grace_expired(&fs) == 0u);
+}
+
+/* **A clock that is not real must not enforce anything.** This is the case
+ * the board was in for its whole life: seconds since boot, which would
+ * compare against a disk deadline as though 1970 and expire every grace
+ * period instantly. Counting without enforcing is the honest behaviour, and
+ * it is what this asserts. */
+static void test_without_a_real_clock_nothing_is_enforced(void) {
+    mount_with_a_soft_limit();
+    fake_real = false;
+    KTEST_CHECK(xfs_quota_charge(&fs, XFS_DQTYPE_USER, 9u, 2, 0) == KERR_OK);
+    /* Years past any plausible deadline, with an unreal clock. */
+    fake_now += 604800ull * 500ull;
+    KTEST_CHECK(xfs_quota_charge(&fs, XFS_DQTYPE_USER, 9u, 1, 0) == KERR_OK);
+    KTEST_CHECK(xfs_quota_grace_expired(&fs) == 0u);
+    KTEST_CHECK(xfs_quota_grace_started(&fs) == 0u);
+}
+
+/* A filesystem with no clock installed at all behaves the same way, which
+ * matters because that is the state of every `struct xfs` until the
+ * composition root installs one. */
+static void test_with_no_clock_at_all_nothing_is_enforced(void) {
+    mount_with_a_soft_limit();
+    xfs_set_clock(&fs, NULL);
+    KTEST_CHECK(xfs_quota_charge(&fs, XFS_DQTYPE_USER, 9u, 2, 0) == KERR_OK);
+    KTEST_CHECK(xfs_quota_charge(&fs, XFS_DQTYPE_USER, 9u, 1, 0) == KERR_OK);
+    KTEST_CHECK(xfs_quota_grace_expired(&fs) == 0u);
+}
+
 static void test_quotas_are_enforced(void) {
     struct xfs_dquot dq;
     mount_fresh();
@@ -1854,6 +1966,12 @@ int main(void) {
     KTEST_RUN(test_the_realtime_bitmap_allocates);
     KTEST_RUN(test_quotas_are_read);
     KTEST_RUN(test_quotas_are_enforced);
+    KTEST_RUN(test_a_soft_limit_starts_a_grace_period);
+    KTEST_RUN(test_an_expired_grace_period_refuses);
+    KTEST_RUN(test_inside_the_grace_period_it_still_allows);
+    KTEST_RUN(test_coming_back_under_the_limit_clears_the_deadline);
+    KTEST_RUN(test_without_a_real_clock_nothing_is_enforced);
+    KTEST_RUN(test_with_no_clock_at_all_nothing_is_enforced);
     KTEST_RUN(test_an_external_log_is_read_from_its_own_device);
     KTEST_RUN(test_a_dirty_log_is_checked);
     KTEST_RUN(test_the_check_stays_inside_the_filesystem);

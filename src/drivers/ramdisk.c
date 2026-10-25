@@ -1,5 +1,7 @@
 #include "drivers/ramdisk.h"
 
+#include "arch/riscv/mmu.h"
+
 #include <stddef.h>
 
 #include "core/errno.h"
@@ -52,7 +54,10 @@ int ramdisk_init(phys_t at, uint64_t bytes, struct blockdev *out) {
     if (at == 0 || bytes < SECTOR || (bytes % SECTOR) != 0) {
         return KERR_INVAL;
     }
-    disk.at = (uint8_t *)(uintptr_t)at;
+    /* The address comes from the command line as a physical one — the
+     * boot loader put the image there — so it is reached through the
+     * direct map rather than used as a pointer. */
+    disk.at = (uint8_t *)mmu_phys_to_virt(at);
     disk.sectors = bytes / SECTOR;
     *out = (struct blockdev){.read = ramdisk_read,
                              .write = ramdisk_write,

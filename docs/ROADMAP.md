@@ -775,9 +775,44 @@ Ordering inside a section is roughly by what unblocks the most.
 - [ ] **A VFS layer.** (L) There is exactly one filesystem, mounted at one
       place, with no mount table. No `mount`/`umount`, no second filesystem,
       no overlay.
-- [ ] **`/proc`, `/sys`, `/dev`.** (M) Nothing synthetic exists. A runtime
+- [ ] **`/proc`, `/sys`, `/dev`.** (M) Nothing synthetic exists beyond a
+      handful of `/dev` names and `/dev/virtual/kernel_logger`. A runtime
       that reads `/proc/self/maps` or `/sys/kernel/mm/transparent_hugepage`
       gets `ENOENT`, which Go tolerates and most other things do not.
+- [ ] **`/proc/ps/` — processes as files, for the coreutils to read.** (M)
+      Three views of the same table, so that a tool can find a process the
+      way it already thinks about it rather than by scanning everything:
+
+          /proc/ps/by-pid/<pid>/
+          /proc/ps/by-name/<name>/<pid>/
+          /proc/ps/by-user/<uid>/<pid>/
+
+      and inside each, one value per file — `memory_bytes`, `pid`,
+      `time_alive`, `niceness`, `fds_opened`, and more as they are needed
+      (`ppid`, `pgid`, `sid`, `uid`, `gid`, `state`, `threads`, `name`).
+
+      **The audience is the point.** This exists to feed a separate project
+      — the coreutils, rewritten in Go — and that fixes the shape of it.
+      One value per file rather than a packed line, because a reader should
+      not have to parse a format to answer "how much memory"; Linux's
+      `/proc/<pid>/stat` is a single line of forty-odd fields whose order is
+      a compatibility contract nobody can change, and that is the mistake
+      worth not repeating. Bytes rather than pages or kilobytes, for the
+      same reason the quota code reports blocks: a unit the kernel chose is
+      a unit every caller has to remember.
+
+      **What it needs first.** `/proc` is not a filesystem here, so this
+      wants the VFS entry above, or at least the synthetic-path dispatch
+      that `fdobjects_open_path` already does for `/dev` — which is how
+      `/dev/virtual/kernel_logger` is served and is probably the honest
+      first step: a directory listing is the part that needs real VFS, and
+      a reader that only ever opens a known path does not need one.
+
+      **The by-name and by-user views are a trap worth naming.** Two
+      processes may share a name and many share a uid, so those are
+      directories of pids rather than of values — and a tool that assumed
+      `by-name/<name>` was a process would work until the second one
+      started. The nesting above says so in the path.
 - [ ] **Device nodes.** (M) No `/dev/null`, `/dev/zero`, `/dev/urandom` as
       *files* — the descriptor layer has the objects, but nothing opens them
       by path.
@@ -1496,7 +1531,67 @@ sparse inodes, `nrext64`, exchange-range, parent pointers, `bigtime`,
       transmit interrupt, so the `0x405` that was read as a fault was
       `TI | TBU | ETI` and entirely normal.
 
-- [ ] **The board's Ethernet: the stack over it.** (M) The network stack and
+- [x] **The board's Ethernet: the stack over it.** **Done, with a real DHCP
+      lease on the board.** `bring_up_network` tries virtio first — which
+      keeps every emulator case behaving identically — and falls through to
+      `dwmac_init` instead of reporting that the machine has no network,
+      which is what it did with a working controller next to it.
+
+      The driver already had both halves of the stack's device interface
+      (`dwmac_init` returning a `netdev_port`, `dwmac_set_sink`,
+      `dwmac_poll`, `dwmac_address`, `dwmac_link_up`); what was missing was
+      thirty lines of wiring. Two things that wiring has to get right: the
+      sink has to be **captured** from `knet_init` rather than discarded as
+      the virtio path could afford to — a GMAC with no sink receives into
+      its ring and delivers nothing — and the tick hook has to poll the
+      device actually in use, or every received frame sits in a ring nobody
+      reads, which looks exactly like a network that does not answer.
+
+      Board: `eth0 192.168.86.247/24 gw 192.168.86.1 dns 1.1.1.1 (dhcp,
+      lease 86400 s)`, rx 2 tx 4, nothing dropped. The lease is the
+      assertion because it is the first thing that cannot happen by
+      accident: ARP, UDP, a broadcast out and two replies in from a real
+      router.
+
+- [x] **The SoC's temperature sensor, through `/proc`.** (S) **Done — the die
+      reads 38.4 C under the operator's radiator and fan, and
+      `/proc/thermal` reports it over the network.**
+
+      The sensor is `starfive,jh7110-temp` at `0x120e0000`, which
+      `minikern.buses` found rather than documentation suggesting. The
+      conversion is the SoC's documented linear relation,
+      `T = 237.5 * dout / 4096 - 81.1`, kept in integers as millidegrees.
+
+      **The register map was wrong again, and the dump settled it in one
+      boot.** The reading is in bits 16..27 of the *control* register at
+      `+00`, not in a data register at `+04` — the first bring-up read `+04`
+      and got zero while the dump beside it showed `+00: 080f0005`, the five
+      being what the driver had just written and `0x80f` the live
+      conversion. That is the fourth register map in this project the
+      documentation gets wrong for this board, and the fourth time printing
+      the window answered it immediately.
+
+      **And a fixed settle was not enough.** Two milliseconds after release
+      the first read still returned zero; the wait is now for a non-zero
+      conversion, bounded, because zero is not a temperature this block can
+      measure and can therefore only mean "not converted yet". A raw zero
+      converts to a confident -81.1 C, which is exactly the kind of
+      plausible wrong number the ARM project's governor once acted on.
+
+      A reading outside -40..150 C is **refused rather than reported**, for
+      the same reason.
+
+      `/proc` is a table of paths and generators (`kernel/procfs.c`), not a
+      branch per file: the kernel log already had one synthesised path and
+      the `/proc/ps` item below wants several more. Each file is generated
+      **whole at open** into a snapshot the descriptor then reads, so a file
+      read in two `read` calls cannot change between them.
+
+      The board case asserts the kernel's own **plausibility verdict** rather
+      than a temperature, because a number would fail on a cold morning and
+      this should fail only when the sensor is wrong.
+
+Superseded:  (M) The network stack and
       sockets work over virtio-net; on the VisionFive 2 there is no driver,
       so the board has no network. The cable is in the **second** controller
       (`ethernet@16040000`), which is the one that negotiates.
@@ -1534,12 +1629,104 @@ sparse inodes, `nrext64`, exchange-range, parent pointers, `bigtime`,
       them is built and host-tested now, including that an impossible
       reading is treated as the worst case, so this is a sensor driver
       rather than a design.
-- [ ] **USB.** (L) The board's VL805 is enumerated on PCIe and otherwise
-      ignored. No XHCI driver, no HID, no mass storage.
+- [~] **USB.** (L) **There is an XHCI driver and the controller runs. The
+      port does not reach its enabled state, and that is where this stops.**
+
+      What is proved on the board, and each of these is something that
+      cannot pass if the layer under it is wrong:
+
+      | | |
+      |---|---|
+      | the controller is found | the VL805 is `1106:3483 class 0c0330` behind `pcie@940000000` — the *first* bridge, where the NVMe is behind the second |
+      | the register window is right | `caplength` is plausible and `HCIVERSION` reads **1.0**, with **5 ports** and **32 device slots**, matching U-Boot's `NbrPorts 5`. A wrong window reads all-ones |
+      | it resets and runs | halted, `HCRST`, `CNR` cleared, rings built, `DCBAAP`/`CRCR`/`ERSTBA`/`ERDP` programmed, `USBCMD.RS`, and `HCH` clear — so the reset sequence, all four DMA pages and the write fences are right |
+      | contexts are 32 bytes | read from `HCCPARAMS1.CSZ` rather than assumed, because a controller using 64 would have every endpoint field written into the slot context |
+      | the port map | **ports 1..1 speak USB 2, ports 2..5 speak USB 3**, walked out of the Supported Protocol capability. Nothing about a port's own register says which it is, and the two need different resets |
+      | the reset reaches the hardware | traced: before `400002e1`, immediately after writing it `40000331` — `PR` set, `PLS` = 9 (Hot Reset) |
+
+      The command ring, the event ring, Enable Slot, Address Device and a
+      three-stage control transfer are written and unexercised, because
+      nothing gets far enough to use them.
+
+      **What does not work, stated exactly.** Port 1 has the operator's flash
+      drive attached. It powers, its change bits are acknowledged, the reset
+      demonstrably applies — and the port settles at `40000ee1`: connected,
+      high-speed (so the reset handshake determined a speed), link
+      **Polling**, `PED` clear, no error bits (`PEC` and `CEC` both zero),
+      no pending changes. Three resets in a row leave it there.
+
+      Ruled out by measurement rather than argument: PCI bus mastering (the
+      `enable_device` path already sets it, and the controller's own DMA
+      works, or it would not be running); the write not landing (traced
+      above); an unacknowledged connect-status change (it is cleared — the
+      register went from `40020ee1` to `40000ee1` when that was fixed, and
+      the false "port 2 enabled" report went with it); ports not having
+      settled after `USBCMD.RS` (200 ms added, no change); a warm reset being
+      needed (that is for a SuperSpeed port, and this one is USB 2); and the
+      event ring going unserviced (events are drained around each reset now,
+      which a driver must do anyway).
+
+      What is left is a USB2 port that completes a reset and does not enable,
+      which wants the VL805's own errata or a hub-level step this driver does
+      not take. Recorded rather than guessed at further: four board runs went
+      into the three causes above, and the next one should start from the
+      trace rather than from a new theory.
+
+      The board case asserts the controller and the port map and deliberately
+      **not** an enumerated device — a test that waited for one would be a
+      known-failing test, and one that asserted nothing would not notice the
+      controller breaking.
+
+      Not started, and behind this: HID, and mass storage for the Fedora
+      stick the operator plugged in.
 - [ ] **eMMC.** (S) The DesignWare driver already binds to both controllers;
       the on-board eMMC socket is simply empty here. Worth testing with a
       module fitted.
-- [ ] **SPI, I²C, PWM, RTC, watchdog.** (M each) None exist.
+- [x] **SPI, I²C, PWM, watchdog — and there is no RTC on this board.**
+      (M each) **Four drivers, each proved on the board by something that
+      cannot pass if it is wrong.**
+
+      **The tree was read before a line was written**, which is the only
+      reason this took one evening rather than three. `minikern.buses` prints
+      every node matching each spelling worth trying, and it immediately
+      corrected two assumptions: SPI on this SoC is **`arm,pl022`** — an ARM
+      PrimeCell, not the Synopsys SSI the documentation describes — and there
+      is **no RTC node at all**. This project has now written a complete
+      driver for the wrong hardware once (the SD controller, documented as
+      Cadence SDHCI, actually a DesignWare MSHC) and that cost a day; a
+      compatible string from the documentation is a guess, the one in the
+      tree is a fact.
+
+      What is there, and how each is proved without an instrument on a pin:
+
+      | | |
+      |---|---|
+      | **SPI** (`arm,pl022` ×7) | the PrimeCell identifier reads `00041022` — part `022`, designer `41`, which is ARM — and then a byte through **internal loopback** comes back: `sent a5, received a5`. The GMAC was proved the same way before a cable existed |
+      | **I²C** (`snps,designware-i2c` ×7) | component type `44570140`, the ASCII `"DW"` signature every one of these blocks carries, and version `3230302a`. The driver already existed and **nothing had ever called it** — the seventh mechanism this session that was complete and never consulted |
+      | **PWM** (`starfive,jh7110-pwm`) | the channel counter read twice while running: `13` then `7251`. An unclocked block or a wrong window reads the same value twice |
+      | **watchdog** (`starfive,jh7110-wdt`) | the counter counting **down**: `1073741818` then `1073738426` |
+      | **RTC** | **not fitted.** The tree names none, and the VisionFive 2 has no battery-backed clock — so there is no device to drive rather than a driver missing. The kernel says so out loud, because "no RTC driver" and "no RTC" are different facts and only one of them is work |
+
+      **The watchdog's reset is never armed, and the register that arms it is
+      deliberately not identified.** Nothing in this kernel has the job of
+      feeding a watchdog, so arming it would turn every pause into a reboot.
+      It counts, which proves the block and the clock, and it is stopped
+      again afterwards rather than left running with no owner.
+
+      Its offsets were **measured, and the published ones are wrong for this
+      board.** The documented JH7110 layout says control `0x00`, load `0x04`;
+      under that, writing a load value to `0x00` would set control bits and
+      leave the load at zero — and the board shows `0x40000000` at *both*
+      after a write to `0x00` alone. A search over the candidates then found
+      the pair that actually makes it move: `unlock +01c, enable +008`. The
+      first version of the driver had `0x008` as *control* and wrote zero to
+      it — switching the enable off — then wrote the run bit to `0x104`,
+      which is nothing. So it loaded the counter, disabled it, and reported
+      that the block was not clocked: a wrong conclusion about working
+      hardware, which is the third time a guessed register map has produced
+      exactly that here. The dump and the search now run **only when the
+      counter does not move**, so the method survives without adding noise to
+      every boot.
 - [ ] **Interrupt-driven storage and network.** (M) Both drivers poll. The
       PLIC is wired and the tick uses it, but no device does — virtio-net
       registers a handler and the poll is still what drives it.
@@ -1564,14 +1751,215 @@ sparse inodes, `nrext64`, exchange-range, parent pointers, `bigtime`,
 - [ ] **The GMAC driver** — see above. Everything else here is behind it on
       real hardware.
 - [ ] **IPv6.** (L) The stack is IPv4 only.
-- [ ] **A routing table.** (S) One interface, one gateway, no routes.
-- [ ] **TCP SACK.** (M) Deliberately not planned: with a reassembly queue a
-      loss already costs one round trip.
-- [ ] **Unix-domain sockets.** (M) Nothing local can talk over a socket.
-- [ ] **`netlink`.** (M) No way for a program to ask what interfaces exist.
-- [ ] **DNS.** (S) The resolver address is learned from DHCP and stored; no
-      resolver exists in the kernel, which is correct — but nothing in user
-      space can resolve a name either.
+- [x] **A routing table.** (S) **Done.** Eight prefixes with **longest prefix
+      match**, which is the only rule that lets a specific route beat a
+      general one without the order of insertion mattering — and insertion
+      order is exactly what a table filled by hand, or later by netlink,
+      cannot be trusted to get right.
+
+      Three sources are ranked together rather than by precedence: the table,
+      the interface's own subnet (a route of `nif->mask`, direct) and the
+      default gateway (a route of length zero). That is what stops an
+      explicit default route from beating the on-link rule, which is the one
+      answer that is always wrong — and `net_route_lookup` returns the
+      matched prefix *length* for it, because a matched default route and
+      nothing matching both return a gateway of zero. With an empty table the
+      behaviour is identical to the two rules it replaced, which is the
+      property the first test pins.
+
+      A mask with a hole is refused at insertion, since bit count and
+      specificity are only the same thing for a contiguous mask, and a route
+      stored from a host address is stored masked. `test/route_test.c` is ten
+      cases on the host — routing needs no device.
+- [x] **TCP SACK.** (M) **Built, after all — the entry's own argument stopped
+      applying.** It read "deliberately not planned: with a reassembly queue
+      a loss already costs one round trip", and the companion sentence in
+      `tcp.h` said SACK "is an improvement on reassembly rather than a
+      substitute for it: without the queue there is nothing for a receiver to
+      acknowledge selectively". The queue was then built. The held segments
+      *are* the blocks, so the thing that made it not worth doing is what
+      made it cheap.
+
+      Both halves, and the distinction matters because a stack can do the
+      first alone and look right on the wire:
+
+      - **As a receiver**: `SACK_PERMITTED` on every SYN, and blocks built
+        from `c->held[]` on every acknowledgement — adjacent held segments
+        coalesced, because two runs that touch are one run the peer should
+        hear about once, and reporting them separately wastes a block and can
+        hide a third behind the limit of four. Blocks go only to a peer that
+        offered the option; sending them unasked is a violation some stacks
+        answer by dropping the segment, which would read as a lost
+        connection rather than a rejected option.
+      - **As a sender**: a retransmission stops where the peer's first
+        reported block begins, so bytes the peer already holds are not sent
+        again. Only the first hole is used, not a full RFC 6675 scoreboard:
+        this sender retransmits forwards from `snd_una`, so the first gap is
+        the only one it can be working on. Skipping *over* a block to the
+        next hole is the rest of that RFC and is not built; what is built is
+        the part that stops the same bytes going twice.
+
+      **A block the sender never sent is discarded.** A peer can claim
+      anything, and a block above `snd_nxt` taken literally would shorten a
+      retransmission — possibly to nothing, which is a stall a remote host
+      could cause on purpose. Blocks at or below `snd_una`, inverted blocks
+      and blocks beyond `snd_nxt` are all dropped, and a test hands the
+      sender all three because no cooperating peer produces them.
+
+      The option walk was **rewritten as one walk** rather than a second one
+      beside `parse_mss`. The list is the first thing a hostile peer can
+      shape, so it is bounded once and every option read inside those
+      bounds; three walks would be three places to get the same bound wrong.
+      It also now runs on **every** segment rather than only on a SYN —
+      blocks arrive on acknowledgements, so reading options only for SYNs is
+      how a sender never sees one.
+
+      Verified by two stacks over a simulated wire with a single early loss,
+      asserting **both** counters: `sack_blocks_sent` on the receiver and
+      `sack_blocks_received` on the sender. The first version of that test
+      sampled the live `sacked_blocks` field between rounds and failed —
+      correctly, because a SACK option is a complete statement and the field
+      is empty again the moment the hole fills. That is "a detector read at
+      the wrong moment" for the fourth time in this project, and the
+      cumulative counters are the fix. Both counters are printed at boot,
+      because an option nobody counts is an option nobody checks.
+- [x] **Unix-domain sockets.** (M) **Done, stream and datagram, proved on the
+      board.** A third `sock_ops` implementation beside UDP and TCP, so the
+      socket layer, `epoll` and the descriptor table are unchanged.
+
+      Why a third protocol rather than reusing loopback: the stack already
+      carries traffic to 127.0.0.1, so a local conversation was *possible* —
+      over IP, with checksums, in a port space shared with the network, and
+      reachable by anything that can reach this host. A unix socket is a
+      different guarantee. The name is not on the network, so nothing outside
+      the machine can connect to it.
+
+      `SOCK_STREAM` is a pair of rings, one per direction, which is what
+      makes a half-close meaningful: the writer closing must let the reader
+      drain what is buffered and *then* see end of file, and the order of
+      those two tests in `unix_recv` is the whole of it. `SOCK_DGRAM` keeps
+      whole messages with their sender's name, and consumes a short-read
+      datagram entirely rather than leaving the remainder to appear as the
+      next message.
+
+      **The name is interned in a kernel table, not a filesystem node**, and
+      that is a documented deviation rather than an oversight: Linux makes a
+      socket inode, and this kernel's root is usually a read-only SD card, so
+      a bind that had to create a file would fail on exactly the machine this
+      is for. It is therefore **exact for the abstract namespace** — a name
+      whose first byte is NUL, which never had a filesystem entry on Linux
+      either — and an approximation for a path: the socket works and `stat`
+      on the path does not find it.
+
+      Proved by `src/userland/unixsock`: two threads, seven checks, **exit
+      127** on the board. The static analyser caught a real defect on the way
+      — `owner_of` bounds-checked an index and returned NULL, and a caller
+      tested that against NULL and then indexed the table itself, so an index
+      past the end passed the test and the write landed past the array. Every
+      use goes through `slot_of` now, which returns the slot so there is no
+      index arithmetic left outside it to get wrong.
+
+**Open, found by that program and not explained** — it is not the socket
+code, and it is written down rather than left as a number nobody questions:
+with no syscall between the steps, a mask built in `.bss` before a blocking
+`recvfrom` lost its low four bits, four runs out of four, while every one of
+its seven messages printed. Adding two `write` calls between the steps makes
+it stop, and the intermediate prints then read `015` and `031` — so the bits
+were never lost in that arrangement. Ruled out by measurement: the kernel's
+exit path (the variable itself read 112), a register not surviving the switch
+(`volatile` changes nothing), the sibling's thread exit (parking it instead
+changes nothing), and an out-of-bounds write around the cloned stack (guards
+either side, intact). What is left is a coherency or scheduling window around
+a blocking syscall with a live sibling, which is the same shape as the
+`endsib` race already recorded. The test now carries the intermediate prints,
+so it reports 127 honestly rather than passing on layout luck.
+- [x] **`netlink`.** (M) **Done — a program asks and gets an answer,
+      board-proved at 127 of 127.** `RTM_GETLINK`, `RTM_GETADDR` and
+      `RTM_GETROUTE` over `AF_NETLINK`/`NETLINK_ROUTE`, as a fourth
+      `sock_ops` implementation.
+
+      Why netlink rather than a `/proc` file or an ioctl of this kernel's
+      own: the question has exactly one form every program already knows how
+      to ask. Go's `net.Interfaces` opens a netlink socket and sends
+      `RTM_GETLINK`, and so does every tool written against Linux — so a
+      private interface would have left a kernel that *holds* the
+      information with nothing able to read it, which is the state this
+      entry described.
+
+      A request is answered **synchronously into a reply buffer** at `send`
+      time rather than by a kernel thread: this is request-and-response over
+      a datagram socket, the answers are small and bounded, and a reply built
+      on the spot cannot become a queue with no reader. Several requests in
+      one datagram are all answered, because netlink permits that and a
+      caller that sent two and got one answer waits for ever.
+
+      The details a hand-written encoder gets wrong, each a comment in the
+      code: a message's `nlmsg_len` is its **true** byte count while the step
+      to the next message is that rounded up to four — storing the aligned
+      value makes every message claim its predecessor's padding; addresses go
+      on the wire in **network** order while the stack holds them in host
+      order; an on-link route is expressed by *omitting* `RTA_GATEWAY` and
+      setting a link scope, never by sending a zero gateway, which a reader
+      would take as a route via 0.0.0.0; and a dump must end with
+      `NLMSG_DONE` or the reader blocks for more.
+
+      An unimplemented request gets `NLMSG_ERROR`, never an empty dump —
+      "this machine has no neighbours" is a *wrong* answer where "I do not
+      implement that" is merely an incomplete one, and the test asserts the
+      refusal for exactly that reason. The routing table from the previous
+      item is reported through `RTM_GETROUTE`, implicit routes included, in
+      the order they are ranked.
+
+      The board program parses the replies by stepping the lengths rather
+      than by looking for bytes, because a test that only checked something
+      came back would pass against an encoder whose lengths are wrong — and
+      a wrong length is the likeliest defect in one written by hand.
+- [x] **DNS.** (S) **Done — a name resolves from user space on the board.**
+      The entry was precise about what was missing, and it was not a
+      resolver: the address was learned from DHCP and stored where nothing in
+      user space could read it. So the kernel synthesises **`/etc/resolv.conf`**
+      from the lease — the file every resolver already looks in, so a stock
+      Go binary's `net.LookupHost` needs nothing ported. A real file on the
+      filesystem wins; this is the fallback, because an operator who wrote
+      their own meant it and a read-only root cannot hold one.
+
+      Proved by `src/userland/resolve`, which reads the file, sends a query
+      and walks the answer to an A record, exiting with a bitmask of the
+      steps that passed. On the board: **31**, every step. It retries the
+      query rather than only listening, because a first datagram to a next
+      hop whose address is not yet known pays for the ARP; and it is
+      non-blocking with a timeout, because a resolver that hangs its caller
+      is wrong on any kernel.
+
+      **What it found on the way is worth more than the feature.** Three
+      defects, each invisible until something tried to use the network for
+      more than DHCP:
+
+      1. **The GMAC had no interrupt.** It was polled from the housekeeping
+         beat, which is enough for a boot-time exchange and cannot complete a
+         blocking read: a thread in `recvfrom` has no deadline, so under
+         dynamic ticks nothing is scheduled, nothing polls, and the reply sits
+         in the ring while the only thread that wants it waits for ever. The
+         deadlock detector caught it. Now armed, acknowledged at the device,
+         and dispatching.
+      2. **The interrupt number was in the other spelling.** The node has no
+         `interrupts`; it has `interrupts-extended`, because its interrupts go
+         to more than one controller. Reading only the first spelling gave
+         source 0 — indistinguishable from "no interrupt" — so registration
+         was skipped and the kernel silently fell back to polling.
+      3. **`MAC_ADDR0_HIGH`'s `AE` bit was being cleared** by writing the
+         address as a bare 16-bit value, and the registers were programmed on
+         only one of the two paths that set an address.
+
+      **And one thing is fixed by workaround, not understood.** With the
+      strict filter — a correct address, `AE` set, mask bytes clear — this
+      controller accepts **no unicast at all**, and the registers in the
+      failing run are byte-identical to the working one. With `PR` the same
+      boot receives the ARP reply and the DNS answer. The default is now `PR`
+      because a board that gets a lease and can then reach nothing is not on
+      the network; `minikern.netfilter` reproduces the strict case in one
+      boot. The cause wants the DWMAC 5.20 detail for this SoC and is **not
+      identified** — recorded rather than papered over.
 
 ---
 
@@ -1613,9 +2001,29 @@ Superseded text, kept because the entry denied what already existed:
       **`seccomp`**, so a process can narrow its own syscall surface.
       `SECCOMP_SET_MODE_STRICT` is small; `MODE_FILTER` needs a classic-BPF
       interpreter over `struct seccomp_data`, which is the bulk of it.
-- [ ] **ASLR.** (M) The stack, the heap and `mmap` are all at fixed
-      addresses. `AT_RANDOM` is filled from the entropy pool, but nothing is
-      actually randomised.
+- [x] **ASLR.** (M) **Done, board-proven across two runs.** The stack top,
+      the signal trampoline (derived from the stack, so it cannot land
+      inside it), the `mmap` floor and the gap before the heap are all
+      chosen per address space — about twelve bits each, deliberately
+      modest so that a Go runtime's placement hints still land.
+      `minikern.noaslr` turns it off, because a fixed layout is what makes
+      a crash address comparable between two runs.
+
+      **The entropy pool had no callers at all.** `entropy_add_timing` was
+      complete and well written and nothing ever fed it, so `samples`
+      stayed zero, every read hashed the same zeroed pool, and the first
+      working version of this produced *identical* addresses on two
+      consecutive boots. The trap path now samples the cycle counter on
+      every interrupt, which required splitting the pool out of
+      `kernel_random` so the architecture layer could feed it without
+      depending on the kernel layer. A single-run test would have passed
+      while randomisation randomised nothing — which is why the suite case
+      runs the program twice and compares, and why it is the only case that
+      is not a line match.
+
+      Also fixed on the way: a program built by `uspace_build` rather than
+      from an ELF had `brk` left at zero, so `brk(0)` returned 0 and it had
+      no usable heap. Found by asking it for one.
 - [x] **A CVE regression suite (Rule 25).** (M) **Run, and it found three
       real defects.** Four surfaces parse untrusted input here. Three are
       pure parsers tested adversarially on the host — the device tree, XFS,
@@ -1649,7 +2057,96 @@ Superseded text, kept because the entry denied what already existed:
 - [ ] **Netboot of its own.** (M) The ARM kernel had an authenticated
       netboot protocol (MKNB, Ed25519-verified offers). The code carried
       over; nothing is wired to it.
-- [ ] **The kernel in the top half of the address space.** (M) It still runs
+- [~] **The kernel in the top half of the address space.** (M) **Two of
+      three steps done.** The kernel's image is mapped both where it is
+      linked and at its load address, the boot jumps to the high alias as
+      soon as translation is on, the secondary harts' entry point is
+      converted back to a physical address for the firmware, and all of
+      RAM and every device have windows in the kernel's half — so nothing
+      *relies* on the identity map any more. `mmu_phys_to_virt` and
+      `mmu_virt_to_phys` are the two directions and `mmu_map_device`
+      returns the address to use.
+
+      **Step three — dropping the kernel's low alias from user page tables
+      — is attempted and reverted**, and the attempt is kept at
+      `docs/kernel-top-half-step-c.patch` with what it found. Restricting
+      `share_kernel_mappings` to `i >= PT_ENTRIES / 2` is the whole change,
+      and it needs every remaining physical-as-pointer use converted first.
+      Those found so far: the page-table walker's `to_virt`, page zeroing
+      and allocation, the ELF loader, `copy_in`/`copy_out`, swap, and **a
+      thread's kernel stack** — the last being the only memory the kernel
+      must reach while a process's table is loaded, and the one that makes
+      the rest moot until it is done. The scheduler's own resume check
+      caught that one immediately and named both disagreeing numbers, which
+      is the argument for asserting an invariant rather than assuming it.
+
+      **Resumed, reverted again — and most of what the last attempt
+      "established" was wrong.** The findings below replace the previous
+      list, which has been deleted rather than amended, because several of
+      its items were artefacts of the investigation rather than facts about
+      the kernel.
+
+      **The baseline was measured, and it settles the argument in favour of
+      the finding rather than against it.** `minikern.noaslr minikern.wait`
+      on the clean tree: **8 boots, 8 passes.** Counting every unpatched run
+      of this session, 12 of 13 passed — the single exception being one
+      anomaly early on, which is the rare tail of the `endsib`-class race
+      recorded elsewhere in this file, not a reason to distrust the test.
+      Against that, **every patched run hung: about ten of ten.**
+
+      So the comparison holds, and more strongly than when it was first
+      claimed. What was wrong before was never the conclusion — it was that
+      a single boot per configuration could not support it. The number is
+      the point: a difference between 10/10 and 0/13 is not a coin.
+
+      **What is solid**, with a control run beside it:
+
+      - Step C **does** break `fork`, at 10 of 10 against a baseline of 0
+        of 13. `minikern.noaslr minikern.wait` hangs with the patch applied
+        and gives `wait exited with 7` without it.
+      - The failure is **layout-sensitive**, which is why it looked
+        intermittent. With a fixed floor it hangs *before* the program's
+        first syscall; with a randomised one it gets as far as `clone` and
+        stops after it. Moving the floor moves the failure.
+      - Ordinary programs are unaffected: `hello` exits 7, `faulter` faults
+        and reports, `regs` passes 57 syscalls.
+
+      **What was withdrawn, and why it was wrong** — recorded because the
+      mistakes are more instructive than the measurements:
+
+      - *"There is a deterministic reproducer: `minikern.noaslr
+        minikern.wait`."* The option was applied **after** the `wait` test,
+        so it did nothing for it; the runs that claimed a fixed floor had a
+        randomised one. The fix for that is a real defect and is committed
+        separately.
+      - *"It is not SMP."* Backwards. Those runs carried
+        `minikern.smp=off`, and **that flag hangs `wait` on the unpatched
+        tree too**. The confounder was in the control, not the subject.
+      - *"Exactly one copy-on-write fault resolves, then nothing"* and
+        *"no fault reaches `handle_demand`"*. Both were measured in runs
+        with `smp=off`, so they describe that hang. Worse, two earlier
+        readings were taken with the diagnostics switched on *after* the
+        programs ran, so their silence was the instrument being off.
+
+      The method lesson, stated plainly because it cost most of a session:
+      **a flag is not set until something proves it was set, and a control
+      must differ from the subject in exactly one thing.** Every wrong
+      conclusion here came from one of those two — a switch that silently
+      did nothing, or a control carrying an extra flag that broke it on its
+      own. The check that works is cheap: assert the *effect* in the log
+      (`randomisation off` on the program's own layout line) before
+      believing anything downstream of it.
+
+      **The patch needs rebasing before the next attempt.** It was generated
+      before `minikern.noaslr` was moved to the top of `run_user_programs`,
+      so its `main.c` hunk now conflicts; a three-way apply reports success
+      and silently rolls the whole thing back, which is its own small trap —
+      check `git diff --stat` rather than the apply's own output.
+
+      The standing warning still holds: **the conversion must not go inside
+      a hot loop**. Written inside the two-megabyte zeroing loop of
+      `back_one_megapage` it turns a free cast into two million cross-module
+      calls per megapage, which looks exactly like a hang. It still runs
       identity-mapped in the bottom half, which `share_kernel_mappings`
       works around — and that workaround has now cost **three** bugs: one
       memory-corruption bug in the teardown path, and two security holes
@@ -1673,15 +2170,225 @@ Measured on the board, so these are gaps with numbers rather than guesses.
       FIFO.
 - [ ] **NVMe beyond 334 MB/s.** (M) One queue, one command in flight,
       polled. Several queues and interrupt completion is the next step.
-- [ ] **Interrupt-driven I/O generally.** (M) Everything polls, so a hart is
-      busy for the whole of every transfer.
-- [ ] **The big kernel lock.** (L) One hart in the kernel at a time. It is
-      what makes four harts safe without auditing every structure, and it is
-      the ceiling on anything syscall-heavy. Splitting it is a large change
-      and should wait until something is actually measured to be blocked on
-      it.
-- [ ] **`me()` scans the hart table on every call.** (S) A cached index in
-      `sscratch` would make it a load.
+- [~] **Interrupt-driven I/O generally.** (M) **The blocker is fixed and the
+
+      **The NVMe drive: converted, and stopped at a named boundary.** The
+      drive is the attached disk on this board and the fastest device on it,
+      so a hart spinning on a completion holds the one kernel lock for the
+      length of the transfer — the case `irqwait.h` was written for. The
+      driver now arms an `irqwait`, sleeps through the command and keeps the
+      phase-bit loop as the authority on whether a completion is there, so a
+      missed interrupt costs latency rather than correctness.
+      `nvme_interrupts_missed_count` is what says which is happening.
+
+      Three facts came out of it, each costing a boot:
+
+      1. **A PCIe device's interrupt is the bridge's, not its own.** The
+         number is on the host-bridge node, so `pci_bridge_path()` now keeps
+         the path that was being discarded in `adopt_bridge`.
+      2. **The mask has to be set before the queues are created**, not
+         before the handler is installed. A completion queue asks for its
+         interrupt at creation, during device bring-up, when the interrupt
+         controller does not exist yet — so the controller's own `INTMS` is
+         set first and the window is closed rather than hoped about.
+      3. **An NVMe pin is level-triggered**, and a completion is
+         acknowledged by advancing the head doorbell, which only the waiter
+         can do. A handler that just notes the firing leaves the line up and
+         the trap re-enters before the waiter runs: one interrupt for ever.
+         The handler masks vector 0 and `submit` unmasks per command, which
+         also makes an abandoned command self-healing.
+
+      **The demultiplexer is written and the boundary has moved.** The
+      controller's control registers are in the window its node calls `apb`
+      — `0x2c000000`, read off the board from `reg-names` rather than
+      assumed, because the order of a `reg` list is not a promise. It maps
+      (as *device* memory: `mmu_phys_to_virt` on an address below DRAM
+      yields one that faults, which cost a boot and a register dump), the
+      INTx mask opens, and the interrupt arms with no storm — so the
+      ordering rules hold: clear before unmasking, and quiet the device
+      before clearing the bridge.
+
+      What is still wrong is the offsets. `IMASK_LOCAL 0x180`,
+      `ISTATUS_LOCAL 0x184` and `INTA` at bit 24 are taken from Linux's
+      driver for the same IP, not measured here, and with them the first
+      command hangs **inside the trap handler** — `irqwait_wait` spins
+      against a deadline and cannot hang, so the hang is re-entry, which is
+      what an uncleared latch looks like. Either the status register is
+      elsewhere on this variant, or its bits are not write-1-to-clear, or
+      `INTA` is not bit 24.
+
+      That makes this the **fifth** guessed register map in this tree, after
+      the SD controller, the GMAC generation, the watchdog and the
+      temperature sensor. Every one of those was settled by dumping the
+      window in a single boot, and not one by a document. Dumping
+      `0x2c000000` across a triggered completion is the next step, and until
+      it is done `minikern.nvmeirq` stays off: the polled path is correct
+      and the root filesystem is on this drive.
+
+      **The boundary.** Source 57 is correct — it is the single cell the
+      bridge declares — but the JH7110 PCIe controller aggregates
+      `INTA`–`INTD` and MSI into it and latches the condition in its *own*
+      status register. Quieting the drive leaves the bridge asserting, so
+      enabling 57 storms. Finishing this means driving the controller's
+      interrupt demultiplexer (the PLDA XpressRICH `ISTATUS_LOCAL` /
+      `ISTATUS_MSI` family), which is its own piece of work and not a
+      property of this driver. `minikern.nvmeirq` therefore defaults off and
+      `minikern.nvmeirqprobe` reports the number without enabling it —
+      which is how it was read without a third storm.
+
+      **What is left is less than this entry has been claiming, and reading
+      the code rather than the entry is what established it.** Two things
+      listed here as "still polled" are not:
+
+      - **The GMAC transmit path does not poll.** `dwmac_send` publishes the
+        descriptor, writes the tail and returns; it checks `DESC_OWN` first
+        and answers `KERR_AGAIN` when the controller still holds that slot.
+        That is a correct asynchronous send, not a poller — there is nothing
+        to convert, and a transmit-complete interrupt would only let the
+        driver reclaim sooner than the next send does.
+      - **There is no UART poller in this kernel.** The console is an SBI
+        ecall (`jh7110_sbi_console` → `sbi_console_putchar`), so the waiting
+        happens inside the firmware, where this kernel cannot reach it.
+        Converting it would mean replacing the firmware's console with a
+        direct 8250 driver *and* an interrupt path — and the console is the
+        channel every failure in this entry was diagnosed over, which is a
+        reason to leave it alone rather than a scheduling decision.
+
+      So the item is substantively finished, with two boundaries that are
+      named rather than open-ended: the PCIe interrupt demultiplexer above,
+      and the SD card's *write* through its interrupt, which does not
+      complete and is why `minikern.mmcirq` is opt-in. Both are recorded
+      where the code is, not only here.
+      primitive exists; one device converted, opt-in.**
+
+      `sie` bit 9 was never set, so **no external interrupt could be taken
+      at all** — and everything downstream of it was already written: the
+      PLIC's claim-and-complete, `irq_register`, `irq_dispatch`, the trap's
+      `IRQ_S_EXTERNAL` case, and virtio-net's handler, which had never
+      received an interrupt in its life. `plic_init` sets the bit now.
+
+      `irqwait` (`kernel/irqwait.h`) is how a driver waits for a device
+      instead of watching it: arm on a source, start the transfer, wait —
+      the hart sleeps if a thread owns it and otherwise releases the kernel
+      lock. The cost of polling here is not the spinning but that one hart
+      is inside the kernel at a time, so a driver spinning on a status bit
+      stops every other hart for the length of a transfer.
+
+      Two things it had to get right. The handler must acknowledge at the
+      **device** (`RINTSTS` is write-one-to-clear, or the PLIC re-raises for
+      ever). And the no-thread path must not be `wfi`: `wfi` returns on
+      *any* interrupt and the deadline is only tested between waits, so a
+      `wfi` for an interrupt that never comes is a hang the timeout cannot
+      catch, with no scheduler tick during boot to rescue it.
+
+      The SD card is converted behind `minikern.mmcirq`. Reads are proven —
+      20 dispatched, 19 waits woken, 0 timed out — and a **write** through
+      the same path does not complete, which is why it is opt-in rather
+      than claimed: a disk that cannot be written is worse than one read by
+      polling. `minikern.mmcirqonly` arms without waiting, which is the
+      bisect that separated "unmasking storms" from "the wait is wrong".
+      The polled path stays because it is *reached*: this driver runs before
+      the interrupt controller exists, since the root filesystem is on the
+      card it reads.
+
+      **The SD write path is done, and the card said what was wrong.** It
+      had been failing with `CMD24 ... response-timeout`, from which a host
+      learns nothing — a response timeout says only that nothing came back.
+      Asking the card instead, with `CMD13` after the failure, gives:
+
+          mmc: after CMD24 the card says R1 00400e00: state 7
+
+      State 7 is `prg`, the programming state, and bit 22 is
+      `ILLEGAL_COMMAND`: the card refusing a write it was not in a state to
+      accept. **After a write a card programs the block and will not take
+      another command until it returns to `tran`**, and this driver issued
+      the next one regardless. So the first write of a boot succeeded, left
+      the card programming, and everything after it failed — which is
+      precisely the shape of "writes to the SD card work sometimes".
+
+      It now polls `CMD13` until the state is `tran`, after a write only: a
+      read leaves the card in `tran` already, so asking there would cost a
+      command per block for nothing. On the board every step of the write
+      suite passes — create, write, read back, link, rename, unlink, and the
+      link-count checks between them.
+
+      The lesson is the one this project keeps relearning in new words: the
+      controller's error told us nothing and the **device's own status told
+      us everything**, and the difference was one command nobody was
+      sending. A diagnostic that asks the far end is worth more than any
+      amount of reasoning about the near one.
+
+      What is left: the other pollers (NVMe, the GMAC, the UART).
+- [x] **The big kernel lock.** (L) **Measured, and the measurement says do
+      not split it.** This entry asked for exactly that — "should wait until
+      something is actually measured to be blocked on it" — and nothing had
+      ever measured it. Four harts, a syscall-heavy load, on the board:
+
+      | | |
+      |---|---|
+      | acquisitions | 10,684 |
+      | that had to wait | 866 — **81 per mille** |
+      | average wait | 22,511 cycles |
+      | average **hold** | **6,269 cycles (~6 us)** |
+      | worst hold | **8,174,682 cycles (~8.2 ms)** |
+
+      **The lock is not the ceiling this entry feared.** Eight per cent of
+      acquisitions wait and the average hold is six microseconds, which is a
+      busy kernel rather than a blocked one. Splitting it would buy that
+      eight per cent and cost an audit of every structure it protects.
+
+      **What is wrong is one critical section, not the lock.** The worst hold
+      and the worst wait are the same number to three figures — a hart cannot
+      wait longer than another held — so the multi-millisecond waits are not
+      queueing, they are one handler. Hold time is the measurement that says
+      so; wait time alone would have been read as "the lock is contended,
+      split it".
+
+      And it names itself: the tag on the longest hold is `scause`
+      `0x8000000000000005`, a **supervisor timer interrupt**, taken in
+      `trap_handle` — 1,300 times the average hold. So the tick does
+      something that runs for milliseconds with the kernel shut. The
+      candidates are the polled ones, and the network poll now runs from the
+      housekeeping beat, so a received frame is carried up through ARP, UDP
+      and DHCP — and reported to a 115200-baud console, where seventy
+      characters is 8 ms on its own — inside the interrupt. Which of those
+      dominates is not yet measured and is not claimed here.
+
+      Two instruments were needed and the first one was useless on its own.
+      `__builtin_return_address` in `klock_enter` resolves to `trap_handle`
+      for nearly every acquisition, because that is where the lock is taken:
+      the address says "a trap" and stops. `klock_tag` is what distinguishes
+      them — the trap path puts the cause in, the syscall layer overwrites it
+      with the call number — and an address with no tag would have made the
+      next person bisect for this.
+
+      **Follow-on, which is item 4's, not this one's:** get long work out of
+      the tick and out of critical sections generally. Converting the SD
+      transfer to interrupts (`minikern.mmcirq`, already built) cuts the
+      worst *wait* from 8.18 ms to 5.30 ms while leaving the worst hold where
+      it is — two long sections, one closed. Splitting the lock would have
+      shortened neither.
+- [x] **`me()` scans the hart table on every call.** (S) **Done.** A load,
+      not a scan — but **not in `sscratch`**, which this entry
+      suggested before the register was spoken for: it holds the kernel
+      stack top for the trap path, and that path depends on its being zero
+      in the kernel and non-zero in user mode. `tp` already holds the hart
+      *id* in one instruction, so what costs the scan is only mapping an id
+      to an index; a small `index_by_id[]` built at enumeration makes that
+      a load, with no CSR involved and nothing on the trap path touched.
+      That is what is built: `index_by_id[]`, filled once after enumeration
+      (per-`add_hart` would leave a window where a hart asking mid-way got
+      a half-filled table, and a wrong answer is worse than a slow one),
+      with the scan kept for an id outside the table and `0xff` meaning
+      "not known yet" so a hart asking before enumeration still gets 0,
+      which is right when there is one hart.
+
+      `smp_hart_misses` is now reported. It existed and nothing called it,
+      so the one number that says whether a hart failed to find its own
+      index — and silently became hart 0 — was being kept and never read.
+      It is also the only check on the new table: a wrong one shows up
+      there and nowhere else, because every other symptom is a hart doing
+      another hart's work. Board: zero misses, four harts.
 
 ---
 
@@ -1697,3 +2404,61 @@ Measured on the board, so these are gaps with numbers rather than guesses.
       command-line flag. (S) `minikern.diskbench` exists and is useful;
       making it a test that records numbers over time would catch a
       regression.
+
+### `/proc`, beyond the thermal reading
+
+`/proc` exists as a table of paths and generators (`procfs.c`), and three
+files are served from it: `/proc/thermal`, which is what it was built for and
+is complete; `/proc/meminfo`, with `MemTotal`/`MemFree`/`MemAvailable` from
+the page allocator; and `/proc/stat`, with a `cpu` line computed from
+`sched_idle_ns()` — nanoseconds accumulated at the one point where a hart's
+idleness starts and stops, rather than sampled, because a sample misses every
+window shorter than itself.
+
+**Deliberately deferred, with the reason.** The remainder of those files is
+not written because the thermal reading is what the management console needs
+now, and a `cpu` line computed from something the scheduler actually measures
+is worth more than a fuller file with guessed columns in it. What is missing,
+roughly in the order it would become useful:
+
+- [ ] **`/proc/stat`'s remaining fields** — `ctxt` (the scheduler counts
+      switches per hart already), `processes`, and the per-hart `cpuN` lines.
+      The per-hart split needs the idle accounting to be per-hart, which is
+      a field in `struct hart` rather than one global, and is the only part
+      of this that is not bookkeeping.
+- [ ] **`user` versus `system` time.** Both busy columns are reported as
+      `system` today, which is true rather than approximate: this kernel has
+      no split, because a program's time in the kernel is time it asked for
+      by trapping. A real split means stamping the trap entry and exit, which
+      is on the syscall fast path and so wants measuring before it is added.
+- [ ] **`/proc/uptime`, `/proc/loadavg`, `/proc/cpuinfo`.** Uptime is a
+      division of `timer_ns()`. Load average needs a decaying average of the
+      run-queue length, which nothing samples yet. `cpuinfo` is the hart
+      table and `mvendorid`/`marchid`, which `smp.c` already reads.
+- [ ] **Per-process files** (`/proc/<pid>/...`). The generator table is keyed
+      by a literal path, so this needs a pattern match or a second table —
+      the one piece here that changes `procfs.c` rather than adding to its
+      callers.
+
+A reader that wants a field this does not serve gets a short file rather than
+a wrong number, which is the property worth keeping as these are filled in.
+
+### The QEMU suite has drifted, and is not the gate
+
+Ten `*_qemu_test` targets fail. They are tagged `manual`, so no ordinary
+`bazel test //...` runs them, and the export's verification no longer does
+either — which is why this is recorded rather than fixed in passing.
+
+The reason is the project's own working rule: **every fix is made on the
+board and verified on the board**, so nothing has been kept working under the
+emulator. The failures say so plainly — `no hart id in the banner`, `the
+fault was not reported as a load page fault at the kernel's text` — which are
+the emulator's expectations of a kernel that has moved on, not defects in the
+kernel.
+
+Two honest options, neither taken yet because the choice is the operator's:
+delete them, which loses a check that once caught real bugs before the board
+existed; or bring them back and keep them green, which means maintaining a
+second target environment for a project whose whole method is the real
+silicon. What is not acceptable is the present state looking like coverage
+while failing, and that is what this entry is for.

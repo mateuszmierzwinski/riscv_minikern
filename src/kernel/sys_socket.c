@@ -4,6 +4,7 @@
 #include "core/errno.h"
 #include "kernel/uspace.h"
 #include "kernel/socket.h"
+#include "kernel/netlink.h"
 #include "kernel/syscall.h"
 #include "kernel/file.h"
 
@@ -38,6 +39,68 @@ struct user_timeval {
 static int32_t install_descriptor(struct file *f, bool cloexec) {
     f->flags |= cloexec ? O_CLOEXEC : 0u;
     return (int32_t)fd_install(f);
+}
+
+/* `sockaddr_un`: the family, then up to 108 bytes of name.
+ *
+ * **The name's length comes from the caller's `socklen_t`, not from a NUL.**
+ * An abstract name — the kind whose first byte is NUL, which is how a
+ * program asks for a name with no filesystem entry — would otherwise measure
+ * as zero bytes long, and every abstract socket in the system would have the
+ * same empty name and collide with every other. So the length is
+ * `len - 2` for an abstract name, and for a path it is the NUL-terminated
+ * string, which is what a caller that passed `sizeof(struct sockaddr_un)`
+ * expects.
+ *
+ * `create` distinguishes bind from connect: a connect must not intern a name
+ * nobody has bound, or it would be handed a valid index for a listener that
+ * does not exist and get ECONNREFUSED one layer too late. */
+static int get_unix_addr(virt_t uaddr, uint32_t len, struct sock_addr *a, bool create) {
+    char name[UNIX_NAME_MAX];
+    uint32_t room;
+    if (len < 3u || len > 2u + UNIX_NAME_MAX) {
+        return KERR_INVAL;
+    }
+    room = len - 2u;
+    if (uspace_copy_in(name, uaddr + 2u, room) != KERR_OK) {
+        return KERR_FAULT;
+    }
+    if (name[0] != '\0') {
+        /* A path: as long as its text, so that a caller passing the whole
+         * structure and one passing the exact length agree. */
+        uint32_t n = 0;
+        while (n < room && name[n] != '\0') {
+            n++;
+        }
+        room = n;
+    }
+    a->unix_name = unix_name_intern(name, room, create);
+    if (a->unix_name == 0) {
+        /* Either the table is full, or this is a connect to a name nobody
+         * holds. The second is far more likely and is what a caller acts on. */
+        return create ? KERR_NOSPC : ECONNREFUSED;
+    }
+    return KERR_OK;
+}
+
+/* `sockaddr_nl`: the family, two bytes of padding, a 32-bit port and a
+ * 32-bit group mask. The port is the caller's own identity, which it chooses
+ * — zero asks the kernel to pick, and the port is echoed back in every reply
+ * so a caller can tell its own answers from another's. */
+static int get_netlink_addr(virt_t uaddr, uint32_t len, struct sock_addr *a) {
+    uint8_t b[12] = {0};
+    if (len < 8u || len > 12u) {
+        return KERR_INVAL;
+    }
+    if (uspace_copy_in(b, uaddr, len) != KERR_OK) {
+        return KERR_FAULT;
+    }
+    if ((b[0] | (b[1] << 8)) != AF_NETLINK) {
+        return EAFNOSUPPORT;
+    }
+    /* Host order, unlike a `sockaddr_in`'s port: netlink's fields are native. */
+    a->port = (uint16_t)((uint32_t)b[4] | ((uint32_t)b[5] << 8));
+    return KERR_OK;
 }
 
 /* sockaddr_in: family (host order), port and address (network order). */
@@ -107,7 +170,21 @@ static int32_t with_addr(struct trapframe *tf, bool connect) {
     if (s == NULL) {
         return err;
     }
-    err = get_addr(sysarg(tf, 1), sysarg(tf, 2), &a);
+    /* **Which shape the address is depends on the socket, not the bytes.**
+     * A `sockaddr_un` and a `sockaddr_in` both begin with a family, and
+     * reading one as the other produces an address that is nobody's rather
+     * than an error — so the socket's own domain decides. */
+    if (s->domain == AF_UNIX) {
+        err = get_unix_addr(sysarg(tf, 1), sysarg(tf, 2), &a, !connect);
+    } else if (s->domain == AF_NETLINK) {
+        /* `sockaddr_nl`: family, two bytes of pad, the port, then a group
+         * mask. Only the port is read — groups are for multicast
+         * notifications, which this does not send, and accepting a
+         * subscription it would never honour is worse than ignoring it. */
+        err = get_netlink_addr(sysarg(tf, 1), sysarg(tf, 2), &a);
+    } else {
+        err = get_addr(sysarg(tf, 1), sysarg(tf, 2), &a);
+    }
     if (err != KERR_OK) {
         return err;
     }
@@ -232,7 +309,8 @@ static int64_t sys_sendto(struct trapframe *tf) {
     if (sysarg(tf, 4) == 0) {
         return send_user(s, sysarg(tf, 1), sysarg(tf, 2), NULL);
     }
-    err = get_addr(sysarg(tf, 4), sysarg(tf, 5), &to);
+    err = s->domain == AF_UNIX ? get_unix_addr(sysarg(tf, 4), sysarg(tf, 5), &to, false)
+                               : get_addr(sysarg(tf, 4), sysarg(tf, 5), &to);
     return err != KERR_OK ? err : send_user(s, sysarg(tf, 1), sysarg(tf, 2), &to);
 }
 

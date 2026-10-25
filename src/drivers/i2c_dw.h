@@ -40,7 +40,8 @@
 /* A controller this driver has brought up. Opaque by convention: callers
  * hold one and pass it back. */
 struct i2c_dw {
-    phys_t base;
+    phys_t base;  /* what the device decodes */
+    void *regs;   /* where this kernel reaches it; see mmu_map_device */
     bool up;
 };
 

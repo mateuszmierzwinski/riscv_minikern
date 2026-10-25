@@ -162,7 +162,11 @@ static void dump_clock_registers(enum crg_domain domain, const char *name, uint3
         kprintf("gmac: %s generator is not present\n", name);
         return;
     }
-    regs = (volatile uint32_t *)(uintptr_t)base;
+    regs = mmu_map_device(base, 0x1000u);
+    if (regs == NULL) {
+        kprintf("gmac:   %llx could not be mapped\n", (unsigned long long)base);
+        return;
+    }
     kprintf("gmac: %s generator at %llx\n", name, (unsigned long long)base);
     for (uint32_t i = 0; i < count; i++) {
         uint32_t v = regs[crg_clock_offset(i) / 4u];
@@ -339,12 +343,18 @@ static void say_controller(const struct fdt *fdt, const char *path) {
          * The actual cause is that nothing has mapped `0x1603_0000`: a
          * driver claims its window, and no driver has claimed this one. The
          * clocks were a red herring, and so was the hardware story. */
-        if (mmu_map_device(base, size) != KERR_OK) {
+        /* **`NULL` on failure, not a status.** This read `!= KERR_OK`, and
+         * when `mmu_map_device` began returning a pointer that compiled
+         * perfectly while meaning the opposite — `KERR_OK` is 0 and so is
+         * `NULL`, so a successful mapping became the failure branch. The
+         * one call site in thirteen that did not have to change is the one
+         * that silently broke. */
+        regs = mmu_map_device(base, size);
+        if (regs == NULL) {
             kprintf("gmac:   could not map its register window at %llx\n",
                     (unsigned long long)base);
             return;
         }
-        regs = (volatile uint32_t *)(uintptr_t)base;
         /* **Both candidate offsets, and the board decides.** A DesignWare
          * version register holds a small revision in its low byte and its
          * complement-ish `snpsver` above; the wrong offset gives something

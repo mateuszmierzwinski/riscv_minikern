@@ -1,17 +1,22 @@
 #include "drivers/nvme.h"
 
+#include "arch/riscv/mmu.h"
+
 #include <stdbool.h>
 #include <stddef.h>
 
 #include "core/console.h"
 #include "core/errno.h"
 #include "drivers/pci.h"
+#include "kernel/irqwait.h"
 #include "kernel/mem.h"
 
 /* Controller registers, in BAR0. */
 #define NVME_CAP 0x00u      /* capabilities, 64-bit */
 #define NVME_CC 0x14u       /* configuration */
 #define NVME_CSTS 0x1cu     /* status */
+#define NVME_INTMS 0x0cu    /* interrupt mask set — write 1s to mask */
+#define NVME_INTMC 0x10u    /* interrupt mask clear — write 1s to unmask */
 #define NVME_AQA 0x24u      /* admin queue attributes */
 #define NVME_ASQ 0x28u      /* admin submission queue address */
 #define NVME_ACQ 0x30u      /* admin completion queue address */
@@ -37,6 +42,64 @@
 #define IO_QUEUE 1u
 
 #define READY_SPINS 10000000u
+/* Generous on purpose: this is the sleep's deadline, not the command's. An
+ * NVMe command that has not completed in two seconds has failed, and the
+ * spin loop below is what decides that — the deadline only has to be longer
+ * than a slow transfer so a working device is never reported as missing its
+ * interrupt. */
+#define COMMAND_TIMEOUT_NS 2000000000ull
+
+/* **Quiets the pin, which is the whole job of this callback.**
+ *
+ * An NVMe legacy pin is level-triggered and stays asserted until the
+ * completion is *consumed* — and consuming it means advancing the head
+ * doorbell, which only the waiter can do, after it has read the entry. So a
+ * handler that merely notes the firing leaves the line up, the controller
+ * re-raises immediately, and the trap is re-entered before the waiter ever
+ * runs again: the machine takes one interrupt for ever and does nothing
+ * else. That is exactly how the first attempt at this hung, with the source
+ * number on the wire and nothing after it.
+ *
+ * Masking vector 0 here breaks that loop. `submit` unmasks before each
+ * command, so the mask is always lifted by whoever is about to need it, and
+ * a mask left behind by an abandoned command heals on the next one rather
+ * than disabling the device for ever.
+ *
+ * **This is not sufficient on this board**, and the reason is worth having
+ * before anyone tries again. The drive's pin does not reach the PLIC: the
+ * JH7110's PCIe controller aggregates `INTA`–`INTD` and MSI into *one*
+ * source — 57, which is the single cell its node declares, and that number
+ * is right. But the controller latches the condition in its own status
+ * register, and the PLIC line stays asserted until *that* is cleared. So
+ * masking the drive's vector 0, as below, quiets the drive and leaves the
+ * bridge asserting. Enabling source 57 then takes one interrupt for ever.
+ *
+ * Finishing it means driving the controller's interrupt demultiplexer — the
+ * PLDA XpressRICH `ISTATUS_LOCAL` / `ISTATUS_MSI` family — which is a
+ * separate piece of work from converting this driver, and is why the switch
+ * below defaults off. `minikern.nvmeirqprobe` reports the number without
+ * enabling it, which is how that number was read without a third storm.
+ *
+ * It writes, which `irqwait.h` describes as a read — the SD driver's handler
+ * does the same thing for the same reason (`put(DW_RINTSTS, ...)`): a device
+ * whose interrupt is not acknowledged in the handler cannot be waited on at
+ * all. The contract that matters is the one the header gives next: do not
+ * take the kernel lock, which this does not. */
+static uint32_t quiet_the_pin(void);
+
+/* The completion wait's state. Declared here rather than beside the function
+ * that arms it because `submit` below is the user, and this file reads top to
+ * bottom; the reasoning for the whole mechanism is on `nvme_use_interrupts`. */
+static struct irqwait nvme_done;
+static bool nvme_irq_armed;
+static bool nvme_probe_only;
+static bool nvme_said_how_the_first_went;
+
+void nvme_irq_probe_only(bool on) {
+    nvme_probe_only = on;
+}
+static uint64_t nvme_interrupts_missed;
+
 
 /* The page size the controller is configured for: CC.MPS of 0 means 4 KiB,
  * which is what this kernel sets. A PRP entry addresses within one of these. */
@@ -100,6 +163,18 @@ static void write_reg(uint32_t off, uint32_t v) {
     nvme.regs[off / 4u] = v;
 }
 
+static uint32_t quiet_the_pin(void) {
+    /* **The device first, the bridge second.** The controller aggregates
+     * INTA-INTD into one PLIC source and latches which fired; clearing that
+     * latch while this device is still asserting simply sets it again. So
+     * the drive's vector is masked here, which drops its pin, and only then
+     * is the bridge's latch cleared. Reversing these two is the difference
+     * between a working wait and a machine that takes one interrupt for
+     * ever — which is how this arrived at two functions. */
+    write_reg(NVME_INTMS, 1u);
+    return pci_bridge_intx_clear();
+}
+
 static uint32_t read_reg(uint32_t off) {
     return nvme.regs[off / 4u];
 }
@@ -127,8 +202,12 @@ static int build_queue(struct nvme_queue *q, uint32_t id) {
     if (rc != KERR_OK) {
         return rc;
     }
-    q->sq = (struct nvme_command *)(uintptr_t)sq;
-    q->cq = (struct nvme_completion *)(uintptr_t)cq;
+    /* **This driver already kept the bus addresses separately** — `sq_phys`
+     * and `cq_phys` below — so only the kernel's own view needed changing.
+     * The separation was there for the controller's sake and happens to be
+     * exactly what an un-mapped kernel needs. */
+    q->sq = (struct nvme_command *)mmu_phys_to_virt(sq);
+    q->cq = (struct nvme_completion *)mmu_phys_to_virt(cq);
     q->sq_phys = sq;
     q->cq_phys = cq;
     q->sq_tail = 0;
@@ -155,7 +234,50 @@ static int submit(struct nvme_queue *q, const struct nvme_command *cmd, uint32_t
     q->sq[q->sq_tail].command_id = nvme.next_command_id++;
     q->sq_tail = (uint16_t)((q->sq_tail + 1u) % QUEUE_ENTRIES);
     __asm__ volatile("fence w, w" : : : "memory");
+    /* **Stale firings are forgotten before the doorbell, not after it.**
+     *
+     * A legacy-pin device holds its line asserted until the completion is
+     * consumed, and the completion is consumed by the loop below advancing
+     * the head — so between the wait returning and the head moving, the PLIC
+     * can re-raise and set `fired` again. Clearing it here rather than after
+     * the transfer means the next wait cannot return immediately on the
+     * last transfer's echo and then find no completion in the ring. */
+    irqwait_rearm(&nvme_done);
+    /* **Unmasked per command, not once at arming.** The handler masks to
+     * stop a level-triggered pin re-raising, so something has to lift it;
+     * doing it here makes the lift belong to the command that needs it and
+     * makes a mask left over from an abandoned command self-healing. */
+    if (nvme_irq_armed) {
+        write_reg(NVME_INTMC, 1u);
+    }
     ring(q->id, false, q->sq_tail);
+    /* **The interrupt ends the sleep; the phase bit remains the truth.**
+     *
+     * The loop below is unchanged and still decides whether a completion is
+     * there. All the wait does is stop this hart spinning — and therefore
+     * stop it holding the kernel lock — for the length of the transfer. A
+     * timeout is not an error here: it falls into the same loop and the
+     * command still completes, just as slowly as before. That is what makes
+     * this safe to add to a working driver, and `irqwait_counts` is what
+     * says whether it is actually helping. */
+    if (nvme_irq_armed) {
+        int waited = irqwait_wait(&nvme_done, COMMAND_TIMEOUT_NS);
+        if (waited != KERR_OK) {
+            nvme_interrupts_missed++;
+        }
+        /* **Once, for the first command only.** Whether the very first
+         * interrupt-driven command was woken or fell back to its timeout is
+         * the one fact that separates "the source and the demultiplexer are
+         * right" from "something else is". Printing it per command would
+         * flood; printing it at the end of the boot is no use when the boot
+         * does not reach the end, which is exactly the case being
+         * diagnosed. */
+        if (!nvme_said_how_the_first_went) {
+            nvme_said_how_the_first_went = true;
+            kprintf("nvme: the first waited command was %s (intx %u)\n",
+                    waited == KERR_OK ? "woken" : "left to its timeout", nvme_done.status);
+        }
+    }
     for (uint32_t spin = 0; spin < READY_SPINS; spin++) {
         __asm__ volatile("fence r, r" : : : "memory");
         /* A completion is new when its phase matches what this pass
@@ -178,6 +300,151 @@ static int submit(struct nvme_queue *q, const struct nvme_command *cmd, uint32_t
     return KERR_TIMEDOUT;
 }
 
+/* ── waiting for a completion instead of watching for one ──────────────── */
+
+/* **Why this driver polled, and why it need not.**
+ *
+ * A completion is a phase bit in a ring, so spinning on it is correct, and it
+ * was the right first implementation. What it costs is not the spinning: one
+ * hart is inside this kernel at a time, so a hart spinning on a completion is
+ * a hart no other hart can replace, and the lock is held for the whole
+ * transfer. On the fastest device on the board that is the longest the lock
+ * is held by anything.
+ *
+ * **The polled path stays, and is reached every boot.** The admin queue
+ * identifies the controller and creates the I/O queues during device
+ * bring-up, before the interrupt controller exists, so the first commands
+ * have no interrupt to wait for — and the root filesystem may be on this
+ * disk, which is to say the kernel may be reading it before it can be told
+ * about it.
+ *
+ * **The mask is the ordering trick.** A completion queue's interrupt is
+ * requested when the queue is created, which happens long before a handler
+ * exists; an interrupt nobody claims is one the PLIC re-raises for ever, and
+ * then the machine does nothing else. So the controller's own mask
+ * (`INTMS`) is set before any queue is created and cleared only once the
+ * handler is installed — the same "mask last" rule the SD driver records,
+ * enforced one level further out because here the device is configured
+ * before the kernel is ready for it.
+ */
+
+/* Waits that ended in a timeout rather than an interrupt.
+ *
+ * Reported for the reason `irqwait.h` gives: a driver that has silently
+ * fallen back to its timeout on every transfer is slower than the polling it
+ * replaced and looks identical from outside. */
+uint64_t nvme_interrupts_missed_count(void) {
+    return nvme_interrupts_missed;
+}
+
+int nvme_use_interrupts(const struct fdt *fdt) {
+    const char *bridge = pci_bridge_path();
+    uint32_t source;
+    int rc;
+    if (!nvme.up || nvme_irq_armed) {
+        return nvme.up ? KERR_OK : KERR_NODEV;
+    }
+    if (bridge == NULL) {
+        kprintf("nvme: no host bridge path; completions stay polled\n");
+        return KERR_NOENT;
+    }
+    /* The bridge's line, not the device's: see `pci_bridge_path`. */
+    source = fdt_get_u32(fdt, bridge, "interrupts", 0);
+    if (source == 0u) {
+        kprintf("nvme: no interrupt in the tree for %s; completions stay polled\n", bridge);
+        return KERR_NOENT;
+    }
+    /* **The whole property, before trusting one cell of it.**
+     *
+     * Enabling a PLIC source that is already asserted — or that belongs to
+     * something else — is a machine that takes one interrupt for ever, and
+     * two boots were spent that way on the first cell of this property. A
+     * PCIe bridge node commonly carries several interrupts (the legacy pins
+     * and the MSI aggregate are not the same line), so the cells and the
+     * names are reported and the choice is made from facts. This kernel has
+     * paid for guessing a register map four times; a source number is the
+     * same kind of guess. */
+    {
+        struct fdt_prop p;
+        if (fdt_get_prop(fdt, bridge, "interrupts", &p) == KERR_OK) {
+            kprintf("nvme: %s interrupts: %u bytes:", bridge, p.len);
+            for (uint32_t i = 0; i + 3u < p.len && i < 64u; i += 4u) {
+                uint32_t v = ((uint32_t)p.value[i] << 24) | ((uint32_t)p.value[i + 1] << 16) |
+                             ((uint32_t)p.value[i + 2] << 8) | (uint32_t)p.value[i + 3];
+                kprintf(" %u", v);
+            }
+            kprintf("\n");
+        }
+        if (fdt_get_prop(fdt, bridge, "interrupt-names", &p) == KERR_OK) {
+            kprintf("nvme: names:");
+            for (uint32_t i = 0; i < p.len && i < 96u; i++) {
+                kprintf("%c", p.value[i] == 0 ? ' ' : (char)p.value[i]);
+            }
+            kprintf("\n");
+        }
+        /* **The bridge's register windows, by name.**
+         *
+         * Finishing this needs the controller's own interrupt status, which
+         * is not in ECAM — it is in a second window the node names. Which
+         * window, and what it is called, is a fact of this board rather
+         * than of the IP, so it is read rather than assumed: four register
+         * maps have been guessed wrong in this tree and each cost a boot.
+         * The PLDA XpressRICH registers this needs (`IMASK_LOCAL 0x180`,
+         * `ISTATUS_LOCAL 0x184`, INTA-INTD at bits 24-27) are offsets
+         * *within* whichever of these is the bridge's control space. */
+        if (fdt_get_prop(fdt, bridge, "reg-names", &p) == KERR_OK) {
+            kprintf("nvme: reg-names:");
+            for (uint32_t i = 0; i < p.len && i < 96u; i++) {
+                kprintf("%c", p.value[i] == 0 ? ' ' : (char)p.value[i]);
+            }
+            kprintf("\n");
+        }
+        for (uint32_t which = 0; which < 4u; which++) {
+            phys_t base = 0;
+            uint64_t size = 0;
+            if (fdt_device_reg(fdt, bridge, which, &base, &size) != KERR_OK) {
+                break;
+            }
+            kprintf("nvme: reg[%u] %016llx + %llx\n", which, (unsigned long long)base,
+                    (unsigned long long)size);
+        }
+        if (fdt_get_prop(fdt, bridge, "msi-parent", &p) == KERR_OK) {
+            kprintf("nvme: the bridge has an msi-parent, so its pins may be MSI-routed\n");
+        }
+    }
+    /* `minikern.nvmeirqprobe` reports and stops, which is how this number
+     * gets read without risking the storm that reading it wrongly causes. */
+    if (nvme_probe_only) {
+        return KERR_NOENT;
+    }
+    /* **Said before it is acted on.** Unmasking a source nothing claims is a
+     * machine that does nothing else, including printing, so the number this
+     * is about to trust goes out while the console still works. The first
+     * attempt hung here with nothing on the wire, which is what that costs. */
+    kprintf("nvme: bridge %s says interrupt %u\n", bridge, source);
+    /* **The demultiplexer before the handler**, because the handler clears
+     * through it: armed the other way round, the first interrupt would be
+     * acknowledged at the drive and left latched at the bridge. */
+    rc = pci_bridge_intx_init(fdt);
+    if (rc != KERR_OK) {
+        kprintf("nvme: the bridge's INTx cannot be demultiplexed (rc %d); staying polled\n", rc);
+        return rc;
+    }
+    rc = irqwait_arm(&nvme_done, source, quiet_the_pin);
+    if (rc != KERR_OK) {
+        kprintf("nvme: interrupt %u could not be armed (rc %d); completions stay polled\n",
+                source, rc);
+        return rc;
+    }
+    /* **Left masked.** `submit` unmasks before each command, so there is no
+     * window here in which the controller can raise into a kernel that is
+     * not yet waiting for it. */
+    nvme_irq_armed = true;
+    kprintf("nvme: completion interrupt %u armed; the lock is free while a command runs\n",
+            source);
+    return KERR_OK;
+}
+
 /* Waits for the controller's ready bit to reach `want`. */
 static int wait_ready(bool want) {
     for (uint32_t spin = 0; spin < READY_SPINS; spin++) {
@@ -198,7 +465,8 @@ static int identify(uint32_t which, uint32_t nsid, void *buf) {
     struct nvme_command cmd = {0};
     cmd.opcode = ADMIN_IDENTIFY;
     cmd.namespace_id = nsid;
-    cmd.prp1 = (uint64_t)(uintptr_t)buf;
+    /* **A bus address, because the controller does the reading.** */
+    cmd.prp1 = (uint64_t)mmu_virt_to_phys(buf);
     cmd.cdw10 = which;
     return submit(&nvme.admin, &cmd, NULL);
 }
@@ -242,7 +510,12 @@ static int create_io_queues(void) {
     cmd.opcode = ADMIN_CREATE_CQ;
     cmd.prp1 = nvme.io.cq_phys;
     cmd.cdw10 = (uint32_t)IO_QUEUE | ((QUEUE_ENTRIES - 1u) << 16);
-    cmd.cdw11 = 1u; /* physically contiguous; no interrupts, since this polls */
+    /* Bit 0 contiguous, bit 1 interrupts enabled, vector 0 in the high half.
+     * **The interrupt is requested here although nothing can handle it yet**:
+     * it is masked at the controller (below, before this runs) and unmasked
+     * by `nvme_use_interrupts` once a handler exists. Asking for it later
+     * would mean deleting and recreating a working queue. */
+    cmd.cdw11 = 1u | 2u;
     rc = submit(&nvme.admin, &cmd, NULL);
     if (rc != KERR_OK) {
         return rc;
@@ -303,7 +576,9 @@ static uint64_t describe_buffer(uint64_t at, uint64_t bytes) {
     for (uint64_t i = 0; i < pages && i < sizeof prp_list / sizeof prp_list[0]; i++) {
         prp_list[i] = next + i * PAGE_BYTES;
     }
-    return (uint64_t)(uintptr_t)prp_list;
+    /* The list itself is read by the controller, so it too is named by its
+     * bus address rather than by where this kernel keeps it. */
+    return (uint64_t)mmu_virt_to_phys(prp_list);
 }
 
 /* The largest transfer this driver will issue in one command, in bytes: what
@@ -312,7 +587,7 @@ static uint64_t describe_buffer(uint64_t at, uint64_t bytes) {
 
 static int transfer(uint8_t opcode, uint64_t lba, uint32_t blocks, void *buf) {
     struct nvme_command cmd = {0};
-    uint64_t at = (uint64_t)(uintptr_t)buf;
+    uint64_t at = (uint64_t)mmu_virt_to_phys(buf);
     uint64_t bytes = (uint64_t)blocks * nvme.block_size;
     if (bytes > MAX_TRANSFER_BYTES) {
         return KERR_INVAL; /* the caller splits it: one list page is the limit */
@@ -374,6 +649,15 @@ static int start_controller(void) {
     uint64_t cap = (uint64_t)read_reg(NVME_CAP) | ((uint64_t)read_reg(NVME_CAP + 4u) << 32);
     int rc;
     nvme.doorbell_stride = 4u << ((cap >> 32) & 0xfu);
+    /* **Masked before anything can raise.** The queues below ask for
+     * completion interrupts, and the handler for them is installed much
+     * later — the interrupt controller does not exist during device
+     * bring-up. An unclaimed interrupt is one the PLIC re-raises for ever,
+     * which is a machine that does nothing else, so the window between
+     * "the queue will raise" and "something will answer" is closed here
+     * rather than hoped about. `0xffffffff` masks all 32 vectors; only
+     * vector 0 is ever used, and masking the rest costs one store. */
+    write_reg(NVME_INTMS, 0xffffffffu);
     write_reg(NVME_CC, 0); /* disable before touching the admin queue addresses */
     rc = wait_ready(false);
     rc = rc != KERR_OK ? rc : build_queue(&nvme.admin, ADMIN_QUEUE);
@@ -409,7 +693,9 @@ int nvme_init(struct blockdev *out) {
     if (rc != KERR_OK) {
         return rc;
     }
-    nvme.regs = (volatile uint32_t *)(uintptr_t)nvme.pci.bar0;
+    /* The mapped address, not the bus address: `bar0` is what the device
+     * decodes and `bar0_virt` is what this kernel can load from. */
+    nvme.regs = (volatile uint32_t *)nvme.pci.bar0_virt;
     /* The controller's capability register, before anything is asked of it.
      * A drive that is mapped but not reachable reads all-ones or zeros here,
      * which separates "the bridge does not forward this address" from "the

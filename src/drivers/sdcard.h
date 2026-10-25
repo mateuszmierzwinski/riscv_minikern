@@ -55,6 +55,11 @@
 #define CMD_READ_SINGLE 17u
 #define CMD_READ_MULTIPLE 18u
 #define CMD_STOP_TRANSMISSION 12u
+/* `SEND_STATUS`: the card's own R1 status word. Worth having because it is
+ * the card's answer to "why did you refuse that" — the write-protect
+ * violation and the current state both live in it, and a driver guessing at
+ * either from a controller-side timeout is guessing. */
+#define CMD_SEND_STATUS 13u
 #define CMD_WRITE_SINGLE 24u
 #define CMD_WRITE_MULTIPLE 25u
 #define CMD_APP_COMMAND 55u

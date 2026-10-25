@@ -158,9 +158,41 @@ uint8_t *net_l4_buffer(struct netif *nif) {
     return TX_L4(nif);
 }
 
-/* The next hop for dst: itself on our subnet (or broadcast), else the gateway. */
+/* How specific the interface's own subnet is, so that an explicit route can
+ * be compared against it rather than assumed to beat it or lose to it. */
+static uint32_t on_link_len(const struct netif *nif) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < 32u; i++) {
+        n += (nif->mask >> i) & 1u;
+    }
+    return n;
+}
+
+/* The next hop for dst: the most specific route that covers it.
+ *
+ * Three sources, ranked by prefix length rather than by precedence, which is
+ * what keeps a specific route from being beaten by a general one that
+ * happens to be consulted first:
+ *
+ *   - the **routing table**, for anything the operator or a protocol added;
+ *   - the interface's **own subnet**, which is a route (direct, `nif->mask`)
+ *     that is not in the table;
+ *   - the **default gateway**, which is a route of length zero.
+ *
+ * With an empty table this is exactly the two rules it replaced, which is
+ * the property that matters: every existing caller is unchanged. */
 static ip4_t next_hop(const struct netif *nif, ip4_t dst) {
-    if (is_broadcast(nif, dst) || (nif->mask != 0 && (dst & nif->mask) == (nif->ip & nif->mask))) {
+    uint32_t from_table = NET_ROUTE_NONE;
+    ip4_t via = net_route_lookup(nif, dst, &from_table);
+    bool on_link = nif->mask != 0 && (dst & nif->mask) == (nif->ip & nif->mask);
+    if (is_broadcast(nif, dst)) {
+        return dst;
+    }
+    if (from_table != NET_ROUTE_NONE && !(on_link && on_link_len(nif) > from_table)) {
+        /* A gateway of zero means the table called this prefix on-link. */
+        return via != 0 ? via : dst;
+    }
+    if (on_link) {
         return dst;
     }
     return nif->gateway != 0 ? nif->gateway : dst;

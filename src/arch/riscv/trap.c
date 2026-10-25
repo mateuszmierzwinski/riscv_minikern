@@ -1,4 +1,5 @@
 #include "arch/riscv/trap.h"
+#include "kernel/entropy.h"
 
 #include "arch/riscv/frame.h"
 #include "arch/riscv/plic.h"
@@ -116,6 +117,27 @@ uint64_t trap_software_interrupts(void) {
 }
 
 static bool handle_interrupt(uint64_t code) {
+    /* **Every interrupt feeds the entropy pool.**
+     *
+     * `entropy_add_timing` had no callers at all, so the pool stayed zero,
+     * `entropy_fill` reported itself unseeded, and `random_fill` hashed the
+     * same zeroed pool on every boot — which made address randomisation
+     * produce *identical* addresses in two consecutive runs. A complete,
+     * well-written mechanism that nothing ever fed.
+     *
+     * The cycle counter's low bits are the sample. What makes them vary is
+     * that the interrupted work does: a timer tick lands at a slightly
+     * different point in whatever the hart was doing, and on real hardware
+     * that spread is real. Under emulation it is much smaller, which is why
+     * the ARM project this came from ended up here too.
+     *
+     * In the trap path, so it must stay cheap: a read of a counter and an
+     * exclusive-or. The hashing happens when the pool is read. */
+    {
+        uint64_t now;
+        __asm__ volatile("rdcycle %0" : "=r"(now));
+        entropy_add_timing((uint32_t)now);
+    }
     switch (code) {
     case IRQ_S_TIMER:
         timer_on_tick();
@@ -204,6 +226,12 @@ static void on_the_way_back(struct trapframe *tf) {
     }
 }
 
+static void (*lock_tag)(uint64_t);
+
+void trap_set_lock_tag(void (*tag)(uint64_t)) {
+    lock_tag = tag;
+}
+
 /* Every trap, holding the kernel lock for as long as it is in the kernel.
  *
  * Taking it here and releasing it on the way out is what makes four harts
@@ -225,6 +253,7 @@ void trap_set_lock(bool (*enter)(void), void (*exit)(bool)) {
     lock_exit = exit;
 }
 
+
 /* How many harts have been inside the kernel at the same time, and the most
  * there has ever been.
  *
@@ -242,6 +271,12 @@ uint32_t trap_most_harts_inside(void) {
 
 void trap_handle(struct trapframe *tf) {
     bool took = lock_enter != NULL && lock_enter();
+    /* The cause, so that the longest hold can be attributed to a kind of trap
+     * rather than to `trap_handle`, which is where every one of them takes
+     * the lock. A syscall overwrites this with its own number. */
+    if (lock_tag != NULL) {
+        lock_tag(tf->scause);
+    }
     uint32_t now = __atomic_add_fetch(&inside_the_kernel, 1u, __ATOMIC_RELAXED);
     most_inside = now > most_inside ? now : most_inside;
     check_the_entry_agrees(tf);

@@ -16,28 +16,49 @@ static uint32_t pseudo_sum(ip4_t src, ip4_t dst, uint32_t len) {
     return net_sum(ph, sizeof ph, 0);
 }
 
-/* Reads the MSS option, ignoring every other option. Malformed option
- * lists stop the walk rather than being followed. */
-static uint32_t parse_mss(const uint8_t *p, uint32_t hlen) {
+/* Walks the options, taking the MSS, SACK-permitted and any SACK blocks.
+ *
+ * **One walk, not three.** The list is attacker-controlled — it is the first
+ * thing a hostile peer can shape — so it is bounded once, here, and every
+ * option is read from inside those bounds. Three separate walks would be
+ * three places to get the same bound wrong, and this file's CVE suite exists
+ * because that is exactly what happens.
+ *
+ * A malformed list stops the walk rather than being followed: a length of
+ * zero or one would not advance, and a length past the header would read
+ * past the segment. */
+static void parse_options(const uint8_t *p, uint32_t hlen, struct tcp_seg *seg) {
     for (uint32_t at = TCP_HLEN; at < hlen;) {
         uint8_t kind = p[at];
         uint8_t len;
         if (kind == TCP_OPT_END) {
-            return 0;
+            return;
         }
         if (kind == TCP_OPT_NOP) {
             at++;
             continue;
         }
         if (at + 2u > hlen || (len = p[at + 1]) < 2u || at + len > hlen) {
-            return 0;
+            return;
         }
         if (kind == TCP_OPT_MSS && len == 4u) {
-            return get16(p + at + 2);
+            seg->mss = get16(p + at + 2);
+        } else if (kind == TCP_OPT_SACK_PERMITTED && len == 2u) {
+            seg->sack_permitted = true;
+        } else if (kind == TCP_OPT_SACK && len >= 10u && ((len - 2u) % 8u) == 0u) {
+            /* Each block is two sequence numbers. The count is taken from
+             * the option's own length and then clamped, so a peer claiming
+             * more blocks than this kernel keeps room for fills the array
+             * rather than overrunning it. */
+            uint32_t blocks = (uint32_t)(len - 2u) / 8u;
+            seg->sack_blocks = blocks < TCP_SACK_BLOCKS ? blocks : TCP_SACK_BLOCKS;
+            for (uint32_t i = 0; i < seg->sack_blocks; i++) {
+                seg->sack_left[i] = get32(p + at + 2u + i * 8u);
+                seg->sack_right[i] = get32(p + at + 6u + i * 8u);
+            }
         }
         at += len;
     }
-    return 0;
 }
 
 /* Validates the segment and fills seg. KERR_OK or an error. */
@@ -59,8 +80,14 @@ static int parse_segment(struct tcp_stack *s, ip4_t src, ip4_t dst, const uint8_
     }
     *seg = (struct tcp_seg){.seq = get32(p + TH_SEQ), .ack = get32(p + TH_ACK), .wnd = get16(p + TH_WINDOW),
                             .sport = get16(p + TH_SPORT), .dport = get16(p + TH_DPORT), .flags = p[TH_FLAGS],
-                            .mss = (p[TH_FLAGS] & TCP_SYN) ? parse_mss(p, hlen) : 0u, .data = p + hlen,
-                            .len = len - hlen};
+                            .data = p + hlen, .len = len - hlen};
+    /* **On every segment, not only a SYN.** The MSS only appears in a SYN,
+     * but SACK blocks appear on any acknowledgement — reading options only
+     * for SYNs is how a sender never sees a single one. */
+    parse_options(p, hlen, seg);
+    if ((p[TH_FLAGS] & TCP_SYN) == 0) {
+        seg->mss = 0;
+    }
     return KERR_OK;
 }
 
@@ -124,6 +151,12 @@ static void accept_syn(struct tcp_stack *s, struct tcp_conn *listener, ip4_t src
     c->snd_wnd = seg->wnd;
     c->snd_una = s->iss;
     c->snd_nxt = c->snd_una + 1u;
+    /* **Recorded from the peer's SYN, before the SYN-ACK is sent.** Blocks
+     * are only ever sent to a peer that offered the option; sending it
+     * unasked is a protocol violation that some stacks answer by dropping
+     * the segment, which would look like a lost connection rather than a
+     * rejected option. */
+    c->sack_ok = seg->sack_permitted;
     s->iss += 0x9e3779b9u;
     s->stats.connections++;
     tcp_enter(c, TCP_SYN_RECEIVED);
@@ -166,6 +199,7 @@ static void in_syn_sent(struct tcp_conn *c, const struct tcp_seg *seg) {
     c->rcv_nxt = seg->seq + 1u;
     c->snd_una = seg->ack;
     c->snd_wnd = seg->wnd;
+    c->sack_ok = seg->sack_permitted;
     tcp_cancel_timer(c);
     tcp_enter(c, TCP_ESTABLISHED);
     tcp_send_ack(c);
@@ -225,9 +259,39 @@ static void on_duplicate_ack(struct tcp_conn *c) {
     tcp_retransmit_oldest(c); /* which counts it */
 }
 
+/* Takes the SACK blocks the peer reported, discarding anything stale.
+ *
+ * **Recorded on a duplicate acknowledgement too**, which is the case that
+ * matters: a peer holding data above a gap sends the same cumulative
+ * acknowledgement with fresh blocks each time, so a sender that only read
+ * them from an advancing ACK would never see one.
+ *
+ * A block at or below `snd_una` is history — the cumulative acknowledgement
+ * already covers it — and one above `snd_nxt` is data this sender never
+ * sent, which a hostile or confused peer can claim and which must not be
+ * allowed to shorten a retransmission to nothing. Both are dropped. */
+void tcp_take_sack_blocks(struct tcp_conn *c, const struct tcp_seg *seg) {
+    if (!c->sack_ok) {
+        return;
+    }
+    c->sacked_blocks = 0;
+    for (uint32_t i = 0; i < seg->sack_blocks; i++) {
+        uint32_t left = seg->sack_left[i];
+        uint32_t right = seg->sack_right[i];
+        if (!seq_gt(right, left) || seq_le(right, c->snd_una) || seq_gt(right, c->snd_nxt)) {
+            continue;
+        }
+        c->sacked_left[c->sacked_blocks] = left;
+        c->sacked_right[c->sacked_blocks] = right;
+        c->sacked_blocks++;
+        c->stack->stats.sack_blocks_received++;
+    }
+}
+
 /* Applies an acknowledgement: drops acknowledged bytes from the queue. */
 static void apply_ack(struct tcp_conn *c, const struct tcp_seg *seg) {
     uint32_t acked;
+    tcp_take_sack_blocks(c, seg);
     if (!(seg->flags & TCP_ACK) || seq_le(seg->ack, c->snd_una) || seq_gt(seg->ack, c->snd_nxt)) {
         if ((seg->flags & TCP_ACK) != 0 && seg->ack == c->snd_una && tcp_in_flight(c) > 0) {
             on_duplicate_ack(c);
@@ -249,6 +313,10 @@ static void apply_ack(struct tcp_conn *c, const struct tcp_seg *seg) {
     }
     c->snd_una = seg->ack;
     c->snd_wnd = seg->wnd;
+    /* Re-filtered against the new `snd_una`: the blocks were taken before it
+     * advanced, and one now at or below it describes data this sender has
+     * already dropped from its queue. */
+    tcp_take_sack_blocks(c, seg);
     c->retries = 0;
     c->rto_ms = TCP_RTO_MIN_MS;
     if (acked > c->tx_len) {

@@ -137,6 +137,13 @@ void knet_report(void) {
             t->connections, t->retransmits, t->resets_sent, t->drop_checksum, t->drop_malformed,
             t->drop_no_socket, t->drop_out_of_window, t->drop_out_of_order, t->drop_backlog_full,
             t->drop_bad_reset);
+    /* **Reported, because an option nobody counts is an option nobody
+     * checks.** SACK is invisible when it works and invisible when it does
+     * not, so the two directions are printed: blocks sent means this stack
+     * told a peer what it was holding, blocks received means it understood a
+     * peer that told it. */
+    kprintf("tcp: sack blocks %u sent, %u received\n", t->sack_blocks_sent,
+            t->sack_blocks_received);
 }
 
 void knet_set_dns(ip4_t dns) {

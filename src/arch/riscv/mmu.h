@@ -45,7 +45,50 @@ int mmu_init(phys_t ram_base, uint64_t ram_bytes);
  * quietly make a megabyte of other peripherals reachable — and on some parts,
  * reachable means a stray write away from reprogrammed. Safe to call twice
  * for the same device; the second call is a no-op rather than an error. */
-int mmu_map_device(phys_t base, uint64_t bytes);
+/* Maps a device's registers and **returns where to reach them**.
+ *
+ * It used to map them identity and return only a status, so every driver
+ * cast the physical address to a pointer. That works exactly as long as the
+ * kernel is identity-mapped, and silently stops the moment it is not — the
+ * driver would then read whatever is at that address in the kernel's own
+ * half. Returning the address makes the dependency explicit and the
+ * conversion impossible to forget: there is nothing else to use.
+ *
+ * `NULL` on failure, so a caller that ignores the error dereferences
+ * nothing rather than the wrong thing. */
+void *mmu_map_device(phys_t base, uint64_t bytes);
+
+/* **A physical address the kernel can read, and the reverse.**
+ *
+ * `mmu_phys_to_virt` answers through the direct map, which covers all of
+ * RAM; it is how the kernel reaches a page table it is building or a page
+ * it is about to hand to a device.
+ *
+ * `mmu_virt_to_phys` is the one that matters for correctness, because
+ * **hardware does not use the kernel's addresses**. Every descriptor and
+ * buffer address written into a device register has to go through it, and
+ * before the kernel moved out of the identity map the two were the same
+ * number — so a missing conversion was invisible. */
+/* How far a kernel address moves when the kernel goes to its own half: the
+ * difference between where it is linked and where it was loaded. Only
+ * meaningful before the jump — afterwards a linker symbol already reads as
+ * its high self. */
+uint64_t mmu_high_offset(void);
+
+/* The kernel image's **physical** bounds, recorded while the linker symbols
+ * still meant them. Anything that reserves the kernel's own memory has to
+ * use these: after the jump the symbols read as high addresses, and a
+ * reservation made from them covers memory that does not exist. */
+void mmu_kernel_phys_range(phys_t *base, uint64_t *bytes);
+
+/* Enters `fn` at the kernel's own address, on `sp_high`, with `a0` and `a1`
+ * as its arguments. **Does not return** — the stack it leaves behind is full
+ * of addresses that are about to stop meaning anything (`arch/riscv/start.S`).
+ */
+void mmu_enter_high(void *fn, uint64_t a0, uint64_t a1, uint64_t sp_high);
+
+void *mmu_phys_to_virt(phys_t phys);
+phys_t mmu_virt_to_phys(const void *virt);
 
 /* The kernel's table, for anything that needs to add to it. */
 struct pgtable *mmu_kernel_table(void);

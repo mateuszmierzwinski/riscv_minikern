@@ -96,6 +96,11 @@ void trap_set_expected(bool (*handler)(struct trapframe *tf));
  * reports whether it took the lock; `exit` is given that answer back. */
 void trap_set_lock(bool (*enter)(void), void (*exit)(bool));
 
+/* Where the trap path reports what it is doing while the kernel lock is held,
+ * so that the longest hold can be attributed to a kind of trap. Optional: a
+ * kernel with no tag port measures the same times and cannot name them. */
+void trap_set_lock_tag(void (*tag)(uint64_t));
+
 /* A hook run on the way back to user mode, after a trap that came from
  * there has been handled. This is where a preemption belongs: inside the
  * interrupt handler the controller has not been told the interrupt is

@@ -53,6 +53,12 @@ struct pci_device {
     uint32_t class_code;  /* class << 16 | subclass << 8 | prog-if */
     phys_t bar0;          /* assigned by this driver, not by firmware */
     uint64_t bar0_size;
+    /* **Where the driver reaches those registers.** The physical address
+     * above is what goes into the device's own BAR; this is what a load or
+     * a store has to use, and the two are only the same number while the
+     * kernel is identity-mapped. Keeping both named separately is what
+     * stops one being used where the other is meant. */
+    void *bar0_virt;
 };
 
 /* Finds the host bridge in the device tree, maps its ECAM region and reads
@@ -87,6 +93,28 @@ void pci_list(void);
 /* Configuration-space access, for a driver that needs more than the walker
  * read. */
 uint32_t pci_config_read32(const struct pci_device *d, uint32_t offset);
+
+/* The device-tree path of the host bridge that was adopted, or NULL.
+ *
+ * For reading the bridge's `interrupts`: a legacy-pin PCIe device raises the
+ * bridge's line, not one of its own, so this is where a driver that wants to
+ * wait for its device has to look. */
+const char *pci_bridge_path(void);
+
+/* Opens the host bridge's INTx demultiplexer, so a legacy-pin device's
+ * interrupt can be acknowledged at the bridge as well as at the device.
+ *
+ * Needed because this controller aggregates INTA-INTD into one PLIC source
+ * and latches which fired in its own register: without clearing that, the
+ * line stays asserted however thoroughly the device is quieted. */
+int pci_bridge_intx_init(const struct fdt *fdt);
+
+/* Clears the bridge's latched INTx bits and returns which were set, as a
+ * four-bit INTA-INTD field.
+ *
+ * **Call it after quieting the device, never before**: a latch cleared while
+ * the device is still asserting is set again immediately. */
+uint32_t pci_bridge_intx_clear(void);
 void pci_config_write32(const struct pci_device *d, uint32_t offset, uint32_t value);
 
 /* Where the bridge is, how many functions exist, and how much window is

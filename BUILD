@@ -140,13 +140,27 @@ cc_test(
 
 cc_library(
     name = "console",
-    srcs = ["src/core/console.c"],
+    srcs = [
+        "src/core/console.c",
+        "src/core/klog.c",
+    ],
     hdrs = [
         "src/core/console.h",
+        "src/core/klog.h",
         "src/core/ports.h",
     ],
     strip_include_prefix = "src",
     deps = [":kfmt"],
+)
+
+cc_test(
+    name = "klog_test",
+    size = "small",
+    srcs = ["test/klog_test.c"],
+    deps = [
+        ":console",
+        ":ktest",
+    ],
 )
 
 # The physical page allocator and the kernel heap: carried over, pure, and
@@ -353,6 +367,7 @@ cc_library(
         "src/core/net/net_echo.c",
         "src/core/net/net_eth.c",
         "src/core/net/net_ipv4.c",
+        "src/core/net/net_route.c",
         "src/core/net/net_tcp.c",
         "src/core/net/net_tcp_in.c",
         "src/core/net/net_tcp_out.c",
@@ -374,6 +389,16 @@ cc_library(
     deps = [
         ":core_boot",
         ":kfmt",
+    ],
+)
+
+cc_test(
+    name = "route_test",
+    size = "small",
+    srcs = ["test/route_test.c"],
+    deps = [
+        ":ktest",
+        ":net",
     ],
 )
 
@@ -517,6 +542,7 @@ cc_library(
     strip_include_prefix = "src",
     target_compatible_with = ["//platforms:riscv64"],
     deps = [
+        ":arch_riscv",
         ":console",
         ":memory",
         ":pgtable",
@@ -623,6 +649,77 @@ cc_test(
 # cheapest possible defence against the mistake this project has made twice
 # with memory-mapped registers.
 cc_library(
+    name = "drivers_spi",
+    srcs = ["src/drivers/spi_pl022.c"],
+    hdrs = ["src/drivers/spi_pl022.h"],
+    strip_include_prefix = "src",
+    target_compatible_with = ["//platforms:riscv64"],
+    deps = [
+        ":arch_riscv",
+        ":console",
+        ":core_boot",
+        ":drivers_gpio",
+    ],
+)
+
+cc_library(
+    name = "drivers_usb",
+    srcs = ["src/drivers/xhci.c"],
+    hdrs = ["src/drivers/xhci.h"],
+    strip_include_prefix = "src",
+    target_compatible_with = ["//platforms:riscv64"],
+    deps = [
+        ":arch_riscv",
+        ":console",
+        ":core_boot",
+        ":drivers_pci",
+        ":kernel_mem",
+    ],
+)
+
+cc_library(
+    name = "drivers_wdt",
+    srcs = ["src/drivers/wdt_jh7110.c"],
+    hdrs = ["src/drivers/wdt_jh7110.h"],
+    strip_include_prefix = "src",
+    target_compatible_with = ["//platforms:riscv64"],
+    deps = [
+        ":arch_riscv",
+        ":console",
+        ":core_boot",
+        ":drivers_gpio",
+    ],
+)
+
+cc_library(
+    name = "drivers_pwm",
+    srcs = ["src/drivers/pwm_jh7110.c"],
+    hdrs = ["src/drivers/pwm_jh7110.h"],
+    strip_include_prefix = "src",
+    target_compatible_with = ["//platforms:riscv64"],
+    deps = [
+        ":arch_riscv",
+        ":console",
+        ":core_boot",
+        ":drivers_gpio",
+    ],
+)
+
+cc_library(
+    name = "drivers_temp",
+    srcs = ["src/drivers/temp_jh7110.c"],
+    hdrs = ["src/drivers/temp_jh7110.h"],
+    strip_include_prefix = "src",
+    target_compatible_with = ["//platforms:riscv64"],
+    deps = [
+        ":arch_riscv",
+        ":console",
+        ":core_boot",
+        ":drivers_gpio",
+    ],
+)
+
+cc_library(
     name = "drivers_i2c",
     srcs = ["src/drivers/i2c_dw.c"],
     hdrs = ["src/drivers/i2c_dw.h"],
@@ -688,6 +785,7 @@ cc_library(
     strip_include_prefix = "src",
     target_compatible_with = ["//platforms:riscv64"],
     deps = [
+        ":irqwait",
         ":arch_riscv",
         ":console",
         ":drivers_sdcard",
@@ -737,6 +835,7 @@ cc_library(
     strip_include_prefix = "src",
     target_compatible_with = ["//platforms:riscv64"],
     deps = [
+        ":irqwait",
         ":arch_riscv",
         ":console",
         ":core_boot",
@@ -754,7 +853,8 @@ cc_library(
     hdrs = ["src/drivers/ramdisk.h"],
     strip_include_prefix = "src",
     target_compatible_with = ["//platforms:riscv64"],
-    deps = [":storage"],
+    deps = [
+        ":arch_riscv",":storage"],
 )
 
 cc_library(
@@ -791,6 +891,8 @@ cc_library(
         "src/kernel/sys_proc.c",
         "src/kernel/sys_socket.c",
         "src/kernel/seccomp.c",
+        "src/kernel/sock_netlink.c",
+        "src/kernel/sock_unix.c",
         "src/kernel/sock_udp.c",
         "src/kernel/socket.c",
         "src/kernel/file.c",
@@ -802,6 +904,7 @@ cc_library(
         "src/arch/riscv/sigframe.h",
         "src/kernel/fdobjects.h",
         "src/kernel/tty.h",
+        "src/kernel/netlink.h",
         "src/kernel/socket.h",
         "src/kernel/file.h",
         "src/kernel/signal.h",
@@ -824,6 +927,8 @@ cc_library(
         ":fair",
         ":kernel_mem",
         ":kernel_swap",
+        ":kernel_procfs",
+        ":kernel_wallclock",
         ":kernel_net",
         ":kernel_xfs",
         ":kernel_random",
@@ -838,16 +943,47 @@ cc_library(
 # bytes. Carried over; what seeds it is a question for later (the ARM
 # project ended up harvesting interrupt arrival times, because its seed was
 # constant under emulation).
+# **Waiting for a device instead of watching it.** Above `arch_riscv` and
+# `klock` both, because it needs the interrupt controller from one and the
+# ability to let go of the lock from the other — and `klock` already depends
+# on `arch_riscv`, so a library needing both cannot live inside either.
+#
+# The scheduler is *installed* rather than depended on (`irqwait_set_sleeper`),
+# which is what keeps this below the scheduler and so usable by a driver.
+cc_library(
+    name = "irqwait",
+    srcs = ["src/kernel/irqwait.c"],
+    hdrs = ["src/kernel/irqwait.h"],
+    strip_include_prefix = "src",
+    target_compatible_with = ["//platforms:riscv64"],
+    deps = [
+        ":arch_riscv",
+        ":console",
+        ":klock",
+    ],
+)
+
 cc_library(
     name = "kernel_random",
-    srcs = [
-        "src/kernel/entropy.c",
-        "src/kernel/random.c",
+    srcs = ["src/kernel/random.c"],
+    hdrs = ["src/kernel/random.h"],
+    strip_include_prefix = "src",
+    deps = [
+        ":crypto_hash",
+        ":entropy",
     ],
-    hdrs = [
-        "src/kernel/entropy.h",
-        "src/kernel/random.h",
-    ],
+)
+
+# **The entropy pool, on its own.** It was part of `kernel_random`, which
+# the architecture layer may not depend on — and the architecture layer is
+# where the samples come from, because the trap path is the only place that
+# sees how long real work took. Splitting it lets the sampler and the
+# consumer both depend on the pool without the lower layer depending on the
+# higher one.
+cc_library(
+    name = "entropy",
+    srcs = ["src/kernel/entropy.c"],
+    hdrs = ["src/kernel/entropy.h"],
     strip_include_prefix = "src",
     deps = [":crypto_hash"],
 )
@@ -878,6 +1014,27 @@ cc_library(
         ":drivers_gpio",
         ":drivers_i2c",
     ],
+)
+
+cc_library(
+    name = "kernel_wallclock",
+    srcs = ["src/kernel/wallclock.c"],
+    hdrs = ["src/kernel/wallclock.h"],
+    strip_include_prefix = "src",
+    target_compatible_with = ["//platforms:riscv64"],
+    deps = [
+        ":arch_riscv",
+        ":core_boot",
+    ],
+)
+
+cc_library(
+    name = "kernel_procfs",
+    srcs = ["src/kernel/procfs.c"],
+    hdrs = ["src/kernel/procfs.h"],
+    strip_include_prefix = "src",
+    target_compatible_with = ["//platforms:riscv64"],
+    deps = [":core_boot"],
 )
 
 cc_library(
@@ -960,6 +1117,7 @@ cc_library(
         ":crypto_hash",
         ":kernel_disk",
         ":kernel_mem",
+        ":kernel_wallclock",
         ":kernel_volumes",
         ":xfs",
     ],
@@ -1026,6 +1184,7 @@ cc_library(
     strip_include_prefix = "src",
     target_compatible_with = ["//platforms:riscv64"],
     deps = [
+        ":entropy",
         ":console",
         ":pgtable",
     ],
@@ -1061,6 +1220,13 @@ cc_library(
         ":arch_riscv",
         ":console",
         ":core_boot",
+        ":drivers_i2c",
+        ":drivers_pwm",
+        ":drivers_temp",
+        ":kernel_procfs",
+        ":drivers_usb",
+        ":drivers_spi",
+        ":drivers_wdt",
         ":drivers_gpio",
         ":drivers_pci",
         ":drivers_virtio",
@@ -1120,9 +1286,44 @@ kernel_binary(
     ],
 )
 
+# **The board link, emitted as an ELF so it has symbols.** Identical to
+# `kernel_board` in every input and link option but `--oformat=binary`, so an
+# address printed by the running kernel resolves here exactly. Needed because
+# the image a loader takes is flat and carries no symbol table, and the QEMU
+# kernel is linked at a different address with a different layout — resolving
+# a board address against it gives a plausible symbol rather than the right
+# one, which is worse than no answer.
+kernel_binary(
+    name = "kernel_board_elf",
+    srcs = [],
+    load_address = "0x40200000",
+    tags = ["manual"],
+    deps = [
+        ":arch_riscv",
+        ":board_jh7110",
+        ":drivers_gpio",
+        ":drivers_pci",
+        ":drivers_virtio",
+        ":kernel_disk",
+        ":kernel_mem",
+        ":kernel_swap",
+        ":kernel_uspace",
+        ":kernel_xfs",
+        ":kmem",
+    ],
+)
+
 kernel_image(
     name = "minikern_board",
     kernel = ":kernel_board",
+    tags = ["manual"],
+)
+
+# The symbol-bearing twin, through the same board transition. `nm` on this
+# resolves an address the running board printed.
+kernel_image(
+    name = "minikern_board_elf",
+    kernel = ":kernel_board_elf",
     tags = ["manual"],
 )
 
@@ -1145,6 +1346,55 @@ kernel_image(
 # §0). It **passes** — raw clone, atomics and a futex mutex are all correct
 # at this scale — which is what narrowed the remaining fault to something a
 # Go runtime does that this does not.
+# Resolves a name from user space, which is the roadmap's DNS item: the
+# resolver's address was learned from DHCP and stored where nothing in user
+# space could read it. Exits with a bitmask of the steps that passed.
+# Two threads talking over a unix-domain socket, which is the roadmap's
+# "nothing local can talk over a socket". Exits with a bitmask of the checks
+# that passed.
+# Asks the kernel what interfaces exist, over netlink — the roadmap's "no way
+# for a program to ask what interfaces exist". It parses the replies by
+# stepping the message lengths, because a test that only checked bytes came
+# back would pass against an encoder whose lengths are wrong.
+user_binary(
+    name = "netlinkask",
+    srcs = [
+        "src/userland/netlink/main.c",
+        "src/userland/start.S",
+    ],
+)
+
+user_image(
+    name = "netlinkask.elf",
+    program = ":netlinkask",
+)
+
+user_binary(
+    name = "unixsock",
+    srcs = [
+        "src/userland/start.S",
+        "src/userland/unixsock/main.c",
+    ],
+)
+
+user_image(
+    name = "unixsock.elf",
+    program = ":unixsock",
+)
+
+user_binary(
+    name = "resolve",
+    srcs = [
+        "src/userland/resolve/main.c",
+        "src/userland/start.S",
+    ],
+)
+
+user_image(
+    name = "resolve.elf",
+    program = ":resolve",
+)
+
 user_binary(
     name = "race",
     srcs = [

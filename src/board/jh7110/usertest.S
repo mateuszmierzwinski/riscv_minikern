@@ -2954,3 +2954,209 @@ ps_write_broken:
     ecall
 11: j       11b
 user_privsep_end:
+
+/* **Address randomisation, reported so that two runs can be compared.**
+ *
+ * The program cannot test randomness by itself — one sample is one sample,
+ * and a program that "checked" its own addresses were random would be
+ * asserting something unfalsifiable from the inside. So it prints three
+ * addresses and the harness runs it twice: the claim is that they differ
+ * between runs, and that is a claim only the harness can make.
+ *
+ * The three are chosen because they are the three the roadmap named:
+ *   - the stack, read from `sp`;
+ *   - the heap, from `brk(0)`;
+ *   - a mapping, from `mmap(NULL, 4096, ...)`.
+ *
+ * Printed as raw hex through `write`, because there is no `printf` here.
+ */
+#define SYS_BRK_N 214
+#define SYS_MMAP_N 222
+
+    .globl user_aslr_start
+    .globl user_aslr_end
+    .balign 4
+user_aslr_start:
+    addi    sp, sp, -64
+    mv      s0, sp                  /* keep the buffer, sp changes below */
+
+    /* "sp=" then the stack pointer. */
+    mv      s2, sp
+    li      t0, 's'
+    sb      t0, 0(s0)
+    li      t0, 'p'
+    sb      t0, 1(s0)
+    li      t0, '='
+    sb      t0, 2(s0)
+    li      a0, 1
+    mv      a1, s0
+    li      a2, 3
+    li      a7, SYS_WRITE
+    ecall
+    mv      a0, s2
+    jal     aslr_put_hex
+
+    /* "brk=" then brk(0). */
+    li      t0, 'b'
+    sb      t0, 0(s0)
+    li      t0, 'r'
+    sb      t0, 1(s0)
+    li      t0, 'k'
+    sb      t0, 2(s0)
+    li      t0, '='
+    sb      t0, 3(s0)
+    li      a0, 1
+    mv      a1, s0
+    li      a2, 4
+    li      a7, SYS_WRITE
+    ecall
+    li      a0, 0
+    li      a7, SYS_BRK_N
+    ecall
+    jal     aslr_put_hex
+
+    /* "map=" then an anonymous mapping's address. */
+    li      t0, 'm'
+    sb      t0, 0(s0)
+    li      t0, 'a'
+    sb      t0, 1(s0)
+    li      t0, 'p'
+    sb      t0, 2(s0)
+    li      t0, '='
+    sb      t0, 3(s0)
+    li      a0, 1
+    mv      a1, s0
+    li      a2, 4
+    li      a7, SYS_WRITE
+    ecall
+    li      a0, 0
+    li      a1, 4096
+    li      a2, 3                   /* PROT_READ|PROT_WRITE */
+    li      a3, 0x22                /* MAP_PRIVATE|MAP_ANONYMOUS */
+    li      a4, -1
+    li      a5, 0
+    li      a7, SYS_MMAP_N
+    ecall
+    jal     aslr_put_hex
+
+    li      a0, 0
+    li      a7, SYS_EXIT_GROUP
+    ecall
+
+/* Writes a0 as sixteen hex digits and a newline. Clobbers t0..t4, a0..a2. */
+aslr_put_hex:
+    mv      s1, ra
+    mv      t3, a0
+    li      t4, 60                  /* the shift for the top nibble */
+aslr_hex_loop:
+    srl     t0, t3, t4
+    andi    t0, t0, 15
+    li      t1, 10
+    blt     t0, t1, aslr_hex_digit
+    addi    t0, t0, 'a' - 10
+    j       aslr_hex_emit
+aslr_hex_digit:
+    addi    t0, t0, '0'
+aslr_hex_emit:
+    sb      t0, 16(s0)
+    li      a0, 1
+    addi    a1, s0, 16
+    li      a2, 1
+    li      a7, SYS_WRITE
+    ecall
+    addi    t4, t4, -4
+    bgez    t4, aslr_hex_loop
+    li      t0, '\n'
+    sb      t0, 16(s0)
+    li      a0, 1
+    addi    a1, s0, 16
+    li      a2, 1
+    li      a7, SYS_WRITE
+    ecall
+    mv      ra, s1
+    ret
+12: j       12b
+user_aslr_end:
+
+/* **`/dev/virtual/kernel_logger`, read the way a program reads it.**
+ *
+ * The kernel cannot test this for itself: a descriptor needs a process's
+ * table, and the first attempt at this check — from the boot path — was
+ * refused with `EBADF`, which was the fd layer telling the truth.
+ *
+ * It opens the device, reads it to the end, and counts newlines. A log tail
+ * that opened and returned nothing would pass a test that only checked the
+ * open, which is the usual way a device file comes to be "working".
+ *
+ * 0 means it opened and gave at least one whole line; 171 that it would not
+ * open, 172 that it opened and gave nothing.
+ */
+#define SYS_OPENAT_N 56
+#define SYS_READ_N 63
+#define SYS_CLOSE_N 57
+#define AT_FDCWD_N -100
+
+    .globl user_klogdev_start
+    .globl user_klogdev_end
+    .balign 4
+user_klogdev_start:
+    addi    sp, sp, -512
+    /* The path, built on the stack: "/dev/virtual/kernel_logger" */
+    la      t0, klogdev_path
+    mv      t1, sp
+1:  lb      t2, 0(t0)
+    sb      t2, 0(t1)
+    addi    t0, t0, 1
+    addi    t1, t1, 1
+    bnez    t2, 1b
+
+    li      a0, AT_FDCWD_N
+    mv      a1, sp
+    li      a2, 0                   /* O_RDONLY */
+    li      a3, 0
+    li      a7, SYS_OPENAT_N
+    ecall
+    bltz    a0, kd_no_open
+    mv      s3, a0                  /* the descriptor */
+    li      s2, 0                   /* newlines seen */
+
+kd_loop:
+    mv      a0, s3
+    addi    a1, sp, 64
+    li      a2, 256
+    li      a7, SYS_READ_N
+    ecall
+    blez    a0, kd_done
+    mv      t3, a0
+    addi    t4, sp, 64
+2:  lb      t5, 0(t4)
+    li      t6, 10
+    bne     t5, t6, 3f
+    addi    s2, s2, 1
+3:  addi    t4, t4, 1
+    addi    t3, t3, -1
+    bnez    t3, 2b
+    j       kd_loop
+
+kd_done:
+    mv      a0, s3
+    li      a7, SYS_CLOSE_N
+    ecall
+    beqz    s2, kd_empty
+    li      a0, 0
+    li      a7, SYS_EXIT_GROUP
+    ecall
+kd_no_open:
+    li      a0, 171
+    li      a7, SYS_EXIT_GROUP
+    ecall
+kd_empty:
+    li      a0, 172
+    li      a7, SYS_EXIT_GROUP
+    ecall
+    .balign 8
+klogdev_path:
+    .asciz "/dev/virtual/kernel_logger"
+    .balign 4
+13: j       13b
+user_klogdev_end:
