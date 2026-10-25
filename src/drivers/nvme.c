@@ -8,6 +8,7 @@
 #include "core/console.h"
 #include "core/errno.h"
 #include "drivers/pci.h"
+#include "arch/riscv/plic.h"
 #include "kernel/irqwait.h"
 #include "kernel/mem.h"
 
@@ -94,6 +95,7 @@ static struct irqwait nvme_done;
 static bool nvme_irq_armed;
 static bool nvme_probe_only;
 static bool nvme_said_how_the_first_went;
+static bool nvme_handler_spoke;
 
 void nvme_irq_probe_only(bool on) {
     nvme_probe_only = on;
@@ -163,6 +165,8 @@ static void write_reg(uint32_t off, uint32_t v) {
     nvme.regs[off / 4u] = v;
 }
 
+static uint32_t nvme_plic_source;
+
 static uint32_t quiet_the_pin(void) {
     /* **The device first, the bridge second.** The controller aggregates
      * INTA-INTD into one PLIC source and latches which fired; clearing that
@@ -171,8 +175,37 @@ static uint32_t quiet_the_pin(void) {
      * is the bridge's latch cleared. Reversing these two is the difference
      * between a working wait and a machine that takes one interrupt for
      * ever — which is how this arrived at two functions. */
+    /* **Masked at the interrupt controller, because nothing else can drop
+     * the line here.**
+     *
+     * A pin-based NVMe interrupt is deasserted when the completion is
+     * *consumed* — when the head doorbell moves — and only the waiter can
+     * do that, after it has read the entry. Masking the drive's vector was
+     * tried and is not enough: a pending assertion survives it. Clearing
+     * the bridge's latch was tried and is not enough either: the drive
+     * re-asserts and it latches again. Both of those were a boot each.
+     *
+     * So the source is masked at the PLIC, which is the one thing that
+     * cannot be re-asserted from outside, and `submit` re-enables it once
+     * the completion has been taken off the ring. That is the ordinary
+     * treatment of a level-triggered line shared by a whole bridge, and it
+     * is what this should have been from the start. */
+    plic_disable(nvme_plic_source);
     write_reg(NVME_INTMS, 1u);
-    return pci_bridge_intx_clear();
+    {
+        uint32_t intx = pci_bridge_intx_clear();
+        /* **Once, and only to establish that this runs at all.** The wait
+         * region does not terminate although it spins against a deadline,
+         * and the two explanations — the handler never runs, or it runs and
+         * something after it does not return — want opposite
+         * investigations. One line, guarded, cannot flood even if this is
+         * being re-entered. */
+        if (!nvme_handler_spoke) {
+            nvme_handler_spoke = true;
+            kprintf("nvme: the handler ran; intx %x\n", intx);
+        }
+        return intx;
+    }
 }
 
 static uint32_t read_reg(uint32_t off) {
@@ -242,6 +275,16 @@ static int submit(struct nvme_queue *q, const struct nvme_command *cmd, uint32_t
      * can re-raise and set `fired` again. Clearing it here rather than after
      * the transfer means the next wait cannot return immediately on the
      * last transfer's echo and then find no completion in the ring. */
+    if (nvme_irq_armed && !nvme_said_how_the_first_went) {
+        /* **Which side of the wait the hang is on.**
+         *
+         * `irqwait_wait` spins against a deadline and cannot hang, yet the
+         * report after it never appears — so either the first command is
+         * never submitted, or the hart is re-entering the trap and the spin
+         * never advances. This says which, and the two want opposite
+         * investigations. */
+        kprintf("nvme: submitting the first waited command\n");
+    }
     irqwait_rearm(&nvme_done);
     /* **Unmasked per command, not once at arming.** The handler masks to
      * stop a level-triggered pin re-raising, so something has to lift it;
@@ -294,6 +337,14 @@ static int submit(struct nvme_queue *q, const struct nvme_command *cmd, uint32_t
              * got wrong (nvme.h). */
             q->phase = q->cq_head == 0 ? !q->phase : q->phase;
             ring(q->id, true, q->cq_head);
+            /* **The head has moved, so the drive has stopped asserting**:
+             * the source the handler masked can be let back in. Doing it
+             * here rather than at the top of the next command means an
+             * interrupt that arrives between two commands is still
+             * delivered rather than silently dropped. */
+            if (nvme_irq_armed) {
+                plic_enable(nvme_plic_source);
+            }
             return status == 0 ? KERR_OK : KERR_IO;
         }
     }
@@ -335,6 +386,74 @@ static int submit(struct nvme_queue *q, const struct nvme_command *cmd, uint32_t
  * replaced and looks identical from outside. */
 uint64_t nvme_interrupts_missed_count(void) {
     return nvme_interrupts_missed;
+}
+
+static int nvme_read(void *self, uint64_t lba, uint32_t count, void *buf);
+
+/* Finds which word of the bridge's window a completion moves, and which bit.
+ *
+ * **The measurement this driver's one guess needs.** `ISTATUS_LOCAL 0x184`
+ * and `INTA` at bit 24 are the PLDA offsets as Linux uses them for this IP;
+ * with them the first interrupt-driven command hangs inside the trap
+ * handler, which is what an uncleared latch looks like. Four register maps
+ * in this kernel have been guessed wrong and every one was settled by
+ * dumping the window in a single boot, so this does that: snapshot the
+ * window, let the drive complete a command with its own interrupt
+ * unmasked, snapshot again, and print what differs.
+ *
+ * Nothing is enabled at the interrupt controller, so a wrong guess costs a
+ * boot's output rather than a hung board. The drive's own mask is opened
+ * because a device that is not asserting cannot make the bridge latch
+ * anything — that is the whole point of the exercise.
+ */
+void nvme_measure_intx(const struct fdt *fdt) {
+    enum { FIRST = 0x100u / 4u, LAST = 0x200u / 4u };
+    const volatile uint32_t *apb;
+    uint64_t bytes = 0;
+    uint32_t before[LAST - FIRST];
+    uint8_t block[512];
+    if (!nvme.up) {
+        return;
+    }
+    apb = pci_bridge_apb(fdt, &bytes);
+    if (apb == NULL || bytes < 0x200u) {
+        kprintf("nvme: no apb window to measure\n");
+        return;
+    }
+    for (uint32_t i = 0; i < LAST - FIRST; i++) {
+        before[i] = apb[FIRST + i];
+    }
+    write_reg(NVME_INTMC, 1u); /* let the drive assert; nothing listens */
+    (void)nvme_read(NULL, 0, 1, block);
+    for (uint32_t i = 0; i < LAST - FIRST; i++) {
+        uint32_t now = apb[FIRST + i];
+        if (now != before[i]) {
+            kprintf("nvme: apb +%03x changed %08x -> %08x\n", (FIRST + i) * 4u, before[i], now);
+        }
+    }
+    kprintf("nvme: apb +180 %08x +184 %08x (the assumed mask and status)\n",
+            apb[0x180u / 4u], apb[0x184u / 4u]);
+    /* **Does the latch answer to a write of 1s?** Nothing read can say, and
+     * it is the question the hang turns on: if bit 24 clears and stays
+     * clear, the offsets are right and the fault is re-assertion; if it
+     * does not clear, the register or its semantics are wrong. The drive is
+     * masked first so it cannot be re-asserting while this is tried. */
+    write_reg(NVME_INTMS, 1u);
+    pci_bridge_apb_poke(fdt, 0x184u, 0x0f000000u);
+    kprintf("nvme: after writing 1s to +184 with the drive masked: %08x\n",
+            apb[0x184u / 4u]);
+    pci_bridge_apb_poke(fdt, 0x184u, 0xffffffffu);
+    kprintf("nvme: after writing 1s to every bit of +184: %08x\n", apb[0x184u / 4u]);
+    /* **Do bits 19 and 23 come back?** That is the question the hang turns
+     * on now. If they re-assert on their own they are a live source, and
+     * whether they can pull the line depends on the mask's polarity —
+     * `+180` reads `ff77ffff`, which either enables everything but those
+     * two or enables only those two, and the two readings demand opposite
+     * writes. A source that re-asserts while enabled is a permanent
+     * assertion, which is what arming the PLIC walks into. */
+    for (uint32_t look = 0; look < 3u; look++) {
+        kprintf("nvme: +184 a moment later: %08x\n", apb[0x184u / 4u]);
+    }
 }
 
 int nvme_use_interrupts(const struct fdt *fdt) {
@@ -430,6 +549,15 @@ int nvme_use_interrupts(const struct fdt *fdt) {
         kprintf("nvme: the bridge's INTx cannot be demultiplexed (rc %d); staying polled\n", rc);
         return rc;
     }
+    /* **The number the handler needs, before the handler can run.**
+     *
+     * `irqwait_arm` installs the handler *and* enables the source, so
+     * anything set afterwards is not set for the first interrupt — and this
+     * handler masks `nvme_plic_source`, which would still be zero. That is
+     * this file's own recorded rule, broken here: a port installed late is
+     * a port that was not installed. It has cost this tree three bugs, and
+     * reading the code for a different reason is how it was noticed. */
+    nvme_plic_source = source;
     rc = irqwait_arm(&nvme_done, source, quiet_the_pin);
     if (rc != KERR_OK) {
         kprintf("nvme: interrupt %u could not be armed (rc %d); completions stay polled\n",

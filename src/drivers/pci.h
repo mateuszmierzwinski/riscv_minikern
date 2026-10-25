@@ -109,6 +109,15 @@ const char *pci_bridge_path(void);
  * line stays asserted however thoroughly the device is quieted. */
 int pci_bridge_intx_init(const struct fdt *fdt);
 
+/* The bridge's control window, mapped and otherwise untouched, for measuring
+ * which register and which bit a real completion actually moves. Enables
+ * nothing, so it cannot storm. */
+const volatile uint32_t *pci_bridge_apb(const struct fdt *fdt, uint64_t *bytes);
+
+/* Writes one word of that window, for establishing whether the interrupt
+ * latch answers to a write of 1s. Enables nothing. */
+void pci_bridge_apb_poke(const struct fdt *fdt, uint32_t offset, uint32_t value);
+
 /* Clears the bridge's latched INTx bits and returns which were set, as a
  * four-bit INTA-INTD field.
  *

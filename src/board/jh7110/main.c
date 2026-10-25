@@ -3490,6 +3490,12 @@ static void kmain_high(uint64_t hart, uint64_t dtb) {
      * node, it is the attached disk on this board where the card is not, and
      * the card's write path through the interrupt is the unfinished part
      * above — none of which is a reason to leave the drive polling. */
+    if (cmdline_has(boot_cmdline, "minikern.nvmeirqmeasure")) {
+        struct fdt fdt;
+        if (fdt_open(&fdt, (const void *)(uintptr_t)dtb, FDT_MAX_BYTES) == KERR_OK) {
+            nvme_measure_intx(&fdt);
+        }
+    }
     if (cmdline_has(boot_cmdline, "minikern.nvmeirq") ||
         cmdline_has(boot_cmdline, "minikern.nvmeirqprobe")) {
         nvme_irq_probe_only(cmdline_has(boot_cmdline, "minikern.nvmeirqprobe"));

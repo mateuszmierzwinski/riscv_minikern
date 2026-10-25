@@ -227,6 +227,47 @@ static int reg_index_named(const struct fdt *fdt, const char *path, const char *
     return -1;
 }
 
+/* Maps the bridge's control window without touching a single bit of it.
+ *
+ * For measuring rather than using: the offsets this file assumes for the
+ * interrupt status are the one part of the demultiplexer that was taken from
+ * a document instead of from the board, and the way to settle that is to
+ * watch the window across a real completion. Unmasking nothing means the
+ * PLIC source is never enabled, so this cannot storm however wrong the
+ * guess turns out to be. */
+/* Writes one word of the bridge's window, for the clear-semantics test only.
+ *
+ * The measurement that matters is whether the latch at `+184` answers to a
+ * write of 1s, which no amount of reading can establish. It is separate from
+ * `pci_bridge_intx_clear` because that one is the production path and this
+ * one must be able to try an offset that turns out to be the wrong one. */
+void pci_bridge_apb_poke(const struct fdt *fdt, uint32_t offset, uint32_t value) {
+    uint64_t bytes = 0;
+    const volatile uint32_t *apb = pci_bridge_apb(fdt, &bytes);
+    if (apb == NULL || bytes < offset + 4u) {
+        return;
+    }
+    ((volatile uint32_t *)apb)[offset / 4u] = value;
+}
+
+const volatile uint32_t *pci_bridge_apb(const struct fdt *fdt, uint64_t *bytes) {
+    const char *path = pci_bridge_path();
+    phys_t base = 0;
+    uint64_t size = 0;
+    int which;
+    if (path == NULL) {
+        return NULL;
+    }
+    which = reg_index_named(fdt, path, "apb");
+    if (which < 0 || fdt_device_reg(fdt, path, (uint32_t)which, &base, &size) != KERR_OK) {
+        return NULL;
+    }
+    if (bytes != NULL) {
+        *bytes = size;
+    }
+    return (const volatile uint32_t *)mmu_map_device(base, size);
+}
+
 int pci_bridge_intx_init(const struct fdt *fdt) {
     const char *path = pci_bridge_path();
     phys_t base = 0;
@@ -262,8 +303,23 @@ int pci_bridge_intx_init(const struct fdt *fdt) {
     /* **Cleared before unmasked.** Anything latched from before the kernel
      * was looking would otherwise arrive the moment the mask opens, as an
      * interrupt for a completion nobody is waiting for. */
-    plda_apb[PLDA_ISTATUS_LOCAL / 4u] = PLDA_INTX_MASK;
-    plda_apb[PLDA_IMASK_LOCAL / 4u] = plda_apb[PLDA_IMASK_LOCAL / 4u] | PLDA_INTX_MASK;
+    /* **Every latched bit, not just the INTx ones — and the mask is left
+     * exactly as the firmware set it.**
+     *
+     * Measured on the board: `+184` reads `01880000` before the kernel has
+     * enabled anything, so bits 19 and 23 are latched as well as `INTA` at
+     * 24, and a write of 1s clears all three. The first version cleared only
+     * bits 24-27 and then enabled the source, which left two asserted bits
+     * behind — and an asserted source enabled at the controller is a trap
+     * that re-enters for ever.
+     *
+     * The mask is not touched because its polarity is the one thing still
+     * not established: `+180` reads `ff77ffff`, which is either "everything
+     * but 19 and 23 is enabled" or its exact opposite, and the two readings
+     * call for opposite writes. Leaving it alone is correct under both —
+     * the firmware's own setting already lets `INTA` through, which is why
+     * the storm happened at all. */
+    plda_apb[PLDA_ISTATUS_LOCAL / 4u] = 0xffffffffu;
     kprintf("pci: %s INTx demultiplexer at %016llx\n", path, (unsigned long long)base);
     return KERR_OK;
 }
@@ -273,11 +329,14 @@ uint32_t pci_bridge_intx_clear(void) {
     if (plda_apb == NULL) {
         return 0;
     }
-    status = plda_apb[PLDA_ISTATUS_LOCAL / 4u] & PLDA_INTX_MASK;
+    status = plda_apb[PLDA_ISTATUS_LOCAL / 4u];
     if (status != 0) {
+        /* All of it, for the reason `init` gives: a bit left latched in a
+         * source that is enabled keeps the line asserted, and this handler
+         * has no way to know which of the others the firmware enabled. */
         plda_apb[PLDA_ISTATUS_LOCAL / 4u] = status;
     }
-    return status >> PLDA_INTX_SHIFT;
+    return (status & PLDA_INTX_MASK) >> PLDA_INTX_SHIFT;
 }
 
 static int adopt_bridge(const struct fdt *fdt, const char *path) {

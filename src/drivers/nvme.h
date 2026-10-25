@@ -55,6 +55,11 @@ int nvme_use_interrupts(const struct fdt *fdt);
  * enabling the wrong one causes. */
 void nvme_irq_probe_only(bool on);
 
+/* Reports which word of the PCIe bridge's control window a real completion
+ * moves, and which bit — the measurement the interrupt path's one remaining
+ * assumption needs. Enables nothing at the interrupt controller. */
+void nvme_measure_intx(const struct fdt *fdt);
+
 /* Waits that timed out rather than being woken — the number that says
  * whether arming actually helped. */
 uint64_t nvme_interrupts_missed_count(void);

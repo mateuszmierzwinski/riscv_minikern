@@ -2208,7 +2208,41 @@ Measured on the board, so these are gaps with numbers rather than guesses.
       ordering rules hold: clear before unmasking, and quiet the device
       before clearing the bridge.
 
-      What is still wrong is the offsets. `IMASK_LOCAL 0x180`,
+      **The offsets were right, and measuring them moved the problem
+      somewhere more interesting.** Poked on the board: `+184` answers to a
+      write of 1s, bit 24 clears on a targeted write, and bits 19 and 23
+      clear with a full write and do **not** come back — so the register is
+      at `0x184`, it is write-1-to-clear, `INTA` is bit 24, and there is no
+      live source re-asserting behind it. Four boots to establish, and worth
+      every one: three different theories died on those three facts.
+
+      Two findings came out of the run that followed, and the second is the
+      one to chase next.
+
+      - **Source 57 fires with no INTx bit set, before any command is
+        submitted.** The handler's one-shot report prints `intx 0` *ahead of*
+        "submitting the first waited command". So the aggregated source
+        delivers something that is not the drive — a spurious claim, or one
+        of the bridge's other events — and every theory in this entry up to
+        now assumed the first interrupt would be a completion. It is not.
+      - **The wait region does not honour its deadline.** `irqwait_wait`
+        spins against `timer_ns() >= deadline` and returns `KERR_TIMEDOUT`,
+        so a command whose interrupt never arrives must report that within
+        two seconds. It does not: the one-shot report after the wait never
+        prints, even in a run where the PLIC source was masked by that first
+        spurious interrupt and therefore could not fire again. That is a
+        defect in `irqwait` rather than in this driver, and it is the reason
+        the symptom reads as a storm — the one explanation the evidence now
+        rules out.
+
+      A real latent bug was fixed on the way, found by reading the code for
+      another reason: `nvme_plic_source` was assigned *after* `irqwait_arm`,
+      which installs the handler and enables the source in one call — so the
+      first interrupt would have masked source 0. That is this file's own
+      rule ("a port installed late is a port that was not installed")
+      broken in new code, for the fourth time in this tree.
+
+      What is still open: `IMASK_LOCAL 0x180`,
       `ISTATUS_LOCAL 0x184` and `INTA` at bit 24 are taken from Linux's
       driver for the same IP, not measured here, and with them the first
       command hangs **inside the trap handler** — `irqwait_wait` spins
@@ -2217,7 +2251,8 @@ Measured on the board, so these are gaps with numbers rather than guesses.
       elsewhere on this variant, or its bits are not write-1-to-clear, or
       `INTA` is not bit 24.
 
-      That makes this the **fifth** guessed register map in this tree, after
+      Reaching for a document instead of the board made this the **fifth**
+      guessed register map in this tree, after
       the SD controller, the GMAC generation, the watchdog and the
       temperature sensor. Every one of those was settled by dumping the
       window in a single boot, and not one by a document. Dumping
