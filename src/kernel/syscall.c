@@ -1051,6 +1051,52 @@ static int64_t sys_getdents64(struct trapframe *tf) {
  * accepted and ignored — this filesystem writer sets 0755 on a directory
  * itself, and pretending to honour a mode it does not store would be a
  * worse answer than visibly not taking one. */
+/* Joins a relative path onto the working directory, in place.
+ *
+ * **This is what makes `chdir` a setting rather than a stored string.** The
+ * whole kernel took absolute paths and answered `ENOENT` to anything else,
+ * so a working directory nobody resolved against would have been the
+ * "declared but never consulted" failure this tree has recorded seven
+ * times. Every path-taking syscall goes through `copy_in_path`, so doing it
+ * here does it once.
+ *
+ * `.` and `..` are **not** resolved, and that is a refusal rather than an
+ * omission: collapsing `..` correctly needs the directory tree, because a
+ * `..` through a symlink does not mean what the textual path says — and a
+ * textual collapse is the classic way out of a sandbox. A path containing
+ * either is answered `ENOENT` until the resolver understands them.
+ */
+static int join_onto_cwd(char *path) {
+    char joined[OPEN_MAX_PATH];
+    const char *cwd = uspace_current_cwd();
+    uint32_t at = 0;
+    uint32_t i;
+    for (i = 0; path[i] != '\0'; i++) {
+        if (path[i] == '.' && (i == 0 || path[i - 1u] == '/') &&
+            (path[i + 1u] == '/' || path[i + 1u] == '\0' || path[i + 1u] == '.')) {
+            return KERR_NOENT; /* a dot component: see above */
+        }
+    }
+    while (cwd[at] != '\0' && at + 2u < sizeof joined) {
+        joined[at] = cwd[at];
+        at++;
+    }
+    if (at == 0 || joined[at - 1u] != '/') {
+        joined[at++] = '/';
+    }
+    for (i = 0; path[i] != '\0'; i++) {
+        if (at + 1u >= sizeof joined) {
+            return KERR_NAMETOOLONG;
+        }
+        joined[at++] = path[i];
+    }
+    joined[at] = '\0';
+    for (i = 0; i <= at; i++) {
+        path[i] = joined[i];
+    }
+    return KERR_OK;
+}
+
 static int copy_in_path(struct trapframe *tf, uint32_t argno, char *path) {
     virt_t at = sysarg(tf, argno);
     for (uint32_t i = 0;; i++) {
@@ -1061,7 +1107,15 @@ static int copy_in_path(struct trapframe *tf, uint32_t argno, char *path) {
             return KERR_FAULT;
         }
         if (path[i] == '\0') {
-            return path[0] == '/' ? KERR_OK : KERR_NOENT;
+            /* **Relative paths resolve now**, against the process's working
+             * directory, rather than being refused as they were. An empty
+             * path stays an error: it names nothing, and `openat`'s
+             * `AT_EMPTY_PATH` is a different request this does not
+             * implement. */
+            if (path[0] == '/') {
+                return KERR_OK;
+            }
+            return path[0] == '\0' ? KERR_NOENT : join_onto_cwd(path);
         }
     }
 }
@@ -1471,6 +1525,116 @@ static int64_t sys_ftruncate(struct trapframe *tf) {
         return KERR_BADF;
     }
     return xfsmount_truncate_path(path, sysarg(tf, 1));
+}
+
+/* chdir(path) and getcwd(buf, size).
+ *
+ * `chdir` checks that the path is there and is a directory **before**
+ * storing it, because a working directory that does not exist turns every
+ * later relative path into a confusing failure far from the mistake. The
+ * check belongs here rather than in `uspace`: that module knows nothing
+ * about filesystems, and `xfsmount` depends on it rather than the reverse.
+ */
+static int64_t sys_chdir(struct trapframe *tf) {
+    char path[OPEN_MAX_PATH];
+    uint32_t mode = 0;
+    uint64_t size = 0;
+    uint32_t nlink = 0;
+    int rc = copy_in_path(tf, 0, path);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    rc = xfsmount_stat_full(path, &mode, &size, &nlink);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    if ((mode & 0170000u) != 0040000u) {
+        return KERR_NOTDIR;
+    }
+    return uspace_set_cwd(path);
+}
+
+/* getcwd returns the **length including the terminator**, which is what
+ * Linux does and is not the obvious choice: a caller that treated it as the
+ * string length would strip the last character of the path. */
+static int64_t sys_getcwd(struct trapframe *tf) {
+    const char *cwd = uspace_current_cwd();
+    uint64_t room = sysarg(tf, 1);
+    uint32_t n = 0;
+    while (cwd[n] != '\0') {
+        n++;
+    }
+    if (room < (uint64_t)n + 1u) {
+        return KERR_RANGE;
+    }
+    if (uspace_copy_out(sysarg(tf, 0), cwd, n + 1u) != KERR_OK) {
+        return KERR_FAULT;
+    }
+    return (int64_t)n + 1;
+}
+
+/* statx(dirfd, path, flags, mask, buf).
+ *
+ * **Written by offset, and the mask is answered honestly.** `statx` differs
+ * from `stat` in exactly one way that matters: it reports which fields it
+ * actually filled, in `stx_mask`. A kernel that set the whole mask and left
+ * fields zero would have callers believe a zero timestamp or a zero inode
+ * number. So this sets only the bits it has values for — type, mode, link
+ * count, owner, size and the block count — and leaves the rest clear,
+ * which is what tells a caller not to read them.
+ *
+ * `statx` was the last name on the roadmap's list of missing file syscalls
+ * and the one with the least to gain: Go falls back to `fstatat`, so nothing
+ * in this userland asks for it. It is here so the list is finished rather
+ * than nearly finished.
+ */
+#define STATX_BYTES 256u
+#define STATX_MASK 0u
+#define STATX_BLKSIZE 4u
+#define STATX_NLINK 16u
+#define STATX_UID 20u
+#define STATX_GID 24u
+#define STATX_MODE 28u
+#define STATX_INO 32u
+#define STATX_SIZE 40u
+#define STATX_BLOCKS 48u
+/* The bits for the fields below, from the ABI. */
+#define STATX_HAVE (0x001u | 0x002u | 0x004u | 0x008u | 0x100u | 0x200u)
+
+static int64_t sys_statx(struct trapframe *tf) {
+    char path[OPEN_MAX_PATH];
+    uint8_t out[STATX_BYTES] = {0};
+    uint32_t mode = 0;
+    uint64_t size = 0;
+    uint32_t nlink = 0;
+    uint32_t uid = 0;
+    uint32_t gid = 0;
+    int rc = copy_in_path(tf, 1, path);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    rc = xfsmount_stat_full(path, &mode, &size, &nlink);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    /* The owner is a second lookup because `stat_full` does not report it.
+     * A failure here is not fatal: the mask simply does not claim it. */
+    if (xfsmount_owner_of(path, &uid, &gid) == KERR_OK) {
+        put_stat_u32(out, STATX_UID, uid);
+        put_stat_u32(out, STATX_GID, gid);
+    }
+    put_stat_u32(out, STATX_MASK, STATX_HAVE);
+    put_stat_u32(out, STATX_BLKSIZE, STAT_REPORTED_BLKSIZE);
+    put_stat_u32(out, STATX_NLINK, nlink);
+    /* `stx_mode` is sixteen bits at offset 28, with `stx_gid` before it —
+     * which is the ordering a struct declaration would get right and a hand
+     * written offset gets wrong, so it is written as the 32-bit store the
+     * little-endian layout makes equivalent. */
+    put_stat_u32(out, STATX_MODE, mode & 0xffffu);
+    put_stat_u64(out, STATX_INO, 0u);
+    put_stat_u64(out, STATX_SIZE, size);
+    put_stat_u64(out, STATX_BLOCKS, (size + 511u) / 512u);
+    return uspace_copy_out(sysarg(tf, 4), out, STATX_BYTES) == KERR_OK ? 0 : KERR_FAULT;
 }
 
 static int64_t sys_eventfd2(struct trapframe *tf) {
@@ -1990,6 +2154,9 @@ static const struct syscall_entry table[] = {
     {62u, "lseek", sys_lseek},
     {43u, "statfs", sys_statfs},
     {45u, "truncate", sys_truncate},
+    {49u, "chdir", sys_chdir},
+    {291u, "statx", sys_statx},
+    {17u, "getcwd", sys_getcwd},
     {46u, "ftruncate", sys_ftruncate},
     {48u, "faccessat", sys_faccessat},
     {166u, "umask", sys_umask},
@@ -2055,7 +2222,37 @@ static const char *name_of(uint64_t nr) {
  * instruction of the program every time a handler returned — a corruption
  * that only shows up as the program behaving slightly wrongly later. */
 bool syscall_steps_over_ecall(const struct trapframe *tf) {
-    return tf->x[17] != SYS_RT_SIGRETURN;
+    /* **Two calls set `sepc` themselves, and stepping over either destroys
+     * what they set.**
+     *
+     * `rt_sigreturn` replaces the whole register set, which is why this
+     * question is asked before the dispatch rather than after.
+     *
+     * `execve` is the other, and it was missing — which is the bug this
+     * comment exists for. A successful `execve` sets `sepc` to the new
+     * program's entry point; adding four afterwards starts that program
+     * **one instruction late**. Every exec'd program on this kernel has
+     * been skipping its first instruction.
+     *
+     * It is invisible in almost every way one would look. The address
+     * space is correct, the stack is correct, `argc` and `argv` are
+     * correct, the entry *recorded* is correct — and the program simply
+     * does the wrong thing, differently for each program. A freestanding
+     * six-instruction test that skipped `li a0, 1` wrote to descriptor zero
+     * and printed nothing; a Go binary that skipped the instruction loading
+     * `argc` reached `runtime.sysargs` with a null `argv` and faulted at a
+     * fixed address inside a function it had no reason to be in. Eight
+     * other mechanisms were proposed and refuted before an instruction
+     * placed at the entry, whose failure named itself, showed the fault one
+     * word past where it was written.
+     *
+     * A failed `execve` must still step: the program carries on after a
+     * refused call, and its `ecall` has to be left behind. `KERR_OK` is the
+     * only answer that means `sepc` was replaced — but this is asked before
+     * the call, so the number is all there is to go on, and the dispatch
+     * leaves `sepc` alone when it fails. That is why the test below is on
+     * the number rather than on the result. */
+    return tf->x[17] != SYS_RT_SIGRETURN && tf->x[17] != SYS_EXECVE;
 }
 
 bool syscall_dispatch(struct trapframe *tf) {
@@ -2156,4 +2353,24 @@ uint64_t syscall_count(void) {
 
 uint64_t syscall_unimplemented(void) {
     return refused;
+}
+
+int syscall_resolve_for_test(const char *given, uint32_t *mode, uint64_t *size, uint32_t *nlink) {
+    char path[OPEN_MAX_PATH];
+    uint32_t n = 0;
+    while (given[n] != '\0') {
+        if (n + 1u >= sizeof path) {
+            return KERR_NAMETOOLONG;
+        }
+        path[n] = given[n];
+        n++;
+    }
+    path[n] = '\0';
+    if (path[0] != '/') {
+        int rc = join_onto_cwd(path);
+        if (rc != KERR_OK) {
+            return rc;
+        }
+    }
+    return xfsmount_stat_full(path, mode, size, nlink);
 }

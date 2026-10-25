@@ -677,6 +677,10 @@ static int64_t sys_waitid(struct trapframe *tf) {
         if (uspace_count_children(me->pid) == 0) {
             return KERR_CHILD;
         }
+        /* **What this call can see, once.** `rc` reaches the end of its
+         * `main` and the parent's wait never returns, so either the child
+         * is not becoming a zombie or this is not finding it. The two want
+         * opposite investigations and one line separates them. */
         uspace_wait_for_child(me);
     }
     /* **Written by offset, little-endian by hand.** A `siginfo_t` laid out

@@ -1023,33 +1023,6 @@ static uint64_t prot_bits(uint32_t prot) {
 static int load_segment(struct uproc *p, const struct elf_load *l, const uint8_t *image) {
     uint64_t start = l->vaddr & ~(PAGE_SIZE - 1u);
     uint64_t end = (l->vaddr + l->memsz + PAGE_SIZE - 1u) & ~(PAGE_SIZE - 1u);
-    /* **Each segment as it is laid down, for comparing the two load paths.**
-     *
-     * A Go program runs when the kernel loads it directly and faults when
-     * another program `execve`s it, and six proposed mechanisms have been
-     * refuted. Both paths come through here, so printing what each one maps
-     * either shows a difference or removes the loader from the list — and
-     * the zero-fill tail, where `.bss` comes from, is `memsz` minus
-     * `filesz`, which is the number this is really about. */
-    {
-        static uint32_t said;
-        if (said < 10u) {
-            said++;
-            kprintf("segment: pid %u va %llx..%llx file %llx mem %llx prot %u\n",
-                    uspace_current() != NULL ? uspace_current()->pid : 0u,
-                    (unsigned long long)l->vaddr,
-                    (unsigned long long)l->vaddr + (unsigned long long)l->memsz,
-                    (unsigned long long)l->filesz, (unsigned long long)l->memsz,
-                    (unsigned)l->prot);
-        }
-    }
-    /* The program's own segments belong in the address space's record like
-     * everything else. They are below the window `mmap` places into, so
-     * nothing would be put on top of them — but a record that is only
-     * *mostly* complete cannot be walked, and `fork` has to walk it to copy
-     * an address space. Overlap at a page shared by two segments is
-     * expected and is not an error here. */
-    (void)vma_insert(&p->vmas, start, end, l->prot, 0);
     for (uint64_t va = start; va < end; va += PAGE_SIZE) {
         phys_t page = 0;
         uint64_t have = 0, want = 0, size = 0;
@@ -1159,6 +1132,55 @@ void uspace_set_extra_env(const char *text, uint32_t len) {
 /* Builds the stack: the block is assembled in the page that will be the top
  * of the stack, then mapped. Assembling it in place would need the process's
  * address space to be loaded, which it is not yet. */
+/* Makes freshly written instructions visible to instruction fetch.
+ *
+ * **The thing a kernel that loads programs cannot do without, and this one
+ * had nowhere.** `load_segment` writes a program's code with ordinary
+ * stores, which land in the data path; on RISC-V an instruction fetch is
+ * not required to see them until the fetching hart executes `fence.i`.
+ * Nothing in this kernel ever did.
+ *
+ * It went unnoticed because the path that loads a program at boot does a
+ * great deal between writing the code and running it — bringing up devices,
+ * mounting a filesystem — and the lines are evicted on the way. `execve`
+ * writes and enters immediately, so the stale lines are still there, and the
+ * hart fetches whatever the previous program left at those addresses. That
+ * reads as an address space which is provably correct in memory and in the
+ * page tables, and which executes something else: a Go program faulting at
+ * a fixed address inside a function it never called, and a six-instruction
+ * assembly program producing no output and no fault at all.
+ *
+ * The data fence comes first and is not decoration: `fence.i` orders
+ * instruction fetch against *completed* stores, so a store still in a
+ * buffer would be missed by it.
+ */
+/* Set by the board when `minikern.execpatch` is given. */
+static bool patch_entry_for_measurement;
+
+void uspace_patch_entry_for_measurement(bool on) {
+    patch_entry_for_measurement = on;
+}
+
+/* Writes words into a process's address space through its own page tables,
+ * which is what makes this a measurement of the fetch rather than of the
+ * loader: the bytes go in the same way the program's own code did. */
+int uspace_poke_user_words(struct uproc *p, uint64_t at, const uint32_t *words, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++) {
+        phys_t page = 0;
+        uint64_t flags = 0, size = 0;
+        uint64_t va = at + (uint64_t)i * 4u;
+        if (!pgtable_lookup(&p->pt, va & ~(PAGE_SIZE - 1u), &page, &flags, &size)) {
+            return KERR_FAULT;
+        }
+        *(volatile uint32_t *)(uintptr_t)(page + (va & (PAGE_SIZE - 1u))) = words[i];
+    }
+    return KERR_OK;
+}
+
+static void make_code_visible(void) {
+    __asm__ volatile("fence rw, rw\n\tfence.i" : : : "memory");
+}
+
 static int build_start_state(struct uproc *p, const struct elf_image *img, const char *path,
                              const char *const *argv, uint32_t argc) {
     struct auxv_pair auxv[USTACK_MAX_AUXV];
@@ -1189,28 +1211,6 @@ static int build_start_state(struct uproc *p, const struct elf_image *img, const
                       &args, &sp, &used);
     if (rc != KERR_OK) {
         return rc;
-    }
-    /* **The first words of the block a program will start on.**
-     *
-     * A Go program faults in `runtime.sysargs` walking `argv` for the NULL
-     * that precedes the auxiliary vector. The kernel passes the right
-     * `argc` — that was checked — so what is left is what this builder
-     * actually wrote, and reading the words is the only way to know. Capped
-     * at two dumps, because every boot builds several. */
-    {
-        static uint32_t dumped;
-        if (dumped < 2u) {
-            const uint64_t *w = (const uint64_t *)(uintptr_t)(stack +
-                                                              USER_STACK_PAGES * PAGE_SIZE -
-                                                              (p->stack_top - sp));
-            dumped++;
-            kprintf("ustack: sp %llx argc %llu; words:", (unsigned long long)sp,
-                    (unsigned long long)w[0]);
-            for (uint32_t i = 1; i < 12u; i++) {
-                kprintf(" %llx", (unsigned long long)w[i]);
-            }
-            kprintf("\n");
-        }
     }
     for (uint32_t i = 0; rc == KERR_OK && i < USER_STACK_PAGES; i++) {
         rc = pgtable_map(&p->pt, p->stack_top - (uint64_t)(i + 1u) * PAGE_SIZE,
@@ -1267,6 +1267,36 @@ int uspace_build_elf_args(struct uproc *p, const uint8_t *image, uint32_t bytes,
     for (uint32_t i = 0; rc == KERR_OK && i < img.nloads; i++) {
         rc = load_segment(p, &img.loads[i], image);
     }
+    /* **Before the stack, because the stack is not the point** — the code
+     * is. Doing it here covers both callers: the boot loader of `/init` and
+     * `execve`, which is the one that needs it. */
+    /* **A measurement of the instruction fetch itself**, which is the one
+     * thing no print can show.
+     *
+     * Everything around the fetch has been checked and is right: the
+     * segments, the entry, the stack, `argc`, `sstatus`, `satp`, the TLB
+     * fence. A hart that `sret`s into that and produces neither output nor
+     * a fault is fetching *something*, and the way to learn what is to put
+     * an instruction there whose failure names itself.
+     *
+     * Two words are written at the entry: `addi t0, zero, 0x7ad` then
+     * `ld t1, 0(t0)`. If the hart fetches them it faults loading address
+     * 0x7ad — a number that appears nowhere else — and the fault report
+     * says so. If it faults somewhere else, or not at all, then what is
+     * being executed is not what was written, and that is the answer.
+     *
+     * Behind a flag because it destroys the program it is measuring. */
+    if (patch_entry_for_measurement) {
+        uint64_t at = img.entry;
+        uint32_t words[2] = {0x7ad00293u, 0x0002b303u};
+        if (uspace_poke_user_words(p, at, words, 2u) == KERR_OK) {
+            kprintf("exec-probe: entry %llx patched to fault on 0x7ad\n",
+                    (unsigned long long)at);
+        } else {
+            kprintf("exec-probe: could not patch entry %llx\n", (unsigned long long)at);
+        }
+    }
+    make_code_visible();
     rc = rc != KERR_OK ? rc : build_start_state(p, &img, path, argv, argc);
     rc = rc != KERR_OK ? rc : map_signal_trampoline(p);
     rc = rc != KERR_OK ? rc : share_kernel_mappings(&p->pt);
@@ -1346,6 +1376,24 @@ int uspace_fork_shared(struct uproc *child, struct uproc *parent) {
     child->rlim_nofile_hard = parent->rlim_nofile_hard;
     child->rlim_nproc_soft = parent->rlim_nproc_soft;
     child->rlim_nproc_hard = parent->rlim_nproc_hard;
+    /* **The credential and the environment a child is born into.**
+     *
+     * Added together with the syscalls that set them, because this list is
+     * exactly where such a field goes missing: a `chdir` a child did not
+     * inherit, or a `umask` reset by a fork, is a setting that works until
+     * something forks and then silently does not. The groups are the same
+     * argument with a security edge — a child that lost its parent's
+     * supplementary groups would quietly have *less* access, and one that
+     * lost a *cleared* list would quietly have more. */
+    child->umask = parent->umask;
+    child->ngroups = parent->ngroups;
+    for (uint32_t g = 0; g < PROC_MAX_GROUPS; g++) {
+        child->groups[g] = parent->groups[g];
+    }
+    for (uint32_t c = 0; c < sizeof child->cwd; c++) {
+        child->cwd[c] = parent->cwd[c];
+    }
+
     for (uint32_t i = 0; i < SIG_COUNT; i++) {
         child->actions[i] = parent->actions[i];
     }
@@ -1622,6 +1670,13 @@ int uspace_exec(struct uproc *p, const uint8_t *image, uint32_t bytes, const cha
      * free it; `main_tid` left stale names a thread that no longer exists. */
     p->shares_pt = fresh->shares_pt;
     p->main_tid = fresh->main_tid;
+    /* **`umask`, the groups and the working directory survive an `execve`**,
+     * which is what the ABI says and what makes them useful: a shell sets a
+     * umask or does a `cd` and every program it then runs is meant to see
+     * it. They are *not* in the seed above because that would state them
+     * twice; they are left on `p` untouched, and this comment exists so the
+     * next person does not "fix" it by adding them to the seed and then
+     * zeroing them here. */
     p->built = true;
     p->shares_pt = false;
     /* **The capabilities are transformed here, on the process itself.**
@@ -1636,9 +1691,24 @@ int uspace_exec(struct uproc *p, const uint8_t *image, uint32_t bytes, const cha
     cap_after_exec(&p->caps, p->euid, seccomp_no_new_privs(p));
     fd_close_on_exec();
     signal_reset();
-    /* The old tables are freed only if they were this process's. A `vfork`
-     * child's were its parent's, and freeing them would take the parent's
-     * program with it — which is the whole reason `shares_pt` exists. */
+    /* **The old tables are freed while the old address space is still
+     * loaded, and that order is load-bearing.**
+     *
+     * I reordered this — adopting the new space first — on the argument that
+     * freeing the tables `satp` points at is obviously wrong. It is not:
+     * `uspace_destroy` walks those tables to find the pages to release, and
+     * with the *new* space loaded that walk reaches for mappings the new
+     * space does not have. The board answered with a kernel fault during an
+     * exec, reported as a user fault because the trap path assumes a fault
+     * in a process is the process's: `pid 1 tid 0, sp ffffffc0…` with
+     * kernel pointers in its argument registers.
+     *
+     * So the original order stands, and what makes it safe is narrower than
+     * "it works": the kernel is mapped in every address space, nothing
+     * between the free and the adopt allocates, and the freed pages are not
+     * handed out until something asks. That is worth stating because it is
+     * the kind of invariant a later change breaks without noticing — as this
+     * one did. */
     if (had_own) {
         free_tables(&old);
     }
@@ -1689,6 +1759,9 @@ void uspace_restart_thread(struct trapframe *tf, const struct uproc *p) {
                 uint64_t back = 0;
                 bool wrote = uspace_copy_out(p->stack_top - 32u, &magic, 8u) == KERR_OK;
                 bool read = uspace_copy_in(&back, p->stack_top - 32u, 8u) == KERR_OK;
+                kprintf("exec-entry: sstatus %llx satp-want %llx\n",
+                        (unsigned long long)tf->sstatus,
+                        (unsigned long long)pgtable_satp(&p->pt, 1));
                 kprintf("exec-entry: sp %llx argc %llu entry %llx; stack write %s, read back %llx\n",
                         (unsigned long long)p->stack_top, (unsigned long long)argc_seen,
                         (unsigned long long)p->entry, wrote ? "ok" : "REFUSED",
@@ -1937,6 +2010,19 @@ void uspace_exit(int64_t status) {
          * until its parent reaps them, because a parent is entitled to ask
          * what happened to a child that has already finished. Its address
          * space goes now, unless it was borrowing its parent's. */
+        /* **Said once per process, because a parent that never returns
+         * from `wait` leaves two possibilities**: the child did not exit,
+         * or its exit was not recorded. One line separates them, and the
+         * case being chased — a program that printed everything it was
+         * asked to and then was never reaped — needs exactly that. */
+        {
+            static uint32_t said;
+            if (said < 8u) {
+                said++;
+                kprintf("exit: pid %u exited %lld; parent %u is waiting\n", me->pid,
+                        (long long)status, me->parent_pid);
+            }
+        }
         me->status = status;
         me->zombie = true;
         /* **Its other threads first, and off their harts**, before the
@@ -2712,6 +2798,23 @@ int uspace_fork(struct uproc *child, struct uproc *parent) {
     child->rlim_nofile_hard = parent->rlim_nofile_hard;
     child->rlim_nproc_soft = parent->rlim_nproc_soft;
     child->rlim_nproc_hard = parent->rlim_nproc_hard;
+    /* **The credential and the environment a child is born into.**
+     *
+     * Added together with the syscalls that set them, because this list is
+     * exactly where such a field goes missing: a `chdir` a child did not
+     * inherit, or a `umask` reset by a fork, is a setting that works until
+     * something forks and then silently does not. The groups are the same
+     * argument with a security edge — a child that lost its parent's
+     * supplementary groups would quietly have *less* access, and one that
+     * lost a *cleared* list would quietly have more. */
+    child->umask = parent->umask;
+    child->ngroups = parent->ngroups;
+    for (uint32_t g = 0; g < PROC_MAX_GROUPS; g++) {
+        child->groups[g] = parent->groups[g];
+    }
+    for (uint32_t c = 0; c < sizeof child->cwd; c++) {
+        child->cwd[c] = parent->cwd[c];
+    }
     for (uint32_t i = 0; i < SIG_COUNT; i++) {
         child->actions[i] = parent->actions[i];
     }
@@ -3607,4 +3710,39 @@ void uspace_set_umask_for_test(uint32_t mask) {
     if (me != NULL) {
         me->umask = mask & 07777u;
     }
+}
+
+const char *uspace_current_cwd(void) {
+    const struct uproc *me = uspace_current();
+    /* **"/" rather than an empty string** when there is no process: the
+     * boot path resolves paths too, and a caller that had to distinguish
+     * "no process" from "the root" would get it wrong somewhere. */
+    return me == NULL || me->cwd[0] == '\0' ? "/" : me->cwd;
+}
+
+int uspace_set_cwd(const char *path) {
+    struct uproc *me = uspace_current();
+    uint32_t n = 0;
+    if (me == NULL) {
+        return KERR_SRCH;
+    }
+    if (path == NULL || path[0] != '/') {
+        return KERR_INVAL; /* stored absolute, so every resolution is cheap */
+    }
+    while (path[n] != '\0') {
+        if (n + 1u >= sizeof me->cwd) {
+            return KERR_NAMETOOLONG;
+        }
+        me->cwd[n] = path[n];
+        n++;
+    }
+    /* **The trailing slash is dropped except at the root**, so that joining
+     * never produces "//x" — which this kernel's path comparison treats as a
+     * different path from "/x" and would make a `chdir("/")` followed by an
+     * open fail for a reason nobody could see. */
+    while (n > 1u && me->cwd[n - 1u] == '/') {
+        n--;
+    }
+    me->cwd[n] = '\0';
+    return KERR_OK;
 }

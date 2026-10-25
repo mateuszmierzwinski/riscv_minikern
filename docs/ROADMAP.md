@@ -820,10 +820,10 @@ Ordering inside a section is roughly by what unblocks the most.
       needed it): `openat` reads it off the filesystem, checks the mode
       against the caller's identity, and gives a descriptor that `read`
       works on. What is still missing here is the *synthetic* ones.
-- [~] **The directory and file syscalls.** (M) **Most of this list is done**,
-      driven by running a real userland on the board rather than by working
-      through the list — which is why the ones that are missing are the ones
-      nothing has needed yet.
+- [x] **The directory and file syscalls.** (M) **Done — the whole list.**
+      Driven by running a real userland on the board rather than by working
+      through the list, which is why the order they arrived in is the order
+      something needed them.
 
       Implemented and board-proven: `getdents64`, `fstat`, `newfstatat`,
       `mkdirat`, `unlinkat`, `renameat2`, `linkat`, `symlinkat`,
@@ -884,11 +884,47 @@ Ordering inside a section is roughly by what unblocks the most.
       would shorten the file the descriptor still holds. Nothing in this
       userland does that.
 
-      Still missing: `chdir`/`getcwd` (a per-process working directory,
-      which nothing has a use for while every path is absolute) and `statx`
-      (Go falls back to `fstatat`, so it buys nothing). Neither is work this
-      kernel needs; they are listed so the absence is deliberate rather than
-      forgotten.
+      **`chdir` and `getcwd` are done, with relative paths actually
+      resolving** — which was the point. A working directory nobody resolved
+      against would have been the "declared but never consulted" failure
+      recorded seven times in this file, so the join went into
+      `copy_in_path`, where every path-taking syscall passes through it
+      once. `chdir` checks the path is a directory before storing it, since
+      a working directory that does not exist turns every later relative
+      path into a failure far from the mistake. `getcwd` returns the length
+      **including** the terminator, which is Linux's answer and not the
+      obvious one — a caller treating it as a string length would strip the
+      last character.
+
+      **A dot component is refused, deliberately.** Collapsing `..`
+      textually is the classic way out of a sandbox, because a `..` through
+      a symlink does not mean what the path says. Anything containing `.` or
+      `..` answers `ENOENT` until the resolver understands the tree, and a
+      board test asserts the refusal so that nobody "fixes" it with a string
+      operation.
+
+      `umask`, the supplementary groups and the working directory are
+      inherited by a fork and kept across an `execve` — added to *both* fork
+      paths at the same time as the syscalls that set them, because that
+      list is exactly where such a field goes missing and a `cd` a child did
+      not inherit is a setting that works until something forks.
+
+      `statx` is in too, and last for a reason: Go falls back to `fstatat`,
+      so nothing here asks for it. It reports **only the fields it filled**
+      in `stx_mask` — type, mode, link count, owner, size, blocks — and
+      leaves the rest clear, because a kernel that set the whole mask would
+      have callers believe a zero inode number or a zero timestamp. That
+      honesty is the one thing `statx` offers over `stat`, and a version
+      that skipped it would be the weaker call wearing the newer name.
+
+      **One thing this self-test cannot do, stated once because it cost four
+      attempts.** It runs during boot with no current *process*, so
+      `uspace_current()` is NULL: a descriptor cannot be installed, a
+      credential cannot be set, and a working directory has nothing to hold
+      it. The seek test, the umask test and the cwd test each failed or —
+      worse — *passed while proving nothing* for that reason. Anything that
+      reads the current process belongs in a user-mode test, and
+      `minikern.execone` is the pattern.
 
       **`lseek` and `fsync` have no board test, and the reason is worth
       recording.** The obvious home was the write self-test, and that is the
@@ -1800,9 +1836,17 @@ Superseded:  (M) The network stack and
       exactly that here. The dump and the search now run **only when the
       counter does not move**, so the method survives without adding noise to
       every boot.
-- [ ] **Interrupt-driven storage and network.** (M) Both drivers poll. The
-      PLIC is wired and the tick uses it, but no device does — virtio-net
-      registers a handler and the poll is still what drives it.
+- [~] **Interrupt-driven storage and network.** (M) **This entry was stale
+      and said the opposite of the truth**: "both drivers poll", when the SD
+      card's reads and writes and the NVMe drive's completions have both been
+      converted and the `sie` bit-9 blocker that made the whole PLIC path
+      unreachable is fixed. See §7's own entry, which is the live one; this
+      is kept only for the tickless argument below, which still stands.
+
+      An entry that has gone false is worse than a missing one, because it is
+      read as current. This one survived because the work happened under a
+      different heading — which is the hazard of recording the same item
+      twice.
       **This is now the last periodic interrupt in the system.** With
       dynamic ticks a busy thread takes 1 timer interrupt in 10 seconds and
       an idle hart 101; turn a network on and the machine pays a 10 ms beat
@@ -1821,8 +1865,11 @@ Superseded:  (M) The network stack and
 
 ## 5. Networking
 
-- [ ] **The GMAC driver** — see above. Everything else here is behind it on
-      real hardware.
+- [x] **The GMAC driver** — done, and the stack runs over it on the board:
+      DHCP, ARP, ping, TCP and DNS. One behaviour is unexplained and
+      recorded in §7: the strict unicast filter refuses frames addressed to
+      the board's own MAC, so the filter defaults to promiscuous. That is a
+      workaround with a measurement beside it, not a fix.
 - [ ] **IPv6.** (L) The stack is IPv4 only.
 - [x] **A routing table.** (S) **Done.** Eight prefixes with **longest prefix
       match**, which is the only rule that lets a specific route beat a
@@ -2670,6 +2717,63 @@ it untouched between the prologue and `ADD X11, X6, X6` — and it really is
 zero, while every piece of memory and every register the kernel controls is
 demonstrably right.
 
+**Six instructions, no runtime, and it still fails — with the control run.**
+
+`/bin/tiny` is a freestanding assembly program with its own `_start`: write
+a line, exit 7. Loaded directly by the kernel it prints `tiny: exec'd and
+running`. `execve`'d by `minikern.execone`, the same 1,280-byte binary
+produces **no output and no fault at all** — the machine simply stops. The
+control was run second and should have been run first; that is this
+session's recurring lesson and it bit again.
+
+So `execve` is broken for six instructions with no runtime, which is as
+reduced as this gets, and every Go detail in this entry was a distraction.
+
+**A real gap found and closed on the way, which was not the cause.** This
+kernel had **no `fence.i` anywhere**. On RISC-V, code written with ordinary
+stores — which is what `load_segment` does — is not required to be visible
+to instruction fetch until the fetching hart executes one. The boot path
+does a great deal between writing a program and running it and the lines get
+evicted; `execve` writes and enters immediately. It explained the symptom
+exactly: an address space provably correct in memory and in the page tables,
+executing something else. It is now issued after the segments are loaded,
+with a data fence before it so a store still in a buffer is not missed. The
+tiny program still produces nothing, so the cause is elsewhere — but a
+kernel that loads programs cannot be without it.
+
+**Still correct, each checked rather than assumed:** the TLB is fenced
+(`csrw satp` then `sfence.vma zero, zero`), the new page table is installed
+before it is adopted, the entry address is in an executable segment, and the
+segments, stack, `argc` and entry are identical to the working direct load.
+
+**One ordering fixed, which was wrong whether or not it was the cause.**
+`free_tables(&old)` ran *before* `uspace_adopt_address_space`, so the old
+page tables went back to the allocator while `satp` still pointed at them —
+and the kernel's own mappings live in that same table. Every kernel access
+in that window translates through freed memory. The adopt comes first now.
+It did not fix the fault.
+
+**And the handoff is correct in every byte that can be observed.** At the
+moment the exec'd program is entered: `sstatus 8000000200046020` — `SPP` 0
+so it returns to user, `SPIE` 1, `SUM` 1, `FS` dirty, `UXL` 64-bit — and
+`satp` is Sv39, ASID 1, PPN `0x40933`, a valid DRAM address. Entry
+`0x11158`, inside the executable segment. Stack pointer at the block base,
+`argc` 3, the block's words right, the stack writable.
+
+**Eight mechanisms refuted now**, and the list is worth keeping because each
+one is a thing that is *not* wrong: a null `argv`, a silent allocator
+failure, a cloned thread resuming astray, a read-only stack, the ELF loader,
+signal handlers, a missing `fence.i` (a real gap, fixed, not this), and
+freeing the live page tables (a real bug, fixed, not this).
+
+What is left to examine is the instruction fetch itself — the one thing no
+print can show. A hart that `sret`s to a correct address in a correct
+address space and produces neither output nor a fault is fetching
+*something*, and the next measurement has to be of the fetch rather than of
+the state around it: single-stepping with `sstatus.SIE` off and a debug
+trap, or placing a known-faulting instruction at the entry so that the fault
+address reports what the hart actually read.
+
 **Go is not involved. `minikern.execone` is the reproducer.**
 
 Forty lines of hand-written assembly: one thread, no runtime, `execve` of
@@ -2788,3 +2892,62 @@ The diagnostics are left in place, capped: the `argc` line in `sys_execve`,
 the block dump in `build_start_state`, and the dispatcher's EAGAIN report.
 Each of them turned a theory into a fact, and two of them turned a confident
 theory of mine into a wrong one.
+
+### The QuokkaOS board case: two variants, both timing-dependent
+
+The case is one expectation short — `init: rc list returned cleanly` — and
+behind it are **two different failures** that alternate between boots.
+Writing them down separately is the point, because every fix so far was
+aimed at whichever one the last run happened to show:
+
+| Variant | What the log shows | What it means |
+|---|---|---|
+| **A: rc finishes, init does not notice** | the full `SERVICE` table, `rc: done`, and `exit: pid 6 exited 0; parent 1 is waiting` | rc did everything asked. The exit reached the kernel and the zombie was set. init's wait did not return |
+| **B: rc produces nothing** | `init: running /bin/rc list` and then nothing — no table, no `rc: done`, no exit for that pid | the program was exec'd and never produced a byte. Nothing aimed at the wait can reach it |
+
+**Variant A had a real cause and it was mine, twice over.** PID 1 must
+collect orphans with `wait4(-1)`, and `os/exec`'s `Wait` waits for one pid;
+the two cannot coexist, because `wait4(-1)` takes whichever child exited
+first and the loser then waits for a status already taken. Fixing it for
+services while leaving `runRCCheck` on `cmd.Run()` made it *deterministic*
+rather than fixing it — half of that rule is worse than none. And the
+reaper's own comment claimed it kept an exit for a pid nobody had claimed
+*yet*, which it did not: `deliver` counted an orphan and dropped the status,
+so a program short enough to exit between `Start` and `Expect` was waited
+for ever. Both are fixed, and **a comment describing behaviour the code does
+not have** is its own lesson.
+
+**Variant B is unexplained.** It is not the wait, not the reaper and not
+`fence.i` on the entering hart. The next step is a measurement of the
+*kernel's* side of an exec that produces nothing: the entry state is already
+printed for one program under `minikern.execpatch`, and pointing that at rc
+would say whether the program is entered at all.
+
+**What the case proves on every boot**, which is most of what it was written
+for: four services started in dependency order with a dependent waiting for
+readiness rather than for a PID, a crashing service restarted under a rate
+limit, a Unix socket served by PID 1, and `rc` connecting to it.
+
+### What chasing one log line cost, and the rule it confirms
+
+Seven changes were made before the wait itself was measured: `fence.i` on the
+entering hart as well as the writing one, periodic ticks instead of dynamic,
+an explicit exit in rc, moving the rc check off init's main goroutine, a
+single central reaper, routing the rc check through it, and retaining
+unclaimed exits. **Four of those fixed real defects** and all are kept. None
+was aimed by evidence; each was aimed by a hypothesis about a symptom seen
+once.
+
+One measurement — printing the wait loop's own decision each round — split
+the problem into the two variants above in a single boot, which is what
+should have happened first. This file has now recorded that lesson in five
+different pieces of work (the dispatcher's EAGAIN report, the device-tree
+read, the two PLDA registers, the patched entry instruction, and this), and
+the pattern in all of them is the same: **a cheap general instrument beats a
+specific theory, and the theory is what I reach for.**
+
+A second-order one, from the same session: the diagnostics themselves became
+the problem. Printing from the deadline sweep put thousands of lines through
+a console that holds the kernel lock, and the case then failed in a *third*
+place. **An instrument that changes the timing of the thing it measures is
+measuring itself.**

@@ -66,6 +66,10 @@
 #define SYS_RT_SIGACTION 134u
 #define SYS_RT_SIGPROCMASK 135u
 #define SYS_RT_SIGRETURN 139u
+/* Named here because `syscall_steps_over_ecall` must know it: a successful
+ * `execve` sets `sepc` itself, and stepping over the `ecall` afterwards
+ * starts the new program one instruction late. */
+#define SYS_EXECVE 221u
 #define SYS_UNAME 160u
 #define SYS_GETRUSAGE 165u
 #define SYS_PRCTL 167u
@@ -165,5 +169,11 @@ uint64_t syscall_unimplemented(void);
 static inline uint64_t sysarg(const struct trapframe *tf, uint32_t n) {
     return tf->x[10u + n]; /* a0 is x10 */
 }
+
+/* Resolves a path the way a syscall would — joining a relative one onto the
+ * working directory — and stats it. For the board self-test, which runs in
+ * the kernel and has no syscall layer to go through; the join is the part
+ * worth testing, since without it a working directory is a stored string. */
+int syscall_resolve_for_test(const char *given, uint32_t *mode, uint64_t *size, uint32_t *nlink);
 
 #endif

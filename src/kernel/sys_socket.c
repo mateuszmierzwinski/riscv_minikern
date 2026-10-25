@@ -125,10 +125,51 @@ static int get_addr(virt_t uaddr, uint32_t len, struct sock_addr *a) {
 }
 
 /* Writes a sockaddr_in to uaddr, honouring and updating *ulen (socklen_t). */
+/* A `sockaddr_un`: the family, then the path, NUL-terminated.
+ *
+ * **This existed only as `sockaddr_in` and it broke every Unix listener.**
+ * `getsockname` wrote an `AF_INET` address whatever the socket was, so a
+ * `net.Listen("unix", ...)` in Go — which asks for its own name after
+ * binding, to fill the listener's `Addr` — got an IPv4 address full of
+ * zeros, failed to parse it as a path, and dereferenced the nil that came
+ * back. The listener that failed was QuokkaOS init's control socket, which
+ * is how `rc` reaches it.
+ *
+ * The length reported is the family plus the path plus its terminator,
+ * which is what Linux reports for a bound filesystem name and what tells a
+ * caller how much of `sun_path` is real. Reporting the whole 110-byte array
+ * would have a caller read 109 bytes of nothing as part of the name. */
+static uint32_t fill_sockaddr_un(uint8_t *b, uint32_t room, struct sock_addr a) {
+    uint32_t len = 0;
+    const char *name = unix_name_at(a.unix_name, &len);
+    uint32_t at = 2u;
+    b[0] = AF_UNIX;
+    b[1] = 0;
+    if (name == NULL) {
+        return 2u; /* bound to nothing: the family alone, as Linux does */
+    }
+    for (uint32_t i = 0; i < len && at + 1u < room; i++) {
+        b[at++] = (uint8_t)name[i];
+    }
+    b[at++] = 0;
+    return at;
+}
+
+#define SOCKADDR_UN_LEN 110u
+
 static int put_addr(virt_t uaddr, virt_t ulen_addr, struct sock_addr a) {
-    uint8_t b[SOCKADDR_IN_LEN] = {AF_INET, 0, (uint8_t)(a.port >> 8), (uint8_t)a.port, (uint8_t)(a.ip >> 24),
+    uint8_t b[SOCKADDR_UN_LEN] = {AF_INET, 0, (uint8_t)(a.port >> 8), (uint8_t)a.port, (uint8_t)(a.ip >> 24),
                                   (uint8_t)(a.ip >> 16), (uint8_t)(a.ip >> 8), (uint8_t)a.ip};
     uint32_t len, want = SOCKADDR_IN_LEN;
+    /* **A unix address is told apart by its interned name**, which is
+     * one-based precisely so that zero means "not a unix address" — so this
+     * needs no extra field and leaves AF_INET untouched. */
+    if (a.unix_name != 0) {
+        for (uint32_t i = 0; i < sizeof b; i++) {
+            b[i] = 0;
+        }
+        want = fill_sockaddr_un(b, sizeof b, a);
+    }
     if (uaddr == 0 || ulen_addr == 0) {
         return KERR_OK;
     }

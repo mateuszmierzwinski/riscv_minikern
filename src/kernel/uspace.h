@@ -161,6 +161,10 @@ struct uproc {
      * across an execve**, which is what the ABI says: a shell sets it once
      * and every program it runs is meant to honour it. */
     uint32_t umask;
+    /* The working directory, as an absolute path with no trailing slash
+     * except at the root. Inherited by a fork and **kept across an
+     * `execve`**, which is what makes `cd` in a shell mean anything. */
+    char cwd[128];
     /* **Resource limits, soft and hard.**
      *
      * Only the ones this kernel can actually enforce are kept: descriptors,
@@ -523,11 +527,29 @@ uint64_t uspace_syscalls(void);
 /* The running process's umask, for the filesystem's installed reader. A
  * function rather than the field, so that nothing outside this module needs
  * a `struct uproc` to ask. */
+/* Turns on the entry-patching measurement: the first two instructions of
+ * every exec'd image are replaced with a load from 0x7ad, so that the fault
+ * report says what the hart actually fetched. Destroys the program it
+ * measures, which is why it is a flag. */
+void uspace_patch_entry_for_measurement(bool on);
+
+/* Writes words into a process's address space through its own page tables. */
+int uspace_poke_user_words(struct uproc *p, uint64_t at, const uint32_t *words, uint32_t n);
+
 uint32_t uspace_current_umask(void);
 
 /* Sets the running process's umask, for the board self-test — which runs in
  * the kernel and has no syscall layer to go through. */
 void uspace_set_umask_for_test(uint32_t mask);
+
+/* The running process's working directory, always absolute. Returns "/" when
+ * there is no process, so a caller never has to handle an empty answer. */
+const char *uspace_current_cwd(void);
+
+/* Sets it, after the caller has checked the path exists and is a directory.
+ * The check is the caller's because this module knows nothing about
+ * filesystems — `uspace` is depended on by `xfsmount`, not the reverse. */
+int uspace_set_cwd(const char *path);
 
 uint64_t uspace_stale_faults(void);
 

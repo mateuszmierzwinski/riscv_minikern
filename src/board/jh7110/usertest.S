@@ -3219,13 +3219,14 @@ user_execone_start:
 
     .balign 8
 execone_path:
-    .asciz  "/bin/qservice"
+    .asciz  "/bin/tiny"
 execone_arg1:
     .asciz  "-name"
 execone_arg2:
     .asciz  "solo"
 execone_says:
-    .ascii  "execone: one thread, about to execve /bin/qservice\n"
+    .ascii  "execone: one thread, about to execve /bin/tiny\n"
+
 execone_says_end:
 execone_failed:
     .ascii  "execone: execve REFUSED\n"

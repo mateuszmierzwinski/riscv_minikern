@@ -350,6 +350,21 @@ static void thread_trampoline(void) {
      * Every other path out of the kernel releases it in `trap_handle`; this
      * one has no trap to return from, so it does it itself. */
     trace("entering user mode at", me()->current, frame->sepc);
+    /* **`fence.i` on the hart that is about to fetch, not only on the one
+     * that wrote.**
+     *
+     * `fence.i` is per-hart. The loader issues one after writing a
+     * program's code, which covers the hart that did the writing — and then
+     * the thread may be entered on a different hart, whose instruction
+     * cache can still hold stale lines for those physical pages. That is an
+     * intermittent, hart-dependent failure, and it looked like one: the
+     * same `rc list` printed its whole table on one boot and nothing at all
+     * on the next.
+     *
+     * Here is the one place every thread passes through on its way to user
+     * mode for the first time, so it is the one place this belongs. The
+     * cost is a single instruction per thread start. */
+    __asm__ volatile("fence.i" : : : "memory");
     klock_exit(true);
     uspace_enter_frame(frame);
 }

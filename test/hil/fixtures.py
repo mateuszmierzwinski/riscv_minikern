@@ -309,7 +309,7 @@ def _proto_line(mode, name, source):
     return f"{name} {mode} 0 0 {source}"
 
 
-def quokka_userland(at, init_binary, rc_binary, service_binary):
+def quokka_userland(at, init_binary, rc_binary, service_binary, tiny_binary=None):
     """An XFS image holding init, rc, a test service and a default runlevel.
 
     The service files are written to the host first and copied in by
@@ -352,6 +352,10 @@ def quokka_userland(at, init_binary, rc_binary, service_binary):
     lines.append("bin d--755 0 0")
     lines.append(_proto_line("---755", "qservice", service_binary))
     lines.append(_proto_line("---755", "rc", rc_binary))
+    if tiny_binary is not None:
+        # A freestanding program with its own _start, for the one comparison
+        # a Go binary cannot make: whether execve itself works.
+        lines.append(_proto_line("---755", "tiny", tiny_binary))
     lines.append("$")
     lines.append("etc d--755 0 0")
     lines.append("init.d d--755 0 0")

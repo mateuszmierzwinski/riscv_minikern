@@ -2371,6 +2371,46 @@ static int rename_moves_a_name(void) {
  * because the type bits are not the caller's to set and a test that compared
  * the whole word would fail for the right reason and look like the wrong
  * one. */
+/* **There is no cwd test here, and this is the fourth time that mattered.**
+ *
+ * This self-test runs during boot with no current *process*: `uspace_current()`
+ * is NULL, so a working directory cannot be set and a relative path has
+ * nothing to resolve against. A version of this test ran, reported that it
+ * could not run, and still printed `ok` — a pass that proves nothing, which
+ * is worse than an absence.
+ *
+ * The pattern is now plain and worth stating once: **this self-test can
+ * exercise filesystem operations and not process ones.** The seek test, the
+ * umask test and this one all failed or lied for the same reason. Anything
+ * that reads the current process — a descriptor, a credential, a working
+ * directory — belongs in a user-mode test, and `minikern.execone` is the
+ * pattern for one.
+ *
+ * What *is* tested below needs no process: the dot-component refusal, which
+ * holds whatever the working directory is.
+ */
+
+/* **A dot component is refused, and that is deliberate.** Collapsing `..`
+ * textually is the classic way out of a sandbox, because a `..` through a
+ * symlink does not mean what the path says. Until the resolver understands
+ * the tree, anything containing a dot component is `ENOENT` — and a test
+ * that asserts the refusal is what stops someone "fixing" it with a string
+ * operation. */
+static int dots_are_refused(void) {
+    uint32_t mode = 0;
+    uint64_t size = 0;
+    uint32_t nlink = 0;
+    if (syscall_resolve_for_test("../w1", &mode, &size, &nlink) == KERR_OK) {
+        kprintf("fswrite:   a path with .. was resolved\n");
+        return KERR_INVAL;
+    }
+    if (syscall_resolve_for_test("./w1", &mode, &size, &nlink) == KERR_OK) {
+        kprintf("fswrite:   a path with . was resolved\n");
+        return KERR_INVAL;
+    }
+    return KERR_OK;
+}
+
 /* **The accounting is the test, not the size.** Setting `di_size` is one
  * line; the part that corrupts quietly is the free-block count, because a
  * filesystem whose counter disagrees with its allocation groups mounts,
@@ -3215,6 +3255,7 @@ static void run_write_selftest(void) {
     ok = ok && wrote_and_checked("a symlink round trips", symlink_round_trip());
     ok = ok && wrote_and_checked("a long target is refused", long_target_refused());
     ok = ok && wrote_and_checked("readlink refuses a file", readlink_refuses_a_file());
+    ok = ok && wrote_and_checked("a dot component is refused", dots_are_refused());
     ok = ok && wrote_and_checked("a truncate frees its blocks", truncate_frees_blocks());
     ok = ok && wrote_and_checked("a truncate keeps the last block", truncate_rounds_up());
     ok = ok && wrote_and_checked("a grow makes a hole", truncate_grows_sparsely());
@@ -3524,6 +3565,7 @@ static void run_user_programs(void) {
      * broken" from "exec after Go's multi-threaded fork is broken". It needs
      * a filesystem with /bin/qservice on it, which the QuokkaOS fixture
      * image has. */
+    uspace_patch_entry_for_measurement(cmdline_has(boot_cmdline, "minikern.execpatch"));
     if (cmdline_has(boot_cmdline, "minikern.execone")) {
         run_one_user_program("execone", user_execone_start, user_execone_end);
     }
