@@ -2250,6 +2250,112 @@ static bool wrote_and_checked(const char *what, int rc) {
     return rc == KERR_OK;
 }
 
+/* **A symlink written and read back as a symlink.**
+ *
+ * The round trip is the test, not the creation: an inode whose mode says
+ * link and whose data is the target is easy to write and easy to write
+ * *wrong* — the format byte left saying EXTENTS, or the size left at zero —
+ * and either produces something `xfs_repair` offers to delete while every
+ * creation call still reports success. Reading it back through the ordinary
+ * path is what proves the two sides agree.
+ *
+ * A relative target on purpose: `../bin/sh` is the ordinary case and the one
+ * a path-validating copy-in would have rejected. */
+static int symlink_round_trip(void) {
+    const char *target = "../bin/sh";
+    char got[64];
+    uint32_t n = 0;
+    int rc = xfsmount_symlink("/w_link", target);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    rc = xfsmount_readlink("/w_link", got, sizeof got, &n);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    if (n != 9u) {
+        kprintf("fswrite:   the target came back %u bytes, want 9\n", n);
+        return KERR_INVAL;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        if (got[i] != target[i]) {
+            kprintf("fswrite:   the target differs at byte %u\n", i);
+            return KERR_INVAL;
+        }
+    }
+    return KERR_OK;
+}
+
+/* A target too long for the inode is refused rather than half-written.
+ *
+ * The bound is the literal area, so the test asks the filesystem for its own
+ * limit instead of quoting a number that changes with the inode size. */
+static int long_target_refused(void) {
+    char target[600];
+    uint32_t max = xfsmount_symlink_limit();
+    uint32_t len = max + 1u < sizeof target ? max + 1u : (uint32_t)sizeof target - 1u;
+    int rc;
+    if (max == 0 || len <= max) {
+        return KERR_OK; /* no mount, or an inode big enough that this cannot be tested */
+    }
+    for (uint32_t i = 0; i < len; i++) {
+        target[i] = 'x';
+    }
+    target[len] = '\0';
+    rc = xfsmount_symlink("/w_toolong", target);
+    if (rc == KERR_OK) {
+        kprintf("fswrite:   a %u-byte target was accepted past a %u-byte limit\n", len, max);
+        return KERR_INVAL;
+    }
+    return KERR_OK;
+}
+
+/* readlink on a regular file is EINVAL, which is the check that stops a
+ * caller mistaking a file's contents for a link's target. */
+static int readlink_refuses_a_file(void) {
+    char got[32];
+    uint32_t n = 0;
+    int rc = xfsmount_readlink("/w1", got, sizeof got, &n);
+    if (rc == KERR_OK) {
+        kprintf("fswrite:   readlink returned %u bytes for a regular file\n", n);
+        return KERR_INVAL;
+    }
+    return KERR_OK;
+}
+
+/* A rename through the path-level call, which is the one a program reaches.
+ *
+ * The write self-test already renames through the filesystem's own call; this
+ * exercises the layer above it — the one that splits two paths into two
+ * directories and two leaves, holds two directory inodes at once, and is
+ * where a frame-size refusal or a mixed-up argument order would live. The
+ * old name must be gone *and* the new one present: either alone is a bug
+ * that reads as success.
+ */
+static int rename_moves_a_name(void) {
+    uint8_t *bytes = NULL;
+    uint32_t size = 0;
+    uint32_t mode = 0;
+    uint64_t fsize = 0;
+    uint32_t nlink = 0;
+    int rc = xfsmount_rename_path("/w_link", "/w_moved");
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    if (xfsmount_stat_full("/w_link", &mode, &fsize, &nlink) == KERR_OK) {
+        kprintf("fswrite:   the old name is still there after a rename\n");
+        return KERR_INVAL;
+    }
+    rc = xfsmount_stat_full("/w_moved", &mode, &fsize, &nlink);
+    if (rc != KERR_OK) {
+        kprintf("fswrite:   the new name is not there after a rename\n");
+        return rc;
+    }
+    (void)bytes;
+    (void)size;
+    return KERR_OK;
+}
+
 static int read_back(const char *name, const char *want, uint32_t len) {
     uint8_t *bytes = NULL;
     uint32_t size = 0;
@@ -2797,6 +2903,10 @@ static void run_write_selftest(void) {
                 (unsigned long long)to_node, (unsigned long long)data_blocks,
                 (unsigned long long)xfsmount_leaf_splits());
     }
+    ok = ok && wrote_and_checked("a symlink round trips", symlink_round_trip());
+    ok = ok && wrote_and_checked("a long target is refused", long_target_refused());
+    ok = ok && wrote_and_checked("readlink refuses a file", readlink_refuses_a_file());
+    ok = ok && wrote_and_checked("a rename moves a name", rename_moves_a_name());
     ok = ok && wrote_and_checked("allocate past one group", fill_past_one_group());
     ok = ok && wrote_and_checked("one group alone must refuse", one_group_refuses());
     /* Last, because it leaves the filesystem read-only: anything after it

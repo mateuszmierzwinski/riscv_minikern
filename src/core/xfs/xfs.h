@@ -689,6 +689,23 @@ int xfs_link(struct xfs *fs, const struct xfs_inode *dir, const char *name, uint
 /* Moves a name, replacing whatever is at the destination. A directory may
  * be renamed within its own parent but not moved to another, because its
  * `..` and both parents' link counts would then be wrong (KERR_NOTSUP). */
+/* Makes a symbolic link called `name` in `dir`, holding `target`.
+ *
+ * The target lives inside the inode (`LOCAL` format), which is what XFS does
+ * for a short one. A target too long for the literal area needs its own data
+ * block with an `XSLM` header, which this does not write: it answers
+ * KERR_NAMETOOLONG rather than leaving a structure xfs_repair has to clean
+ * up. KERR_INVAL for an empty target, since a link to nothing is not a link.
+ *
+ * Reading one back needs nothing special — `xfs_file_read` already accepts a
+ * link inode and a LOCAL fork (core/xfs/xfs_symlink.c). */
+int xfs_symlink(struct xfs *fs, const struct xfs_inode *dir, const char *name, uint32_t namelen,
+                const char *target, uint32_t targetlen, uint64_t now_s, uint64_t *ino_out);
+
+/* The longest symlink target that fits inside an inode here: it depends on
+ * the inode size, so a caller that must refuse one can say by how much. */
+uint32_t xfs_symlink_max(const struct xfs *fs);
+
 int xfs_rename(struct xfs *fs, const struct xfs_inode *olddir, const char *from, uint32_t fromlen,
                const struct xfs_inode *newdir, const char *to, uint32_t tolen, uint64_t now_s);
 

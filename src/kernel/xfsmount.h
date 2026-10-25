@@ -178,6 +178,34 @@ int xfsmount_unlink(const char *name);
  * how a bad entry gets cleared. */
 int xfsmount_unlink_path(const char *path);
 
+/* Makes a symbolic link at `path` holding `target`.
+ *
+ * The target lives inside the inode, so it is bounded by the literal area —
+ * KERR_NAMETOOLONG past that, rather than a half-written structure. */
+int xfsmount_symlink(const char *path, const char *target);
+
+/* A second name for an existing file. KERR_XDEV across volumes, because a
+ * hard link is an inode number and that means nothing outside the
+ * filesystem that issued it. */
+int xfsmount_link_path(const char *from, const char *to);
+
+/* The longest symlink target this mount can store, or zero when nothing is
+ * mounted. A caller that must refuse one should ask rather than quote a
+ * constant: the bound is the inode's literal area. */
+uint32_t xfsmount_symlink_limit(void);
+
+/* Moves a name within one volume. KERR_XDEV across two, because a rename is
+ * not a copy. This is the mechanism a bounded log file rotates with: there
+ * is no ftruncate either, so moving the file aside is the only option. */
+int xfsmount_rename_path(const char *from, const char *to);
+
+/* Reads a symbolic link's target into `out`, without a terminator.
+ *
+ * KERR_INVAL for anything that is not a link, which is what readlink(2)
+ * answers: a caller handed a file's contents instead would have no way to
+ * tell a link to "hello" from a file containing the word. */
+int xfsmount_readlink(const char *path, char *out, uint32_t max, uint32_t *got);
+
 /* A name's inode and its link count, which is how a test of `link` and
  * `unlink` checks what they did rather than that they returned 0. */
 int xfsmount_inode_of(const char *name, uint64_t *ino, uint32_t *nlink);

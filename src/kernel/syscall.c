@@ -1040,6 +1040,101 @@ static int64_t sys_unlinkat(struct trapframe *tf) {
     return rc != KERR_OK ? rc : xfsmount_unlink_path(path);
 }
 
+/* symlinkat(target, newdirfd, linkpath).
+ *
+ * **The target is not a path to be validated.** It is the link's *contents*,
+ * and a relative symlink is both legal and common — `../bin/sh` is the
+ * ordinary case. So it is copied in with no leading-slash requirement, which
+ * `copy_in_path` would impose, and that is why this reads it by hand.
+ */
+static int64_t sys_symlinkat(struct trapframe *tf) {
+    char target[OPEN_MAX_PATH];
+    char link[OPEN_MAX_PATH];
+    virt_t at = sysarg(tf, 0);
+    int rc;
+    for (uint32_t i = 0;; i++) {
+        if (i == OPEN_MAX_PATH) {
+            return KERR_NAMETOOLONG;
+        }
+        if (uspace_copy_in(&target[i], at + i, 1) != KERR_OK) {
+            return KERR_FAULT;
+        }
+        if (target[i] == '\0') {
+            break;
+        }
+    }
+    if (target[0] == '\0') {
+        return KERR_INVAL;
+    }
+    rc = copy_in_path(tf, 2, link);
+    return rc != KERR_OK ? rc : xfsmount_symlink(link, target);
+}
+
+/* readlinkat(dirfd, path, buf, bufsiz).
+ *
+ * Returns the number of bytes placed and **writes no terminator**, which is
+ * readlink(2)'s contract and the part every first implementation gets wrong:
+ * a caller that trusted a NUL would read past the target into whatever its
+ * buffer held before. */
+static int64_t sys_readlinkat(struct trapframe *tf) {
+    char path[OPEN_MAX_PATH];
+    char target[OPEN_MAX_PATH];
+    virt_t out = sysarg(tf, 2);
+    uint64_t room = sysarg(tf, 3);
+    uint32_t got = 0;
+    int rc = copy_in_path(tf, 1, path);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    if (room == 0) {
+        return KERR_INVAL;
+    }
+    rc = xfsmount_readlink(path, target, room < sizeof target ? (uint32_t)room : sizeof target,
+                           &got);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    if (uspace_copy_out(out, target, got) != KERR_OK) {
+        return KERR_FAULT;
+    }
+    return (int64_t)got;
+}
+
+/* linkat(olddirfd, oldpath, newdirfd, newpath, flags): a second name for a
+ * file that already exists. The filesystem has had this since hard links
+ * were tested on the board; it was simply never exposed. */
+static int64_t sys_linkat(struct trapframe *tf) {
+    char from[OPEN_MAX_PATH];
+    char to[OPEN_MAX_PATH];
+    int rc = copy_in_path(tf, 1, from);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    rc = copy_in_path(tf, 3, to);
+    return rc != KERR_OK ? rc : xfsmount_link_path(from, to);
+}
+
+/* renameat2(olddirfd, oldpath, newdirfd, newpath, flags).
+ *
+ * The flags are refused rather than ignored: `RENAME_NOREPLACE` and
+ * `RENAME_EXCHANGE` change what the call means, and a caller that asked for
+ * "do not replace" and got a replacement has lost a file. Zero flags is the
+ * ordinary rename, which is what this does. */
+static int64_t sys_renameat2(struct trapframe *tf) {
+    char from[OPEN_MAX_PATH];
+    char to[OPEN_MAX_PATH];
+    int rc;
+    if (sysarg(tf, 4) != 0) {
+        return KERR_NOTSUP;
+    }
+    rc = copy_in_path(tf, 1, from);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    rc = copy_in_path(tf, 3, to);
+    return rc != KERR_OK ? rc : xfsmount_rename_path(from, to);
+}
+
 static int64_t sys_eventfd2(struct trapframe *tf) {
     return fdobjects_open_eventfd(sysarg(tf, 0), (uint32_t)sysarg(tf, 1) & O_NONBLOCK);
 }
@@ -1523,6 +1618,10 @@ static const struct syscall_entry table[] = {
     {61u, "getdents64", sys_getdents64},
     {34u, "mkdirat", sys_mkdirat},
     {35u, "unlinkat", sys_unlinkat},
+    {36u, "symlinkat", sys_symlinkat},
+    {37u, "linkat", sys_linkat},
+    {78u, "readlinkat", sys_readlinkat},
+    {276u, "renameat2", sys_renameat2},
     {SYS_RISCV_HWPROBE, "riscv_hwprobe", sys_riscv_hwprobe},
     {SYS_NANOSLEEP, "nanosleep", sys_nanosleep},
     {SYS_RSEQ, "rseq", sys_ok},

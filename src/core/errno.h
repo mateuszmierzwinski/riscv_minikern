@@ -42,6 +42,7 @@
 #define KERR_NOSYS   (-38)  /* not implemented */
 #define KERR_NOTEMPTY (-39)
 #define KERR_PROTO   (-71)  /* a peer broke its own protocol */
+#define KERR_XDEV    (-18)  /* EXDEV: a link across two filesystems */
 #define KERR_NOTSUP  (-95)  /* EOPNOTSUPP: understood, and refused */
 #define KERR_TIMEDOUT (-110)
 /* A filesystem's log holds work that was never committed to its metadata.

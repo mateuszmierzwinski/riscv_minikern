@@ -906,3 +906,226 @@ int xfsmount_write_into(const char *dir, const char *leaf, const void *bytes, ui
     }
     return rc != KERR_OK ? rc : xfs_flush(vol);
 }
+
+/* ── symbolic links ────────────────────────────────────────────────────── */
+
+/* Splits a path into the directory holding it and the final component.
+ *
+ * Into a caller-provided buffer rather than returning a pointer, because the
+ * directory part is a *prefix* of the path and there is nowhere to put the
+ * terminator without writing into the caller's string. A path with no slash
+ * belongs to the root of its volume, which is the case `"/"` covers.
+ */
+static int split_parent(const char *within, char *dir, uint32_t dirmax, const char **leaf) {
+    uint32_t last = 0;
+    uint32_t n = 0;
+    bool found = false;
+    for (n = 0; within[n] != '\0'; n++) {
+        if (within[n] == '/') {
+            last = n;
+            found = true;
+        }
+    }
+    if (!found || within[last + 1] == '\0') {
+        return KERR_INVAL; /* no leaf to create */
+    }
+    if (last == 0) {
+        dir[0] = '/';
+        dir[1] = '\0';
+    } else {
+        if (last >= dirmax) {
+            return KERR_NAMETOOLONG;
+        }
+        xfs_copy_bytes((uint8_t *)dir, (const uint8_t *)within, last);
+        dir[last] = '\0';
+    }
+    *leaf = within + last + 1;
+    return KERR_OK;
+}
+
+int xfsmount_symlink(const char *path, const char *target) {
+    struct xfs_inode dir;
+    const char *within = path;
+    struct xfs *vol = owner_of(path, &within);
+    char dirpath[128];
+    const char *leaf = NULL;
+    uint32_t namelen = 0;
+    uint32_t targetlen = 0;
+    int rc;
+    if (vol == NULL) {
+        return KERR_NODEV;
+    }
+    rc = split_parent(within, dirpath, sizeof dirpath, &leaf);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    rc = xfs_path_lookup(vol, dirpath, &dir);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    while (leaf[namelen] != '\0') {
+        namelen++;
+    }
+    while (target[targetlen] != '\0') {
+        targetlen++;
+    }
+    return xfs_symlink(vol, &dir, leaf, namelen, target, targetlen, now_seconds(), NULL);
+}
+
+int xfsmount_readlink(const char *path, char *out, uint32_t max, uint32_t *got) {
+    struct xfs_inode ip;
+    const char *within = path;
+    struct xfs *vol = owner_of(path, &within);
+    int rc;
+    if (vol == NULL) {
+        return KERR_NODEV;
+    }
+    rc = xfs_path_lookup(vol, within[0] == '\0' ? "/" : within, &ip);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    /* **The check is the point of a separate call.** `readlink` on anything
+     * that is not a link is `EINVAL`, and a caller that got the file's
+     * contents instead would have no way to tell a symlink to "hello" from
+     * a file containing the word. */
+    if (!xfs_is_link(&ip)) {
+        return KERR_INVAL;
+    }
+    *got = 0;
+    return xfs_file_read(vol, &ip, 0, (uint8_t *)out, max, got);
+}
+
+/* The existing file's inode number, on a frame of its own.
+ *
+ * `noinline` load-bearingly: a `struct xfs_inode` is large, and two of them
+ * on one frame is 1136 bytes against the kernel's 1024-byte limit. Inlining
+ * this would put them back together and the guard would refuse the build —
+ * which is the guard working, and the fifth time this tree has answered it
+ * the same way. */
+static __attribute__((noinline)) int ino_of(struct xfs *vol, const char *within, uint64_t *ino) {
+    struct xfs_inode ip;
+    int rc = xfs_path_lookup(vol, within, &ip);
+    if (rc == KERR_OK) {
+        *ino = ip.ino;
+    }
+    return rc;
+}
+
+int xfsmount_link_path(const char *from, const char *to) {
+    uint64_t existing = 0;
+    struct xfs_inode dir;
+    const char *fromwithin = from;
+    const char *towithin = to;
+    struct xfs *fromvol = owner_of(from, &fromwithin);
+    struct xfs *tovol = owner_of(to, &towithin);
+    char dirpath[128];
+    const char *leaf = NULL;
+    uint32_t namelen = 0;
+    int rc;
+    if (fromvol == NULL || tovol == NULL) {
+        return KERR_NODEV;
+    }
+    /* **A hard link cannot cross a volume**, because the second name is an
+     * inode number and an inode number means nothing outside the
+     * filesystem that issued it. EXDEV is what the caller expects. */
+    if (fromvol != tovol) {
+        return KERR_XDEV;
+    }
+    rc = ino_of(fromvol, fromwithin, &existing);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    rc = split_parent(towithin, dirpath, sizeof dirpath, &leaf);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    rc = xfs_path_lookup(tovol, dirpath, &dir);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    while (leaf[namelen] != '\0') {
+        namelen++;
+    }
+    return xfs_link(tovol, &dir, leaf, namelen, existing, now_seconds());
+}
+
+uint32_t xfsmount_symlink_limit(void) {
+    const struct xfs *vol = xfsmount_fs();
+    return vol == NULL ? 0 : xfs_symlink_max(vol);
+}
+
+/* Moves a name, which is what log rotation is made of.
+ *
+ * `xfs_rename` has been here since the write path was tested on the board;
+ * like hard links it was simply never exposed to a program. Rotation needs
+ * exactly this and nothing else: there is no `ftruncate` either, so moving
+ * the file aside is the only mechanism a log can use to stay bounded.
+ *
+ * Two directory inodes are live at once here, which the frame guard would
+ * refuse at 1136 bytes, so each lookup stands on its own frame through
+ * `ino_of`-style helpers. The source directory is resolved to an inode
+ * because `xfs_rename` needs it; the destination's likewise.
+ */
+static __attribute__((noinline)) int dir_and_leaf(struct xfs *vol, const char *within, char *dir,
+                                                  uint32_t dirmax, const char **leaf,
+                                                  uint32_t *namelen) {
+    int rc = split_parent(within, dir, dirmax, leaf);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    *namelen = 0;
+    while ((*leaf)[*namelen] != '\0') {
+        (*namelen)++;
+    }
+    (void)vol;
+    return KERR_OK;
+}
+
+/* The two directory inodes, on a frame of their own for the frame guard's
+ * sake — two of them plus the caller's buffers is past the kernel's 1024
+ * bytes, and `noinline` is what keeps them from being summed back together. */
+static __attribute__((noinline)) int rename_resolved(struct xfs *vol, const char *fromdir,
+                                                     const char *fromleaf, uint32_t fromlen,
+                                                     const char *todir, const char *toleaf,
+                                                     uint32_t tolen) {
+    struct xfs_inode olddir;
+    struct xfs_inode newdir;
+    int rc = xfs_path_lookup(vol, fromdir, &olddir);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    rc = xfs_path_lookup(vol, todir, &newdir);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    return xfs_rename(vol, &olddir, fromleaf, fromlen, &newdir, toleaf, tolen, now_seconds());
+}
+
+int xfsmount_rename_path(const char *from, const char *to) {
+    const char *fromwithin = from;
+    const char *towithin = to;
+    struct xfs *fromvol = owner_of(from, &fromwithin);
+    struct xfs *tovol = owner_of(to, &towithin);
+    char fromdir[128];
+    char todir[128];
+    const char *fromleaf = NULL;
+    const char *toleaf = NULL;
+    uint32_t fromlen = 0;
+    uint32_t tolen = 0;
+    int rc;
+    if (fromvol == NULL || tovol == NULL) {
+        return KERR_NODEV;
+    }
+    if (fromvol != tovol) {
+        return KERR_XDEV; /* a rename is not a copy */
+    }
+    rc = dir_and_leaf(fromvol, fromwithin, fromdir, sizeof fromdir, &fromleaf, &fromlen);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    rc = dir_and_leaf(tovol, towithin, todir, sizeof todir, &toleaf, &tolen);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    return rename_resolved(fromvol, fromdir, fromleaf, fromlen, todir, toleaf, tolen);
+}

@@ -84,6 +84,10 @@ void irqwait_rearm(struct irqwait *w) {
     }
 }
 
+static bool said_which_way;
+static bool said_what_the_sleeper_did;
+static bool said_how_the_spin_ended;
+
 int irqwait_wait(struct irqwait *w, uint64_t timeout_ns) {
     uint64_t deadline;
     if (w == NULL || !w->armed) {
@@ -99,6 +103,20 @@ int irqwait_wait(struct irqwait *w, uint64_t timeout_ns) {
         return KERR_OK;
     }
     deadline = timer_ns() + timeout_ns;
+    /* **One boot's worth of self-report, because this does not terminate.**
+     *
+     * A command whose interrupt never arrives must be reported inside the
+     * timeout, and it is not: a caller's own report after this function
+     * never prints. Every branch below ends either in a return or in a
+     * bounded spin, so the fault is in which branch is taken — and that
+     * cannot be read off the source, because it depends on whether the
+     * caller is a thread. Guarded to one line so it cannot flood. */
+    if (!said_which_way) {
+        said_which_way = true;
+        kprintf("irqwait: waiting, sleeper %s, deadline in %llu ms\n",
+                sleeper_wait != NULL ? "installed" : "absent",
+                (unsigned long long)(timeout_ns / 1000000ull));
+    }
     while (w->fired == 0u) {
         if (timer_ns() >= deadline) {
             timeout_count++;
@@ -120,8 +138,15 @@ int irqwait_wait(struct irqwait *w, uint64_t timeout_ns) {
          * time, so a driver that spins with the lock held stops every other
          * hart for the length of a transfer. Interrupts stay on so the
          * handler can set the flag. */
-        if (sleeper_wait != NULL && sleeper_wait(w, deadline) != KERR_INVAL) {
-            continue;
+        if (sleeper_wait != NULL) {
+            int slept = sleeper_wait(w, deadline);
+            if (!said_what_the_sleeper_did) {
+                said_what_the_sleeper_did = true;
+                kprintf("irqwait: the sleeper returned %d\n", slept);
+            }
+            if (slept != KERR_INVAL) {
+                continue;
+            }
         }
         {
             bool held = klock_held();
@@ -129,6 +154,11 @@ int irqwait_wait(struct irqwait *w, uint64_t timeout_ns) {
             __asm__ volatile("csrsi sstatus, 2" : : : "memory");
             while (w->fired == 0u && timer_ns() < deadline) {
                 /* Nothing: the handler is what ends this. */
+            }
+            if (!said_how_the_spin_ended) {
+                said_how_the_spin_ended = true;
+                kprintf("irqwait: the spin ended %s\n",
+                        w->fired != 0u ? "on the handler" : "on the deadline");
             }
             __asm__ volatile("csrci sstatus, 2" : : : "memory");
             if (held) {
