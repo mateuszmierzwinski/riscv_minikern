@@ -102,7 +102,19 @@ static int walk_leaves(const struct pgtable *pt, const uint64_t *table, uint32_t
     for (uint32_t i = 0; i < PT_ENTRIES; i++) {
         virt_t va = base + (virt_t)i * span;
         int rc;
-        if (table[i] == 0 || va >= below) {
+        /* **Valid entries only, and the `V` bit is the whole of it.**
+         *
+         * A non-zero entry is not necessarily an address. A swapped-out page
+         * keeps its slot number in the entry with `V` clear, and anything
+         * else this kernel stores there is equally not a frame — so handing
+         * `pte_phys` of one to a caller gives it a physical address that was
+         * never memory. The board said so precisely: a direct-map pointer
+         * 34 GB up, on a machine with 8 GB, and a load page fault in the
+         * kernel the moment it was dereferenced.
+         *
+         * Checked here rather than left to each visitor, because every
+         * visitor would have to know it and the first one did not. */
+        if ((table[i] & PTE_V) == 0 || va >= below) {
             continue;
         }
         if (pte_is_table(table[i])) {

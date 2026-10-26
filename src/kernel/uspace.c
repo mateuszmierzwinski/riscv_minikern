@@ -2898,6 +2898,25 @@ static int give_this_leaf(void *ctx, virt_t va, phys_t pa, uint64_t prot, uint64
  * pass also takes the file references a region carries and handles the
  * megapage case; this one is only concerned with pages nobody gave.
  */
+/* Whether `fork` also hands over pages no region claims.
+ *
+ * **Off by default, and that is a defect rather than a preference.** It fixes
+ * a real bug — a forked child dies on an instruction page fault at its own
+ * entry, because the region record does not mention a program's text — and it
+ * makes kernel code on the housekeeping beat fault on device memory thousands
+ * of times a boot (`dwmac_poll`, `plic_claim`, `temp_jh7110_sample`). Both
+ * are measured on the board.
+ *
+ * Behind a flag rather than deleted, because the next attempt should start
+ * from code the compiler still checks and the board can still run — which is
+ * what this tree does for every other half-finished mechanism.
+ * `minikern.forkleaves` turns it on. */
+static bool fork_gives_every_leaf;
+
+void uspace_set_fork_leaves(bool on) {
+    fork_gives_every_leaf = on;
+}
+
 static int give_every_mapped_page(struct uproc *child, struct uproc *parent) {
     struct handing_over h = {.child = child, .parent = parent};
     return pgtable_for_each_leaf(&parent->pt, USER_TOP, give_this_leaf, &h);
@@ -2986,7 +3005,7 @@ static int give_address_space(struct uproc *child, struct uproc *parent) {
     }
     /* The break is not an `mmap` region and is not recorded as one, so it
      * is walked explicitly. */
-    {
+    if (fork_gives_every_leaf) {
         int rc = give_every_mapped_page(child, parent);
         if (rc != KERR_OK) {
             return rc;

@@ -275,13 +275,11 @@ void user_main(void *start_state) {
      * is not a useful gate, so the configuration that is proven is the one
      * that ships, and the race is a roadmap entry with this one line to
      * reproduce it. */
-    /* **On now, because the children live.** The segment-recording route to
-     * that broke other things; walking the parent's page tables in `fork`
-     * does not, and these four processes stay alive as a service does. What
-     * the round then reaches is the sleeper hang — the wait never returning
-     * with company — which is the defect this was built to reproduce and is
-     * recorded in docs/ROADMAP.md. */
-    fork_bystanders();
+    /* **Off: the children die again.** `give_every_mapped_page` is what made
+     * them live and it is not called — see docs/ROADMAP.md. One line in each
+     * of the two places turns the whole reproducer on. */
+    (void)fork_bystanders;
+
     if (run_form("waitloop: wait4(pid), the form os/exec uses\n", 0) != 0u) {
         passed |= 1u;
     }

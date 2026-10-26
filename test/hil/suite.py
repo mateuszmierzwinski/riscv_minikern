@@ -471,15 +471,11 @@ CASES = [
     # the one fact silence destroys.
     ("§P2: wait4 returns for an exited child, two hundred times, both forms",
      "",
-     # **Asserts the fork fix, not the wait.** With four live children the
-     # wait hits a known, recorded defect — the sleeper that never wakes —
-     # so expecting 200 rounds would make this case a second report of that
-     # bug rather than a gate on this one. What it does gate is what was
-     # broken until now: four forked children that live, each reaching its
-     # own code, and the first round getting as far as the child's exit.
-     ["waitloop: four children alive alongside the one being waited for",
-      "waitloop: wait4(pid), the form os/exec uses",
-      "waitloop: child reached its exit"],
+     ["waitloop: wait4(pid), the form os/exec uses",
+      "waitloop:   through round 200",
+      "waitloop: wait4(-1), the form PID 1 collects orphans with",
+      "waitloop: passed mask 3",
+      "exited with 3"],
      200, "//:waitloop.elf"),
 
     # **A name resolved from user space**, which is the roadmap's DNS item.

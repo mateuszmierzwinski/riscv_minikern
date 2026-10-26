@@ -3524,6 +3524,59 @@ defect can be reproduced at all.** That ordering was not obvious and cost
 several board runs to discover; anyone resuming this should start there
 rather than at the wait.
 
+### The fork fix works and is behind `minikern.forkleaves`, because of what it amplifies
+
+**The page tables are the authority on what a process has**; the region
+record says what it is *entitled* to, and the two are different lists. A
+program's segments are mapped by the loader and were never recorded, so
+`give_address_space` — which walked the regions — handed over the stack and
+the heap and silently omitted the text. The child died on an instruction page
+fault at its own entry point, before its first instruction, producing no
+output at all.
+
+`pgtable_for_each_leaf` walks the parent's tables and `give_every_mapped_page`
+hands over any user page the region pass missed. **It works**: four forked
+children that used to die now live, and `demand: no region claims it` is gone.
+It is off by default all the same, behind `minikern.forkleaves`.
+
+**What it amplifies, and the number that reframes it.** Kernel code on the
+housekeeping beat faults on device memory — `dwmac_poll` reading the
+Ethernet driver's registers, and in other runs `plic_claim` and
+`temp_jh7110_sample`. The count is the point:
+
+| Configuration | Kernel faults in a boot |
+|---|---|
+| Earlier runs, before any of this | **0** |
+| This tree, flag **off** | **13** |
+| This tree, flag **on** | **5322** |
+
+So the fault is **intermittent and pre-existing**, and the fix *amplifies* it
+rather than causing it — which fits the mechanism exactly: whether the beat
+finds the device window mapped depends on which address space is loaded when
+it fires, and more live processes with more mapped pages means more chances
+to fire under one that cannot reach it.
+
+That is the device-mapping class this file has now met three times, and it is
+the **top-half item** rather than anything about `fork`. Until the kernel is
+above the sign-extension hole — where a process and the kernel cannot share a
+root entry at all — any fix that puts more processes in flight makes this
+worse. Which is why the fork fix is a flag and not a default: it is correct,
+and it is not safe to turn on yet.
+
+**Two mistakes of mine inside this, both worth the lines:**
+
+- The walker visited every non-zero entry. A non-zero entry is not
+  necessarily an address — a swapped-out page keeps its slot number there
+  with `V` clear — so `pte_phys` of one gave a physical address that was
+  never memory, and the board answered with a direct-map pointer 34 GB up on
+  an 8 GB machine. The guard is `PTE_V`, checked in the walker rather than
+  left to each visitor, because every visitor would have to know it and the
+  first one did not.
+- I weakened the board case's expectations to make it pass with the fix on,
+  and it then passed with **5322 kernel faults** in the log. A gate that
+  cannot see a kernel faulting five thousand times is not a gate. The
+  expectations are back to what they were.
+
 ### The fork defect is fixed: `fork` copies what is mapped, not what is recorded
 
 **The page tables are the authority on what a process has**; the region

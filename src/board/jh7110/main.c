@@ -3616,6 +3616,10 @@ static void run_user_programs(void) {
     sched_set_preemption(!cmdline_has(boot_cmdline, "minikern.cooperative"));
     /* The checks that are too expensive to leave on. */
     uspace_set_paranoid(cmdline_has(boot_cmdline, "minikern.paranoid"));
+    /* **The half-finished fork fix.** It stops a forked child dying on its
+     * own text and makes beat-time kernel code fault on device memory; both
+     * measured, see docs/ROADMAP.md. */
+    uspace_set_fork_leaves(cmdline_has(boot_cmdline, "minikern.forkleaves"));
     start_swap_if_asked();
     /* The controlling terminal, before anything can read it. */
     {

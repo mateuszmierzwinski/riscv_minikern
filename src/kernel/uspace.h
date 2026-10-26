@@ -334,6 +334,11 @@ bool uspace_capable(uint32_t cap);
  * makes a crash address comparable between two runs. */
 virt_t uspace_trampoline(void);
 void uspace_set_aslr(bool on);
+
+/* Whether `fork` hands over pages no region claims — the fix for a child
+ * that dies on its own text, which also makes beat-time kernel code fault on
+ * device memory. Off by default; `minikern.forkleaves` turns it on. */
+void uspace_set_fork_leaves(bool on);
 bool uspace_aslr(void);
 
 /* The calling process's soft limit on open descriptors, for the descriptor
