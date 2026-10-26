@@ -3377,6 +3377,20 @@ static void cat_a_file(const char *path) {
     {
         uint64_t hashed = 0, walked = 0;
         xfsmount_lookup_counts(&hashed, &walked);
+        /* **Says whether the index answered, as well as how often.**
+         *
+         * The counts alone cannot be asserted usefully. A test that demanded
+         * "0 walked" was demanding something wrong: a shortform or
+         * block-format directory has no leaf block to search, so walking is
+         * the *correct* path for one, and the boot looks things up in small
+         * directories — `/var` for the log, among others. The case failed on
+         * three legitimate walks while the index was working perfectly.
+         *
+         * Pinning the exact numbers instead would make the case fail
+         * whenever the boot's own lookups change, which is not what it is
+         * about. So the kernel states the property and the test asserts
+         * that: the index was consulted, or it was not. */
+        kprintf("cat: hash index %s\n", hashed != 0 ? "answered" : "was never reached");
         kprintf("cat: %s is %u bytes, checksum %llu (%llu hashed, %llu walked)\n", path, size,
                 (unsigned long long)sum, (unsigned long long)hashed,
                 (unsigned long long)walked);

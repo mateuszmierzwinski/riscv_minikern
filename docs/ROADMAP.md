@@ -3627,3 +3627,33 @@ a defect already recorded rather than a gate on this one.
 several commits old. The rebuilt twin said `plic_claim`, which is a device
 register and explains it exactly. **A wrong symbol is worse than no symbol,
 because it is acted on.** The script now rebuilds the twin itself.
+
+### The XFS b-tree case was failing on a wrong expectation, not a wrong reader
+
+`§3: a b-tree extent fork and a 3,000-entry directory` had been failing. The
+board said `(15 hashed, 3 walked)` and the case demanded `" hashed, 0
+walked)"`.
+
+**The reader was right and the test was wrong.** A shortform or block-format
+directory has no leaf block to search, so a walk is the *correct* path for
+one — `xfs_dir_lookup`'s own comment says so, and `KERR_NOTSUP` is how the
+hash lookup reports "this directory has no index" as distinct from "the name
+is not here". The boot looks things up in small directories, `/var` for the
+log among them. So the case was failing on three legitimate walks while the
+index was working perfectly on the 3,000-entry directory it was built to
+test.
+
+**Pinning the numbers would have been the other wrong answer.** `(15 hashed,
+3 walked)` is whatever this boot happens to do, and it changes whenever the
+kernel's own start-up lookups change — which has nothing to do with b-tree
+extent forks.
+
+So the kernel states the property and the test asserts the property: `cat:
+hash index answered`, or `was never reached`. The counts are still printed,
+because they are informative; they are no longer the gate.
+
+This is the shape of mistake this file already records twice — a test that
+encodes an assumption protects the assumption rather than the user, and an
+expectation has to come from the program's own behaviour rather than from
+what the harness assumes. It cost nothing this time because the failure was
+honest and visible; the expensive version is the one that passes.

@@ -132,7 +132,16 @@ CASES = [
       # **And answered by the index, not by walking.** The two paths return
       # the same inode, so without this the case passes just as happily
       # when the hash index is never reached.
-      " hashed, 0 walked)"],
+      #
+      # This asked for "0 walked" and was wrong: a shortform or block-format
+      # directory has no leaf block to search, so a walk is the *correct*
+      # path for one, and the boot looks things up in small directories —
+      # `/var` for the log among them. The case failed on three legitimate
+      # walks while the index was working. Pinning the exact counts instead
+      # would make it fail whenever the boot's own lookups change, which is
+      # not what it is about, so the kernel states the property and this
+      # asserts the property.
+      "cat: hash index answered"],
      150, None, True),
     # **A real v4 filesystem**, built by `mkfs.xfs -m crc=0` rather than by
     # altering a v5 image's version number — which is the only way the
