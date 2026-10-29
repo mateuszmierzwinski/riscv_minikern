@@ -4,6 +4,7 @@
 #include "core/bcache.h"
 #include "core/console.h"
 #include "core/errno.h"
+#include "core/fat/fat.h"
 #include "core/xfs/xfs.h"
 #include "kernel/disk.h"
 #include "kernel/mem.h"
@@ -29,9 +30,11 @@
  * at a wrong log offset because the bytes there happened to be zero. */
 struct volume {
     struct xfs own;   /* storage, for a volume this table mounted itself */
+    struct fat fat;   /* or, for a FAT volume, this */
     struct bcache cache;
-    struct xfs *use;  /* &own, or somebody else's mount */
+    struct xfs *use;  /* &own, or somebody else's mount; NULL for a FAT volume */
     char at[VOLUMES_PATH_MAX];
+    bool is_fat;
     bool used;
 };
 
@@ -125,6 +128,34 @@ static int cache_for(struct volume *v, const struct blockdev *dev) {
     return bcache_init(&v->cache, dev, mem, VOLUMES_CACHE_SLOTS);
 }
 
+/* A candidate that is not XFS, tried as FAT: the boot partition U-Boot
+ * reads, labelled `BOOT`, goes to `/boot`; any other FAT goes where its
+ * label says, under `/volumes`, and `/boot` is given to the first FAT
+ * after automount when none is labelled so (`settle_boot`). */
+static bool mount_fat(struct volume *v, uint32_t index) {
+    int rc;
+    bcache_invalidate(&v->cache);
+    rc = fat_mount(&v->fat, &v->cache);
+    if (rc != KERR_OK) {
+        kprintf("volumes: candidate %u is not a filesystem this kernel mounts (rc %d)\n",
+                index, rc);
+        return false;
+    }
+    v->use = NULL;
+    v->is_fat = true;
+    if (same_str(v->fat.label, VOLUMES_BOOT_LABEL)) {
+        copy_str(v->at, sizeof v->at, VOLUMES_BOOT_DIR);
+    } else {
+        mount_point_for(v->fat.label, index, v->at, sizeof v->at);
+    }
+    v->used = true;
+    count++;
+    kprintf("volumes: FAT%u \"%s\" mounted at %s%s\n", v->fat.type,
+            v->fat.label[0] != '\0' ? v->fat.label : "(no label)", v->at,
+            v->fat.writable ? "" : " (read-only)");
+    return true;
+}
+
 /* Mounts one candidate and records where it went, or says why it did not.
  *
  * A candidate that is not a filesystem this kernel reads is **not** a
@@ -141,10 +172,9 @@ static bool mount_one(uint32_t index, const struct blockdev *dev) {
     }
     rc = xfs_mount(&v->own, &v->cache);
     v->use = &v->own;
+    v->is_fat = false;
     if (rc != KERR_OK) {
-        kprintf("volumes: candidate %u is not a filesystem this kernel mounts (rc %d)\n",
-                index, rc);
-        return false;
+        return mount_fat(v, index);
     }
     mount_point_for(v->own.label, index, v->at, sizeof v->at);
     v->used = true;
@@ -186,24 +216,45 @@ void volumes_register(struct xfs *fs, uint32_t index) {
             xfs_writable(fs) ? "" : " (read-only)");
 }
 
+/* **`/boot` is the boot partition, whatever it is called.** One labelled
+ * `BOOT` already went there; otherwise the first FAT volume does — a card
+ * formatted for U-Boot need not have labelled its FAT, and the one the
+ * firmware loads the kernel from is the one a kernel update must reach. */
+static void settle_boot(void) {
+    for (uint32_t i = 0; i < count; i++) {
+        if (same_str(table[i].at, VOLUMES_BOOT_DIR)) {
+            return;
+        }
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        if (table[i].is_fat) {
+            copy_str(table[i].at, sizeof table[i].at, VOLUMES_BOOT_DIR);
+            kprintf("volumes: FAT at %s is the boot partition\n", VOLUMES_BOOT_DIR);
+            return;
+        }
+    }
+}
+
 uint32_t volumes_automount(void) {
     uint32_t candidates = disk_volume_count();
     count = 0;
-    /* **From the second candidate.** The first is the one
-     * `adopt_partition_or_whole` gives to `xfsmount`, and mounting it here
-     * as well would be the same device under two caches. It reaches the
-     * table through `volumes_register` instead, pointed at rather than
-     * copied. */
-    for (uint32_t i = 1; i < candidates && count < VOLUMES_MAX; i++) {
+    /* **Every candidate but the root.** The root is the one `disk.c`
+     * chose and `xfsmount` mounted, and mounting it here as well would be
+     * the same device under two caches. It reaches the table through
+     * `volumes_register` instead, pointed at rather than copied. */
+    for (uint32_t i = 0; i < candidates && count < VOLUMES_MAX; i++) {
         const struct blockdev *dev = disk_volume(i);
-        if (dev != NULL) {
+        if (dev != NULL && i != disk_root_volume()) {
             (void)mount_one(i, dev);
         }
     }
+    settle_boot();
     return count;
 }
 
-struct xfs *volumes_resolve(const char *path, const char **within) {
+/* The volume a path is on — the longest mount point it lies under — and
+ * the path inside it; VOLUMES_MAX for none. */
+static uint32_t pick_volume(const char *path, const char **within) {
     uint32_t best = 0;
     uint32_t pick = VOLUMES_MAX;
     for (uint32_t i = 0; i < count; i++) {
@@ -214,7 +265,7 @@ struct xfs *volumes_resolve(const char *path, const char **within) {
         }
     }
     if (pick == VOLUMES_MAX) {
-        return NULL;
+        return VOLUMES_MAX;
     }
     /* The path inside the volume. `/` matched as one character and owns the
      * whole path; any other mount point is stripped, and a path that named
@@ -225,7 +276,36 @@ struct xfs *volumes_resolve(const char *path, const char **within) {
     } else {
         *within = path[best] == '\0' ? "/" : path + best;
     }
+    return pick;
+}
+
+/* **NULL with `within` NULL for a path on a FAT volume**, so the caller
+ * cannot mistake it for "no volume at all" and fall back to the root — which
+ * would have answered for `/boot` out of the root filesystem. */
+struct xfs *volumes_resolve(const char *path, const char **within) {
+    uint32_t pick = pick_volume(path, within);
+    if (pick == VOLUMES_MAX) {
+        return NULL;
+    }
+    if (table[pick].is_fat) {
+        *within = NULL;
+        return NULL;
+    }
     return table[pick].use;
+}
+
+struct fat *volumes_resolve_fat(const char *path, const char **within) {
+    uint32_t pick = pick_volume(path, within);
+    return pick != VOLUMES_MAX && table[pick].is_fat ? &table[pick].fat : NULL;
+}
+
+int volumes_flush_fat(void) {
+    int rc = KERR_OK;
+    for (uint32_t i = 0; i < count; i++) {
+        int one = table[i].is_fat ? fat_flush(&table[i].fat) : KERR_OK;
+        rc = rc == KERR_OK ? one : rc;
+    }
+    return rc;
 }
 
 uint32_t volumes_count(void) {
@@ -237,10 +317,16 @@ const char *volumes_at(uint32_t i) {
 }
 
 const char *volumes_label(uint32_t i) {
+    if (i < count && table[i].is_fat) {
+        return table[i].fat.label;
+    }
     return i < count && table[i].use != NULL ? table[i].use->label : "";
 }
 
 bool volumes_readonly(uint32_t i) {
+    if (i < count && table[i].is_fat) {
+        return !table[i].fat.writable;
+    }
     return i < count && table[i].use != NULL ? !xfs_writable(table[i].use) : true;
 }
 

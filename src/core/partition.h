@@ -60,6 +60,12 @@ struct partdev {
  * filesystem somewhere else on the disk. */
 uint32_t partition_scan(struct blockdev *dev, struct partition *out, uint32_t cap);
 
+/* `partition_scan`, telling a table that could not be **read** from one that
+ * is not there: `KERR_IO` when a read failed and nothing was found, so the
+ * caller can try again rather than use a partitioned disk whole. */
+int partition_scan_checked(struct blockdev *dev, struct partition *out, uint32_t cap,
+                           uint32_t *found);
+
 /* Presents `p` of `dev` as a block device of its own. The partition must lie
  * inside the device; `KERR_INVAL` when it does not, which is what a corrupt
  * table looks like. */

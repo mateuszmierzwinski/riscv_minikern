@@ -42,7 +42,7 @@ timeout 90 qemu-system-riscv64 -M virt -smp 4 -m 1G -nographic -bios default -ke
     -global virtio-mmio.force-legacy=false \
     -drive "file=$disk,if=none,format=raw,id=hd0" -device virtio-blk-device,drive=hd0 \
     -append "console=sbi minikern.halt=poweroff minikern.disktest=1" > "$log" 2>&1 || status=$?
-tr -d '\r' < "$log" > "$log.clean" && mv "$log.clean" "$log"
+tr -d '\r' < "$log" | sed -E 's/^\[[0-9:.]+\] [A-Z] //' > "$log.clean" && mv "$log.clean" "$log"
 cat "$log"
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
@@ -86,7 +86,7 @@ status=0
 timeout 90 qemu-system-riscv64 -M virt -smp 4 -m 1G -nographic -bios default -kernel "$image" \
     -drive "file=$nvme,if=none,format=raw,id=nvm0" -device nvme,serial=mk0001,drive=nvm0 \
     -append "console=sbi minikern.halt=poweroff minikern.disktest=1" > "$nvmelog" 2>&1 || status=$?
-tr -d '\r' < "$nvmelog" > "$nvmelog.clean" && mv "$nvmelog.clean" "$nvmelog"
+tr -d '\r' < "$nvmelog" | sed -E 's/^\[[0-9:.]+\] [A-Z] //' > "$nvmelog.clean" && mv "$nvmelog.clean" "$nvmelog"
 cat "$nvmelog"
 [ "$status" -eq 0 ] || fail "the NVMe boot exited $status"
 ! grep -qF PANIC "$nvmelog" || fail "the kernel panicked with an NVMe drive"
@@ -111,7 +111,7 @@ timeout 90 qemu-system-riscv64 -M virt -m 1G -nographic -bios default -kernel "$
     -drive "file=$disk,if=none,format=raw,id=hd0" -device virtio-blk-device,drive=hd0 \
     -drive "file=$nvme,if=none,format=raw,id=nvm1" -device nvme,serial=mk0002,drive=nvm1 \
     -append "console=sbi minikern.halt=poweroff" > "$bothlog" 2>&1 || fail "the two-disk boot failed"
-tr -d '\r' < "$bothlog" > "$bothlog.clean" && mv "$bothlog.clean" "$bothlog"
+tr -d '\r' < "$bothlog" | sed -E 's/^\[[0-9:.]+\] [A-Z] //' > "$bothlog.clean" && mv "$bothlog.clean" "$bothlog"
 grep -qF "disk: nvme" "$bothlog" ||
     { cat "$bothlog"; fail "with both devices present, NVMe was not preferred"; }
 echo "ok: with both a virtio disk and an NVMe drive, the NVMe drive is chosen"
@@ -143,7 +143,7 @@ status=0
 timeout 120 qemu-system-riscv64 -M virt -smp 4 -m 1G -nographic -bios default -kernel "$image" \
     -device sdhci-pci -drive "file=$sdimg,if=none,format=raw,id=sd0" -device sd-card,drive=sd0 \
     -append "console=sbi minikern.halt=poweroff minikern.disktest=1" > "$sdlog" 2>&1 || status=$?
-tr -d '\r' < "$sdlog" > "$sdlog.clean" && mv "$sdlog.clean" "$sdlog"
+tr -d '\r' < "$sdlog" | sed -E 's/^\[[0-9:.]+\] [A-Z] //' > "$sdlog.clean" && mv "$sdlog.clean" "$sdlog"
 cat "$sdlog"
 [ "$status" -eq 0 ] || fail "the SD boot exited $status"
 ! grep -qF PANIC "$sdlog" || fail "the kernel panicked with an SD card"
@@ -162,7 +162,7 @@ echo "ok: an SD card through a standard host controller — identified, sized, w
 nodisk="$tmp/nodisk.log"
 timeout 90 qemu-system-riscv64 -M virt -m 1G -nographic -bios default -kernel "$image" \
     -append "console=sbi minikern.halt=poweroff" > "$nodisk" 2>&1 || fail "the no-disk boot failed"
-tr -d '\r' < "$nodisk" > "$nodisk.clean" && mv "$nodisk.clean" "$nodisk"
+tr -d '\r' < "$nodisk" | sed -E 's/^\[[0-9:.]+\] [A-Z] //' > "$nodisk.clean" && mv "$nodisk.clean" "$nodisk"
 grep -qF "disk: none attached" "$nodisk" || { cat "$nodisk"; fail "a machine with no disk did not say so"; }
 grep -qF "minikern: powering off" "$nodisk" || fail "the no-disk boot did not finish"
 echo "ok: a machine with no disk says so and carries on"

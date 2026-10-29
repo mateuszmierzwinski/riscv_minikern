@@ -111,6 +111,26 @@ uint32_t xfs_fork_bytes(const struct xfs *fs, const uint8_t *di);
 void xfs_stamp_owner(const struct xfs *fs, uint8_t *at, uint32_t blkno_off, uint32_t uuid_off,
                      uint32_t owner_off, uint64_t blkno, uint64_t owner);
 
+/* A filesystem block's **disk address**: in 512-byte sectors from the
+ * start of the device, whatever the block size. It is what every v5
+ * self-describing header's `blkno` holds — not the filesystem block, and
+ * not the block's place in the file it belongs to. */
+uint64_t xfs_fsb_to_daddr(const struct xfs *fs, uint64_t fsb);
+
+/* Recomputes a directory data block's `bestfree` table from its free
+ * spans, trimming a block directory's last span to its hash array
+ * (xfs_dirbest.c). Any other kind of block is left alone. */
+void xfs_dir_seal_free(const struct xfs *fs, uint8_t *block);
+
+/* Writes a directory or attribute block's own disk address into its
+ * header, by its magic, and reseals it; nothing on v4 or for any other kind.
+ *
+ * **Stamped where the block is stored**, because that is the one place its
+ * address is certain. The builders used to skip the field or fill it with
+ * the block's logical number, and nothing here ever read it back —
+ * `xfs_repair` does, and condemned every block a directory grew. */
+void xfs_stamp_daddr(const struct xfs *fs, uint8_t *block, uint64_t fsb);
+
 /* The filesystem's UUID at uuid, or not. */
 bool xfs_uuid_ok(const struct xfs *fs, const uint8_t *uuid);
 
@@ -163,6 +183,11 @@ int xfs_log_replay(struct xfs *fs);
  * a v2 inode are the file's own fork. */
 void xfs_log_dinode_to_disk(uint8_t *di, const uint8_t *logged, uint32_t core);
 
+/* How many basic blocks the record whose header is at `hdr` occupies:
+ * its header blocks and its data, which a v2 record's `h_len` counts
+ * padding included. */
+uint64_t xfs_log_record_blocks(const uint8_t *hdr);
+
 /* Writes an unmount record, which is what makes a log clean. */
 int xfs_log_mark_clean(struct xfs *fs);
 
@@ -170,6 +195,24 @@ int xfs_log_mark_clean(struct xfs *fs);
  * offset within that block. The same arithmetic the reader uses, exposed
  * because a write has to put the inode back where it came from. */
 void xfs_inode_place(const struct xfs *fs, uint64_t ino, uint64_t *device_block, uint32_t *boffset);
+
+/* An on-disk inode's two extent counts, each read and written in the field
+ * the inode's own `NREXT64` flag says — a 64-bit data count at offset 24
+ * and a 32-bit attribute count where the narrow data count was, or the
+ * narrow pair at 76 and 80.
+ *
+ * **Every writer goes through these.** Three of the five that wrote the
+ * data count knew only the narrow field, and `mkfs` sets the flag on the
+ * root directory: the first time the root outgrew its inode the count went
+ * where the attribute count lives, the directory read back as empty, and
+ * the next create failed `ENOENT`. And the attribute count was not written
+ * at all — the end of the list was found by a zero record, which is not
+ * what the format says and not what `xfs_repair` reads. */
+bool xfs_dinode_big_counts(const struct xfs *fs, const uint8_t *di);
+uint64_t xfs_dinode_data_extents(const struct xfs *fs, const uint8_t *di);
+void xfs_dinode_set_data_extents(const struct xfs *fs, uint8_t *di, uint64_t n);
+uint32_t xfs_dinode_attr_extents(const struct xfs *fs, const uint8_t *di);
+void xfs_dinode_set_attr_extents(const struct xfs *fs, uint8_t *di, uint32_t n);
 
 /* One inode in a transaction: which inode, where on the device its chunk
  * is and where in that chunk it sits — what recovery would need to find it
@@ -184,6 +227,16 @@ struct xfs_log_inode_item {
 #define XFS_LOG_MAX_ITEMS 2u
 
 /* ── the group headers and the btrees (xfs_create.c) ───────────────────── */
+
+/* One of a group's four header sectors — superblock, AGF, AGI, AGFL — in its
+ * block, wherever the sector size puts it.
+ *
+ * **Not always the group's first block.** With 512-byte sectors all four
+ * share it; with 4 KiB sectors (`mkfs.xfs -s size=4096`, and any 4Kn
+ * drive) each has a block of its own, and indexing them inside the first
+ * block's buffer read past its end into whatever the cache kept next. */
+int xfs_group_header(struct xfs *fs, uint32_t agno, uint32_t sector, struct bbuf **out,
+                     uint8_t **at);
 
 /* The group's first block, where its four header sectors live. */
 uint64_t xfs_group_block(const struct xfs *fs, uint32_t agno);
@@ -206,6 +259,22 @@ int xfs_tree_get(struct xfs *fs, uint32_t agno, uint32_t block, uint32_t magic, 
  * NULL. Found by range: a chunk does not begin at a multiple of its size. */
 uint8_t *xfs_tree_record_for(const struct xfs *fs, const struct bbuf *b, uint32_t agino);
 
+/* An inode b-tree record's free count, read and written in whichever layout
+ * the filesystem uses; the free inodes that exist (holes taken out); and a
+ * fresh record for a full chunk of free inodes (xfs_inobt.c). */
+uint32_t xfs_inobt_freecount(const struct xfs *fs, const uint8_t *rec);
+void xfs_inobt_set_freecount(const struct xfs *fs, uint8_t *rec, uint32_t n);
+uint64_t xfs_inobt_usable(const struct xfs *fs, const uint8_t *rec);
+void xfs_inobt_rec_init(const struct xfs *fs, uint8_t *rec, uint32_t startino);
+
+/* Takes the lowest free inode of the first chunk that has one, in both
+ * inode trees and the group's free count — KERR_NOENT when every chunk is
+ * full; gives one back; and puts a new chunk of free inodes into the trees
+ * (xfs_inobt.c). Inode numbers here are the group's own. */
+int xfs_inobt_take(struct xfs *fs, uint32_t agno, uint32_t *agino);
+int xfs_inobt_release(struct xfs *fs, uint32_t agno, uint32_t agino);
+int xfs_inobt_add_chunk(struct xfs *fs, uint32_t agno, uint32_t startino);
+
 /* The superblock's free-inode counter, moved by delta. */
 int xfs_count_inodes_free(struct xfs *fs, int32_t delta);
 
@@ -221,6 +290,86 @@ void xfs_put_be64(uint8_t *p, uint64_t v);
  * it took. KERR_NOSPC when the group has none, KERR_NOTSUP for a tree with
  * branches. */
 int xfs_alloc_block(struct xfs *fs, uint32_t agno, uint32_t want, uint32_t *got);
+
+/* What a block taken from or put on a group's free list is for: a refill
+ * (nothing counted), a free-space tree block (`agf_btreeblks`) or a
+ * reverse-map tree block (that and `agf_rmap_blocks`) — xfs_agfl.c. */
+enum xfs_agfl_use {
+    XFS_AGFL_PLAIN,
+    XFS_AGFL_FREESPACE,
+    XFS_AGFL_RMAP,
+};
+
+int xfs_agfl_pop(struct xfs *fs, uint32_t agno, enum xfs_agfl_use use, uint32_t *agbno);
+int xfs_agfl_push(struct xfs *fs, uint32_t agno, enum xfs_agfl_use use, uint32_t agbno);
+
+/* Makes sure group `agno`'s free list holds what one change to its
+ * free-space and reverse-map trees can take, topping it up from free space
+ * when it does not. Called before every allocation, free and map change;
+ * KERR_NOSPC when the list cannot be made deep enough. */
+int xfs_agfl_ensure(struct xfs *fs, uint32_t agno);
+
+/* An allocation of `count` blocks in one group that asks nothing of the
+ * free list and moves no superblock count — the refill's own path. */
+int xfs_alloc_raw(struct xfs *fs, uint32_t agno, uint32_t count, uint32_t *got);
+
+/* A group's free-space header, with its magic, checksum and UUID checked. */
+int xfs_agf_get(struct xfs *fs, uint32_t agno, struct bbuf **out, uint8_t **agf);
+
+/* The superblock's free-block counter, moved by delta. */
+int xfs_count_blocks_free(struct xfs *fs, int64_t delta);
+
+/* Records that `count` blocks from `fsb` belong to `owner` — an inode, or
+ * one of the `XFS_RMAP_OWN_*` structures — at logical block `offset`, whose
+ * high bits carry the `XFS_RMAP_OFF_*` flags; and takes such a record back
+ * out, whole or in part (xfs_rmap.c). Both do nothing on a filesystem
+ * without the reverse map, so a caller never asks which kind it has.
+ *
+ * **Every block an inode gains or loses goes through these.** A block the
+ * map does not know about, or one it still credits to a file that freed
+ * it, is what `xfs_repair` reports first on a filesystem `mkfs.xfs` made
+ * with its defaults. */
+int xfs_rmap_map(struct xfs *fs, uint64_t fsb, uint32_t count, uint64_t owner, uint64_t offset);
+int xfs_rmap_unmap(struct xfs *fs, uint64_t fsb, uint32_t count, uint64_t owner,
+                   uint64_t offset);
+
+/* Maps blocks another owner maps too — a reflink's share — which
+ * `xfs_rmap_map` refuses as a second mapping (xfs_rmap.c). */
+int xfs_rmap_map_shared(struct xfs *fs, uint64_t fsb, uint32_t count, uint64_t owner,
+                        uint64_t offset);
+
+/* Moves the share count of a range by `delta` (xfs_refcount.c). A block
+ * held once has no record; lowering one hands it to `on_last`, which
+ * frees it. Whether a block is shared, for copy-on-write. */
+typedef int (*xfs_refcount_free_fn)(void *self, uint64_t fsb, uint32_t count);
+int xfs_refcount_adjust(struct xfs *fs, uint64_t fsb, uint32_t count, int32_t delta,
+                        xfs_refcount_free_fn on_last, void *self);
+int xfs_refcount_shared(struct xfs *fs, uint64_t fsb, bool *shared);
+
+/* Frees a file's data extent: as `xfs_free_owned` for a file that shares
+ * nothing, and for one that may, its reverse-map record out and the counts
+ * down — only blocks nobody else holds are freed (xfs_reflink.c). */
+int xfs_free_data(struct xfs *fs, const struct xfs_inode *ip, uint64_t fsb, uint32_t count,
+                  uint64_t offset);
+
+/* Makes logical block `logical` of a regular file writable where it is: a
+ * hole filled, an unwritten block written, a shared block copied
+ * (xfs_fill.c). `ip` is re-read when the map changed. */
+int xfs_file_prepare_block(struct xfs *fs, struct xfs_inode *ip, uint64_t logical);
+
+/* Makes the empty file `dst` share every block of `src` — what `FICLONE`
+ * does — with the counts and the reverse map to match. */
+int xfs_reflink_clone(struct xfs *fs, const struct xfs_inode *src, const struct xfs_inode *dst);
+
+/* Gives back blocks an owner had: out of the reverse map first, then to the
+ * free-space trees. What every free of a file's or directory's blocks uses,
+ * so that none of them can forget the map. */
+int xfs_free_owned(struct xfs *fs, uint64_t fsb, uint32_t count, uint64_t owner,
+                   uint64_t offset);
+
+/* Gives back every block of an extent-format attribute fork, as a file that
+ * is going away must (xfs_attr.c). Nothing for a fork held in the inode. */
+int xfs_attr_free_blocks(struct xfs *fs, const struct xfs_inode *ip);
 
 /* Gives an extent back, joined to whatever it abuts. */
 int xfs_free_extent(struct xfs *fs, uint32_t agno, uint32_t start, uint32_t count);
@@ -240,6 +389,44 @@ struct xfs_extent {
     uint32_t blockcount;
     bool unwritten; /* allocated but never written: reads as zeroes */
 };
+
+/* The reverse-map offset of an extent's block `skip` blocks in: its logical
+ * block, flagged unwritten when it is. */
+static inline uint64_t xfs_rmap_offset_of(const struct xfs_extent *e, uint64_t skip) {
+    return (e->startoff + skip) | (e->unwritten ? XFS_RMAP_OFF_UNWRITTEN : 0u);
+}
+
+/* ── a data fork's extent map, whatever its shape (xfs_fork.c) ─────────── */
+
+#define XFS_FORK_MAP_MAX    4096u /* extents one map may hold while edited */
+#define XFS_FORK_LEAVES_MAX 32u   /* leaves a two-level tree may have */
+
+struct xfs_fork_map {
+    struct xfs_extent *e; /* sorted by file offset */
+    uint32_t count;
+    uint32_t cap;
+};
+
+/* The header of a long-form b-tree block: 72 bytes on v5, 24 on v4. */
+uint32_t xfs_bmbt_hdr(const struct xfs *fs);
+
+/* Loads the data fork of the on-disk inode `di` into a map — an extent
+ * list or a two-level tree alike — and stores one back in whichever form
+ * fits, taking and giving tree blocks as needed and moving `di_nblocks` by
+ * them. **A store follows the load of the same fork**: the tree's leaves
+ * are remembered between the two, and nothing in between may load another.
+ * KERR_NOSPC for a map past either limit above. */
+int xfs_fork_load(struct xfs *fs, const uint8_t *di, struct xfs_fork_map *out);
+int xfs_fork_store(struct xfs *fs, uint64_t ino, uint8_t *di, const struct xfs_fork_map *m);
+
+/* Adds an extent in file order, joined to neighbours it continues; and
+ * takes record `i` out. */
+int xfs_fork_map_add(struct xfs_fork_map *m, const struct xfs_extent *e);
+void xfs_fork_map_drop(struct xfs_fork_map *m, uint32_t i);
+
+/* Takes `len` blocks at `logical` out of the one extent holding them, and
+ * says where on disk they were. */
+int xfs_fork_map_cut(struct xfs_fork_map *m, uint64_t logical, uint32_t len, uint64_t *fsb);
 
 /* Unpacks the sixteen-byte record at p. */
 void xfs_extent_unpack(const uint8_t *p, struct xfs_extent *out);
@@ -282,6 +469,10 @@ int xfs_inode_chunk_add(struct xfs *fs, uint32_t *agno, uint32_t *startino);
  * means nothing in another. */
 int xfs_alloc_somewhere(struct xfs *fs, uint32_t *agno, uint32_t count, uint32_t want,
                         uint32_t *got);
+
+/* `xfs_alloc_somewhere` for an inode chunk: the run starts at a multiple
+ * of the superblock's inode alignment, in whichever group has one. */
+int xfs_alloc_chunk_somewhere(struct xfs *fs, uint32_t *agno, uint32_t count, uint32_t *got);
 
 /* Marks a directory's own inode as changed: its times, and nothing else,
  * because an edit inside an existing block moves neither its size nor its
@@ -334,6 +525,22 @@ uint32_t xfs_dir_find_room(const struct xfs *fs, const uint8_t *block, uint32_t 
 int xfs_dir_raw_load(struct xfs *fs, const struct xfs_inode *dir, uint64_t logical,
                      uint64_t *fsb);
 int xfs_dir_raw_store(struct xfs *fs, uint64_t fsb);
+
+/* Records a directory block in the reverse map as the directory's, at its
+ * logical block, while the caller holds the inode's buffer — which is put
+ * on failure, so a caller returns the error and nothing else. Called after
+ * every check that could refuse the block and before the fork changes. */
+int xfs_dir_map_block(struct xfs *fs, struct bbuf *held, uint64_t fsb, uint64_t dirino,
+                      uint64_t logical);
+
+/* Whether a data block holds no entry at all — the state `xfs_repair` junks
+ * a data block for — and takes one directory block at `logical` out of the
+ * fork and gives it back, leaving a hole (xfs_dirshrink.c). KERR_NOSPC when
+ * cutting it from the middle of an extent would need a slot the inode does
+ * not have; the block then stays, and is a refusal rather than a loss. */
+bool xfs_dir_block_is_empty(const struct xfs *fs, const uint8_t *block);
+int xfs_dir_fork_remove(struct xfs *fs, const struct xfs_inode *dir, uint64_t logical,
+                        uint64_t now_s);
 
 /* A fresh block for the directory, from any group that has one. */
 int xfs_dir_take_block(struct xfs *fs, uint64_t near, uint64_t *fsb);

@@ -49,8 +49,8 @@ static uint32_t node_capacity(const struct xfs *fs) {
 
 /* Writes a `da3` header into the buffer: the shape every index block of a
  * directory shares, whatever it then holds. */
-static void da3_header(struct xfs *fs, uint16_t magic, uint64_t ino, uint64_t blkno,
-                       uint32_t count, uint64_t forw, uint64_t back) {
+static void da3_header(struct xfs *fs, uint16_t magic, uint64_t ino, uint32_t count,
+                       uint64_t forw, uint64_t back) {
     for (uint32_t i = 0; i < fs->dirblocksize; i++) {
         fs->dirblock[i] = 0;
     }
@@ -58,8 +58,7 @@ static void da3_header(struct xfs *fs, uint16_t magic, uint64_t ino, uint64_t bl
     xfs_put_be32(fs->dirblock + XFS_DA3_BACK_OFF, (uint32_t)back);
     xfs_put_be16(fs->dirblock + XFS_DA3_MAGIC_OFF, magic);
     xfs_put_be16(fs->dirblock + fs->da_count, (uint16_t)count);
-    xfs_stamp_owner(fs, fs->dirblock, XFS_DA3_BLKNO_OFF, XFS_DA3_UUID_OFF, XFS_DA3_OWNER_OFF,
-                    blkno, ino);
+    xfs_stamp_owner(fs, fs->dirblock, 0, XFS_DA3_UUID_OFF, XFS_DA3_OWNER_OFF, 0, ino);
 }
 
 /* The highest hash in a run of pairs, which is what a node entry carries
@@ -69,32 +68,61 @@ static uint32_t top_hash(const uint8_t *pairs, uint32_t count) {
     return count == 0 ? 0 : xfs_be32(pairs + (count - 1u) * XFS_DA3_ENTRY_SIZE);
 }
 
-/* Writes the free block: the `bests` array, evicted from the leaf.
+/* Where the free block's three counts live: after the v5 header, or
+ * straight after the magic on v4. `nth` is 0, 1 or 2 — `firstdb`, `nvalid`
+ * and `nused`. These were v5's offsets on both, which on v4 put the counts
+ * inside the `bests` array. */
+static uint32_t free_count_at(const struct xfs *fs, uint32_t nth) {
+    return (fs->v5 ? XFS_DIR3_FREE_FIRSTDB : XFS_DIR2_FREE_FIRSTDB) + 4u * nth;
+}
+
+/* Recounts `nused`: the entries that name a data block at all.
  *
+ * **Not the ones with room.** A best of zero is a data block that is
+ * entirely full, which is a block in use; only `NULLDATAOFF` means none.
+ * This counted the non-zero ones, so a full block went uncounted — and
+ * once the free block existed nothing recounted it as blocks were added. */
+static void free_recount(struct xfs *fs) {
+    uint32_t n = xfs_be32(fs->dirblock + free_count_at(fs, 1u)), used = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t at = fs->dir_free_hdr + i * XFS_DIR2_LEAF_BEST_SIZE;
+        used += xfs_be16(fs->dirblock + at) != XFS_DIR2_NULL_DATAOFF ? 1u : 0u;
+    }
+    xfs_put_be32(fs->dirblock + free_count_at(fs, 2u), used);
+}
+
+/* Ends `nvalid` at the last data block there is, past any trailing slots a
+ * given-back block left as `NULLDATAOFF`. */
+static void free_trim(struct xfs *fs) {
+    uint32_t n = xfs_be32(fs->dirblock + free_count_at(fs, 1u));
+    while (n > 0 && xfs_be16(fs->dirblock + fs->dir_free_hdr +
+                             (n - 1u) * XFS_DIR2_LEAF_BEST_SIZE) == XFS_DIR2_NULL_DATAOFF) {
+        xfs_put_be16(fs->dirblock + fs->dir_free_hdr + (n - 1u) * XFS_DIR2_LEAF_BEST_SIZE, 0);
+        n--;
+    }
+    xfs_put_be32(fs->dirblock + free_count_at(fs, 1u), n);
+}
+
+/* Writes the free block: the `bests` array, evicted from the leaf.
  * `nvalid` is how many data blocks it describes and `nused` how many of
- * those have a non-zero best — the format keeps both because a data block
- * that is entirely full has no free span, and "no room here" and "no such
- * block" must not read alike. */
+ * those exist. */
 static void build_free(struct xfs *fs, uint64_t ino, const uint8_t *bests, uint32_t n) {
-    uint32_t used = 0;
     for (uint32_t i = 0; i < fs->dirblocksize; i++) {
         fs->dirblock[i] = 0;
     }
     xfs_put_be32(fs->dirblock, xfs_magic_for(fs, XFS_BLK_DIR_FREE));
-    for (uint32_t i = 0; i < 16; i++) {
-        fs->dirblock[24u + i] = fs->uuid[i];
-    }
-    xfs_put_be64(fs->dirblock + 32u, ino);
-    xfs_put_be32(fs->dirblock + XFS_DIR3_FREE_FIRSTDB, 0);
-    xfs_put_be32(fs->dirblock + XFS_DIR3_FREE_NVALID, n);
+    /* The UUID at 24 and the owner at 40, as every v5 directory header has
+     * them. The owner went in at 32, over the UUID's second half, and the
+     * field `xfs_repair` reads stayed zero. */
+    xfs_stamp_owner(fs, fs->dirblock, 0, XFS_DIR3_HDR_UUID, XFS_DIR3_HDR_OWNER, 0, ino);
+    xfs_put_be32(fs->dirblock + free_count_at(fs, 0), 0);
+    xfs_put_be32(fs->dirblock + free_count_at(fs, 1u), n);
     for (uint32_t i = 0; i < n; i++) {
         uint16_t best = (uint16_t)xfs_be16(bests + i * XFS_DIR2_LEAF_BEST_SIZE);
         xfs_put_be16(fs->dirblock + fs->dir_free_hdr + i * XFS_DIR2_LEAF_BEST_SIZE,
                      best);
-        used += best != 0 ? 1u : 0u;
     }
-    xfs_put_be32(fs->dirblock + XFS_DIR3_FREE_NUSED, used);
-    xfs_reseal(fs, fs->dirblock, fs->dirblocksize, 4u);
+    free_recount(fs);
 }
 
 /* Records one data block's largest free span in the free block.
@@ -114,10 +142,11 @@ static int free_set(struct xfs *fs, const struct xfs_inode *dir, uint32_t which,
         return KERR_IO;
     }
     xfs_put_be16(fs->dirblock + at, (uint16_t)best);
-    if (xfs_be32(fs->dirblock + XFS_DIR3_FREE_NVALID) < blocks) {
-        xfs_put_be32(fs->dirblock + XFS_DIR3_FREE_NVALID, blocks);
+    if (xfs_be32(fs->dirblock + free_count_at(fs, 1u)) < blocks) {
+        xfs_put_be32(fs->dirblock + free_count_at(fs, 1u), blocks);
     }
-    xfs_reseal(fs, fs->dirblock, fs->dirblocksize, 4u);
+    free_trim(fs);
+    free_recount(fs);
     return xfs_dir_raw_store(fs, fsb);
 }
 
@@ -151,10 +180,9 @@ static int free_block_from_leaf(struct xfs *fs, const struct xfs_inode *dir, uin
 }
 
 /* Writes one of the two leaves the conversion splits into. */
-static int write_leafn(struct xfs *fs, const struct xfs_inode *dir, uint32_t which,
-                       const uint8_t *pairs, uint32_t count, uint64_t forw, uint64_t back,
-                       uint64_t fsb) {
-    da3_header(fs, xfs_magic_for(fs, XFS_BLK_DIR_LEAFN), dir->ino, leaf_n(fs, which), count, forw, back);
+static int write_leafn(struct xfs *fs, const struct xfs_inode *dir, const uint8_t *pairs,
+                       uint32_t count, uint64_t forw, uint64_t back, uint64_t fsb) {
+    da3_header(fs, xfs_magic_for(fs, XFS_BLK_DIR_LEAFN), dir->ino, count, forw, back);
     xfs_copy_bytes(fs->dirblock + fs->da_hdr, pairs, count * XFS_DA3_ENTRY_SIZE);
     xfs_reseal(fs, fs->dirblock, fs->dirblocksize, XFS_DA3_CRC_OFF);
     return xfs_dir_raw_store(fs, fsb);
@@ -169,7 +197,7 @@ static int write_leafn(struct xfs *fs, const struct xfs_inode *dir, uint32_t whi
 static int write_root(struct xfs *fs, const struct xfs_inode *dir, const uint8_t *pairs,
                       uint32_t half, uint32_t count, uint64_t root_fsb) {
     uint8_t *e = fs->dirblock + fs->da_hdr;
-    da3_header(fs, xfs_magic_for(fs, XFS_BLK_DA_NODE), dir->ino, fs->dir_leaf_block, 2u, 0, 0);
+    da3_header(fs, xfs_magic_for(fs, XFS_BLK_DA_NODE), dir->ino, 2u, 0, 0);
     xfs_put_be16(fs->dirblock + fs->da_level, 1u);
     xfs_put_be32(e, top_hash(pairs, half));
     xfs_put_be32(e + 4u, (uint32_t)leaf_n(fs, 0));
@@ -208,9 +236,9 @@ int xfs_dir_to_node(struct xfs *fs, const struct xfs_inode *dir, uint64_t now_s)
     half = count / 2u;
     /* Chained forward, so that a run of equal hashes split across the
      * boundary is followed through `forw` — which the reader already does. */
-    rc = write_leafn(fs, dir, 0, pairs, half, leaf_n(fs, 1), 0, a_fsb);
+    rc = write_leafn(fs, dir, pairs, half, leaf_n(fs, 1), 0, a_fsb);
     rc = rc != KERR_OK ? rc
-                       : write_leafn(fs, dir, 1, pairs + half * XFS_DA3_ENTRY_SIZE,
+                       : write_leafn(fs, dir, pairs + half * XFS_DA3_ENTRY_SIZE,
                                      count - half, 0, leaf_n(fs, 0), b_fsb);
     rc = rc != KERR_OK ? rc : write_root(fs, dir, pairs, half, count, root_fsb);
     rc = rc != KERR_OK ? rc : xfs_dir_fork_insert(fs, dir, leaf_n(fs, 0), a_fsb, false, now_s);
@@ -319,13 +347,47 @@ static int node_set(struct xfs *fs, const struct xfs_inode *dir, uint32_t index,
  * — the old leaf's count and forward link, the new leaf's contents and both
  * links, and the root's two entries — and no half of it leaves the
  * directory readable (Rule 11, Single derivation). */
+static int set_sibling(struct xfs *fs, const struct xfs_inode *dir, uint64_t logical,
+                       uint32_t off, uint32_t value);
+
+/* A logical block for a new hash leaf: past the highest the directory has.
+ *
+ * **Not `leaf_n(children)`.** That was the next leaf's place while leaves
+ * only ever came into being; once an emptied one is given back, counting
+ * children names a block a live leaf already has, and the fork would map
+ * two blocks at one offset. */
+static int next_leaf_at(struct xfs *fs, const struct xfs_inode *dir, uint64_t *at) {
+    struct xfs_fork_map m;
+    uint64_t block;
+    uint32_t boffset;
+    struct bbuf *b;
+    int rc;
+    xfs_inode_place(fs, dir->ino, &block, &boffset);
+    rc = bcache_get(fs->cache, block, &b);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    rc = xfs_fork_load(fs, b->data + boffset, &m);
+    bcache_put(fs->cache, b);
+    *at = leaf_n(fs, 0);
+    for (uint32_t i = 0; rc == KERR_OK && i < m.count; i++) {
+        uint64_t end = m.e[i].startoff + m.e[i].blockcount;
+        if (m.e[i].startoff >= fs->dir_leaf_block && m.e[i].startoff < fs->dir_free_block &&
+            end > *at) {
+            *at = end;
+        }
+    }
+    return rc;
+}
+
 static int split_leaf(struct xfs *fs, struct xfs_inode *dir, uint32_t index,
                       uint64_t child, uint32_t children, uint64_t now_s) {
     uint8_t *pairs = fs->dirpairs;
     uint32_t count, half;
-    uint64_t old_fsb = 0, new_fsb = 0, forw;
-    uint64_t at = leaf_n(fs, children);
-    int rc = xfs_dir_raw_load(fs, dir, child, &old_fsb);
+    uint64_t old_fsb = 0, new_fsb = 0, forw, at = 0;
+    int rc = next_leaf_at(fs, dir, &at);
+    (void)children;
+    rc = rc != KERR_OK ? rc : xfs_dir_raw_load(fs, dir, child, &old_fsb);
     if (rc != KERR_OK) {
         return rc;
     }
@@ -348,11 +410,15 @@ static int split_leaf(struct xfs *fs, struct xfs_inode *dir, uint32_t index,
     if (rc != KERR_OK) {
         return rc;
     }
-    da3_header(fs, xfs_magic_for(fs, XFS_BLK_DIR_LEAFN), dir->ino, at, count - half, forw, child);
+    da3_header(fs, xfs_magic_for(fs, XFS_BLK_DIR_LEAFN), dir->ino, count - half, forw, child);
     xfs_copy_bytes(fs->dirblock + fs->da_hdr, pairs + half * XFS_DA3_ENTRY_SIZE,
                    (count - half) * XFS_DA3_ENTRY_SIZE);
     xfs_reseal(fs, fs->dirblock, fs->dirblocksize, XFS_DA3_CRC_OFF);
     rc = xfs_dir_raw_store(fs, new_fsb);
+    /* **And the leaf after it points back at the new one.** Left pointing at
+     * the old leaf, the chain read differently forwards and backwards, and
+     * the first removal to follow it relinked a live leaf out of it. */
+    rc = rc != KERR_OK ? rc : set_sibling(fs, dir, forw, XFS_DA3_BACK_OFF, (uint32_t)at);
     rc = rc != KERR_OK ? rc : xfs_dir_fork_insert(fs, dir, at, new_fsb, false, now_s);
     /* The old child's top hash has fallen to the halfway pair, and the new
      * child goes in after it carrying what used to be the old one's. */
@@ -437,8 +503,92 @@ int xfs_dir_node_add(struct xfs *fs, const struct xfs_inode *dir, const char *na
  * only one of them is being removed. A run of equal hashes may continue
  * into the next leaf through `forw`, so the search follows the chain — the
  * same reason the reader does. */
+/* Writes `value` into the sibling pointer at `off` of the leaf at `logical`;
+ * nothing for 0, which is "no sibling". */
+static int set_sibling(struct xfs *fs, const struct xfs_inode *dir, uint64_t logical,
+                       uint32_t off, uint32_t value) {
+    uint64_t fsb = 0;
+    int rc;
+    if (logical == 0) {
+        return KERR_OK;
+    }
+    rc = xfs_dir_raw_load(fs, dir, logical, &fsb);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    xfs_put_be32(fs->dirblock + off, value);
+    xfs_reseal(fs, fs->dirblock, fs->dirblocksize, XFS_DA3_CRC_OFF);
+    return xfs_dir_raw_store(fs, fsb);
+}
+
+/* The root's entry naming leaf `child`, found by its pointer — which is
+ * the one thing that names it unambiguously: a position worked out while
+ * following a run of equal hashes along `forw` can be off by one, and
+ * dropping by position once took out a live leaf's entry and left the
+ * emptied one in place, so a name became unfindable. Leaves the root in
+ * the buffer; `count` for none. */
+static uint32_t entry_of(const struct xfs *fs, uint32_t count, uint64_t child) {
+    for (uint32_t i = 0; i < count; i++) {
+        if (xfs_be32(fs->dirblock + fs->da_hdr + i * XFS_DA3_ENTRY_SIZE + 4u) == child) {
+            return i;
+        }
+    }
+    return count;
+}
+
+/* Takes the root's entry for leaf `child` out. */
+/* Sets the hash of the root's entry for leaf `child`, found by pointer. */
+static int node_set_for(struct xfs *fs, const struct xfs_inode *dir, uint64_t child,
+                        uint32_t hash) {
+    uint64_t root_fsb = 0;
+    uint32_t count, index;
+    int rc = xfs_dir_raw_load(fs, dir, fs->dir_leaf_block, &root_fsb);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    count = xfs_be16(fs->dirblock + fs->da_count);
+    index = entry_of(fs, count, child);
+    return index < count ? node_set(fs, dir, index, hash, 0, false) : KERR_IO;
+}
+
+static int node_drop(struct xfs *fs, const struct xfs_inode *dir, uint64_t child) {
+    uint64_t root_fsb = 0;
+    uint32_t count, index;
+    int rc = xfs_dir_raw_load(fs, dir, fs->dir_leaf_block, &root_fsb);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    count = xfs_be16(fs->dirblock + fs->da_count);
+    index = entry_of(fs, count, child);
+    if (index >= count || count < 2u) {
+        return KERR_IO;
+    }
+    for (uint32_t i = index; i + 1u < count; i++) {
+        xfs_copy_bytes(fs->dirblock + fs->da_hdr + i * XFS_DA3_ENTRY_SIZE,
+                       fs->dirblock + fs->da_hdr + (i + 1u) * XFS_DA3_ENTRY_SIZE,
+                       XFS_DA3_ENTRY_SIZE);
+    }
+    xfs_put_be16(fs->dirblock + fs->da_count, (uint16_t)(count - 1u));
+    xfs_reseal(fs, fs->dirblock, fs->dirblocksize, XFS_DA3_CRC_OFF);
+    return xfs_dir_raw_store(fs, root_fsb);
+}
+
+/* A hash leaf left with no hashes leaves the directory, as `xfs_da3_join`
+ * takes one out: its entry in the root, its place in the sibling chain, and
+ * its block. Kept, it carried a key for hashes it no longer had, which the
+ * checker reports for every such leaf. The leaf is in the buffer. */
+static int drop_empty_leaf(struct xfs *fs, const struct xfs_inode *dir, uint64_t logical,
+                           uint64_t now_s) {
+    uint32_t forw = xfs_be32(fs->dirblock + XFS_DA3_FORW_OFF);
+    uint32_t back = xfs_be32(fs->dirblock + XFS_DA3_BACK_OFF);
+    int rc = node_drop(fs, dir, logical);
+    rc = rc != KERR_OK ? rc : set_sibling(fs, dir, back, XFS_DA3_FORW_OFF, forw);
+    rc = rc != KERR_OK ? rc : set_sibling(fs, dir, forw, XFS_DA3_BACK_OFF, back);
+    return rc != KERR_OK ? rc : xfs_dir_fork_remove(fs, dir, logical, now_s);
+}
+
 static int leaf_remove(struct xfs *fs, const struct xfs_inode *dir, uint32_t hash,
-                       uint32_t address) {
+                       uint32_t address, uint64_t now_s) {
     uint32_t index = 0, children = 0;
     uint64_t child = 0;
     int rc = child_for(fs, dir, hash, &index, &child, &children);
@@ -463,6 +613,7 @@ static int leaf_remove(struct xfs *fs, const struct xfs_inode *dir, uint32_t has
                 return KERR_NOENT;
             }
             child = next;
+            index++; /* the root names the leaves in the order `forw` links them */
             continue;
         }
         for (uint32_t i = found; i + 1u < count; i++) {
@@ -471,10 +622,40 @@ static int leaf_remove(struct xfs *fs, const struct xfs_inode *dir, uint32_t has
                            XFS_DA3_ENTRY_SIZE);
         }
         xfs_put_be16(fs->dirblock + fs->da_count, (uint16_t)(count - 1u));
+        if (count == 1u && children > 1u) {
+            return drop_empty_leaf(fs, dir, child, now_s);
+        }
         xfs_reseal(fs, fs->dirblock, fs->dirblocksize, XFS_DA3_CRC_OFF);
-        return xfs_dir_raw_store(fs, leaf_fsb);
+        rc = xfs_dir_raw_store(fs, leaf_fsb);
+        /* The mirror of the add path's rule: when the highest hash in the
+         * leaf goes, the root's key for this leaf must come down to the new
+         * highest. The checker requires the two to be equal, and this left
+         * the old one behind. */
+        if (rc == KERR_OK && found + 1u == count && count > 1u) {
+            rc = node_set_for(fs, dir, child, top_hash(fs->dirblock + fs->da_hdr, count - 1u));
+        }
+        return rc;
     }
     return rc == KERR_OK ? KERR_IO : rc;
+}
+
+/* Finishes a removal from data block `which`, as the leaf format's does:
+ * the hash out of its leaf, and the block either stored or — empty now —
+ * given back, its slot in the free block emptied. */
+static int node_after_removal(struct xfs *fs, const struct xfs_inode *dir, const char *name,
+                              uint32_t namelen, uint64_t fsb, uint32_t which, uint32_t at,
+                              uint32_t blocks, uint64_t now_s) {
+    bool empty = which != 0 && xfs_dir_block_is_empty(fs, fs->dirblock);
+    uint32_t best = empty ? XFS_DIR2_NULL_DATAOFF : xfs_dir_largest_free(fs, fs->dirblock);
+    int rc = empty ? KERR_OK : xfs_dir_raw_store(fs, fsb);
+    rc = rc != KERR_OK ? rc
+                       : leaf_remove(fs, dir, xfs_dir_hashname(name, namelen),
+                                     xfs_dir_address_of(fs, which, at), now_s);
+    rc = rc != KERR_OK ? rc : free_set(fs, dir, which, best, blocks);
+    rc = rc != KERR_OK || !empty ? rc
+                                 : xfs_dir_fork_remove(fs, dir, (uint64_t)which * fs->dirblocks,
+                                                       now_s);
+    return rc != KERR_OK ? rc : xfs_dir_touch(fs, dir, now_s);
 }
 
 int xfs_dir_node_remove(struct xfs *fs, const struct xfs_inode *dir, const char *name,
@@ -485,6 +666,9 @@ int xfs_dir_node_remove(struct xfs *fs, const struct xfs_inode *dir, const char 
     int rc = KERR_NOENT;
     for (which = 0; which < blocks; which++) {
         rc = xfs_dir_raw_load(fs, dir, (uint64_t)which * fs->dirblocks, &fsb);
+        if (rc == KERR_NOENT) {
+            continue; /* a block given back earlier: a hole */
+        }
         if (rc != KERR_OK) {
             return rc;
         }
@@ -496,14 +680,5 @@ int xfs_dir_node_remove(struct xfs *fs, const struct xfs_inode *dir, const char 
     if (rc != KERR_OK) {
         return rc;
     }
-    {
-        uint32_t best = xfs_dir_largest_free(fs, fs->dirblock);
-        xfs_reseal(fs, fs->dirblock, fs->dirblocksize, XFS_DIR3_HDR_CRC);
-        rc = xfs_dir_raw_store(fs, fsb);
-        rc = rc != KERR_OK ? rc
-                           : leaf_remove(fs, dir, xfs_dir_hashname(name, namelen),
-                                         xfs_dir_address_of(fs, which, at));
-        rc = rc != KERR_OK ? rc : free_set(fs, dir, which, best, blocks);
-    }
-    return rc != KERR_OK ? rc : xfs_dir_touch(fs, dir, now_s);
+    return node_after_removal(fs, dir, name, namelen, fsb, which, at, blocks, now_s);
 }

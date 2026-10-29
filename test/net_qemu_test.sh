@@ -49,7 +49,7 @@ trap cleanup EXIT
 
 wait_for() {
     for _ in $(seq 1 150); do
-        tr -d '\r' < "$log" 2>/dev/null | grep -qE -- "$1" && return 0
+        tr -d '\r' < "$log" 2>/dev/null | sed -E 's/^\[[0-9:.]+\] [A-Z] //' | grep -qE -- "$1" && return 0
         sleep 0.1
     done
     fail "the console never showed: $1"
@@ -76,7 +76,7 @@ printf '%s' "$payload" >&3
 reply=""
 read -r -t 10 -N "${#payload}" reply <&3 || true
 exec 3<&-
-tr -d '\r' < "$log" > "$log.clean" && mv "$log.clean" "$log"
+tr -d '\r' < "$log" | sed -E 's/^\[[0-9:.]+\] [A-Z] //' > "$log.clean" && mv "$log.clean" "$log"
 cat "$log"
 [ "$reply" = "$payload" ] || fail "the echo service returned '$reply', want '$payload'"
 ! grep -qF "PANIC" "$log" || fail "the kernel panicked"

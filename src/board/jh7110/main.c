@@ -137,7 +137,16 @@ static void read_bootinfo(uint64_t dtb, struct bootinfo *info) {
  * more time in the tick than in the work it was timing. */
 #define TICK_HZ 100u
 
-extern char __kernel_end[];
+
+/* The first page after the kernel image, physically: where the table arena
+ * goes. `__kernel_end` is a linked — high — address, so the image's
+ * physical bounds are asked for. */
+static uint64_t arena_after_the_image(void) {
+    phys_t image_at = 0;
+    uint64_t image_size = 0;
+    mmu_kernel_phys_range(&image_at, &image_size);
+    return (image_at + image_size + PAGE_SIZE - 1u) & ~(PAGE_SIZE - 1u);
+}
 
 /* Turns translation on, and says what it cost.
  *
@@ -146,7 +155,7 @@ extern char __kernel_end[];
  * exists to say so. And deliberately before the self-tests, so those faults
  * are taken with paging on. */
 static void bring_up_translation(const struct bootinfo *info) {
-    uint64_t arena = ((uint64_t)(uintptr_t)__kernel_end + PAGE_SIZE - 1u) & ~(PAGE_SIZE - 1u);
+    uint64_t arena = arena_after_the_image();
     int rc;
     if (info->source != BOOTINFO_FDT || info->mem_size == 0) {
         kprintf("mmu: no memory map, so translation stays off\n");
@@ -217,16 +226,7 @@ static bool find_a_loaded_range(const char *key, phys_t *at, uint64_t *bytes) {
 }
 
 static void bring_up_memory(const struct bootinfo *info) {
-    /* **The physical end of the image, asked for rather than computed.**
-     * `__kernel_end` reads as a high address once the kernel is running in
-     * its own half, and an arena placed from it is nowhere near RAM. */
-    phys_t image_at = 0;
-    uint64_t image_size = 0;
-    uint64_t arena;
-    mmu_kernel_phys_range(&image_at, &image_size);
-    arena = image_at == 0
-                ? (((uint64_t)(uintptr_t)__kernel_end + PAGE_SIZE - 1u) & ~(PAGE_SIZE - 1u))
-                : ((image_at + image_size + PAGE_SIZE - 1u) & ~(PAGE_SIZE - 1u));
+    uint64_t arena = arena_after_the_image();
     if (mem_init(info, arena, TABLE_ARENA_BYTES) != KERR_OK) {
         kprintf("mem: no usable memory map\n");
         return;
@@ -638,6 +638,62 @@ static bool same_text(const char *a, const char *b) {
     return a[i] == b[i];
 }
 
+/* One step of the boot partition's self-test, named when it fails. */
+static bool boot_step(bool ok, const char *what) {
+    if (!ok) {
+        kprintf("boot: %s FAILED\n", what);
+    }
+    return ok;
+}
+
+/* Counts a listing's entries, for the boot partition's self-test. */
+static int count_entry(void *self, const struct xfs_dirent *e) {
+    (void)e;
+    (*(uint32_t *)self)++;
+    return KERR_OK;
+}
+
+/* Whether a file holds exactly `want`. */
+static bool holds(const char *path, const char *want, uint32_t len) {
+    uint8_t *bytes = NULL;
+    uint32_t size = 0;
+    bool same = xfsmount_read_file(path, 4096u, &bytes, &size) == KERR_OK && size == len;
+    for (uint32_t i = 0; same && i < len; i++) {
+        same = bytes[i] == (uint8_t)want[i];
+    }
+    kfree(bytes);
+    return same;
+}
+
+/* The FAT boot partition at `/boot`, through the calls a program's system
+ * calls make: listed, written, read back, moved into a directory made for
+ * it, refused across to the root filesystem, removed. `minikern.bootwrite`
+ * runs it, on a disk whose first partition is FAT. */
+static void run_boot_selftest(void) {
+    static const char text[] = "written by minikern into its own boot partition\n";
+    uint32_t mode = 0, nlink = 0, entries = 0;
+    uint64_t size = 0;
+    bool ok = boot_step(xfsmount_stat_full("/boot", &mode, &size, &nlink) == KERR_OK &&
+                            (mode & 0170000u) == 0040000u, "/boot is a directory");
+    ok = ok && boot_step(xfsmount_list("/boot", count_entry, &entries) == KERR_OK && entries > 0,
+                         "/boot lists");
+    ok = ok && boot_step(xfsmount_write_into("/boot", "fromkern.txt", text, sizeof text - 1u) ==
+                             KERR_OK, "a file is written");
+    ok = ok && boot_step(holds("/boot/fromkern.txt", text, sizeof text - 1u), "it reads back");
+    ok = ok && boot_step(xfsmount_mkdir_p("/boot/efi/sub") == KERR_OK, "directories are made");
+    ok = ok && boot_step(xfsmount_rename_path("/boot/fromkern.txt", "/boot/efi/sub/moved.txt") ==
+                             KERR_OK, "it is moved into one");
+    ok = ok && boot_step(holds("/boot/efi/sub/moved.txt", text, sizeof text - 1u),
+                         "it reads back from there");
+    ok = ok && boot_step(xfsmount_rename_path("/boot/efi/sub/moved.txt", "/moved.txt") ==
+                             KERR_XDEV, "a move to the root filesystem is EXDEV");
+    ok = ok && boot_step(xfsmount_unlink_path("/boot/efi/sub/moved.txt") == KERR_OK &&
+                             xfsmount_stat_full("/boot/efi/sub/moved.txt", &mode, &size,
+                                                &nlink) == KERR_NOENT, "it is removed");
+    kprintf("boot: %u entries at /boot; %s\n", entries,
+            ok ? "the boot partition is read and written at /boot" : "FAILED");
+}
+
 /* Checks automount put each volume where its label says.
  *
  * **The decision, not the mounting.** That both filesystems mount is the
@@ -649,7 +705,8 @@ static bool same_text(const char *a, const char *b) {
  *
  * `minikern.volumes` runs it. */
 static void run_volumes_selftest(void) {
-    bool ok = volumes_count() == 2u;
+    /* Two XFS volumes, and the FAT boot partition when the disk has one. */
+    bool ok = volumes_count() == 2u || volumes_count() == 3u;
     const char *root = NULL, *data = NULL;
     for (uint32_t i = 0; i < volumes_count(); i++) {
         root = same_text(volumes_label(i), "ROOT") ? volumes_at(i) : root;
@@ -786,22 +843,24 @@ void _secondary_start(void);
  * intermediate state — the bring-up is proved, and the lock is a separate
  * piece of work that can be tested on its own.
  */
-void smp_secondary_main(uint64_t hart, uint64_t satp);
+void smp_secondary_main(uint64_t hart);
 static void secondary_hart_loop(void);
 static void report_hart_usage(void);
 static void start_swap_if_asked(void);
 static void swap_selftest(void);
 static void report_swap(void);
 
-void smp_secondary_main(uint64_t hart, uint64_t satp) {
+/* A secondary hart's bring-up, at the kernel's own address.
+ *
+ * `start.S` has already adopted the kernel's table and jumped to the linked
+ * address, so everything here — the trap vector above all — is set at the
+ * address the kernel actually runs at. A vector set while running at the
+ * load address would be a low address, and every trap would re-enter the
+ * kernel there. */
+void smp_secondary_main(uint64_t hart) {
     smp_set_this_hart(hart);
     fp_enable();
     trap_init_cpu();
-    /* The boot hart's page tables, which map the kernel globally — so this
-     * hart can reach the kernel's code and data the moment translation is
-     * on, and no bring-up table is needed. The fence is not optional: a
-     * hart's TLB starts with whatever the firmware left in it. */
-    __asm__ volatile("csrw satp, %0\n\tsfence.vma zero, zero" : : "r"(satp) : "memory");
     timer_init_cpu();
     smp_secondary_arrived(hart);
     __atomic_add_fetch(&harts_arrived, 1u, __ATOMIC_SEQ_CST);
@@ -2243,6 +2302,22 @@ static void run_one_user_program(const char *name, const char *from, const char 
     uspace_release(proc);
 }
 
+/* Deadlines armed behind the clock, and whether the interrupt still came. */
+static void report_past_arms(void) {
+    struct sched_past_arm_report r;
+    sched_past_arms(&r);
+    kprintf("sched: %llu deadlines armed already past (worst %llu us behind); %llu followed "
+            "by a tick, worst %llu us later\n",
+            (unsigned long long)r.arms, (unsigned long long)r.worst_behind_us,
+            (unsigned long long)r.fired, (unsigned long long)r.worst_fire_us);
+    kprintf("sched:   %llu re-armed before the tick; worst behind by source: slice %llu us, "
+            "beat %llu us, sleeper %llu us\n",
+            (unsigned long long)r.superseded, (unsigned long long)r.worst_behind_by_source_us[0],
+            (unsigned long long)r.worst_behind_by_source_us[1],
+            (unsigned long long)r.worst_behind_by_source_us[2]);
+}
+
+
 /* What each hart actually did.
  *
  * The measurement that distinguishes "four harts are available" from "four
@@ -2273,6 +2348,7 @@ static void report_hart_usage(void) {
          * rescued; a lost deadline is one nothing would have rescued. */
         kprintf("sched: %u missed pokes, %u lost deadlines\n", sched_missed_pokes(),
                 sched_lost_deadlines());
+        report_past_arms();
     }
     kprintf("smp: switches/ticks by hart:");
     for (uint32_t i = 0; i < smp_hart_count(); i++) {
@@ -3630,10 +3706,8 @@ static void run_user_programs(void) {
     sched_set_preemption(!cmdline_has(boot_cmdline, "minikern.cooperative"));
     /* The checks that are too expensive to leave on. */
     uspace_set_paranoid(cmdline_has(boot_cmdline, "minikern.paranoid"));
-    /* **The half-finished fork fix.** It stops a forked child dying on its
-     * own text and makes beat-time kernel code fault on device memory; both
-     * measured, see docs/ROADMAP.md. */
-    uspace_set_fork_leaves(cmdline_has(boot_cmdline, "minikern.forkleaves"));
+    /* The fork fix, on unless the control asks for it off. */
+    uspace_set_fork_leaves(!cmdline_has(boot_cmdline, "minikern.noforkleaves"));
     start_swap_if_asked();
     /* The controlling terminal, before anything can read it. */
     {
@@ -3834,6 +3908,9 @@ static void run_user_programs(void) {
     if (cmdline_has(boot_cmdline, "minikern.volumes")) {
         run_volumes_selftest();
     }
+    if (cmdline_has(boot_cmdline, "minikern.bootwrite")) {
+        run_boot_selftest();
+    }
     /* `minikern.cat=<path>` — lookup and extent reading, in one answer. */
     {
         size_t len = 0;
@@ -3987,7 +4064,6 @@ static bool halt_requested(void) {
 }
 
 static void kmain_after_devices(uint64_t hart, uint64_t dtb);
-static void enter_the_kernels_own_half(uint64_t hart, uint64_t dtb);
 
 /* The boot, from the point where the kernel is running at its own address.
  *
@@ -4098,24 +4174,6 @@ static void kmain_high(uint64_t hart, uint64_t dtb) {
     kmain_after_devices(hart, dtb);
 }
 
-/* Jumps into `kmain_high` at its high address, on this hart's boot stack at
- * its high alias. Does not return. */
-static void enter_the_kernels_own_half(uint64_t hart, uint64_t dtb) {
-    uint64_t shift = mmu_high_offset();
-    void *fn = (void *)((uint64_t)(uintptr_t)&kmain_high + shift);
-    uint64_t sp;
-    if (!mmu_enabled()) {
-        /* Translation never came up, so there is no high mapping to jump
-         * to and the boot carries on where it is. Saying so, because a
-         * kernel that silently stayed low would look identical. */
-        kprintf("mmu: translation is off, so the kernel stays at its load address\n");
-        kmain_high(hart, dtb);
-        return;
-    }
-    __asm__ volatile("mv %0, sp" : "=r"(sp));
-    mmu_enter_high(fn, hart, dtb, sp + shift);
-}
-
 void kmain(uint64_t hart, uint64_t dtb) {
     /* The hart id into `tp`, first thing: every per-hart array is indexed
      * through it, and the kernel lock asks who holds it. The firmware passed
@@ -4148,16 +4206,9 @@ void kmain(uint64_t hart, uint64_t dtb) {
      * alive. */
     klog_time_source(timer_ns);
     bring_up_translation(&info);
-    /* **From here on, at the kernel's own address.** `mmu_init` mapped the
-     * image both where it is linked and where it was loaded, so the jump is
-     * safe and the identity half is still there for anything that has not
-     * been re-registered yet — which is what lets this be verified on its
-     * own, before that half is taken away.
-     *
-     * It does not return: the rest of the boot runs on the other side. */
-    /* **Does not return**: the rest of the boot is `kmain_high`, running at
-     * the kernel's own address. Nothing may be added below this line. */
-    enter_the_kernels_own_half(hart, dtb);
+    /* The rest of the boot. There is no jump here any more: `start.S` put
+     * the kernel at its linked address before `kmain` was called. */
+    kmain_high(hart, dtb);
 }
 
 /* The boot from the point where the devices are up — shared, because

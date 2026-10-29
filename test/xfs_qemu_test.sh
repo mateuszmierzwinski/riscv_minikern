@@ -70,7 +70,7 @@ boot() {
         -kernel "$image" -drive "file=$img,if=none,format=raw,id=nvm0" \
         -device nvme,serial=mkxfs,drive=nvm0 \
         -append "console=sbi minikern.halt=poweroff" > "$out" 2>&1 || status=$?
-    tr -d '\r' < "$out" > "$out.clean" && mv "$out.clean" "$out"
+    tr -d '\r' < "$out" | sed -E 's/^\[[0-9:.]+\] [A-Z] //' > "$out.clean" && mv "$out.clean" "$out"
     [ "$status" -eq 0 ] || { cat "$out"; fail "qemu exited $status"; }
     ! grep -qF PANIC "$out" || { cat "$out"; fail "the kernel panicked"; }
 }
@@ -86,7 +86,7 @@ grep -qE '^disk: nvme .*, 76800 sectors of 4096 bytes \(300 MiB\)$' "$tmp/mount.
     fail "the device was not presented in 4 KiB blocks"
 
 # The superblock, read and agreeing with what mkfs made.
-grep -qF "xfs: 76800 blocks of 4096 bytes, 4 groups, 512-byte inodes, root 96" "$tmp/mount.log" ||
+grep -qF "xfs: v5, 76800 blocks of 4096 bytes, 4 groups, 512-byte inodes, root 96" "$tmp/mount.log" ||
     fail "the superblock was not read, or disagrees with mkfs"
 
 # The root directory: every entry mkfs put there, and the two that are always
@@ -120,13 +120,15 @@ echo "ok: a filesystem mkfs.xfs made, mounted off an NVMe drive, listed and read
 # filesystem formatted specially for it, which is not a filesystem reader.
 make_image "$tmp/reflink.img" "crc=1,finobt=1,reflink=1,rmapbt=1,bigtime=0,inobtcount=0"
 boot "$tmp/reflink.img" "$tmp/reflink.log"
-grep -qF "xfs: read-only features" "$tmp/reflink.log" ||
-    { cat "$tmp/reflink.log"; fail "the read-only features were not reported"; }
+# Both are maintained by the writer now, so neither is reported as a reason
+# not to write (xfs_write_test.sh proves the writes on the host).
+! grep -qF "xfs: read-only features" "$tmp/reflink.log" ||
+    { cat "$tmp/reflink.log"; fail "reflink and rmapbt were still treated as unwritable"; }
 grep -qF "xfs: mounted read-only" "$tmp/reflink.log" ||
     { cat "$tmp/reflink.log"; fail "a reflink filesystem did not mount"; }
 grep -qF "hello.txt" "$tmp/reflink.log" ||
     { cat "$tmp/reflink.log"; fail "a reflink filesystem mounted but could not be listed"; }
-echo "ok: reflink and rmapbt mount read-only, as the format allows"
+echo "ok: reflink and rmapbt mount, and are not refused for writing"
 
 # Sparse inode chunks change how the inode *b-tree* records which inodes in
 # a chunk exist. This reader finds an inode by arithmetic from its number and
@@ -150,16 +152,31 @@ grep -qF "hello.txt" "$tmp/default.log" ||
     { cat "$tmp/default.log"; fail "a default filesystem mounted but could not be listed"; }
 echo "ok: a filesystem made with mkfs.xfs defaults mounts and lists"
 
+# A directory block larger than one filesystem block. This case used to
+# assert a refusal; the reader walks such directories now (`dirblocks`), so
+# what it asserts is that one mounts and lists.
+make_image "$tmp/bigdir.img" "$MINIMAL_M" "$MINIMAL_I" "-n size=8192"
+boot "$tmp/bigdir.img" "$tmp/bigdir.log"
+grep -qF "xfs: mounted read-only" "$tmp/bigdir.log" ||
+    { cat "$tmp/bigdir.log"; fail "a multi-block directory filesystem did not mount"; }
+grep -qF "hello.txt" "$tmp/bigdir.log" ||
+    { cat "$tmp/bigdir.log"; fail "a multi-block directory could not be listed"; }
+echo "ok: a multi-block directory mounts and lists"
+
 # What is still refused, and the refusal must name its own reason rather than
 # have it paraphrased: an earlier version of the boot path guessed a different
 # cause from the error code and printed "a dirty log" over the top of the real
-# message. A directory block larger than one filesystem block is a layout this
-# reader does not walk.
-make_image "$tmp/bigdir.img" "$MINIMAL_M" "$MINIMAL_I" "-n size=8192"
-boot "$tmp/bigdir.img" "$tmp/bigdir.log"
-grep -qF "multi-block directory" "$tmp/bigdir.log" ||
-    { cat "$tmp/bigdir.log"; fail "a multi-block directory filesystem was not refused"; }
-grep -qF "the reason is above" "$tmp/bigdir.log" ||
+# message. NEEDSREPAIR is the incompat flag this reader refuses; `xfs_db`
+# sets it and recomputes the superblock's CRC, so the refusal is the flag's
+# and not a checksum's.
+make_image "$tmp/repair.img"
+needs=$(( $(xfs_db -c 'sb 0' -c 'print features_incompat' "$tmp/repair.img" | sed 's/.*= //') | 0x10 ))
+xfs_db -x -c 'sb 0' -c "write -d features_incompat $needs" "$tmp/repair.img" >/dev/null 2>&1 ||
+    fail "xfs_db could not set NEEDSREPAIR"
+boot "$tmp/repair.img" "$tmp/repair.log"
+grep -qF "the filesystem says it needs repair" "$tmp/repair.log" ||
+    { cat "$tmp/repair.log"; fail "a filesystem marked NEEDSREPAIR was not refused"; }
+grep -qF "the reason is above" "$tmp/repair.log" ||
     fail "the mount failure paraphrases the filesystem's diagnosis instead of deferring to it"
 echo "ok: the kernel defers to the filesystem's own diagnosis"
 echo PASS

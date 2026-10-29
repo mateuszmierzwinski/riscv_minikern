@@ -1232,8 +1232,21 @@ bool fdobjects_epoll_has_events(int32_t epfd) {
  * `ESPIPE`, which is what a program checks for to find out whether it may
  * seek at all — so answering it correctly matters as much as seeking does.
  */
+/* A write descriptor's file as it is on disk: its end is its size there,
+ * not how far this descriptor has written — another descriptor, or a
+ * truncate, may have moved it. */
+static uint64_t written_size(int32_t fd) {
+    const char *path = fdobjects_path_of(fd);
+    uint32_t mode = 0, nlink = 0;
+    uint64_t size = 0;
+    return path != NULL && xfsmount_stat_full(path, &mode, &size, &nlink) == KERR_OK ? size : 0;
+}
+
 int fdobjects_seek(int32_t fd, int64_t offset, uint32_t whence, uint64_t *result) {
-    struct file *f = fdobjects_file_of(fd);
+    /* **The descriptor itself, not `fdobjects_file_of`**, which answers for
+     * read descriptors only: every `lseek` on a file opened for writing was
+     * `EBADF`, and the write branch below was never reached. */
+    struct file *f = fd_get(fd);
     uint64_t base = 0;
     uint64_t size = 0;
     if (f == NULL) {
@@ -1246,7 +1259,7 @@ int fdobjects_seek(int32_t fd, int64_t offset, uint32_t whence, uint64_t *result
     } else if (f->ops == &writefile_ops) {
         struct writefile *w = f->priv;
         base = w->offset;
-        size = w->offset; /* a write file's end is wherever it has reached */
+        size = written_size(fd);
     } else {
         return KERR_SPIPE;
     }
@@ -1316,7 +1329,7 @@ int32_t fdobjects_read_for_test(int32_t fd, void *buf, uint32_t n) {
  */
 const char *fdobjects_path_of(int32_t fd) {
     static char joined[WRITEFILE_PATH_MAX * 2u];
-    struct file *f = fdobjects_file_of(fd);
+    struct file *f = fd_get(fd); /* a write descriptor: `fdobjects_file_of` never returns one */
     const struct writefile *w;
     uint32_t at = 0;
     if (f == NULL || f->ops != &writefile_ops) {

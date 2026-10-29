@@ -154,6 +154,8 @@ struct hartstate {
      * it has no clock of its own to find out with. */
     bool untimed;
     bool backstop; /* the armed deadline is the idle timeout, not a real one */
+    uint64_t past_armed_at; /* when this hart armed a deadline already behind the clock; 0 if none */
+    uint64_t past_when;     /* the deadline it armed then */
     /* **Per hart, because a timer interrupt is per hart.** This was one
      * global: every hart's tick set it and whichever hart next returned to
      * user space consumed it. So a hart that had just been given a thread
@@ -888,6 +890,76 @@ uint32_t sched_lost_deadlines(void) {
     return lost_deadlines;
 }
 
+/* **Arming behind the clock, measured rather than feared.** A deadline
+ * computed earlier can be past by the time it is armed (a slice or beat that
+ * has gone by), and the worry was that the comparator then never fires. The
+ * counters say how often it happens, how far behind, and how long until the
+ * timer interrupt actually arrived — the last being the whole question. */
+static struct {
+    uint64_t arms;
+    uint64_t fired;
+    uint64_t superseded;
+    uint64_t worst_behind_ns;
+    uint64_t worst_fire_ns;
+    uint64_t behind_by_source_ns[3]; /* worst per source: slice, beat, sleeper */
+} past_arm;
+
+static uint64_t earliest_deadline(void);
+static uint64_t housekeeping_deadline(const struct hartstate *h);
+
+/* Which of `next_deadline`'s three sources produced `when`. */
+static uint32_t deadline_source(const struct hartstate *h, uint64_t when) {
+    if (when == earliest_deadline()) {
+        return 2u;
+    }
+    return when == housekeeping_deadline(h) ? 1u : 0u;
+}
+
+static void note_past_arm(struct hartstate *h, uint64_t when) {
+    uint64_t now = timer_ns();
+    uint32_t source;
+    if (h->past_armed_at != 0 && when != h->past_when) {
+        past_arm.superseded++; /* re-armed for something else before the tick */
+        h->past_armed_at = 0;
+    }
+    if (when >= now) {
+        return;
+    }
+    source = deadline_source(h, when);
+    past_arm.arms++;
+    past_arm.worst_behind_ns = now - when > past_arm.worst_behind_ns ? now - when
+                                                                     : past_arm.worst_behind_ns;
+    if (now - when > past_arm.behind_by_source_ns[source]) {
+        past_arm.behind_by_source_ns[source] = now - when;
+    }
+    if (h->past_armed_at == 0) {
+        h->past_armed_at = now;
+        h->past_when = when;
+    }
+}
+
+static void note_past_arm_fired(struct hartstate *h) {
+    uint64_t took;
+    if (h->past_armed_at == 0) {
+        return;
+    }
+    took = timer_ns() - h->past_armed_at;
+    h->past_armed_at = 0;
+    past_arm.fired++;
+    past_arm.worst_fire_ns = took > past_arm.worst_fire_ns ? took : past_arm.worst_fire_ns;
+}
+
+void sched_past_arms(struct sched_past_arm_report *out) {
+    out->arms = past_arm.arms;
+    out->fired = past_arm.fired;
+    out->worst_behind_us = past_arm.worst_behind_ns / 1000u;
+    out->worst_fire_us = past_arm.worst_fire_ns / 1000u;
+    out->superseded = past_arm.superseded;
+    for (uint32_t i = 0; i < 3u; i++) {
+        out->worst_behind_by_source_us[i] = past_arm.behind_by_source_ns[i] / 1000u;
+    }
+}
+
 uint64_t sched_affinity(void) {
     const struct thread *t = running_thread();
     return t != NULL ? placeable(t) : ~isolated;
@@ -1291,6 +1363,35 @@ static void let_go_of(struct hartstate *h, uint32_t t) {
     }
 }
 
+/* An idle hart gives up the address space it last ran, before it waits.
+ *
+ * **A hart in `wfi` still runs kernel code** — the housekeeping beat, a
+ * device interrupt — and it runs it on whatever `satp` it holds. Lazily
+ * keeping the last process's table loaded meant that table could be
+ * destroyed underneath an idle hart: `uspace_destroy` clears the kernel's
+ * entries out of it and frees it, and the beat's next miss in the TLB then
+ * walked a table with no direct map. That is the `dwmac_poll` fault loop
+ * the board printed 2,621 times after a forked child exited. The cost is
+ * one `satp` write when the hart wakes to run that process again. */
+static void unload_before_idling(struct hartstate *h) {
+    if (h->loaded != NULL) {
+        uspace_release_address_space();
+        h->loaded = NULL;
+    }
+}
+
+void sched_forget_address_space(const struct uproc *p) {
+    struct hartstate *h = me();
+    if (h->loaded == p) {
+        uspace_release_address_space();
+    }
+    for (uint32_t i = 0; i < SMP_MAX_HARTS; i++) {
+        if (harts[i].loaded == p) {
+            harts[i].loaded = NULL;
+        }
+    }
+}
+
 /* One hart's scheduling loop: claim a thread, run it, repeat until the
  * process is over.
  *
@@ -1309,19 +1410,8 @@ void sched_run(void) {
     bool took = klock_enter();
     h = me();
     h->joined = true;
-    /* **Off by default, and the reason is recorded rather than guessed.**
-     *
-     * Taking the timer away from its periodic schedule works — one-shot
-     * deadlines, no re-arm when the deadline has not changed, a poke
-     * instead of a tick — and it exposes something the periodic tick had
-     * been hiding: a Go runtime stops four syscalls into its startup, in a
-     * fault loop that a hundred interrupts a second was evidently kicking
-     * along. A tick that papers over a fault loop is not a tick worth
-     * keeping, but neither is a kernel that only runs because of one.
-     *
-     * So the machinery is here and `minikern.dynticks` turns it on, which
-     * is how the fault loop will be found; the default stays periodic until
-     * it is. docs/PREEMPTION_MODEL.md says what is built and what is not. */
+    /* Dynamic ticks, on by default; `minikern.periodic` puts the 100 Hz
+     * clock back. docs/PREEMPTION_MODEL.md says what is built. */
     if (dynticks_wanted) {
         timer_take_over();
     }
@@ -1338,6 +1428,7 @@ void sched_run(void) {
             /* An idle hart still wants waking for a sleeper's deadline,
              * and for nothing else. */
             sched_arm_timer();
+            unload_before_idling(h);
             h->idle = true;
             {
                 /* **The one place a hart's idleness has a beginning and an
@@ -2105,6 +2196,7 @@ void sched_arm_timer(void) {
         return;
     }
     h->backstop = false;
+    note_past_arm(h, when);
     timer_arm_at(when);
     /* **Whether this hart can actually take the interrupt it just armed.**
      *
@@ -2139,6 +2231,7 @@ void sched_tick(void) {
     struct hartstate *h = me();
     bool expired = false;
     ticks_seen++;
+    note_past_arm_fired(h);
     /* **The slice ends here, not on a periodic clock.** Without a tick
      * counting down, the only thing that knows a thread has had its turn is
      * this comparison against when the turn started. */

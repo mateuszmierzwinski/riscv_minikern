@@ -204,7 +204,7 @@ CASES = [
       # splits mattered most: seven hundred names reached node format and
       # split nothing, because the conversion's two leaves hold about a
       # thousand hashes between them.
-      "1 to block, 1 to leaf, 1 to node, 4 data block(s), 4 leaf split(s)",
+      "1 to block, 1 to leaf, 1 to node, 8 data block(s), 5 leaf split(s)",
       # The allocator left a full group — and its control, in this same
       # run, shows the write being refused without that search.
       "crossed a group after",
@@ -233,6 +233,23 @@ CASES = [
       "the log was replayed; the filesystem is clean",
       "the log could not be replayed; mounting read-only"],
      700, None, "small"),
+
+    # **The same write path on a filesystem made with `mkfs.xfs` defaults**:
+    # reverse map, reflink, sparse inodes and 64-bit extent counts all on.
+    # That filesystem mounted read-only until the writer kept the reverse
+    # map, so this case is the board's half of that change; the host's
+    # `xfs_write_test` is the other half, with `xfs_repair` as the judge.
+    # The growth counts are left out for the reason the v4 case gives:
+    # they are behavioural for one geometry, and sparse inodes change it.
+    ("§3: the write path on a filesystem made with mkfs.xfs defaults",
+     "minikern.fswrite",
+     ["fswrite: every step passed",
+      "crossed a group after",
+      "fswrite: attributes set, listed, survived a mount, removed; 1 to leaf",
+      "fswrite: a 3000-byte value went to its own blocks and came back",
+      "the log was replayed; the filesystem is clean",
+      "the log could not be replayed; mounting read-only"],
+     700, None, "defaults"),
 
     # **The whole write path on a real v4 filesystem.** The same instrument
     # as the case above, pointed at an image `mkfs.xfs -m crc=0` made — so
@@ -285,9 +302,10 @@ CASES = [
     ("quokka: init starts a runlevel in order, supervises it, and answers rc",
      "minikern.init",
      ["init: QuokkaOS on",
-      # a's readiness file is written by the service itself, so this line
-      # proves the service ran and the check is reading what it wrote.
-      "a: ready, wrote /run/a.ready",
+      # a's readiness comes from a file the service writes itself, and rc
+      # reports it. The service's own "ready, wrote" line went to its log
+      # file once QuokkaOS stopped sharing the console with services.
+      "a        default   ready",
       # Every service up, which for b and c means their dependencies were
       # ready first — the graph refusing to start them otherwise.
       "init: level 1 of",
@@ -480,7 +498,8 @@ CASES = [
     # the one fact silence destroys.
     ("§P2: wait4 returns for an exited child, two hundred times, both forms",
      "",
-     ["waitloop: wait4(pid), the form os/exec uses",
+     ["waitloop: four children alive alongside the one being waited for",
+      "waitloop: wait4(pid), the form os/exec uses",
       "waitloop:   through round 200",
       "waitloop: wait4(-1), the form PID 1 collects orphans with",
       "waitloop: passed mask 3",
@@ -523,9 +542,12 @@ CASES = [
      ["net: over the board's Ethernet, link up at 1000 Mbit full duplex",
       "/24 gw 192.168.86.1",
       "(dhcp, lease",
-      # And nothing was dropped on the way, which a lease alone would not
+      # And nothing was dropped as damaged, which a lease alone would not
       # show: a stack can bind while discarding most of what it receives.
-      "dropped: malformed 0 checksum 0 fragment 0 not-ours 0"],
+      # `not-ours` is not asserted: the controller runs promiscuous (the
+      # strict-unicast-filter workaround, ROADMAP §5), so other hosts'
+      # frames on the LAN are counted there by design.
+      "dropped: malformed 0 checksum 0 fragment 0 not-ours"],
      150, None),
 
     ("§4: the board's own Ethernet negotiates a link",
@@ -569,6 +591,32 @@ CASES = [
       # satisfy a test that merely counted mounts.
       "volumes: every volume where its label says"],
      240, None, "twovol"),
+
+    # **The root by its label, behind a FAT boot partition.** Partition 1 is
+    # FAT — what a disk that boots locally carries, because U-Boot cannot
+    # read XFS — so a kernel that took partition 1 as the root would fail
+    # here. ROOT is partition 2 and DATA partition 3, and the FAT is passed
+    # over by automount as not a filesystem this kernel mounts.
+    ("§3: the root is found by its label behind a FAT boot partition",
+     "minikern.volumes",
+     ["disk: the root is volume 1 on ram, labelled ROOT",
+      "volumes: FAT32 \"BOOT\" mounted at /boot",
+      "volumes: \"ROOT\" at / (the root filesystem's own mount)",
+      "volumes: \"DATA\" mounted at /volumes/DATA",
+      "volumes: every volume where its label says"],
+     240, None, "bootfirst"),
+    # **The boot partition at /boot**, read and written by the kernel the
+    # firmware loaded from it: a file listed, written, read back, moved into
+    # a directory made for it, refused across to the root filesystem, and
+    # removed — the calls a program's `cp`, `mv` and `rm` make. The stand-in
+    # kernel `mcopy` put there is read back too. The host's `fat_write_test`
+    # judges the same driver with `fsck.fat`.
+    ("§3: the FAT boot partition, read and written at /boot",
+     "minikern.bootwrite minikern.cat=/boot/minikern.bin",
+     ["volumes: FAT32 \"BOOT\" mounted at /boot",
+      "the boot partition is read and written at /boot",
+      "cat: /boot/minikern.bin is 48 bytes"],
+     240, None, "bootfirst"),
 ]
 
 
@@ -626,8 +674,12 @@ def run_case(name, bootargs, wanted, seconds, out_dir, program=None, needs_image
         at = os.path.join(out_dir, "fx")
         if needs_image == "small":
             img = fixtures.small_directory(at)
+        elif needs_image == "defaults":
+            img = fixtures.small_directory_defaults(at)
         elif needs_image == "twovol":
             img = fixtures.two_labelled_volumes(at)
+        elif needs_image == "bootfirst":
+            img = fixtures.boot_partition_first(at)
         elif needs_image == "swap":
             img = fixtures.swap_volume(at)
         elif needs_image == "quokka":

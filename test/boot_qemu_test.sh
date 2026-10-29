@@ -29,7 +29,7 @@ boot() {
     local append="console=sbi minikern.halt=poweroff${extra:+ $extra}"
     timeout 60 qemu-system-riscv64 -M virt -smp 4 -m "$memory" -nographic \
         -bios default -kernel "$image" -append "$append" > "$out" 2>&1 || status=$?
-    tr -d '\r' < "$out" > "$out.clean" && mv "$out.clean" "$out"
+    tr -d '\r' < "$out" | sed -E 's/^\[[0-9:.]+\] [A-Z] //' > "$out.clean" && mv "$out.clean" "$out"
     [ "$status" -eq 0 ] || { cat "$out"; echo "FAIL: with $memory, qemu exited $status" >&2; exit 1; }
 }
 

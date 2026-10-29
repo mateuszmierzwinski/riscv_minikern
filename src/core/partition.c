@@ -24,6 +24,22 @@
  * other and never hold a sector across the handover. */
 static uint8_t sector[4096];
 
+/* Whether a read during the current scan failed. A scan that could not read
+ * the table has not learned that there is none, and saying "no table" for it
+ * made a partitioned card look like a whole-disk one — the first SD read
+ * after bring-up fails now and then, and the kernel then mounted the FAT
+ * boot partition as its root. */
+static bool read_failed;
+
+/* Reads one sector into `sector`, remembering a failure. */
+static bool read_sector(struct blockdev *dev, uint64_t lba) {
+    if (dev->read(dev->self, lba, 1, sector) == KERR_OK) {
+        return true;
+    }
+    read_failed = true;
+    return false;
+}
+
 static uint32_t le32(const uint8_t *p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
@@ -66,8 +82,7 @@ static uint32_t read_gpt_entries(struct blockdev *dev, uint64_t table_lba, uint3
     }
     for (uint32_t i = 0; i < count && found < cap; i++) {
         const uint8_t *e;
-        if (i % per_sector == 0 && dev->read(dev->self, table_lba + i / per_sector, 1, sector) !=
-                                       KERR_OK) {
+        if (i % per_sector == 0 && !read_sector(dev, table_lba + i / per_sector)) {
             return found;
         }
         e = sector + (i % per_sector) * stride;
@@ -92,7 +107,7 @@ static uint32_t read_gpt_entries(struct blockdev *dev, uint64_t table_lba, uint3
 static uint32_t scan_gpt(struct blockdev *dev, struct partition *out, uint32_t cap) {
     uint64_t table_lba;
     uint32_t count, stride;
-    if (dev->read(dev->self, GPT_HEADER_LBA, 1, sector) != KERR_OK || !is_efi_part(sector)) {
+    if (!read_sector(dev, GPT_HEADER_LBA) || !is_efi_part(sector)) {
         return 0;
     }
     table_lba = le64(sector + GPT_TABLE_LBA_AT);
@@ -109,7 +124,7 @@ static uint32_t scan_gpt(struct blockdev *dev, struct partition *out, uint32_t c
 
 static uint32_t scan_mbr(struct blockdev *dev, struct partition *out, uint32_t cap) {
     uint32_t found = 0;
-    if (dev->read(dev->self, 0, 1, sector) != KERR_OK) {
+    if (!read_sector(dev, 0)) {
         return 0;
     }
     if (sector[MBR_SIGNATURE_OFFSET] != 0x55u || sector[MBR_SIGNATURE_OFFSET + 1u] != 0xaau) {
@@ -132,13 +147,24 @@ static uint32_t scan_mbr(struct blockdev *dev, struct partition *out, uint32_t c
     return found;
 }
 
-uint32_t partition_scan(struct blockdev *dev, struct partition *out, uint32_t cap) {
-    uint32_t found;
+int partition_scan_checked(struct blockdev *dev, struct partition *out, uint32_t cap,
+                           uint32_t *found) {
+    *found = 0;
     if (dev->block_size > sizeof sector || cap == 0) {
-        return 0;
+        return KERR_OK;
     }
-    found = scan_gpt(dev, out, cap);
-    return found > 0 ? found : scan_mbr(dev, out, cap);
+    read_failed = false;
+    *found = scan_gpt(dev, out, cap);
+    if (*found == 0) {
+        *found = scan_mbr(dev, out, cap);
+    }
+    return read_failed && *found == 0 ? KERR_IO : KERR_OK;
+}
+
+uint32_t partition_scan(struct blockdev *dev, struct partition *out, uint32_t cap) {
+    uint32_t found = 0;
+    (void)partition_scan_checked(dev, out, cap, &found);
+    return found;
 }
 
 /* Every access is shifted, and one past the end is refused rather than

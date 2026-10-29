@@ -51,7 +51,7 @@ status=0
 timeout 120 qemu-system-riscv64 -M virt -smp 4 -m 1G -nographic -bios default -kernel "$image" \
     -drive "file=$tmp/fs.img,if=none,format=raw,id=nvm0" -device nvme,serial=mkinit,drive=nvm0 \
     -append "console=sbi minikern.halt=poweroff minikern.init=1" > "$log" 2>&1 || status=$?
-tr -d '\r' < "$log" > "$log.clean" && mv "$log.clean" "$log"
+tr -d '\r' < "$log" | sed -E 's/^\[[0-9:.]+\] [A-Z] //' > "$log.clean" && mv "$log.clean" "$log"
 cat "$log"
 
 [ "$status" -eq 0 ] || fail "qemu exited $status"

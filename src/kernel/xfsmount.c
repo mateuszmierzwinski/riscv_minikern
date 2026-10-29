@@ -13,6 +13,7 @@
 #include "arch/riscv/timer.h"
 #include "kernel/disk.h"
 #include "kernel/mem.h"
+#include "kernel/fatmount.h"
 #include "kernel/volumes.h"
 
 static struct xfs fs;
@@ -58,7 +59,7 @@ int xfsmount_attach(void) {
      * — `/` for `ROOT`, `/volumes/<label>` otherwise. Without it the table
      * would describe every filesystem on the machine except the one the
      * machine is running from. */
-    volumes_register(&fs, 0);
+    volumes_register(&fs, disk_root_volume());
     return KERR_OK;
 }
 
@@ -227,13 +228,63 @@ static uint32_t create_permissions(uint32_t base) {
     return base & ~mask & 07777u;
 }
 
+/* The XFS volume a path is on, and the path inside it.
+ *
+ * NULL for a path on a FAT volume, which `volumes_resolve` marks by leaving
+ * `within` NULL: falling back to the root there would answer for `/boot`
+ * out of the root filesystem. Every call that can take a FAT path asks
+ * `fat_for` first; one that cannot reports no such device. */
 static struct xfs *owner_of(const char *path, const char **within) {
     struct xfs *v = volumes_resolve(path, within);
-    if (v != NULL) {
+    if (v != NULL || *within == NULL) {
         return v;
     }
     *within = path;
     return mounted ? &fs : NULL;
+}
+
+/* The FAT volume a path is on, or NULL. */
+static struct fat *fat_for(const char *path, const char **within) {
+    return volumes_resolve_fat(path, within);
+}
+
+/* FAT's answers to the questions it has no fields for: every file is
+ * root's, and its mode is the one `fatmount` reports. */
+static int fat_stat(struct fat *vol, const char *within, uint32_t *uid, uint32_t *gid,
+                    uint32_t *mode) {
+    uint64_t size = 0;
+    uint32_t nlink = 0, m = 0;
+    int rc = fatmount_stat_full(vol, within, &m, &size, &nlink);
+    if (rc == KERR_OK && uid != NULL) {
+        *uid = 0;
+    }
+    if (rc == KERR_OK && gid != NULL) {
+        *gid = 0;
+    }
+    if (rc == KERR_OK && mode != NULL) {
+        *mode = m;
+    }
+    return rc;
+}
+
+static int fat_owner(struct fat *vol, const char *within, uint32_t *uid, uint32_t *gid) {
+    return fat_stat(vol, within, uid, gid, NULL);
+}
+
+static int fat_exists(struct fat *vol, const char *within) {
+    return fat_stat(vol, within, NULL, NULL, NULL);
+}
+
+/* Two paths and where each is: a rename or link across two volumes is
+ * `EXDEV`, as it is between any two filesystems. */
+static int fat_pair(const char *from, const char *to, struct fat **vol, const char **a,
+                    const char **b) {
+    struct fat *x = fat_for(from, a), *y = fat_for(to, b);
+    *vol = x;
+    if (x == NULL && y == NULL) {
+        return KERR_NOENT; /* neither is FAT: the XFS path answers */
+    }
+    return x == y ? KERR_OK : KERR_XDEV;
 }
 
 int xfsmount_show_file(const char *path) {
@@ -268,6 +319,11 @@ int xfsmount_show_file(const char *path) {
 }
 
 int xfsmount_stat_full(const char *path, uint32_t *mode, uint64_t *size, uint32_t *nlink) {
+    const char *fat_within = NULL;
+    struct fat *fat = fat_for(path, &fat_within);
+    if (fat != NULL) {
+        return fatmount_stat_full(fat, fat_within, mode, size, nlink);
+    }
     struct xfs_inode ip;
     const char *within = path;
     struct xfs *vol = owner_of(path, &within);
@@ -286,6 +342,11 @@ int xfsmount_stat_full(const char *path, uint32_t *mode, uint64_t *size, uint32_
 }
 
 int xfsmount_list(const char *path, xfs_dirent_fn fn, void *self) {
+    const char *fat_within = NULL;
+    struct fat *fat = fat_for(path, &fat_within);
+    if (fat != NULL) {
+        return fatmount_list(fat, fat_within, fn, self);
+    }
     struct xfs_inode dir;
     const char *within = path;
     struct xfs *vol = owner_of(path, &within);
@@ -318,6 +379,11 @@ int xfsmount_list(const char *path, xfs_dirent_fn fn, void *self) {
  * caller yet — regular-file `openat` is §3 of the roadmap — which is stated
  * rather than papered over with a check that only ever sees root. */
 int xfsmount_stat(const char *path, uint32_t *uid, uint32_t *gid, uint32_t *mode) {
+    const char *fat_within = NULL;
+    struct fat *fat = fat_for(path, &fat_within);
+    if (fat != NULL) {
+        return fat_stat(fat, fat_within, uid, gid, mode);
+    }
     struct xfs_inode ip;
     int rc;
     if (!mounted) {
@@ -389,6 +455,11 @@ int xfsmount_map_file(const char *path, uint64_t *offsets, uint32_t max, uint32_
 }
 
 int xfsmount_read_file(const char *path, uint32_t limit, uint8_t **out, uint32_t *size) {
+    const char *fat_within = NULL;
+    struct fat *fat = fat_for(path, &fat_within);
+    if (fat != NULL) {
+        return fatmount_read_file(fat, fat_within, limit, out, size);
+    }
     struct xfs_inode ip;
     uint8_t *buf;
     uint32_t got = 0, at = 0;
@@ -675,6 +746,11 @@ int xfsmount_unlink(const char *name) {
  * refused by `xfs_unlink` with `EISDIR`, which is right: removing one is
  * `rmdir`, and this is not it. */
 int xfsmount_unlink_path(const char *path) {
+    const char *fat_within = NULL;
+    struct fat *fat = fat_for(path, &fat_within);
+    if (fat != NULL) {
+        return fatmount_unlink_path(fat, fat_within);
+    }
     struct xfs_inode dir;
     const char *within = path;
     struct xfs *vol = owner_of(path, &within);
@@ -749,6 +825,11 @@ void xfsmount_root_shape(void) {
  * would be doing this loop itself. An existing component is not an error —
  * that is what makes this safe to call on every boot. */
 int xfsmount_mkdir_p(const char *path) {
+    const char *fat_within = NULL;
+    struct fat *fat = fat_for(path, &fat_within);
+    if (fat != NULL) {
+        return fatmount_mkdir_p(fat, fat_within, now_seconds());
+    }
     struct xfs_inode here;
     const char *within = path;
     struct xfs *vol = owner_of(path, &within);
@@ -876,6 +957,11 @@ __attribute__((noinline)) static int find_or_make_leaf(struct xfs *vol, const ch
 
 int xfsmount_write_at(const char *dir, const char *leaf, uint64_t off, const void *bytes,
                       uint32_t len) {
+    const char *fat_within = NULL;
+    struct fat *fat = fat_for(dir, &fat_within);
+    if (fat != NULL) {
+        return fatmount_write_at(fat, fat_within, leaf, off, bytes, len, now_seconds());
+    }
     struct xfs_inode file;
     uint64_t ino = 0;
     uint32_t put = 0;
@@ -902,7 +988,10 @@ int xfsmount_write_at(const char *dir, const char *leaf, uint64_t off, const voi
     return rc != KERR_OK ? rc : xfs_flush(vol);
 }
 
-int xfsmount_write_into(const char *dir, const char *leaf, const void *bytes, uint32_t len) {
+/* `xfsmount_write_into` for an XFS volume. Its own frame, because it holds
+ * two inodes and the FAT check beside them crossed the 1 KiB limit. */
+static __attribute__((noinline)) int write_into_xfs(const char *dir, const char *leaf,
+                                                    const void *bytes, uint32_t len) {
     struct xfs_inode parent, file;
     uint64_t ino = 0;
     uint32_t put = 0;
@@ -937,6 +1026,15 @@ int xfsmount_write_into(const char *dir, const char *leaf, const void *bytes, ui
         return KERR_IO;
     }
     return rc != KERR_OK ? rc : xfs_flush(vol);
+}
+
+int xfsmount_write_into(const char *dir, const char *leaf, const void *bytes, uint32_t len) {
+    const char *fat_within = NULL;
+    struct fat *fat = fat_for(dir, &fat_within);
+    if (fat != NULL) {
+        return fatmount_write_at(fat, fat_within, leaf, 0, bytes, len, now_seconds());
+    }
+    return write_into_xfs(dir, leaf, bytes, len);
 }
 
 /* ── symbolic links ────────────────────────────────────────────────────── */
@@ -976,6 +1074,11 @@ static int split_parent(const char *within, char *dir, uint32_t dirmax, const ch
 }
 
 int xfsmount_symlink(const char *path, const char *target) {
+    const char *fat_within = NULL;
+    struct fat *fat = fat_for(path, &fat_within);
+    if (fat != NULL) {
+        return KERR_PERM /* FAT has no symbolic links */;
+    }
     struct xfs_inode dir;
     const char *within = path;
     struct xfs *vol = owner_of(path, &within);
@@ -1005,6 +1108,11 @@ int xfsmount_symlink(const char *path, const char *target) {
 }
 
 int xfsmount_readlink(const char *path, char *out, uint32_t max, uint32_t *got) {
+    const char *fat_within = NULL;
+    struct fat *fat = fat_for(path, &fat_within);
+    if (fat != NULL) {
+        return KERR_INVAL /* nothing on FAT is a link */;
+    }
     struct xfs_inode ip;
     const char *within = path;
     struct xfs *vol = owner_of(path, &within);
@@ -1044,6 +1152,12 @@ static __attribute__((noinline)) int ino_of(struct xfs *vol, const char *within,
 }
 
 int xfsmount_link_path(const char *from, const char *to) {
+    const char *fa = NULL, *fb = NULL;
+    struct fat *fat = NULL;
+    int frc = fat_pair(from, to, &fat, &fa, &fb);
+    if (frc != KERR_NOENT) {
+        return frc != KERR_OK ? frc : KERR_PERM; /* FAT has no hard links */
+    }
     uint64_t existing = 0;
     struct xfs_inode dir;
     const char *fromwithin = from;
@@ -1134,6 +1248,12 @@ static __attribute__((noinline)) int rename_resolved(struct xfs *vol, const char
 }
 
 int xfsmount_rename_path(const char *from, const char *to) {
+    const char *fa = NULL, *fb = NULL;
+    struct fat *fat = NULL;
+    int frc = fat_pair(from, to, &fat, &fa, &fb);
+    if (frc != KERR_NOENT) {
+        return frc != KERR_OK ? frc : fatmount_rename_path(fat, fa, fb, now_seconds());
+    }
     const char *fromwithin = from;
     const char *towithin = to;
     struct xfs *fromvol = owner_of(from, &fromwithin);
@@ -1179,6 +1299,11 @@ static __attribute__((noinline)) int resolve_for_attrs(const char *path, struct 
 }
 
 int xfsmount_chmod_path(const char *path, uint32_t mode) {
+    const char *fat_within = NULL;
+    struct fat *fat = fat_for(path, &fat_within);
+    if (fat != NULL) {
+        return KERR_PERM /* FAT keeps no permission bits */;
+    }
     struct xfs *vol = NULL;
     struct xfs_inode ip;
     int rc = resolve_for_attrs(path, &vol, &ip);
@@ -1186,6 +1311,11 @@ int xfsmount_chmod_path(const char *path, uint32_t mode) {
 }
 
 int xfsmount_chown_path(const char *path, uint32_t uid, uint32_t gid) {
+    const char *fat_within = NULL;
+    struct fat *fat = fat_for(path, &fat_within);
+    if (fat != NULL) {
+        return KERR_PERM /* nor owners */;
+    }
     struct xfs *vol = NULL;
     struct xfs_inode ip;
     int rc = resolve_for_attrs(path, &vol, &ip);
@@ -1193,6 +1323,11 @@ int xfsmount_chown_path(const char *path, uint32_t uid, uint32_t gid) {
 }
 
 int xfsmount_owner_of(const char *path, uint32_t *uid, uint32_t *gid) {
+    const char *fat_within = NULL;
+    struct fat *fat = fat_for(path, &fat_within);
+    if (fat != NULL) {
+        return fat_owner(fat, fat_within, uid, gid);
+    }
     struct xfs *vol = NULL;
     struct xfs_inode ip;
     int rc = resolve_for_attrs(path, &vol, &ip);
@@ -1207,9 +1342,10 @@ int xfsmount_owner_of(const char *path, uint32_t *uid, uint32_t *gid) {
 int xfsmount_flush(void) {
     struct xfs *vol = NULL;
     const char *within = "/";
+    int fat_rc = volumes_flush_fat();
     vol = owner_of("/", &within);
-    if (vol == NULL) {
-        return KERR_NODEV;
+    if (vol == NULL || fat_rc != KERR_OK) {
+        return vol == NULL ? KERR_NODEV : fat_rc;
     }
     /* **The whole cache, not one file's blocks.** A per-file flush would
      * need to know which buffers belong to which inode, which this cache
@@ -1220,12 +1356,22 @@ int xfsmount_flush(void) {
 }
 
 int xfsmount_counters(const char *path, struct xfs_counters *out) {
+    const char *fat_within = NULL;
+    struct fat *fat = fat_for(path, &fat_within);
+    if (fat != NULL) {
+        return fatmount_counters(fat, out);
+    }
     const char *within = path;
     struct xfs *vol = owner_of(path, &within);
     return vol == NULL ? KERR_NODEV : xfs_counters(vol, out);
 }
 
 int xfsmount_utimes_path(const char *path, uint64_t atime_s, uint64_t mtime_s) {
+    const char *fat_within = NULL;
+    struct fat *fat = fat_for(path, &fat_within);
+    if (fat != NULL) {
+        return fat_exists(fat, fat_within); /* FAT keeps one time, set as a file is written */
+    }
     struct xfs *vol = NULL;
     struct xfs_inode ip;
     int rc = resolve_for_attrs(path, &vol, &ip);
@@ -1233,6 +1379,11 @@ int xfsmount_utimes_path(const char *path, uint64_t atime_s, uint64_t mtime_s) {
 }
 
 int xfsmount_truncate_path(const char *path, uint64_t size) {
+    const char *fat_within = NULL;
+    struct fat *fat = fat_for(path, &fat_within);
+    if (fat != NULL) {
+        return fatmount_truncate_path(fat, fat_within, size, now_seconds());
+    }
     struct xfs *vol = NULL;
     struct xfs_inode ip;
     int rc = resolve_for_attrs(path, &vol, &ip);

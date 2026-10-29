@@ -25,11 +25,14 @@
 #include <stdint.h>
 
 struct xfs;
+struct fat;
 
 /* Where a volume without a usable label is mounted, and the label that
  * means "this is the root filesystem". */
 #define VOLUMES_ROOT_LABEL "ROOT"
 #define VOLUMES_DIR "/volumes"
+#define VOLUMES_BOOT_LABEL "BOOT"
+#define VOLUMES_BOOT_DIR "/boot"
 
 /* Mounts every filesystem the disk offers, each where its label says.
  *
@@ -59,6 +62,13 @@ void volumes_register(struct xfs *fs, uint32_t index);
  * the root — which is the whole reason a table is ordered rather than
  * searched linearly for a first hit. NULL when nothing owns it. */
 struct xfs *volumes_resolve(const char *path, const char **within);
+
+/* The FAT volume a path lies on, and the path inside it; NULL when the path
+ * is on an XFS volume or none (`volumes_resolve` answers then). */
+struct fat *volumes_resolve_fat(const char *path, const char **within);
+
+/* Flushes every FAT volume: its free count back to FSInfo, its cache out. */
+int volumes_flush_fat(void);
 
 /* The table, for listing `/volumes` and for the boot log. */
 uint32_t volumes_count(void);

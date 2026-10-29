@@ -19,16 +19,14 @@ with every one of the mistakes they found.
 | **XFS mounted from that card, and a stock Go binary loaded off it and run** | `logstart` is an AG-encoded block number — this filesystem's *write* path converted it and its *read* path did not, so the two halves disagreed about where the log was |
 | **An NVMe drive in the M.2 slot**: `TS128GMTE110S`, 122 GB, at **334 MB/s** | the board's PCIe is `starfive,jh7110-pcie`, read through the link the firmware trained; a command's data pointer must be page-aligned, which `kzalloc` is not; and a page list raises a transfer's ceiling from 8 KiB to 2 MiB |
 | **The SD card at 8.2 MB/s**, against 2.5 when it first worked | one command per transfer rather than per block, and the card's standard 25 MHz rather than a cautious 12.5 — both measured with a benchmark built into the kernel |
+| **XFS written as `mkfs.xfs`'s defaults make it** — reverse map, reflink (copy-on-write), b-tree forks and directories, a log that wraps; judged by `xfs_repair` after every change | `test/xfs_write_test.sh` on real `mkfs.xfs` images; on the board, 1,200 names added and removed twice |
+| **The FAT boot partition at `/boot`**, read and written — FAT12/16/32 with long names | `test/fat_write_test.sh` (`fsck.fat`, mtools); on the board, a file written there and read back |
 | **Its GPT read**, and the first partition presented as a disk | GPT and MBR, with a GPT disk's protective MBR recognised and skipped rather than followed |
 | **The kernel's own UART**, taking the console over from the firmware | a 16550's registers are not always one byte apart: this one has `reg-shift = 2` and `reg-io-width = 4`, and getting it wrong is *garbling*, not silence |
 | **A GPIO level crossing a physical wire**: driven on pin 60, read on pin 63 | the operator's jumper. It immediately showed what a loopback cannot: the other pin could not be driven at all, because this driver does not yet select a pad's function |
 | **Both pin controllers clocked**, including the always-on one | a clock index belongs to a generator, not to a SoC — and the right numbers are in each node's own `clocks` property |
 
-What is **not** done on the board: the pad function is not selected, so only a
-pin the firmware already left as GPIO can be driven; there is no driver for
-the board's own DesignWare GMAC; an XFS made with `mkfs.xfs`'s defaults stops
-at `nrext64`, which changes the inode layout; and thermal and frequency
-scaling are not started.
+What is **not** done on the board is in `ROADMAP.md`, the only list of it.
 
 ## Working now
 

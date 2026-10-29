@@ -90,15 +90,24 @@ uint64_t xfs_group_block(const struct xfs *fs, uint32_t agno) {
     return (uint64_t)agno * fs->agblocks;
 }
 
+int xfs_group_header(struct xfs *fs, uint32_t agno, uint32_t sector, struct bbuf **out,
+                     uint8_t **at) {
+    uint64_t byte = (uint64_t)sector * fs->sectsize;
+    int rc = bcache_get(fs->cache, xfs_group_block(fs, agno) + byte / fs->blocksize, out);
+    if (rc == KERR_OK) {
+        *at = (*out)->data + byte % fs->blocksize;
+    }
+    return rc;
+}
+
 /* The group's inode header, checked the way everything else here is
  * checked: its magic, its checksum and the filesystem's own UUID. */
 int xfs_agi_get(struct xfs *fs, uint32_t agno, struct bbuf **out, uint8_t **agi) {
     uint8_t *at;
-    int rc = bcache_get(fs->cache, xfs_group_block(fs, agno), out);
+    int rc = xfs_group_header(fs, agno, XFS_AGI_SECTOR, out, &at);
     if (rc != KERR_OK) {
         return rc;
     }
-    at = (*out)->data + XFS_AGI_SECTOR * fs->sectsize;
     if (xfs_be32(at) != XFS_AGI_MAGIC || !xfs_crc_ok(fs, at, fs->sectsize, XFS_AGI_CRC) ||
         !xfs_uuid_ok(fs, at + XFS_AGI_UUID)) {
         bcache_put(fs->cache, *out);
@@ -141,34 +150,6 @@ uint8_t *xfs_tree_record_for(const struct xfs *fs, const struct bbuf *b, uint32_
     return NULL;
 }
 
-/* The first record with at least two free inodes, and the lowest free one
- * in it. Two, not one: taking the last would have to delete the record
- * from the free-inode tree, which is a btree operation this does not do. */
-static uint8_t *pick_record(const struct xfs *fs, const struct bbuf *b, uint32_t *bit) {
-    uint32_t n = xfs_be16(b->data + XFS_BTREE_NUMRECS);
-    for (uint32_t i = 0; i < n; i++) {
-        uint8_t *rec = b->data + fs->btree_hdr + i * XFS_INOBT_REC_SIZE;
-        uint64_t free = xfs_be64(rec + XFS_INOBT_REC_FREE);
-        if (xfs_be32(rec + XFS_INOBT_REC_FREECOUNT) < 2u) {
-            continue;
-        }
-        for (uint32_t b2 = 0; b2 < XFS_INODES_PER_CHUNK; b2++) {
-            if ((free & ((uint64_t)1 << b2)) != 0) {
-                *bit = b2;
-                return rec;
-            }
-        }
-    }
-    return NULL;
-}
-
-/* Marks one inode of a record used: its bit cleared, its count down. */
-static void take_from_record(uint8_t *rec, uint32_t bit) {
-    uint64_t free = xfs_be64(rec + XFS_INOBT_REC_FREE) & ~((uint64_t)1 << bit);
-    xfs_put_be32(rec + XFS_INOBT_REC_FREECOUNT, xfs_be32(rec + XFS_INOBT_REC_FREECOUNT) - 1u);
-    xfs_put_be64(rec + XFS_INOBT_REC_FREE, free);
-}
-
 /* Takes a free inode from this group, marking it used in both trees and in
  * the group header. *ino is the inode number it allocated.
  *
@@ -183,92 +164,26 @@ static void take_from_record(uint8_t *rec, uint32_t bit) {
 static int take_inode(struct xfs *fs, uint32_t agno, uint64_t *ino);
 
 static int take_inode(struct xfs *fs, uint32_t agno, uint64_t *ino) {
-    struct bbuf *agib, *inob;
-    /* **NULL is the "no free-inode tree" case**, which is every v4
-     * filesystem, and it has to be the initial value rather than something
-     * the guard sets: the compiler caught both of these being read on the
-     * path where the tree does not exist. */
-    struct bbuf *finob = NULL;
-    uint8_t *agi, *rec, *frec = NULL;
-    uint32_t bit = 0, startino;
-    int rc = xfs_agi_get(fs, agno, &agib, &agi);
-    if (rc != KERR_OK) {
-        return rc;
-    }
-    rc = xfs_tree_get(fs, agno, xfs_be32(agi + XFS_AGI_ROOT), xfs_magic_for(fs, XFS_BLK_INOBT), &inob);
-    if (rc != KERR_OK) {
-        bcache_put(fs->cache, agib);
-        return rc;
-    }
-    rec = pick_record(fs, inob, &bit);
-    if (rec == NULL) {
+    uint32_t agino = 0, startino = 0, landed = agno;
+    int rc = xfs_inobt_take(fs, agno, &agino);
+    if (rc == KERR_NOENT) {
         /* **Every chunk in the group is full, so make another one.** This
          * answered `KERR_NOSPC` instead, which meant a fresh filesystem
          * took about sixty files and then refused — the limit being the one
-         * chunk `mkfs` had made, not anything about the disk. The trees and
-         * the group's counts are released and re-read afterwards, because
-         * adding a chunk changes all three. */
-        bcache_put(fs->cache, inob);
-        bcache_put(fs->cache, agib);
-        uint32_t landed = agno;
+         * chunk `mkfs` had made, not anything about the disk. Retried in
+         * the group the chunk landed in, which need not be this one:
+         * retrying here would find it just as full and recurse until the
+         * stack ran out. */
         rc = xfs_inode_chunk_add(fs, &landed, &startino);
-        if (rc == KERR_OK) {
-            fs->inode_chunks_added++;
-        }
-        /* **Retried in the group the chunk landed in**, which need not be
-         * the one asked for. Retrying in the original would find it just as
-         * full as a moment ago and recurse until the stack ran out. */
+        fs->inode_chunks_added += rc == KERR_OK ? 1u : 0u;
         return rc != KERR_OK ? rc : take_inode(fs, landed, ino);
     }
-    startino = xfs_be32(rec + XFS_INOBT_REC_STARTINO);
-    /* **The free-inode tree only if there is one.** On v4 there is not, and
-     * `agi_free_root` is past the end of the AGI as v4 defined it — so this
-     * would hand `xfs_tree_get` whatever byte follows in the sector. */
-    if (fs->has_finobt) {
-        rc = xfs_tree_get(fs, agno, xfs_be32(agi + XFS_AGI_FREE_ROOT),
-                          xfs_magic_for(fs, XFS_BLK_FINOBT), &finob);
-        if (rc != KERR_OK) {
-            bcache_put(fs->cache, inob);
-            bcache_put(fs->cache, agib);
-            return rc;
-        }
-        frec = xfs_tree_record_for(fs, finob, startino + bit);
-        if (frec == NULL) {
-            bcache_put(fs->cache, finob);
-            bcache_put(fs->cache, inob);
-            bcache_put(fs->cache, agib);
-            return KERR_IO;
-        }
-    }
-    take_from_record(rec, bit);
-    if (frec != NULL) {
-        take_from_record(frec, bit);
-    }
-    xfs_put_be32(agi + XFS_AGI_FREECOUNT, xfs_be32(agi + XFS_AGI_FREECOUNT) - 1u);
-    xfs_reseal(fs, inob->data, fs->blocksize, XFS_BTREE_CRC);
-    xfs_reseal(fs, agi, fs->sectsize, XFS_AGI_CRC);
-    bcache_dirty(inob);
-    bcache_dirty(agib);
-    if (finob != NULL) {
-        xfs_reseal(fs, finob->data, fs->blocksize, XFS_BTREE_CRC);
-        bcache_dirty(finob);
-        bcache_put(fs->cache, finob);
-    }
-    bcache_put(fs->cache, inob);
-    bcache_put(fs->cache, agib);
-    /* **`+ bit`, not `| bit`.** The chunk's first inode number is not
-     * aligned to the chunk's size — the first one in a group commonly
-     * starts at 96 — so an offset shares bits with it and an `or` silently
-     * returns an inode that is already in use. With a start of 96, offset
-     * 32 produced 96 again: the **root directory**, whose inode was then
-     * overwritten with the new file's, after which the filesystem had no
-     * root. Twenty-eight creates worked first, because the offsets below 32
-     * happen to have no bits in common with 96.
-     *
-     * It had never run: `xfs_create` had no caller until the write path was
-     * wired up, so this was waiting in code that compiled. */
-    *ino = ((uint64_t)agno << (fs->agblklog + fs->inopblog)) + (startino & 0xffffffffu) + bit;
-    return KERR_OK;
+    /* **`+`, not `|`.** A chunk's first inode number is not aligned to the
+     * chunk's size — the first one in a group commonly starts at 96 — so an
+     * `or` of the offset into it once returned the root directory's inode
+     * for a new file, which was then overwritten. */
+    *ino = ((uint64_t)agno << (fs->agblklog + fs->inopblog)) + agino;
+    return rc;
 }
 
 /* The superblock's free-inode counter, which must follow the groups'. */
@@ -481,6 +396,30 @@ static int log_create(struct xfs *fs, uint64_t ino, uint64_t dirino) {
     return rc;
 }
 
+/* The type byte for an entry naming an inode of this mode.
+ *
+ * **From the mode, not assumed.** Every entry `xfs_create` made said
+ * "regular file", symlinks included, and only `xfs_repair` noticed: this
+ * kernel reads the inode's own mode and never trusts the byte. */
+static uint8_t ftype_of(uint16_t mode) {
+    switch (mode & 0170000u) {
+    case 0120000u:
+        return XFS_DIR3_FT_SYMLINK;
+    case 0020000u:
+        return XFS_DIR3_FT_CHRDEV;
+    case 0060000u:
+        return XFS_DIR3_FT_BLKDEV;
+    case 0010000u:
+        return XFS_DIR3_FT_FIFO;
+    case 0140000u:
+        return XFS_DIR3_FT_SOCK;
+    case 0040000u:
+        return XFS_DIR3_FT_DIR;
+    default:
+        return XFS_DIR3_FT_REG;
+    }
+}
+
 int xfs_create(struct xfs *fs, const struct xfs_inode *dir, const char *name, uint32_t namelen, uint16_t mode,
                uint64_t now_s, uint64_t *ino_out) {
     uint64_t ino = 0;
@@ -491,7 +430,8 @@ int xfs_create(struct xfs *fs, const struct xfs_inode *dir, const char *name, ui
     if (!xfs_is_dir(dir)) {
         return KERR_NOTDIR;
     }
-    if (dir->format != XFS_DINODE_FMT_LOCAL && dir->format != XFS_DINODE_FMT_EXTENTS) {
+    if (dir->format != XFS_DINODE_FMT_LOCAL && dir->format != XFS_DINODE_FMT_EXTENTS &&
+        dir->format != XFS_DINODE_FMT_BTREE) {
         return KERR_NOTSUP; /* a fork shape the write path cannot place into */
     }
     if (!name_is_allowed(name, namelen)) {
@@ -517,7 +457,7 @@ int xfs_create(struct xfs *fs, const struct xfs_inode *dir, const char *name, ui
         rc = write_new_inode(fs, ino, mode, now_s);
     }
     if (rc == KERR_OK) {
-        rc = xfs_dir_add(fs, dir, name, namelen, ino, XFS_DIR3_FT_REG, now_s);
+        rc = xfs_dir_add(fs, dir, name, namelen, ino, ftype_of(mode), now_s);
     }
     if (rc == KERR_OK) {
         rc = log_create(fs, ino, dir->ino);
@@ -734,46 +674,6 @@ static int fill_inode_block(struct xfs *fs, uint64_t device_block, uint64_t firs
     return KERR_OK;
 }
 
-/* Puts a record into an inode b-tree leaf, keeping it sorted by inode
- * number.
- *
- * A **leaf**, singular: when it is full the tree would have to split, and
- * that is refused rather than approximated. A group's first leaf holds a
- * few hundred records — tens of thousands of inodes — so the refusal is far
- * away, and a wrong b-tree is much worse than a filesystem that stops
- * growing. */
-static int tree_insert(struct xfs *fs, struct bbuf *b, uint32_t startino, uint32_t freecount,
-                       uint64_t free) {
-    uint32_t n = xfs_be16(b->data + XFS_BTREE_NUMRECS);
-    uint32_t max = (fs->blocksize - fs->btree_hdr) / XFS_INOBT_REC_SIZE;
-    uint32_t at = n;
-    if (n >= max) {
-        return KERR_NOSPC; /* the leaf would have to split */
-    }
-    for (uint32_t i = 0; i < n; i++) {
-        uint8_t *rec = b->data + fs->btree_hdr + i * XFS_INOBT_REC_SIZE;
-        if (xfs_be32(rec + XFS_INOBT_REC_STARTINO) > startino) {
-            at = i;
-            break;
-        }
-    }
-    for (uint32_t i = n; i > at; i--) {
-        xfs_copy_bytes(b->data + fs->btree_hdr + i * XFS_INOBT_REC_SIZE,
-                       b->data + fs->btree_hdr + (i - 1u) * XFS_INOBT_REC_SIZE,
-                       XFS_INOBT_REC_SIZE);
-    }
-    {
-        uint8_t *rec = b->data + fs->btree_hdr + at * XFS_INOBT_REC_SIZE;
-        xfs_put_be32(rec + XFS_INOBT_REC_STARTINO, startino);
-        xfs_put_be32(rec + XFS_INOBT_REC_FREECOUNT, freecount);
-        xfs_put_be64(rec + XFS_INOBT_REC_FREE, free);
-    }
-    xfs_put_be16(b->data + XFS_BTREE_NUMRECS, (uint16_t)(n + 1u));
-    xfs_reseal(fs, b->data, fs->blocksize, XFS_BTREE_CRC);
-    bcache_dirty(b);
-    return KERR_OK;
-}
-
 /* Raises the superblock's count of inodes, which a new chunk changes and
  * nothing else does. */
 static int count_inodes(struct xfs *fs, int32_t delta) {
@@ -790,14 +690,34 @@ static int count_inodes(struct xfs *fs, int32_t delta) {
     return KERR_OK;
 }
 
+/* The group's inode counts for a new chunk of free inodes, and where the
+ * newest chunk is. */
+static int agi_new_chunk(struct xfs *fs, uint32_t agno, uint32_t startino) {
+    struct bbuf *b;
+    uint8_t *agi;
+    int rc = xfs_agi_get(fs, agno, &b, &agi);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    xfs_put_be32(agi + XFS_AGI_COUNT, xfs_be32(agi + XFS_AGI_COUNT) + XFS_INODES_PER_CHUNK);
+    xfs_put_be32(agi + XFS_AGI_FREECOUNT, xfs_be32(agi + XFS_AGI_FREECOUNT) + XFS_INODES_PER_CHUNK);
+    xfs_put_be32(agi + XFS_AGI_NEWINO, startino);
+    xfs_reseal(fs, agi, fs->sectsize, XFS_AGI_CRC);
+    bcache_dirty(b);
+    bcache_put(fs->cache, b);
+    return KERR_OK;
+}
+
 int xfs_inode_chunk_add(struct xfs *fs, uint32_t *agno, uint32_t *startino) {
     uint32_t blocks = XFS_INODES_PER_CHUNK / fs->inopblock;
     uint32_t agbno = 0;
-    struct bbuf *agib, *inob;
-    struct bbuf *finob = NULL; /* absent on v4: see take_inode */
-    uint8_t *agi;
-    int rc = xfs_alloc_somewhere(fs, agno, blocks, 0, &agbno);
+    int rc = xfs_alloc_chunk_somewhere(fs, agno, blocks, &agbno);
     if (rc != KERR_OK) {
+        return rc;
+    }
+    rc = xfs_rmap_map(fs, ((uint64_t)*agno << fs->agblklog) | agbno, blocks, XFS_RMAP_OWN_INODES, 0);
+    if (rc != KERR_OK) {
+        (void)xfs_free_extent(fs, *agno, agbno, blocks);
         return rc;
     }
     /* **The inode number a chunk starts at is its block times the inodes a
@@ -814,36 +734,8 @@ int xfs_inode_chunk_add(struct xfs *fs, uint32_t *agno, uint32_t *startino) {
         uint64_t fsb = ((uint64_t)*agno << fs->agblklog) | (agbno + i);
         rc = fill_inode_block(fs, xfs_fsb_to_block(fs, fsb), *startino + i * fs->inopblock);
     }
-    rc = rc != KERR_OK ? rc : xfs_agi_get(fs, *agno, &agib, &agi);
-    if (rc != KERR_OK) {
-        return rc;
-    }
-    rc = xfs_tree_get(fs, *agno, xfs_be32(agi + XFS_AGI_ROOT), xfs_magic_for(fs, XFS_BLK_INOBT), &inob);
-    if (rc == KERR_OK && fs->has_finobt) {
-        rc = xfs_tree_get(fs, *agno, xfs_be32(agi + XFS_AGI_FREE_ROOT),
-                          xfs_magic_for(fs, XFS_BLK_FINOBT), &finob);
-    }
-    if (rc != KERR_OK) {
-        bcache_put(fs->cache, agib);
-        return rc;
-    }
-    rc = tree_insert(fs, inob, *startino, XFS_INODES_PER_CHUNK, ~(uint64_t)0);
-    if (rc == KERR_OK && finob != NULL) {
-        rc = tree_insert(fs, finob, *startino, XFS_INODES_PER_CHUNK, ~(uint64_t)0);
-    }
-    if (rc == KERR_OK) {
-        xfs_put_be32(agi + XFS_AGI_COUNT, xfs_be32(agi + XFS_AGI_COUNT) + XFS_INODES_PER_CHUNK);
-        xfs_put_be32(agi + XFS_AGI_FREECOUNT,
-                     xfs_be32(agi + XFS_AGI_FREECOUNT) + XFS_INODES_PER_CHUNK);
-        xfs_put_be32(agi + XFS_AGI_NEWINO, *startino);
-        xfs_reseal(fs, agi, fs->sectsize, XFS_AGI_CRC);
-        bcache_dirty(agib);
-    }
-    if (finob != NULL) {
-        bcache_put(fs->cache, finob);
-    }
-    bcache_put(fs->cache, inob);
-    bcache_put(fs->cache, agib);
+    rc = rc != KERR_OK ? rc : xfs_inobt_add_chunk(fs, *agno, *startino);
+    rc = rc != KERR_OK ? rc : agi_new_chunk(fs, *agno, *startino);
     rc = rc != KERR_OK ? rc : count_inodes(fs, XFS_INODES_PER_CHUNK);
     return rc != KERR_OK ? rc : xfs_count_inodes_free(fs, XFS_INODES_PER_CHUNK);
 }

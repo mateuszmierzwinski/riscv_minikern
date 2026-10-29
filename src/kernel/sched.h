@@ -121,6 +121,15 @@ void sched_run(void);
  * moment a child exits: a child ending must leave its parent running. */
 void sched_exit_proc(struct uproc *p, bool is_root);
 
+/* Takes `p`'s table out of every hart's record of what it has loaded, and
+ * out of this hart's `satp` if it is there — called before the table is
+ * torn down. Another hart cannot be running on it: its threads are off
+ * every hart by then, and an idle hart has already released it (see
+ * `unload_before_idling`). Clearing the record matters even so, because a
+ * process slot is reused, and a hart whose record still named the slot
+ * would skip loading the new process's table and run it on the old one's. */
+void sched_forget_address_space(const struct uproc *p);
+
 /* How many harts a process may run on: those that reached the kernel. This
  * is what `sched_getaffinity` reports, and therefore what a Go runtime's
  * `NumCPU` and `GOMAXPROCS` become. */
@@ -374,6 +383,19 @@ uint32_t sched_missed_pokes(void);
  * that did not happen yet**: nothing will interrupt any hart, so whoever was
  * waiting waits for ever. It must be zero. */
 uint32_t sched_lost_deadlines(void);
+
+/* Deadlines armed after their moment had passed: how many, how many were
+ * followed by a timer interrupt on that hart, the worst lateness at arming
+ * and the worst wait for the interrupt after it. */
+struct sched_past_arm_report {
+    uint64_t arms;
+    uint64_t fired;
+    uint64_t worst_behind_us;
+    uint64_t worst_fire_us;
+    uint64_t superseded;
+    uint64_t worst_behind_by_source_us[3]; /* slice, beat, sleeper */
+};
+void sched_past_arms(struct sched_past_arm_report *out);
 
 /* Threads found still blocked a second or more past their own deadline — a
  * wake-up that was armed and never arrived. The deadlock detector cannot

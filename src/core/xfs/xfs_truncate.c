@@ -44,11 +44,13 @@ static uint64_t blocks_past(const struct xfs_extent *e, uint64_t from) {
     return e->startoff + e->blockcount - from;
 }
 
-/* Hands one run of blocks back to its allocation group. */
-static int give_back(struct xfs *fs, uint64_t startblock, uint64_t count) {
-    uint64_t mask = ((uint64_t)1 << fs->agblklog) - 1u;
-    return xfs_free_extent(fs, xfs_fsb_ag(fs, startblock), (uint32_t)(startblock & mask),
-                           (uint32_t)count);
+/* Hands the last `past` blocks of a file's extent back: out of the
+ * reverse map, at the logical block they held, and to their group. */
+static int give_back(struct xfs *fs, const struct xfs_inode *ip, const struct xfs_extent *e,
+                     uint64_t past) {
+    uint64_t keep = e->blockcount - past;
+    return xfs_free_data(fs, ip, e->startblock + keep, (uint32_t)past,
+                         xfs_rmap_offset_of(e, keep));
 }
 
 /* Rewrites the fork with the records that survive, and frees the rest.
@@ -61,31 +63,29 @@ static int give_back(struct xfs *fs, uint64_t startblock, uint64_t count) {
  */
 static int shrink_fork(struct xfs *fs, struct xfs_inode *ip, uint8_t *di, uint64_t last_block,
                        uint64_t *freed) {
-    uint32_t kept = 0;
+    struct xfs_fork_map m;
+    int rc = xfs_fork_load(fs, di, &m);
     *freed = 0;
-    for (uint32_t i = 0; i < ip->nextents; i++) {
-        struct xfs_extent e;
-        uint64_t past;
-        int rc;
-        xfs_extent_unpack(ip->fork + i * XFS_EXTENT_BYTES, &e);
-        past = blocks_past(&e, last_block);
+    for (uint32_t i = 0; rc == KERR_OK && i < m.count;) {
+        uint64_t past = blocks_past(&m.e[i], last_block);
         if (past > 0) {
-            rc = give_back(fs, e.startblock + (e.blockcount - past), past);
-            if (rc != KERR_OK) {
-                return rc;
-            }
-            *freed += past;
-            e.blockcount -= past;
+            rc = give_back(fs, ip, &m.e[i], past);
+            *freed += rc == KERR_OK ? past : 0u;
+            m.e[i].blockcount -= rc == KERR_OK ? (uint32_t)past : 0u;
         }
-        if (e.blockcount == 0) {
-            continue; /* wholly past the new end: the record goes away */
+        if (rc == KERR_OK && m.e[i].blockcount == 0) {
+            xfs_fork_map_drop(&m, i); /* wholly past the new end: the record goes away */
+        } else {
+            i++;
         }
-        xfs_extent_pack(ip->fork + kept * XFS_EXTENT_BYTES, &e);
-        xfs_extent_pack(di + fs->dinode_size + kept * XFS_EXTENT_BYTES, &e);
-        kept++;
     }
-    ip->nextents = kept;
-    return KERR_OK;
+    /* Stored even after a failure part way, so the map says what was freed. */
+    if (*freed > 0) {
+        int stored = xfs_fork_store(fs, ip->ino, di, &m);
+        rc = rc != KERR_OK ? rc : stored;
+    }
+    ip->nextents = m.count;
+    return rc;
 }
 
 /* Writes just the size, for the two cases that free nothing: growing, and a
@@ -118,34 +118,26 @@ static int set_size_only(struct xfs *fs, struct xfs_inode *ip, uint64_t size, ui
     return KERR_OK;
 }
 
-int xfs_truncate(struct xfs *fs, struct xfs_inode *ip, uint64_t size, uint64_t now_s) {
-    uint64_t block;
-    uint32_t boffset;
-    struct bbuf *b;
-    uint8_t *di;
-    uint64_t freed = 0;
-    int rc;
-    if (ip == NULL) {
-        return KERR_INVAL;
-    }
+/* The refusals that hold whatever the new size: a filesystem that cannot be
+ * written, something that is not a regular file, and a b-tree fork. */
+static int refuse_truncate(const struct xfs *fs, const struct xfs_inode *ip) {
     if (!xfs_writable(fs)) {
         return KERR_ROFS;
     }
     if (!xfs_is_reg(ip)) {
         return KERR_INVAL; /* a directory is shortened by removing names */
     }
-    if (ip->format == XFS_DINODE_FMT_BTREE) {
-        return KERR_NOTSUP;
-    }
-    if (ip->format == XFS_DINODE_FMT_LOCAL) {
-        /* A file small enough to live inside its inode owns no blocks, so
-         * there is nothing to free and the size is the whole change. */
-        return set_size_only(fs, ip, size, now_s);
-    }
-    if (size >= ip->size) {
-        /* **Growing makes a hole, not an allocation.** */
-        return set_size_only(fs, ip, size, now_s);
-    }
+    return KERR_OK;
+}
+
+/* Frees what lies past the new end and records the size, the block count
+ * and the extent count together. */
+static int shrink_file(struct xfs *fs, struct xfs_inode *ip, uint64_t size, uint64_t now_s) {
+    uint64_t block, freed = 0;
+    uint32_t boffset;
+    struct bbuf *b;
+    uint8_t *di;
+    int rc;
     xfs_inode_place(fs, ip->ino, &block, &boffset);
     rc = bcache_get(fs->cache, block, &b);
     if (rc != KERR_OK) {
@@ -160,7 +152,7 @@ int xfs_truncate(struct xfs *fs, struct xfs_inode *ip, uint64_t size, uint64_t n
     if (rc == KERR_OK) {
         xfs_put_be64(di + XFS_DI_SIZE, size);
         xfs_put_be64(di + XFS_DI_NBLOCKS, xfs_be64(di + XFS_DI_NBLOCKS) - freed);
-        xfs_put_be32(di + XFS_DI_NEXTENTS, ip->nextents);
+        xfs_dinode_set_data_extents(fs, di, ip->nextents);
         xfs_put_be32(di + XFS_DI_MTIME, (uint32_t)now_s);
         xfs_put_be32(di + XFS_DI_CTIME, (uint32_t)now_s);
         xfs_reseal(fs, di, fs->inodesize, XFS_DI_CRC);
@@ -168,5 +160,27 @@ int xfs_truncate(struct xfs *fs, struct xfs_inode *ip, uint64_t size, uint64_t n
         ip->size = size;
     }
     bcache_put(fs->cache, b);
-    return rc;
+    /* The caller's copy follows the disk: the fork may have changed shape. */
+    return rc == KERR_OK ? xfs_inode_read(fs, ip->ino, ip) : rc;
+}
+
+int xfs_truncate(struct xfs *fs, struct xfs_inode *ip, uint64_t size, uint64_t now_s) {
+    int rc = ip == NULL ? KERR_INVAL : refuse_truncate(fs, ip);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    /* A file small enough to live inside its inode owns no blocks, so there
+     * is nothing to free and the size is the whole change; and **growing
+     * makes a hole, not an allocation**. */
+    if (ip->format == XFS_DINODE_FMT_LOCAL || size >= ip->size) {
+        return set_size_only(fs, ip, size, now_s);
+    }
+    if (ip->realtime) {
+        /* A realtime block would be freed into a group it never belonged to
+         * — which this did, until the header's promise was checked. A
+         * shared block is not freed from under the other file: its count
+         * drops instead (xfs_free_data). */
+        return KERR_NOTSUP;
+    }
+    return shrink_file(fs, ip, size, now_s);
 }

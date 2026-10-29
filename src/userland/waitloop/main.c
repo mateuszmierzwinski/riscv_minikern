@@ -226,59 +226,18 @@ static void fork_bystanders(void) {
 void user_main(void *start_state) {
     uint32_t passed = 0;
     (void)start_state;
-    /* **Not called, and the reason is a finding rather than a decision.**
+    /* **Four live, sleeping children first: the sleeper-hang reproducer.**
      *
-     * The bystanders are meant to give the parent four live children, which
-     * is the shape a real init has and the shape under which its waits
-     * appear to hang. They do not sleep: every one of them exits with -14,
-     * EFAULT, from a `nanosleep` whose remaining-time pointer is null — so
-     * the experiment measured a parent with no children rather than one with
-     * four, and the hang it showed cannot be attributed to the wait.
-     *
-     * That is a second bug and it is recorded in the roadmap rather than
-     * fixed here, because this test's job is `wait4` and a test that depends
-     * on an unfixed call elsewhere proves nothing about its own subject.
-     * What is kept is what is proven: four hundred rounds of both forms,
-     * through the blocking path, with a real status pointer. */
-    /* **Called again, now that a kernel fault says so.**
-     *
-     * The bystanders exited with -14 and the explanation was going to be a
-     * guess about `nanosleep`. The log had the answer and the heading hid
-     * it: an *instruction page fault at a kernel pc*, printed under "fault
-     * in user code". The kernel was dying, and the four children "exiting"
-     * were the machine going down around them.
-     *
-     * So this is kept, and it is the reproducer for that fault rather than
-     * for anything about waiting. The report now names the kernel as the
-     * faulting party, which is the difference between a one-boot diagnosis
-     * and the session this cost. */
-    /* **Not called, and now for a diagnosed reason rather than a guess.**
-     *
-     * Every bystander dies on an *instruction page fault on its own text* —
-     * pids 2, 3 and 4, same fault, every boot. That is a fork bug and not
-     * anything about waiting, so calling it from here would make this test
-     * fail for a reason that is not its subject. The reproducer stays in the
-     * tree: change this to a call and the fault is three lines into the log.
-     *
-     * It is also the likely identity of QuokkaOS "variant B" — `rc` exec'd
-     * and producing nothing. A child that faults before its first
-     * instruction produces nothing, and for a whole session that was read as
-     * a program that ran and stayed silent. */
-    /* **Off in the committed test, and the reason has changed again.**
-     *
-     * With the segment-recording fix the bystanders now *live*: they no
-     * longer die on an instruction page fault at their own entry. What they
-     * expose instead is that every wait then costs the full one-second
-     * deadline, because `clone` returns a pid the parent cannot yet find —
-     * so two hundred rounds take two hundred seconds and the case times out
-     * rather than failing. A test that is correct and twenty times too slow
-     * is not a useful gate, so the configuration that is proven is the one
-     * that ships, and the race is a roadmap entry with this one line to
-     * reproduce it. */
-    /* **Off: the children die again.** `give_every_mapped_page` is what made
-     * them live and it is not called — see docs/ROADMAP.md. One line in each
-     * of the two places turns the whole reproducer on. */
-    (void)fork_bystanders;
+     * A real init has services running while it waits for a fifth child,
+     * and that shape is what hung — the parent blocked with a one-second
+     * deadline and the clock stopped. It was off for a long time because
+     * the bystanders could not live: a forked child died on its own text
+     * (fixed by `fork` handing over every mapped page), and when it lived,
+     * every wait cost its full deadline — the kernel running at two
+     * addresses at once, so the exit woke the parent's low alias while the
+     * parent slept on its high one (fixed in `start.S`). So this runs now,
+     * and two hundred rounds of each form must still finish. */
+    fork_bystanders();
 
     if (run_form("waitloop: wait4(pid), the form os/exec uses\n", 0) != 0u) {
         passed |= 1u;

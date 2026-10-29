@@ -10,8 +10,6 @@
 #include "core/kheap.h"
 #include "core/pmm.h"
 
-extern char __kernel_start[];
-extern char __kernel_end[];
 
 /* The bitmap lives in the kernel's .bss rather than in the memory it
  * describes, which keeps the bootstrap honest: there is no moment where the
@@ -149,12 +147,6 @@ static void reserve_what_is_in_use(const struct bootinfo *info, phys_t arena_bas
     uint64_t kernel_bytes = 0;
     phys_t kernel_hi;
     mmu_kernel_phys_range(&kernel_lo, &kernel_bytes);
-    if (kernel_lo == 0) {
-        /* Translation never came up, so the symbols still mean the load
-         * address and are the only answer there is. */
-        kernel_lo = (phys_t)(uintptr_t)__kernel_start;
-        kernel_bytes = (uint64_t)((uintptr_t)__kernel_end - (uintptr_t)__kernel_start);
-    }
     kernel_hi = kernel_lo + kernel_bytes;
     if (info->mem_base < kernel_lo) {
         pmm_reserve(&frames, info->mem_base, kernel_lo - info->mem_base);

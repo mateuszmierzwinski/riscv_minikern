@@ -61,6 +61,9 @@ int dwmmc_use_interrupts(const struct fdt *fdt);
  * the polling it replaced, which is invisible from outside. */
 uint64_t dwmmc_interrupts_missed(void);
 
+/* How many reads needed a second attempt (see `dw_read`). */
+uint64_t dwmmc_read_retries(void);
+
 /* Where it was found, and how big the card is, for a report. */
 const char *dwmmc_path(void);
 uint64_t dwmmc_blocks(void);

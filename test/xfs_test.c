@@ -491,6 +491,13 @@ static void damage_rmapbt(void) {
     seal(block(0), 512u, XFS_SB_CRC);
 }
 
+/* A read-only-compatible feature this writer has never heard of: a bit the
+ * format has not assigned. */
+static void damage_unknown_ro_feature(void) {
+    put32(block(0) + XFS_SB_FEAT_RO_COMPAT, XFS_FEAT_RO_FINOBT | 0x80000000u);
+    seal(block(0), 512u, XFS_SB_CRC);
+}
+
 static void damage_nrext64(void) {
     put32(block(0) + XFS_SB_FEAT_INCOMPAT, XFS_FEAT_IN_FTYPE | XFS_FEAT_IN_NREXT64);
     seal(block(0), 512u, XFS_SB_CRC);
@@ -599,13 +606,22 @@ static void damage_dirblklog(void) {
 }
 
 /* The promise made when a read-only-compatible feature is allowed through:
- * the filesystem is readable and **not writable**. Reflink means extents
- * can be shared, and a writer that does not implement copy-on-write would
- * corrupt the file that shares them. */
-static void test_read_only_features_mount_but_forbid_writing(void) {
+ * the filesystem is readable, and writable **only if this writer maintains
+ * what the feature adds**.
+ *
+ * Reflink and the reverse map are maintained — `mkfs.xfs` turns both on,
+ * and a writer that refused them could not write to a filesystem made the
+ * ordinary way (xfs_write_test.sh is the vendor's checker's verdict on
+ * that). A feature it does not know is still a refusal to write: whatever
+ * structure it adds would go stale under the first change. */
+static void test_read_only_features_are_written_only_when_kept(void) {
     KTEST_CHECK(mount_with(damage_reflink) == KERR_OK);
-    KTEST_CHECK(!xfs_writable(&fs));
+    KTEST_CHECK(xfs_writable(&fs));
+    KTEST_CHECK(fs.has_reflink);
     KTEST_CHECK(mount_with(damage_rmapbt) == KERR_OK);
+    KTEST_CHECK(xfs_writable(&fs));
+    KTEST_CHECK(fs.has_rmapbt);
+    KTEST_CHECK(mount_with(damage_unknown_ro_feature) == KERR_OK);
     KTEST_CHECK(!xfs_writable(&fs));
     /* A filesystem with none of them stays writable, so the refusal is the
      * feature's doing and not a mount that is read-only anyway. */
@@ -696,9 +712,9 @@ static void test_a_superblock_that_cannot_be_trusted(void) {
     KTEST_CHECK(mount_with(damage_inprogress) == KERR_INVAL);
     /* Reflink and reverse mapping are **read-only-compatible** features:
      * the format says a reader may ignore them so long as it does not
-     * write, and this reader does not. So they mount — and the obligation
-     * that buys the mount is checked next door, in
-     * `test_read_only_features_mount_but_forbid_writing`.
+     * write. So they mount — and whether they may then be written, which
+     * is now yes because the writer keeps both, is checked next door, in
+     * `test_read_only_features_are_written_only_when_kept`.
      *
      * These two lines used to assert a refusal, which made the reader
      * usable only on a filesystem formatted specially for it: `mkfs.xfs`
@@ -1950,7 +1966,36 @@ static void an_extent_round_trips(void) {
     }
 }
 
+/* The label is read from a bare superblock, without a mount. */
+static void a_label_is_read_without_mounting(void) {
+    uint8_t sb[512] = {0};
+    char label[XFS_LABEL_BYTES];
+    sb[0] = 'X'; sb[1] = 'F'; sb[2] = 'S'; sb[3] = 'B';
+    sb[108] = 'R'; sb[109] = 'O'; sb[110] = 'O'; sb[111] = 'T';
+    KTEST_CHECK(xfs_superblock_label(sb, sizeof sb, label));
+    KTEST_CHECK_STR(label, "ROOT");
+    for (uint32_t i = 0; i < 12u; i++) {
+        sb[108 + i] = 'A'; /* full width: no terminator on disk */
+    }
+    KTEST_CHECK(xfs_superblock_label(sb, sizeof sb, label));
+    KTEST_CHECK_STR(label, "AAAAAAAAAAAA");
+}
+
+/* Not XFS, too short, or absent: false, and the label is empty. */
+static void a_label_is_refused_when_it_is_not_xfs(void) {
+    uint8_t sb[512] = {0};
+    char label[XFS_LABEL_BYTES] = "junk";
+    sb[0] = 0xeb; /* a FAT boot sector's jump */
+    KTEST_CHECK(!xfs_superblock_label(sb, sizeof sb, label));
+    KTEST_CHECK_STR(label, "");
+    sb[0] = 'X'; sb[1] = 'F'; sb[2] = 'S'; sb[3] = 'B';
+    KTEST_CHECK(!xfs_superblock_label(sb, 64u, label));
+    KTEST_CHECK(!xfs_superblock_label(NULL, sizeof sb, label));
+}
+
 int main(void) {
+    KTEST_RUN(a_label_is_read_without_mounting);
+    KTEST_RUN(a_label_is_refused_when_it_is_not_xfs);
     KTEST_RUN(an_extent_round_trips);
     KTEST_RUN(test_mount_and_geometry);
     KTEST_RUN(test_list_the_root);
@@ -1959,7 +2004,7 @@ int main(void) {
     KTEST_RUN(test_paths);
     KTEST_RUN(test_a_directory_is_not_a_file);
     KTEST_RUN(test_holes_and_unwritten_read_as_zeroes);
-    KTEST_RUN(test_read_only_features_mount_but_forbid_writing);
+    KTEST_RUN(test_read_only_features_are_written_only_when_kept);
     KTEST_RUN(test_a_v4_filesystem_is_read);
     KTEST_RUN(test_a_superblock_that_cannot_be_trusted);
     KTEST_RUN(test_a_realtime_file_is_read_from_its_own_device);

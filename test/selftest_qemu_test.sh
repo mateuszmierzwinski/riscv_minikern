@@ -29,7 +29,7 @@ run() {
     local status=0
     timeout 60 qemu-system-riscv64 -M virt -m 1G -nographic -bios default -kernel "$image" \
         -append "console=sbi minikern.halt=poweroff minikern.selftest=$which" > "$log" 2>&1 || status=$?
-    tr -d '\r' < "$log" > "$log.clean" && mv "$log.clean" "$log"
+    tr -d '\r' < "$log" | sed -E 's/^\[[0-9:.]+\] [A-Z] //' > "$log.clean" && mv "$log.clean" "$log"
     [ "$status" -eq 0 ] || { cat "$log"; echo "FAIL: $which: qemu exited $status (124 = the kernel never got back)" >&2; exit 1; }
     ! grep -qF "PANIC" "$log" ||
         { cat "$log"; echo "FAIL: $which: the kernel panicked, so the fault was not the expected one" >&2; exit 1; }
@@ -59,7 +59,7 @@ grep -qF "load page fault at 3000000000000000" "$log" ||
     { echo "FAIL: the load fault did not report a page fault at the faulting address" >&2; exit 1; }
 grep -qF "store page fault at 3000000000000008" "$log" ||
     { echo "FAIL: the store fault did not report a page fault at the faulting address" >&2; exit 1; }
-grep -qE "breakpoint at 00000000[0-9a-f]+" "$log" ||
+grep -qE "breakpoint at ffffffc0[0-9a-f]{8}" "$log" ||  # the kernel runs in its own half
     { echo "FAIL: the breakpoint did not report where it happened" >&2; exit 1; }
 echo "ok: every cause and faulting address was reported correctly"
 
@@ -67,7 +67,7 @@ echo "ok: every cause and faulting address was reported correctly"
 # kernel's own text must be unwritable — proved by writing to it, not asserted.
 grep -qE "^mmu: sv39 on, [0-9]+ table pages, kernel text read-execute$" "$log" ||
     { echo "FAIL: translation was not enabled, so the page faults above prove less" >&2; exit 1; }
-grep -qF "a store into the kernel's own text faulted as expected: store page fault at 0000000080200000" "$log" ||
+grep -qF "a store into the kernel's own text faulted as expected: store page fault at ffffffc000200000" "$log" ||
     { echo "FAIL: the kernel's text was writable, or the attempt was not reported" >&2; exit 1; }
 echo "ok: sv39 is on and the kernel's own text is not writable"
 

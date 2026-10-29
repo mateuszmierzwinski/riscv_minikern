@@ -33,7 +33,7 @@ command -v qemu-system-riscv64 >/dev/null || { echo "qemu-system-riscv64 is not 
 status=0
 timeout 90 qemu-system-riscv64 -M virt -smp 4 -m 1G -nographic -bios default -kernel "$image" \
     -append "console=sbi minikern.halt=poweroff minikern.user=1" > "$log" 2>&1 || status=$?
-tr -d '\r' < "$log" > "$log.clean" && mv "$log.clean" "$log"
+tr -d '\r' < "$log" | sed -E 's/^\[[0-9:.]+\] [A-Z] //' > "$log.clean" && mv "$log.clean" "$log"
 cat "$log"
 
 fail() { echo "FAIL: $1" >&2; exit 1; }

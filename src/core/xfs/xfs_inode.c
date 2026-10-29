@@ -55,6 +55,36 @@ void xfs_extent_pack(uint8_t *p, const struct xfs_extent *e) {
     }
 }
 
+bool xfs_dinode_big_counts(const struct xfs *fs, const uint8_t *di) {
+    return fs->v5 && (xfs_be64(di + XFS_DI_FLAGS2) & XFS_DIFLAG2_NREXT64) != 0;
+}
+
+uint64_t xfs_dinode_data_extents(const struct xfs *fs, const uint8_t *di) {
+    return xfs_dinode_big_counts(fs, di) ? xfs_be64(di + XFS_DI_BIG_NEXTENTS)
+                                         : xfs_be32(di + XFS_DI_NEXTENTS);
+}
+
+void xfs_dinode_set_data_extents(const struct xfs *fs, uint8_t *di, uint64_t n) {
+    if (xfs_dinode_big_counts(fs, di)) {
+        xfs_put_be64(di + XFS_DI_BIG_NEXTENTS, n);
+    } else {
+        xfs_put_be32(di + XFS_DI_NEXTENTS, (uint32_t)n);
+    }
+}
+
+uint32_t xfs_dinode_attr_extents(const struct xfs *fs, const uint8_t *di) {
+    return xfs_dinode_big_counts(fs, di) ? xfs_be32(di + XFS_DI_BIG_ANEXTENTS)
+                                         : xfs_be16(di + XFS_DI_ANEXTENTS);
+}
+
+void xfs_dinode_set_attr_extents(const struct xfs *fs, uint8_t *di, uint32_t n) {
+    if (xfs_dinode_big_counts(fs, di)) {
+        xfs_put_be32(di + XFS_DI_BIG_ANEXTENTS, n);
+    } else {
+        xfs_put_be16(di + XFS_DI_ANEXTENTS, (uint16_t)n);
+    }
+}
+
 void xfs_inode_place(const struct xfs *fs, uint64_t ino, uint64_t *device_block, uint32_t *boffset) {
     uint64_t fsb;
     uint32_t slot;
@@ -128,7 +158,7 @@ static int take(struct xfs *fs, const uint8_t *di, uint64_t ino, struct xfs_inod
      * count is then read from `di_big_nextents`, also in the fork, and came
      * back as **zero for a 79 MB file** — every block of it a hole. The
      * feature is v5's, so on v4 the answer is no without asking. */
-    bool big = fs->v5 && (xfs_be64(di + XFS_DI_FLAGS2) & XFS_DIFLAG2_NREXT64) != 0;
+    bool big = xfs_dinode_big_counts(fs, di);
     *out = (struct xfs_inode){
         .ino = ino,
         .size = xfs_be64(di + XFS_DI_SIZE),
@@ -137,11 +167,12 @@ static int take(struct xfs *fs, const uint8_t *di, uint64_t ino, struct xfs_inod
         .uid = xfs_be32(di + XFS_DI_UID),
         .gid = xfs_be32(di + XFS_DI_GID),
         .nlink = xfs_be32(di + XFS_DI_NLINK),
-        .nextents = big ? (uint32_t)xfs_be64(di + XFS_DI_BIG_NEXTENTS)
-                        : xfs_be32(di + XFS_DI_NEXTENTS),
+        .nextents = (uint32_t)xfs_dinode_data_extents(fs, di),
         .big_extent_counts = big,
         .format = di[XFS_DI_FORMAT],
         .aformat = di[XFS_DI_AFORMAT],
+        .naextents = xfs_dinode_attr_extents(fs, di),
+        .shares_blocks = fs->v5 && (xfs_be64(di + XFS_DI_FLAGS2) & XFS_DIFLAG2_REFLINK) != 0,
         .realtime = (xfs_be16(di + XFS_DI_FLAGS) & XFS_DIFLAG_REALTIME) != 0,
         .forkoff = di[XFS_DI_FORKOFF],
         .fork_len = avail < XFS_FORK_MAX ? avail : XFS_FORK_MAX,

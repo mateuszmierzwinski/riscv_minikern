@@ -14,7 +14,7 @@ set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-for dev in "${MINIKERN_CONSOLE:-/dev/ttyUSB0}" "${MINIKERN_RELAY:-/dev/ttyACM0}"; do
+for dev in "${MINIKERN_CONSOLE:-/dev/ttyUSB0}" "/dev/${MINIKERN_RELAY_CHIP:-gpiochip1}"; do
     if [ ! -c "$dev" ]; then
         echo "hil: $dev is not there — is the board attached?" >&2
         exit 2

@@ -336,8 +336,8 @@ virt_t uspace_trampoline(void);
 void uspace_set_aslr(bool on);
 
 /* Whether `fork` hands over pages no region claims — the fix for a child
- * that dies on its own text, which also makes beat-time kernel code fault on
- * device memory. Off by default; `minikern.forkleaves` turns it on. */
+ * that dies on its own text. On by default; `minikern.noforkleaves` turns it
+ * off, as the control. */
 void uspace_set_fork_leaves(bool on);
 bool uspace_aslr(void);
 

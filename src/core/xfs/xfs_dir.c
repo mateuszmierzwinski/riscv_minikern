@@ -144,8 +144,10 @@ void xfs_dir_block_put(struct xfs *fs, struct xfs_dirblock *b) {
  *
  * Each is found through `xfs_bmap`, so a directory whose extent map is a
  * b-tree gathers exactly like one whose extents are in the inode. A hole
- * part way through a directory block is corruption rather than a sparse
- * directory: the block's own checksum covers all of it. */
+ * at its first block is a directory block that is not there — `KERR_NOENT`,
+ * which a directory that has given back an emptied block has — and a hole
+ * part way through one is corruption: the block's own checksum covers all
+ * of it. */
 static int gather(struct xfs *fs, const struct xfs_inode *dir, uint64_t first) {
     for (uint32_t i = 0; i < fs->dirblocks; i++) {
         struct xfs_extent e;
@@ -153,7 +155,7 @@ static int gather(struct xfs *fs, const struct xfs_inode *dir, uint64_t first) {
         uint64_t at = first + i;
         int rc = xfs_bmap(fs, dir, at, &e);
         if (rc != KERR_OK) {
-            return rc == KERR_NOENT ? KERR_IO : rc;
+            return rc == KERR_NOENT && i > 0 ? KERR_IO : rc;
         }
         rc = bcache_get(fs->cache, xfs_fsb_to_block(fs, e.startblock + (at - e.startoff)), &b);
         if (rc != KERR_OK) {

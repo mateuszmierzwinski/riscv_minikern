@@ -359,6 +359,9 @@ void uspace_destroy(struct uproc *p) {
     }
     release_every_slot(p);
     drop_every_file(p);
+    /* Off every hart first: `unshare_kernel_mappings` edits this table, and
+     * the exiting thread itself is still running on it. */
+    sched_forget_address_space(p);
     unshare_kernel_mappings(&p->pt);
     pgtable_destroy(&p->pt);
     p->built = false;
@@ -2900,18 +2903,15 @@ static int give_this_leaf(void *ctx, virt_t va, phys_t pa, uint64_t prot, uint64
  */
 /* Whether `fork` also hands over pages no region claims.
  *
- * **Off by default, and that is a defect rather than a preference.** It fixes
- * a real bug — a forked child dies on an instruction page fault at its own
- * entry, because the region record does not mention a program's text — and it
- * makes kernel code on the housekeeping beat fault on device memory thousands
- * of times a boot (`dwmac_poll`, `plic_claim`, `temp_jh7110_sample`). Both
- * are measured on the board.
- *
- * Behind a flag rather than deleted, because the next attempt should start
- * from code the compiler still checks and the board can still run — which is
- * what this tree does for every other half-finished mechanism.
- * `minikern.forkleaves` turns it on. */
-static bool fork_gives_every_leaf;
+ * **On by default.** It fixes a real bug — a forked child dies on an
+ * instruction page fault at its own entry, because the region record does
+ * not mention a program's text. It was held behind a flag because it made
+ * beat-time kernel code fault on device memory thousands of times a boot;
+ * those faults were the kernel's own, from two causes now fixed — a table
+ * torn down while harts still had it loaded, and the kernel running at two
+ * addresses at once — and with both gone the board shows none with this on.
+ * `minikern.noforkleaves` puts the old behaviour back, as the control. */
+static bool fork_gives_every_leaf = true;
 
 void uspace_set_fork_leaves(bool on) {
     fork_gives_every_leaf = on;

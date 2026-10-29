@@ -81,7 +81,11 @@ static void tree_root_ok(struct xfs *fs, uint32_t agno, uint32_t block, uint32_t
         fault(r, name, agno);
         return;
     }
-    if (xfs_tree_get(fs, agno, block, magic, &b) != KERR_OK) {
+    /* **At whatever height it is.** This used `xfs_tree_get`, which only
+     * hands over a lone leaf — so any filesystem used long enough to grow a
+     * tree past one block was reported faulty here. */
+    if (xfs_meta_block(fs, ((uint64_t)agno << fs->agblklog) | block, magic, 0, XFS_BTREE_CRC,
+                       XFS_BTREE_UUID, &b) != KERR_OK) {
         fault(r, name, agno);
         return;
     }
@@ -106,6 +110,24 @@ static void counts_possible(struct xfs *fs, uint32_t agno, const uint8_t *agf,
     }
 }
 
+/* The trees the two headers root, and the counts they state. */
+static void check_roots(struct xfs *fs, uint32_t agno, const uint8_t *agf, const uint8_t *agi,
+                        struct report *r) {
+    tree_root_ok(fs, agno, xfs_be32(agf + XFS_AGF_ROOTS), xfs_magic_for(fs, XFS_BLK_BNOBT), r,
+                 "free space by block");
+    tree_root_ok(fs, agno, xfs_be32(agf + XFS_AGF_ROOTS + 4u), xfs_magic_for(fs, XFS_BLK_CNTBT), r,
+                 "free space by count");
+    tree_root_ok(fs, agno, xfs_be32(agi + XFS_AGI_ROOT), xfs_magic_for(fs, XFS_BLK_INOBT), r, "inodes");
+    /* No free-inode tree on v4, and `agi_free_root` is past the end of the
+     * AGI as v4 defined it — so checking it would read whatever follows in
+     * the sector and count a fault that does not exist. */
+    if (fs->has_finobt) {
+        tree_root_ok(fs, agno, xfs_be32(agi + XFS_AGI_FREE_ROOT),
+                     xfs_magic_for(fs, XFS_BLK_FINOBT), r, "free inodes");
+    }
+    counts_possible(fs, agno, agf, agi, r);
+}
+
 /* One group: both its headers, the four b-tree roots they name, and the
  * counts they state.
  *
@@ -114,37 +136,30 @@ static void counts_possible(struct xfs *fs, uint32_t agno, const uint8_t *agf,
  * from a header that failed its checksum is reading a number somebody else
  * wrote. That ordering is the difference between a checker and a crash.
  *
- * Both headers come from one block, which is where the format puts them. */
+ * The two headers are got separately: with 512-byte sectors they share the
+ * group's first block, with 4 KiB sectors each has its own. */
 static void check_group(struct xfs *fs, uint32_t agno, struct report *r) {
-    struct bbuf *b;
-    const uint8_t *agf, *agi;
+    struct bbuf *fb, *ib;
+    uint8_t *agf, *agi;
     uint32_t before = r->faults;
-    if (bcache_get(fs->cache, xfs_group_block(fs, agno), &b) != KERR_OK) {
-        fault(r, "the group's first block", agno);
+    if (xfs_group_header(fs, agno, XFS_AGF_SECTOR, &fb, &agf) != KERR_OK) {
+        fault(r, "the group's free-space header block", agno);
         return;
     }
-    agf = b->data + XFS_AGF_SECTOR * fs->sectsize;
-    agi = b->data + XFS_AGI_SECTOR * fs->sectsize;
+    if (xfs_group_header(fs, agno, XFS_AGI_SECTOR, &ib, &agi) != KERR_OK) {
+        bcache_put(fs->cache, fb);
+        fault(r, "the group's inode header block", agno);
+        return;
+    }
     header_ok(fs, agno, agf, XFS_AGF_MAGIC, XFS_AGF_CRC, XFS_AGF_UUID, r,
               "group free-space header");
     header_ok(fs, agno, agi, XFS_AGI_MAGIC, XFS_AGI_CRC, XFS_AGI_UUID, r,
               "group inode header");
     if (r->faults == before) {
-        tree_root_ok(fs, agno, xfs_be32(agf + XFS_AGF_ROOTS), xfs_magic_for(fs, XFS_BLK_BNOBT), r,
-                     "free space by block");
-        tree_root_ok(fs, agno, xfs_be32(agf + XFS_AGF_ROOTS + 4u), xfs_magic_for(fs, XFS_BLK_CNTBT), r,
-                     "free space by count");
-        tree_root_ok(fs, agno, xfs_be32(agi + XFS_AGI_ROOT), xfs_magic_for(fs, XFS_BLK_INOBT), r, "inodes");
-        /* No free-inode tree on v4, and `agi_free_root` is past the end of
-         * the AGI as v4 defined it — so checking it would read whatever
-         * follows in the sector and count a fault that does not exist. */
-        if (fs->has_finobt) {
-            tree_root_ok(fs, agno, xfs_be32(agi + XFS_AGI_FREE_ROOT),
-                         xfs_magic_for(fs, XFS_BLK_FINOBT), r, "free inodes");
-        }
-        counts_possible(fs, agno, agf, agi, r);
+        check_roots(fs, agno, agf, agi, r);
     }
-    bcache_put(fs->cache, b);
+    bcache_put(fs->cache, ib);
+    bcache_put(fs->cache, fb);
 }
 
 /* The root directory must read and must be a directory.

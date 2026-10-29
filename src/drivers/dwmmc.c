@@ -100,6 +100,7 @@ static struct {
     bool irq_armed;
     bool arm_only;
     uint64_t interrupts_missed;
+    uint64_t read_retries;
     /* Set once the card has been asked why a write failed, so the answer is
      * printed once per boot rather than once per refused block. */
     bool asked_why;
@@ -146,6 +147,25 @@ static int reset_controller(void) {
     put(DW_CTRL, CTRL_RESET | CTRL_FIFO_RESET | CTRL_DMA_RESET);
     for (uint32_t spin = 0; spin < WAIT_SPINS; spin++) {
         if ((get(DW_CTRL) & (CTRL_RESET | CTRL_FIFO_RESET | CTRL_DMA_RESET)) == 0) {
+            return KERR_OK;
+        }
+    }
+    return KERR_TIMEDOUT;
+}
+
+/* Empties the FIFO before a data command.
+ *
+ * **Measured on the board: the first data read after bring-up overran**
+ * (`RINTSTS 0x82c`, `FRUN` among the completion bits). Bring-up leaves words
+ * in the FIFO — the controller is reset once, before the card is talked to —
+ * so the first 512 bytes landed on top of them and the read returned `EIO`
+ * with correct data. Nothing noticed while the first read was a whole-disk
+ * superblock that the filesystem simply read again; a partition table read
+ * once, and believed, turned it into "this disk has no partitions". */
+static int reset_fifo(void) {
+    put(DW_CTRL, get(DW_CTRL) | CTRL_FIFO_RESET);
+    for (uint32_t spin = 0; spin < WAIT_SPINS; spin++) {
+        if ((get(DW_CTRL) & CTRL_FIFO_RESET) == 0) {
             return KERR_OK;
         }
     }
@@ -503,7 +523,10 @@ static int wait_until_ready_for_a_command(void) {
 
 static int one_block(bool reading, uint64_t lba, void *buf) {
     uint32_t argument = mmc.card.high_capacity ? (uint32_t)lba : (uint32_t)(lba * SD_BLOCK_BYTES);
-    int rc;
+    int rc = reset_fifo();
+    if (rc != KERR_OK) {
+        return rc;
+    }
     put(DW_BLKSIZ, SD_BLOCK_BYTES);
     put(DW_BYTCNT, SD_BLOCK_BYTES);
     rc = dw_command(NULL, reading ? CMD_READ_SINGLE : CMD_WRITE_SINGLE, argument, SD_RESP_SHORT,
@@ -538,7 +561,10 @@ static int one_block(bool reading, uint64_t lba, void *buf) {
  * block. One failed read would corrupt every read after it. */
 static int read_many(uint64_t lba, uint32_t count, uint8_t *to) {
     uint32_t argument = mmc.card.high_capacity ? (uint32_t)lba : (uint32_t)(lba * SD_BLOCK_BYTES);
-    int rc;
+    int rc = reset_fifo();
+    if (rc != KERR_OK) {
+        return rc;
+    }
     put(DW_BLKSIZ, SD_BLOCK_BYTES);
     put(DW_BYTCNT, count * SD_BLOCK_BYTES);
     rc = dw_command(NULL, CMD_READ_MULTIPLE, argument, SD_RESP_SHORT, NULL);
@@ -555,15 +581,39 @@ static int read_many(uint64_t lba, uint32_t count, uint8_t *to) {
     return rc;
 }
 
+static int read_once(uint64_t lba, uint32_t count, void *buf) {
+    return count == 1u ? one_block(true, lba, buf) : read_many(lba, count, buf);
+}
+
+/* A read, **retried** when it fails (two more attempts at most).
+ *
+ * Measured on the board: the first data read after bring-up overruns the
+ * FIFO (`RINTSTS 0x82c`, `FRUN`) and returns `EIO` with correct data, and
+ * emptying the FIFO first does not prevent it — the cause is in the
+ * controller's first transfer at the new clock and width, not identified.
+ * A read changes nothing on the card, so another attempt is safe; it
+ * succeeds, and `dwmmc_read_retries` counts how often that was needed so
+ * the workaround stays visible. A partition table read once and believed
+ * had turned the overrun into "this card has no partitions". */
 static int dw_read(void *self, uint64_t lba, uint32_t count, void *buf) {
+    int rc;
     (void)self;
     if (count == 0) {
         return KERR_INVAL;
     }
-    if (count == 1u) {
-        return one_block(true, lba, buf);
+    rc = read_once(lba, count, buf);
+    /* Up to two more tries: one was not always enough — a boot on
+     * 2026-10-28 failed a read twice running, and the partition table that
+     * read was for went unseen. */
+    for (uint32_t again = 0; rc == KERR_IO && again < 2u; again++) {
+        mmc.read_retries++;
+        rc = read_once(lba, count, buf);
     }
-    return read_many(lba, count, buf);
+    return rc;
+}
+
+uint64_t dwmmc_read_retries(void) {
+    return mmc.read_retries;
 }
 
 static int dw_write(void *self, uint64_t lba, uint32_t count, const void *buf) {

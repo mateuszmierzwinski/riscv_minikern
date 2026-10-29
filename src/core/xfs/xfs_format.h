@@ -53,6 +53,13 @@
 #define XFS_SB_FEATURES2       200u /* u32, valid only with MOREBITS */
 #define XFS_SB_BAD_FEATURES2   204u /* u32, the same value at the buggy offset */
 #define XFS_SB_V4_MOREBITS     0x8000u
+/* Inode chunks are aligned, to `sb_inoalignmt` blocks. Always set on v5;
+ * `mkfs` has set it on v4 for two decades. */
+#define XFS_SB_V_ALIGNBIT      0x0080u
+#define XFS_SB_INOALIGNMT      180u /* u32: a chunk's block is a multiple of this */
+#define XFS_SB_V_LOGV2         0x0400u /* the log is version 2: always set on v5 */
+#define XFS_SB_LOGSECTSIZE     194u /* u16: the log's sector, 0 meaning 512 */
+#define XFS_SB_LOGSUNIT        196u /* u32: the log's stripe unit in bytes, 0 or 1 meaning none */
 
 #define XFS_SB_V2_LAZYSBCOUNT  0x00000004u
 #define XFS_SB_V2_ATTR2        0x00000008u
@@ -130,14 +137,17 @@
 #define XFS_DIR2_DATA_HDR_SIZE 16u /* magic and three best-free pairs */
 #define XFS_DA_HDR_SIZE        16u /* the 12-byte blkinfo, count and level */
 #define XFS_DIR2_FREE_HDR_SIZE 16u /* magic, firstdb, nvalid, nused */
+#define XFS_DIR2_FREE_FIRSTDB  4u  /* be32, then nvalid and nused */
+#define XFS_DIR2_NULL_DATAOFF  0xffffu /* a `bests` slot naming no data block */
 
 /* Features. A reader must refuse anything it does not understand here,
  * which is what keeps it from misreading a filesystem into rubbish. */
 #define XFS_FEAT_RO_FINOBT    0x00000001u /* the free-inode btree: we never read it */
-#define XFS_FEAT_RO_RMAPBT    0x00000002u /* reverse mapping: refused */
-#define XFS_FEAT_RO_REFLINK   0x00000004u /* shared extents: refused */
+#define XFS_FEAT_RO_RMAPBT    0x00000002u /* reverse mapping: kept by every write */
+#define XFS_FEAT_RO_REFLINK   0x00000004u /* shared extents: a sharing file is not rewritten */
 #define XFS_FEAT_RO_INOBTCNT  0x00000008u /* a counter in the inode btree: harmless */
-#define XFS_FEAT_RO_SUPPORTED (XFS_FEAT_RO_FINOBT | XFS_FEAT_RO_INOBTCNT)
+#define XFS_FEAT_RO_SUPPORTED \
+    (XFS_FEAT_RO_FINOBT | XFS_FEAT_RO_INOBTCNT | XFS_FEAT_RO_RMAPBT | XFS_FEAT_RO_REFLINK)
 
 #define XFS_FEAT_IN_FTYPE     0x00000001u /* directory entries carry a type byte */
 #define XFS_FEAT_IN_SPINODES  0x00000002u /* sparse inode chunks */
@@ -225,6 +235,7 @@
  * returns whatever that device happens to hold at those block numbers. */
 #define XFS_DIFLAG_REALTIME 0x0001u
 
+#define XFS_DIFLAG2_REFLINK 0x02u /* this inode's blocks may be shared with another's */
 #define XFS_DIFLAG2_NREXT64 0x10u /* this inode uses the 64-bit extent layout */
 
 /* di_format */
@@ -270,25 +281,36 @@
 #define ATTR_REMOTE_NAMELEN  8u /* u8 */
 #define ATTR_REMOTE_NAME     9u
 
-/* A local pair's bytes in the block, and a remote one's — both rounded to
- * eight. A remote entry carries only the name and where the value lives, so
- * its size does not depend on the value's length at all, which is the whole
- * point of it. */
-#define ATTR_LOCAL_SIZE(nlen, vlen) (((nlen) + (vlen) + 3u + 7u) & ~7u)
-#define ATTR_REMOTE_SIZE(nlen) (((nlen) + 9u + 7u) & ~7u)
+/* A local pair's bytes in the block, and a remote one's, as
+ * `xfs_attr_leaf_entsize_local`/`_remote` compute them: rounded to **four**
+ * (`XFS_ATTR_LEAF_NAME_ALIGN`), and a remote entry costs the *padded* size
+ * of its header, twelve, rather than the nine bytes before its name — the
+ * format froze that padding into `usedbytes` long ago. Both were rounded to
+ * eight here, from nine, and `xfs_repair` recounted every leaf.
+ *
+ * A remote entry carries only the name and where the value lives, so its
+ * size does not depend on the value's length at all. */
+#define ATTR_LOCAL_SIZE(nlen, vlen) (((nlen) + (vlen) + 3u + 3u) & ~3u)
+#define ATTR_REMOTE_SIZE(nlen) (((nlen) + 12u + 3u) & ~3u)
 
 /* A **remote value block**: the value itself, with a header of its own on a
  * v5 filesystem so that a torn or misplaced block is detectable rather than
  * being read as value bytes. */
+/*
+ * `struct xfs_attr3_rmt_hdr`, in its own order: the offset and length come
+ * **before** the checksum. This table had them after the owner, sixty bytes
+ * in all, and the writer and reader agreed with each other and with nothing
+ * else — `xfs_repair` found the checksum four bytes from where it looked,
+ * and a value Linux had written would have been read as its own header. */
 #define XFS_ATTR3_RMT_MAGIC 0x5841524du /* "XARM" */
-#define ATTR_RMT_CRC        8u   /* u32, little-endian */
-#define ATTR_RMT_UUID       12u  /* 16 bytes */
-#define ATTR_RMT_OWNER      28u  /* u64: the inode it belongs to */
-#define ATTR_RMT_BLKNO      36u  /* u64 */
-#define ATTR_RMT_LSN        44u  /* u64 */
-#define ATTR_RMT_OFFSET     52u  /* u32: this block's offset into the value */
-#define ATTR_RMT_BYTES      56u  /* u32: value bytes in this block */
-#define ATTR_RMT_HDR        60u  /* then the value bytes */
+#define ATTR_RMT_OFFSET     4u   /* u32: this block's offset into the value */
+#define ATTR_RMT_BYTES      8u   /* u32: value bytes in this block */
+#define ATTR_RMT_CRC        12u  /* u32, little-endian */
+#define ATTR_RMT_UUID       16u  /* 16 bytes */
+#define ATTR_RMT_OWNER      32u  /* u64: the inode it belongs to */
+#define ATTR_RMT_BLKNO      40u  /* u64: the block's own disk address */
+#define ATTR_RMT_LSN        48u  /* u64 */
+#define ATTR_RMT_HDR        56u  /* then the value bytes */
 
 /* The largest value this writes, which bounds the blocks a single set may
  * need. XFS itself allows 64 KiB; this takes a quarter of that, which is
@@ -311,6 +333,7 @@
  * tree that points at itself into an error instead of a loop. */
 #define XFS_BMDR_HDR_BYTES   4u          /* level and numrecs, in the fork */
 #define XFS_BMBT_BLOCK_BYTES 72u         /* a v5 long-form btree block header */
+#define XFS_BMBT_V4_BLOCK_BYTES 24u      /* and a v4 one: magic, level, count, two siblings */
 #define XFS_BMBT_CRC_MAGIC   0x424d4133u /* "BMA3" */
 #define XFS_BMBT_KEY_BYTES   8u
 #define XFS_BMBT_PTR_BYTES   8u
@@ -354,6 +377,8 @@
 #define XFS_DIR3_HDR_UUID  24u /* 16 bytes */
 #define XFS_DIR3_HDR_OWNER 40u /* u64: the directory's own inode */
 #define XFS_DIR3_DATA_HDR_SIZE 64u /* magic..owner, three best-free pairs, pad */
+#define XFS_DIR3_BESTFREE_OFF  48u /* the three {offset, length} pairs, on v5 */
+#define XFS_DIR2_BESTFREE_OFF  4u  /* and on v4, straight after the magic */
 
 /* An entry: inumber(u64) namelen(u8) name[] ftype(u8) tag(u16), the whole
  * thing rounded up to eight bytes. An unused run starts with 0xffff. */
@@ -391,7 +416,7 @@
 #define XFS_DA3_COUNT_OFF  56u /* u16: entries in a leaf, or children in a node */
 #define XFS_DA3_LEVEL_OFF  58u /* u16, node blocks only: 0 is the leaf level */
 #define XFS_DA3_BACK_OFF   4u  /* u32: the previous block at this level */
-#define XFS_DA3_BLKNO_OFF  16u /* u64: this block's own da address, in fs blocks */
+#define XFS_DA3_BLKNO_OFF  16u /* u64: this block's own disk address, in sectors */
 #define XFS_DA_COUNT_OFF   12u /* v4: straight after the 12-byte blkinfo */
 #define XFS_DA_LEVEL_OFF   14u
 #define XFS_DA3_ENTRY_SIZE 8u  /* {hash, address} or {hash, block} */
@@ -464,9 +489,45 @@
 
 #define XFS_AGF_ROOTS     16u  /* three u32: by block, by count, by owner */
 #define XFS_AGF_LEVELS    28u  /* three u32 */
+#define XFS_AGF_FLFIRST   40u  /* u32: the free list's first slot in use */
+#define XFS_AGF_FLLAST    44u  /* u32: and its last */
+#define XFS_AGF_FLCOUNT   48u  /* u32: blocks on the free list */
 #define XFS_AGF_FREEBLKS  52u  /* u32: free blocks in this group */
 #define XFS_AGF_LONGEST   56u  /* u32: the largest free extent in it */
+#define XFS_AGF_BTREEBLKS 60u  /* u32: free-space and rmap tree blocks beyond their roots */
 #define XFS_AGF_UUID      64u  /* 16 bytes */
+#define XFS_AGF_RMAP_BLOCKS 80u /* u32: blocks in the reverse-map tree */
+#define XFS_AGF_REFC_BLOCKS 84u /* u32: blocks in the reference-count tree */
+#define XFS_AGF_REFC_ROOT   88u /* u32 */
+#define XFS_AGF_REFC_LEVEL  92u /* u32 */
+
+/* The group's **free list** (AGFL), in the fourth sector: a ring of blocks
+ * set aside for the trees the AGF roots, so that growing one never has to
+ * ask the allocator whose trees it is changing. */
+#define XFS_AGFL_SECTOR 3u
+#define XFS_AGFL_MAGIC  0x5841464cu /* "XAFL" */
+#define XFS_AGFL_UUID   8u   /* 16 bytes, v5 */
+#define XFS_AGFL_CRC    32u  /* u32, little-endian, v5 */
+#define XFS_AGFL_BNO    36u  /* the ring of u32 block numbers, v5 */
+
+/* The **reverse-map tree** (`rmapbt`): for every block in use, who owns it.
+ * Records are sorted by (start, owner, offset); a node holds a low and a
+ * high key per child, because with shared extents records may overlap. */
+#define XFS_RMAP_MAGIC    0x524d4233u /* "RMB3" */
+#define XFS_RMAP_REC_SIZE 24u /* start u32, count u32, owner u64, offset u64 */
+#define XFS_RMAP_KEY_SIZE 20u /* start u32, owner u64, offset u64 */
+#define XFS_RMAP_OFF_ATTR      ((uint64_t)1 << 63) /* the attribute fork's */
+#define XFS_RMAP_OFF_BMBT      ((uint64_t)1 << 62) /* a block of a fork's b-tree */
+#define XFS_RMAP_OFF_UNWRITTEN ((uint64_t)1 << 61) /* allocated, never written */
+#define XFS_RMAP_OFF_MASK      (((uint64_t)1 << 54) - 1u)
+/* Owners that are not inodes: the format's small negative numbers. */
+#define XFS_RMAP_OWN_FS     ((uint64_t)-3) /* headers */
+#define XFS_RMAP_OWN_LOG    ((uint64_t)-4)
+#define XFS_RMAP_OWN_AG     ((uint64_t)-5) /* free-space and rmap trees, and the free list */
+#define XFS_RMAP_OWN_INOBT  ((uint64_t)-6)
+#define XFS_RMAP_OWN_INODES ((uint64_t)-7)
+#define XFS_RMAP_OWN_REFC   ((uint64_t)-8)
+#define XFS_RMAP_OWN_MIN    ((uint64_t)-9) /* every owner at or above this is one of them */
 #define XFS_AGF_CRC       216u /* u32, little-endian */
 
 /* The free-space btrees: the same shape as the inode ones, with 8-byte
@@ -560,6 +621,12 @@
 
 #define XFS_BTREE_LEVEL   4u  /* u16 */
 #define XFS_BTREE_NUMRECS 6u  /* u16 */
+#define XFS_MAX_EXTLEN    0x1fffffu /* the longest extent a 21-bit count records */
+#define XFS_BTREE_LEFTSIB 8u  /* u32: the block before this one at its level */
+#define XFS_BTREE_RIGHTSIB 12u /* u32: and after it */
+#define XFS_BTREE_BLKNO   16u /* u64, v5: the block's own disk address */
+#define XFS_BTREE_OWNER   48u /* u32, v5: the group the block belongs to */
+#define XFS_NULL_AGBNO    0xffffffffu /* no sibling */
 #define XFS_BTREE_UUID    32u /* 16 bytes */
 #define XFS_BTREE_CRC     52u /* u32, little-endian */
 #define XFS_BTREE_RECORDS 56u    /* where the records start on v5 */
@@ -590,7 +657,15 @@
 #define XLOG_REC_VERSION    8u  /* u32 */
 #define XLOG_REC_LEN        12u /* u32 */
 #define XLOG_REC_LSN        16u /* u64 */
+#define XLOG_REC_TAIL_LSN   24u /* u64: where recovery starts, as of this record */
+#define XLOG_REC_PREV_BLOCK 36u /* u32: the record before this one */
 #define XLOG_REC_NUM_OPS    40u /* u32 */
+#define XLOG_REC_FMT        300u
+#define XLOG_REC_FS_UUID    304u
+#define XLOG_REC_SIZE       320u /* u32: the writer's in-core log size, which sets the header blocks */
+#define XLOG_REC_STRUCT     324u /* what the CRC covers of the header */
+#define XLOG_HEADER_CYCLE_SIZE 32768u /* data one header block can describe */
+#define XLOG_DATA_MAX_BB    64u  /* and so the most data blocks one header carries */
 #define XLOG_REC_HDR_SIZE   512u
 
 /* The operation header that follows a record header. */

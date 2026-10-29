@@ -93,15 +93,15 @@ _start_after_header:
     csrw    sie, zero
     csrci   sstatus, 2          /* SIE = 0 */
 
-    /* This hart's stack. One per hart, indexed by a0, so a secondary that
-     * arrives later does not land on the boot hart's stack. */
-    la      t0, boot_stacks
-    li      t1, BOOT_STACK_SIZE
-    addi    t2, a0, 1           /* stacks grow down: hart n uses slot n+1 */
-    mul     t1, t1, t2
-    add     sp, t0, t1
+    /* The two arguments the boot protocol gave us, kept across the switch
+     * below: everything until `kmain` is assembly, so saved registers are
+     * free to use. */
+    mv      s0, a0
+    mv      s1, a1
 
-    /* Zero .bss before any C runs, because C assumes it. */
+    /* Zero .bss before anything is written to it. `la` is PC-relative, and
+     * translation is off, so these are physical addresses — the same
+     * bytes the linked (high) addresses will name once it is on. */
     la      t0, __bss_start
     la      t1, __bss_end
 1:  bgeu    t0, t1, 2f
@@ -109,18 +109,95 @@ _start_after_header:
     addi    t0, t0, 8
     j       1b
 
-2:  call    kmain               /* a0 = hart id, a1 = device tree, as given */
+    /* Where the image physically is. After the jump below `__kernel_start`
+     * reads as the linked address, so this is the only moment the load
+     * address can be read rather than computed. */
+2:  la      t0, _start
+    la      t1, kernel_load_phys
+    sd      t0, 0(t1)
+
+    /* ── the boot table: translation on before any C runs ─────────────────
+     *
+     * **The kernel is linked in its own half and loaded low**, so it cannot
+     * run C at the load address: an absolute address the linker wrote — a
+     * function-pointer table, a switch's jump table, a static port struct —
+     * names the high alias, while a PC-relative one names wherever the code
+     * is executing. Linked low and executed high (the previous design), the
+     * two disagreed, and every object had two addresses: the board showed a
+     * child's exit waking `0x403371c8` while its parent slept on
+     * `0xffffffc0003371c8`. So nothing in C ever runs low.
+     *
+     * One root table, gigapages only: slots 0..255 identity (RWX, so the
+     * early boot reaches the device tree, the firmware's console and the
+     * table arena exactly as it did with translation off), and slot 256 —
+     * `KERNEL_VIRT_BASE` — the gigabyte the image was loaded into. The image
+     * sits `KERNEL_VIRT_OFFSET` into that gigabyte on every board, because
+     * the loader puts it at DRAM's base plus 2 MiB. `mmu_init` replaces this
+     * table with the real one; nothing frees it, and it is 4 KiB. */
+    la      t2, boot_root_table
+    li      t3, 0
+    li      t4, 256
+3:  slli    t5, t3, 28          /* PPN of gigabyte i, at bit 10: (i << 30) >> 12 << 10 */
+    ori     t5, t5, 0xcf        /* V R W X A D */
+    slli    t6, t3, 3
+    add     t6, t6, t2
+    sd      t5, 0(t6)
+    addi    t3, t3, 1
+    bltu    t3, t4, 3b
+    srli    t5, t0, 30          /* the gigabyte the image is in */
+    slli    t5, t5, 28
+    ori     t5, t5, 0xcf
+    addi    t6, t2, 2047        /* slot 256 is byte 2048, one past the immediate's reach */
+    sd      t5, 1(t6)
+    srli    t5, t2, 12
+    li      t6, 8               /* Sv39 */
+    slli    t6, t6, 60
+    or      t5, t5, t6
+    csrw    satp, t5
+    sfence.vma zero, zero
+
+    /* Still executing at the load address, which the identity slots map.
+     * The literal holds the linked address, so this is the jump. */
+    ld      t0, .Lstart_high
+    jr      t0
+
+    .balign 8
+.Lstart_high:
+    .dword  _start_high
+
+_start_high:
+    /* This hart's stack, now at its linked address. One per hart, indexed
+     * by the hart id, so a secondary that arrives later does not land on
+     * the boot hart's stack. */
+    la      t0, boot_stacks
+    li      t1, BOOT_STACK_SIZE
+    addi    t2, s0, 1           /* stacks grow down: hart n uses slot n+1 */
+    mul     t1, t1, t2
+    add     sp, t0, t1
+
+    mv      a0, s0
+    mv      a1, s1
+    call    kmain               /* a0 = hart id, a1 = device tree, as given */
 
     /* kmain does not return. If it ever does, stop this hart rather than
      * falling into whatever follows in memory. */
-3:  wfi
-    j       3b
+4:  wfi
+    j       4b
 
     .section .bss
     .align 12
     .globl boot_stacks
 boot_stacks:
     .space BOOT_STACK_SIZE * MAX_HARTS
+
+    .align 12
+boot_root_table:
+    .space 4096
+
+    .align 3
+    .globl kernel_load_phys
+kernel_load_phys:
+    .space 8
 
 /* _secondary_start — where a hart started by the firmware arrives.
  *
@@ -131,10 +208,9 @@ boot_stacks:
  * again would wipe what the boot hart has been doing), and no device tree to
  * read.
  *
- * That it is a physical address is only convenient because the kernel is
- * still identity-mapped. When the kernel moves to the top half (P0.4), this
- * entry has to stay reachable physically — which is what a trampoline page
- * is for, and it is the one piece of that move that cannot be deferred.
+ * The firmware needs the *physical* address of this entry
+ * (`mmu_virt_to_phys` of the symbol), and the code here runs there only
+ * until the kernel's table is on and the jump has been taken.
  */
     .section .text
     .globl _secondary_start
@@ -142,41 +218,29 @@ _secondary_start:
     csrw    sie, zero
     csrci   sstatus, 2
 
+    /* The kernel's own table, which `a1` carries. It maps the image at its
+     * load address as well as its linked one, so the next instruction is
+     * still fetchable; the literal then takes this hart to the linked
+     * address, before any C — the same rule, and the same reason, as the
+     * boot hart's. */
+    csrw    satp, a1
+    sfence.vma zero, zero
+    ld      t0, .Lsecondary_high
+    jr      t0
+
+    .balign 8
+.Lsecondary_high:
+    .dword  _secondary_high
+
+_secondary_high:
     la      t0, boot_stacks
     li      t1, BOOT_STACK_SIZE
     addi    t2, a0, 1
     mul     t1, t1, t2
     add     sp, t0, t1
 
-    call    smp_secondary_main  /* a0 = hart id, a1 = the satp to adopt */
+    call    smp_secondary_main  /* a0 = hart id */
 
 1:  wfi
     j       1b
 
-/* mmu_enter_high — leave the load address behind and never come back.
- *
- * `a0` is the function to enter, already converted to its high address by
- * the caller; `a1` and `a2` are its two arguments; `a3` is the stack to use,
- * which is this hart's boot stack at its high alias.
- *
- * **A new stack rather than a relocated one.** Adding an offset to `sp`
- * would leave the frames below it full of low addresses — saved registers,
- * pointers to locals — every one of which stops working when the identity
- * map goes. Entering on a fresh stack abandons them, which is only safe
- * because the caller is not coming back: it is the last thing the physical
- * phase does.
- *
- * Nothing between the `csrw satp` that made the high mapping live and this
- * jump may touch anything that will move, which is why this is five
- * instructions and why it is written here rather than as inline assembly
- * inside a C function whose prologue is the compiler's business.
- */
-    .section .text
-    .globl mmu_enter_high
-mmu_enter_high:
-    mv      t0, a0
-    mv      sp, a3
-    mv      a0, a1
-    mv      a1, a2
-    jr      t0
-1:  j       1b

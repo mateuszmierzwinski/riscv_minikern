@@ -7,17 +7,26 @@
  * `kernel_addr_r=0x40200000`. The 2 MiB below the kernel is where the SBI
  * firmware lives.
  *
- * So the address is a parameter, with QEMU's as the default because that is
- * what the tests run on. `--defsym KERNEL_LOAD=0x40200000` builds the board's
- * image. Everything else about the kernel is already address-agnostic: it
- * reads where memory is from the device tree. */
+ * So the load address is a parameter, with QEMU's as the default.
+ * `--defsym KERNEL_LOAD=0x40200000` builds the board's image.
+ *
+ * **Linked in the kernel's own half, loaded low.** Every section's virtual
+ * address is `KERNEL_VIRT_BASE + KERNEL_VIRT_OFFSET` onwards (layout.h; the
+ * linker cannot include it, so the number is repeated here) and its load
+ * address is the physical one. `start.S` turns a boot table on before any C
+ * runs, so the absolute addresses the linker writes and the PC-relative
+ * ones the code computes name the same alias. The flat image `booti` takes
+ * is laid out by load address, so it is unchanged. */
 ENTRY(_start)
 
+KERNEL_PHYS = DEFINED(KERNEL_LOAD) ? KERNEL_LOAD : 0x80200000;
+KERNEL_VIRT = 0xFFFFFFC000200000;
+
 SECTIONS {
-    . = DEFINED(KERNEL_LOAD) ? KERNEL_LOAD : 0x80200000;
+    . = KERNEL_VIRT;
     __kernel_start = .;
 
-    .text : {
+    .text : AT(KERNEL_PHYS) {
         KEEP(*(.text.entry))
         *(.text .text.*)
     }
@@ -28,14 +37,14 @@ SECTIONS {
      * written and its own data cannot be executed. */
     __text_end = .;
 
-    .rodata : { *(.rodata .rodata.*) }
+    .rodata : AT(KERNEL_PHYS + ADDR(.rodata) - KERNEL_VIRT) { *(.rodata .rodata.*) }
 
     . = ALIGN(4096);
-    .data : { *(.data .data.*) *(.sdata .sdata.*) }
+    .data : AT(KERNEL_PHYS + ADDR(.data) - KERNEL_VIRT) { *(.data .data.*) *(.sdata .sdata.*) }
 
     . = ALIGN(4096);
     __bss_start = .;
-    .bss : { *(.bss .bss.*) *(.sbss .sbss.*) *(COMMON) }
+    .bss : AT(KERNEL_PHYS + ADDR(.bss) - KERNEL_VIRT) { *(.bss .bss.*) *(.sbss .sbss.*) *(COMMON) }
     . = ALIGN(8);
     __bss_end = .;
 

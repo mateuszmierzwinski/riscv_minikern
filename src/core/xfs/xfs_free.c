@@ -99,13 +99,6 @@ int xfs_dir_sf_remove(struct xfs *fs, const struct xfs_inode *dir, const char *n
     return KERR_OK;
 }
 
-/* Puts one inode back in a record: its bit set, its count up. */
-static void give_to_record(uint8_t *rec, uint32_t bit) {
-    uint64_t free = xfs_be64(rec + XFS_INOBT_REC_FREE) | ((uint64_t)1 << bit);
-    xfs_put_be32(rec + XFS_INOBT_REC_FREECOUNT, xfs_be32(rec + XFS_INOBT_REC_FREECOUNT) + 1u);
-    xfs_put_be64(rec + XFS_INOBT_REC_FREE, free);
-}
-
 /* Returns an inode to both trees and to the counters.
  *
  * The free-inode tree must already describe this chunk. It will, for any
@@ -113,65 +106,12 @@ static void give_to_record(uint8_t *rec, uint32_t bit) {
  * the record never goes away — and refusing otherwise is better than
  * inserting a btree record badly. */
 static int release_inode(struct xfs *fs, uint32_t agno, uint64_t ino) {
-    struct bbuf *agib, *inob;
-    struct bbuf *finob = NULL; /* absent on v4 */
-    uint8_t *agi, *rec, *frec;
     /* The records are keyed by the **group-relative** inode number, not the
-     * whole one: the group is in the high bits of an inode number and must
-     * come off before the chunk is looked for, or no record matches and a
-     * remove fails with EIO for no reason the caller can act on. */
+     * whole one: the group is in the high bits and must come off first, or
+     * no record matches and a remove fails with EIO for no reason the
+     * caller can act on. */
     uint64_t agino = ino & (((uint64_t)1 << (fs->agblklog + fs->inopblog)) - 1u);
-    uint32_t bit;
-    int rc = xfs_agi_get(fs, agno, &agib, &agi);
-    if (rc != KERR_OK) {
-        return rc;
-    }
-    rc = xfs_tree_get(fs, agno, xfs_be32(agi + XFS_AGI_ROOT), xfs_magic_for(fs, XFS_BLK_INOBT), &inob);
-    if (rc != KERR_OK) {
-        bcache_put(fs->cache, agib);
-        return rc;
-    }
-    /* The free-inode tree only where there is one: on v4 `agi_free_root`
-     * is past the end of the AGI as v4 defined it. */
-    if (fs->has_finobt) {
-        rc = xfs_tree_get(fs, agno, xfs_be32(agi + XFS_AGI_FREE_ROOT),
-                          xfs_magic_for(fs, XFS_BLK_FINOBT), &finob);
-        if (rc != KERR_OK) {
-            bcache_put(fs->cache, inob);
-            bcache_put(fs->cache, agib);
-            return rc;
-        }
-    }
-    rec = xfs_tree_record_for(fs, inob, (uint32_t)agino);
-    frec = rec == NULL || finob == NULL ? NULL : xfs_tree_record_for(fs, finob, (uint32_t)agino);
-    /* **A missing record and an absent tree are different.** Without the
-     * tree there is no record to want; with the tree and no record the
-     * inode is not where the index says it should be, which is a refusal
-     * rather than something to work around. */
-    if (rec == NULL || (finob != NULL && frec == NULL)) {
-        if (finob != NULL) {
-            bcache_put(fs->cache, finob);
-        }
-        bcache_put(fs->cache, inob);
-        bcache_put(fs->cache, agib);
-        return rec == NULL ? KERR_IO : KERR_NOTSUP;
-    }
-    bit = (uint32_t)agino - xfs_be32(rec + XFS_INOBT_REC_STARTINO);
-    give_to_record(rec, bit);
-    xfs_put_be32(agi + XFS_AGI_FREECOUNT, xfs_be32(agi + XFS_AGI_FREECOUNT) + 1u);
-    xfs_reseal(fs, inob->data, fs->blocksize, XFS_BTREE_CRC);
-    xfs_reseal(fs, agi, fs->sectsize, XFS_AGI_CRC);
-    bcache_dirty(inob);
-    bcache_dirty(agib);
-    if (finob != NULL) {
-        give_to_record(frec, bit);
-        xfs_reseal(fs, finob->data, fs->blocksize, XFS_BTREE_CRC);
-        bcache_dirty(finob);
-        bcache_put(fs->cache, finob);
-    }
-    bcache_put(fs->cache, inob);
-    bcache_put(fs->cache, agib);
-    return KERR_OK;
+    return xfs_inobt_release(fs, agno, (uint32_t)agino);
 }
 
 /* Clears the inode on disk.
@@ -218,35 +158,84 @@ static int clear_inode(struct xfs *fs, uint64_t ino) {
     return KERR_OK;
 }
 
-/* Gives a file's blocks back to the group they came from.
- *
- * Every extent, in turn, joined to whatever it abuts (xfs_alloc.c). It
- * happens **before** the directory entry goes, so that a failure half way
- * leaves a file that still exists and still owns what it owns — a leak is
- * worse than a file that would not delete. */
-/* `noinline`: its caller already holds an inode, and folding this frame into
- * that one is what crosses the 1 KiB limit. Taking the inode by pointer was
- * never enough on its own — the extent walk below has locals of its own. */
-__attribute__((noinline)) static int free_file_blocks(struct xfs *fs, const struct xfs_inode *ip) {
-    uint32_t n = ip->nextents;
-    if (ip->nblocks == 0) {
-        return KERR_OK;
+/* Gives back one extent of a file's data: to the realtime bitmap for a
+ * realtime file, whose blocks never belonged to a group, and otherwise out
+ * of the reverse map and to the group it came from. */
+static int free_data_extent(struct xfs *fs, const struct xfs_inode *ip,
+                            const struct xfs_extent *e) {
+    if (ip->realtime) {
+        return xfs_rt_release(fs, e->startblock / fs->rextsize, e->blockcount / fs->rextsize);
     }
-    for (uint32_t i = 0; i < n; i++) {
-        struct xfs_extent e;
-        uint64_t mask = ((uint64_t)1 << fs->agblklog) - 1u;
-        int rc;
-        xfs_extent_unpack(ip->fork + i * XFS_EXTENT_BYTES, &e);
-        if (e.blockcount == 0) {
-            continue;
-        }
-        rc = xfs_free_extent(fs, xfs_fsb_ag(fs, e.startblock), (uint32_t)(e.startblock & mask),
-                             e.blockcount);
-        if (rc != KERR_OK) {
-            return rc;
+    return xfs_free_data(fs, ip, e->startblock, e->blockcount, xfs_rmap_offset_of(e, 0));
+}
+
+/* Whether every block the file owns is one this can give back, asked before
+ * any is: a refusal part way through would leave a file that owns half of
+ * what it did.
+ *
+ * Refused: an attribute fork that is a b-tree; a realtime extent that is
+ * not whole realtime extents; and a file that may share blocks with
+ * another, where freeing one frees it from under the other. Each used to be
+ * freed anyway — a b-tree root walked as if it were extents, a realtime
+ * file's blocks put into a group's free space, an attribute fork's blocks
+ * not freed at all. A data fork that is a b-tree is freed like any other
+ * now: its map is loaded whole (xfs_fork.c). */
+static int frees_cleanly(const struct xfs *fs, const struct xfs_inode *ip,
+                         const struct xfs_fork_map *m) {
+    if (ip->aformat == XFS_DINODE_FMT_BTREE || (ip->shares_blocks && !fs->has_rmapbt)) {
+        return KERR_NOTSUP; /* sharing without a reverse map: not a shape this frees */
+    }
+    for (uint32_t i = 0; ip->realtime && i < m->count; i++) {
+        if (fs->rextsize == 0 || m->e[i].startblock % fs->rextsize != 0 ||
+            m->e[i].blockcount % fs->rextsize != 0) {
+            return KERR_NOTSUP;
         }
     }
     return KERR_OK;
+}
+
+/* Frees every extent of the map, then stores it empty — which gives back
+ * the tree's leaves when it had any. */
+static int free_map(struct xfs *fs, const struct xfs_inode *ip, uint8_t *di,
+                    struct xfs_fork_map *m) {
+    int rc = frees_cleanly(fs, ip, m);
+    for (uint32_t i = 0; rc == KERR_OK && i < m->count; i++) {
+        rc = m->e[i].blockcount == 0 ? KERR_OK : free_data_extent(fs, ip, &m->e[i]);
+    }
+    if (rc == KERR_OK) {
+        m->count = 0;
+        rc = xfs_fork_store(fs, ip->ino, di, m);
+    }
+    return rc;
+}
+
+/* Gives a file's blocks back: its data, then its attributes' blocks.
+ *
+ * It happens **before** the directory entry goes, so that a failure half
+ * way leaves a file that still exists and still owns what it owns — a leak
+ * is worse than a file that would not delete. */
+/* `noinline`: its caller already holds an inode, and folding this frame into
+ * that one is what crosses the 1 KiB limit. */
+__attribute__((noinline)) static int free_file_blocks(struct xfs *fs, const struct xfs_inode *ip) {
+    struct xfs_fork_map m;
+    uint64_t block;
+    uint32_t boffset;
+    struct bbuf *b;
+    int rc;
+    if (ip->nblocks == 0 || ip->format == XFS_DINODE_FMT_LOCAL) {
+        return KERR_OK;
+    }
+    xfs_inode_place(fs, ip->ino, &block, &boffset);
+    rc = bcache_get(fs->cache, block, &b);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    rc = xfs_fork_load(fs, b->data + boffset, &m);
+    rc = rc != KERR_OK ? rc : free_map(fs, ip, b->data + boffset, &m);
+    xfs_reseal(fs, b->data + boffset, fs->inodesize, XFS_DI_CRC);
+    bcache_dirty(b);
+    bcache_put(fs->cache, b);
+    return rc != KERR_OK ? rc : xfs_attr_free_blocks(fs, ip);
 }
 
 /* Logs the parent, whose directory has changed. The inode that has gone is
@@ -340,7 +329,8 @@ __attribute__((noinline)) static int take_one_name_away(struct xfs *fs,
     if (xfs_is_dir(&ip)) {
         return KERR_ISDIR; /* removing a directory is rmdir, and is not this */
     }
-    if (ip.format != XFS_DINODE_FMT_EXTENTS && ip.nblocks != 0) {
+    if (ip.format != XFS_DINODE_FMT_EXTENTS && ip.format != XFS_DINODE_FMT_BTREE &&
+        ip.nblocks != 0) {
         return KERR_NOTSUP; /* a fork shape whose blocks this cannot find */
     }
     /* **A name, not a file.** `unlink` removes one link; the file goes
@@ -364,7 +354,8 @@ int xfs_unlink(struct xfs *fs, const struct xfs_inode *dir, const char *name, ui
     if (!xfs_is_dir(dir)) {
         return KERR_NOTDIR;
     }
-    if (dir->format != XFS_DINODE_FMT_LOCAL && dir->format != XFS_DINODE_FMT_EXTENTS) {
+    if (dir->format != XFS_DINODE_FMT_LOCAL && dir->format != XFS_DINODE_FMT_EXTENTS &&
+        dir->format != XFS_DINODE_FMT_BTREE) {
         return KERR_NOTSUP; /* a fork shape the write path cannot edit */
     }
     rc = xfs_dir_lookup(fs, dir, name, namelen, &ino);

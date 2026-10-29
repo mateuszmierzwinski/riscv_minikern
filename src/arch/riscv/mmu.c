@@ -82,34 +82,35 @@ static uint64_t page_up(uint64_t v) {
     return (v + PAGE_SIZE - 1u) & ~(PAGE_SIZE - 1u);
 }
 
+/* Where `start.S` found the image, before translation was on. */
+extern uint64_t kernel_load_phys;
+
 /* Where the kernel's bytes physically are.
  *
- * **`__kernel_start` is a high symbol read through a PC-relative
- * instruction**, so while the kernel is still executing at its load address
- * this yields that load address — which is exactly what is wanted here and
- * is *not* what it yields after the jump. Everything in this file that
- * takes a linker symbol runs before the jump, and that is why it can. */
+ * **Recorded, not derived from a symbol.** The image is linked in the
+ * kernel's half, so `__kernel_start` is the high address however it is read;
+ * `start.S` stores the load address while it can still see it. */
 static uint64_t kernel_phys_base(void) {
-    return page_down((uint64_t)(uintptr_t)__kernel_start);
+    return page_down(kernel_load_phys);
 }
 
-/* The image's size, as a difference of two linker symbols — which is a
- * link-time constant and so means the same thing in either phase. */
+/* The image's size, as a difference of two linker symbols — a link-time
+ * constant, so it means the same thing at either address. */
 static uint64_t kernel_text_bytes(void) {
-    return page_up((uint64_t)(uintptr_t)__text_end) - kernel_phys_base();
+    return page_up((uint64_t)(uintptr_t)__text_end) - page_down((uint64_t)(uintptr_t)__kernel_start);
 }
 
 static uint64_t kernel_total_bytes(void) {
-    return page_up((uint64_t)(uintptr_t)__kernel_end) - kernel_phys_base();
+    return page_up((uint64_t)(uintptr_t)__kernel_end) - page_down((uint64_t)(uintptr_t)__kernel_start);
 }
 
 /* The kernel's own image: code read-execute, the rest read-write.
  *
  * **Mapped twice, on purpose.** Once at the address it is linked for, in
- * the kernel's own half, which is where it will run; and once identity, so
- * that the instruction after `satp` is written is still fetchable. The
- * identity half is what the jump leaves behind, and it is dropped
- * separately once nothing is holding a low address. */
+ * the kernel's own half, which is where it runs; and once identity, because
+ * a secondary hart arrives at its physical entry with translation off, and
+ * the instruction after it writes `satp` must still be fetchable before its
+ * jump to the linked address (`start.S`). */
 static int map_kernel_image(struct pgtable *pt) {
     uint64_t phys = kernel_phys_base();
     uint64_t text = kernel_text_bytes();
@@ -124,40 +125,20 @@ static int map_kernel_image(struct pgtable *pt) {
                : pgtable_map_range(pt, phys + text, phys + text, all - text, PT_PROT_RW);
 }
 
-/* How far a low kernel address has to move to become its high self.
- *
- * Valid only before the jump, for the same reason `kernel_phys_base` is. */
-uint64_t mmu_high_offset(void) {
-    return (KERNEL_VIRT_BASE + KERNEL_VIRT_OFFSET) - kernel_phys_base();
-}
-
-/* Where the kernel's image physically is, **recorded before the jump**.
- *
- * `__kernel_start` is read through a PC-relative instruction, so it means
- * the load address while the kernel is executing there and its own high
- * address afterwards. Anything that needs the *physical* bounds after the
- * jump — the page allocator, which must not hand out the kernel's own
- * pages — has to ask for them rather than take the symbol.
- *
- * The first thing this broke was loud, which was luck: the allocator
- * reserved a high range that does not intersect RAM, decided every page was
- * taken, and reported "0 of 2097152 pages free". A reservation that had
- * merely been the wrong size would have handed out the kernel's own memory
- * and corrupted something days later. */
-static phys_t image_base;
-static uint64_t image_bytes;
-
+/* Where the kernel's image physically is — the allocator must not hand out
+ * its pages. Valid from the first instruction, because `start.S` records the
+ * load address before any C runs. */
 void mmu_kernel_phys_range(phys_t *base, uint64_t *bytes) {
-    *base = image_base;
-    *bytes = image_bytes;
+    *base = (phys_t)kernel_phys_base();
+    *bytes = kernel_total_bytes();
 }
 
 /* Everything else in RAM, read-write and not executable: the device tree the
  * firmware left there, the table arena, and whatever the page allocator will
  * hand out later. Split around the kernel image, which is already mapped. */
 static int map_remaining_ram(struct pgtable *pt, phys_t base, uint64_t bytes) {
-    uint64_t kernel_lo = page_down((uint64_t)(uintptr_t)__kernel_start);
-    uint64_t kernel_hi = page_up((uint64_t)(uintptr_t)__kernel_end);
+    uint64_t kernel_lo = kernel_phys_base();
+    uint64_t kernel_hi = kernel_lo + kernel_total_bytes();
     int rc = KERR_OK;
     if (base < kernel_lo) {
         rc = pgtable_map_range(pt, base, base, kernel_lo - base, PT_PROT_RW);
@@ -196,10 +177,6 @@ int mmu_init(phys_t ram_base, uint64_t ram_bytes) {
     }
     ram_origin = ram_base;
     ram_span = ram_bytes;
-    /* Before any mapping, and so before the jump: this is the only moment
-     * the linker symbols still mean the load address. */
-    image_base = (phys_t)kernel_phys_base();
-    image_bytes = kernel_total_bytes();
     rc = map_kernel_image(&kernel_table);
     rc = rc != KERR_OK ? rc : map_remaining_ram(&kernel_table, ram_base, ram_bytes);
     rc = rc != KERR_OK ? rc : map_direct_window(&kernel_table, ram_base, ram_bytes);

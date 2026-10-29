@@ -18,8 +18,10 @@ output, which presented as `Bad Linux RISCV Image magic!`: the loader
 refusing an address nothing had been written to.
 
 The operator's wiring, which is a fact about this machine and not a choice:
-the board's console is `/dev/ttyUSB0`, and its power is switched by an
-ESP32 relay on `/dev/ttyACM0` that takes `POWER_UP` and `POWER_DOWN`. The
+the board's console is `/dev/ttyUSB0`, and its power is switched by a relay
+on line 0 of `/dev/gpiochip1` — the GPIO pins of the console's own USB-UART
+bridge — driven high for off and low for on, through `gpioset` run under
+`sg gpio`. The
 image is served over HTTP from this host because U-Boot's `wget` is the one
 transfer that needs nothing installed on the host beyond a web server.
 
@@ -33,6 +35,7 @@ import fcntl
 import gzip
 import os
 import shutil
+import subprocess
 import sys
 import time
 
@@ -45,7 +48,10 @@ except ImportError:  # pragma: no cover - the operator's machine has it
 
 PROMPT = b"StarFive #"
 CONSOLE = os.environ.get("MINIKERN_CONSOLE", "/dev/ttyUSB0")
-RELAY = os.environ.get("MINIKERN_RELAY", "/dev/ttyACM0")
+# The relay: a GPIO line, active low (0 = power on, 1 = power off).
+RELAY_CHIP = os.environ.get("MINIKERN_RELAY_CHIP", "gpiochip1")
+RELAY_LINE = os.environ.get("MINIKERN_RELAY_LINE", "0")
+RELAY_GROUP = os.environ.get("MINIKERN_RELAY_GROUP", "gpio")
 IMAGE_URL = os.environ.get("MINIKERN_IMAGE_URL", "http://192.168.86.119:8780/minikern.bin")
 LOAD_AT = "0x82000000"
 
@@ -124,13 +130,18 @@ STANDARD_ARGS = "console=sbi minikern.halt=poweroff"
 
 
 def power(command):
-    """Switches the board's power through the relay. Fire and forget: the
-    relay does not answer, and a missing relay must fail loudly here rather
-    than as a board that never prints anything."""
-    with serial.Serial(RELAY, 115200, timeout=1) as esp:
-        esp.write((command + "\r\n").encode())
-        esp.flush()
-        time.sleep(1.0)
+    """Switches the board's power through the relay: `POWER_DOWN` or
+    `POWER_UP`.
+
+    `gpioset -t0` sets the line and exits, and the line keeps its value. It
+    runs under `sg`, because the device belongs to a group this login may
+    have been added to after the session began. A failure raises rather than
+    returning: a relay that did not switch must fail here, not as a board
+    that never prints anything."""
+    level = {"POWER_DOWN": "1", "POWER_UP": "0"}[command]
+    gpioset = ("gpioset -c %s -d push-pull -t0 %s=%s" % (RELAY_CHIP, RELAY_LINE, level))
+    subprocess.run(["sg", RELAY_GROUP, "-c", gpioset], check=True, timeout=10)
+    time.sleep(1.0)
 
 
 def send(port, line):

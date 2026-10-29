@@ -17,6 +17,7 @@ has a checksum anyone can compute, and gzips to nothing.
 320 MB and why it matters that they are mostly holes.
 """
 import os
+import shutil
 import subprocess
 import sys
 
@@ -93,10 +94,80 @@ def small_directory(at):
     return img
 
 
+def small_directory_defaults(at):
+    """`small_directory`, made the way anyone would make it: `mkfs.xfs` with
+    **no feature options at all**.
+
+    Its defaults turn on what the fixture above turns off — the reverse-map
+    tree, reflink, sparse inodes, 64-bit extent counts, big timestamps — and
+    every write the kernel makes then has to keep the reverse map exact.
+    The host's `xfs_write_test` judges those writes with `xfs_repair`; this
+    runs the same writer on the board, through the kernel's own self-test."""
+    os.makedirs(at, exist_ok=True)
+    data = payload(at)
+    proto = os.path.join(at, "protodefaults")
+    with open(proto, "w") as f:
+        f.write(f"dummy\n0 0\nd--755 0 0\nseed ---644 0 0 {data}\n$\n")
+    img = os.path.join(at, "defaults.img")
+    with open(img, "wb") as f:
+        f.truncate(320 * 1024 * 1024)
+    subprocess.run(["mkfs.xfs", "-q", "-f", "-p", proto, img], check=True)
+    return img
+
+
 # Two filesystems on one disk, labelled so that automount has a decision to
 # make. The sizes are forced by `mkfs.xfs` refusing anything under 300 MB.
 VOLUME_MB = 320
 VOLUME_FIRST_SECTOR = 2048  # 1 MiB in, which is where a partitioner starts
+
+
+def _labelled_xfs(at, label, data):
+    """One XFS volume file labelled `label`, carrying `/on<label>`."""
+    proto = os.path.join(at, f"proto{label}")
+    with open(proto, "w") as f:
+        f.write(f"dummy\n0 0\nd--755 0 0\non{label} ---644 0 0 {data}\n$\n")
+    one = os.path.join(at, f"vol{label}.img")
+    with open(one, "wb") as f:
+        f.truncate(VOLUME_MB * 1024 * 1024)
+    subprocess.run(MKFS + ["-L", label, "-n", "ftype=1", "-p", proto, one], check=True)
+    return one
+
+
+def _boot_fat(at):
+    """A FAT32 boot partition file holding a stand-in `minikern.bin`."""
+    one = os.path.join(at, "volBOOT.img")
+    with open(one, "wb") as f:
+        f.truncate(BOOT_MB * 1024 * 1024)
+    subprocess.run(["mkfs.vfat", "-F", "32", "-n", "BOOT", one], check=True,
+                   stdout=subprocess.DEVNULL)
+    kernel = os.path.join(at, "minikern.bin")
+    with open(kernel, "wb") as f:
+        f.write(b"not a kernel, only a file in the boot partition\n")
+    subprocess.run(["mcopy", "-i", one, kernel, "::minikern.bin"], check=True)
+    return one
+
+
+def _gpt_image(img, volumes):
+    """Lays `volumes` — (name, file) pairs, in partition order — into a GPT
+    image at consecutive sector offsets, without root: `sfdisk` writes the
+    table into the file and each volume is copied in at its offset."""
+    first, lines = VOLUME_FIRST_SECTOR, []
+    for name, one in volumes:
+        sectors = os.path.getsize(one) // 512
+        lines.append(f"start={first}, size={sectors}, name={name}\n")
+        first += sectors
+    with open(img, "wb") as f:
+        f.truncate((first + VOLUME_FIRST_SECTOR) * 512)
+    subprocess.run(["sfdisk", "--quiet", img], input="label: gpt\n" + "".join(lines),
+                   text=True, check=True)
+    with open(img, "r+b") as out:
+        at = VOLUME_FIRST_SECTOR
+        for _, one in volumes:
+            out.seek(at * 512)
+            with open(one, "rb") as src:
+                shutil.copyfileobj(src, out, 1 << 20)
+            at += os.path.getsize(one) // 512
+    return img
 
 
 def two_labelled_volumes(at):
@@ -105,45 +176,32 @@ def two_labelled_volumes(at):
     **This is the fixture the mount policy needs and nothing else provides.**
     A single filesystem cannot show the difference between "mounted at /
     because it is labelled ROOT" and "mounted at / because it is the only
-    thing there" — and the second is what the kernel used to do. So there
-    are two, labelled, and the DATA one carries a file that can only be
-    reached through `/volumes/DATA`.
-
-    Built without root: `mkfs.xfs` writes each filesystem into its own
-    file, `sfdisk` writes a partition table into a third, and the two are
-    copied in at their sector offsets. `losetup` would be the ordinary way
-    and needs privileges this account does not have.
+    thing there". So there are two, labelled, and the DATA one carries a file
+    that can only be reached through `/volumes/DATA`.
     """
     os.makedirs(at, exist_ok=True)
     data = payload(at)
-    parts = []
-    for label in ("ROOT", "DATA"):
-        proto = os.path.join(at, f"proto{label}")
-        with open(proto, "w") as f:
-            f.write(f"dummy\n0 0\nd--755 0 0\non{label} ---644 0 0 {data}\n$\n")
-        one = os.path.join(at, f"vol{label}.img")
-        with open(one, "wb") as f:
-            f.truncate(VOLUME_MB * 1024 * 1024)
-        subprocess.run(MKFS + ["-L", label, "-n", "ftype=1", "-p", proto, one], check=True)
-        parts.append(one)
-    img = os.path.join(at, "twovol.img")
-    sectors = VOLUME_MB * 1024 * 1024 // 512
-    with open(img, "wb") as f:
-        f.truncate((VOLUME_FIRST_SECTOR + 2 * sectors + VOLUME_FIRST_SECTOR) * 512)
-    script = (f"label: gpt\n"
-              f"start={VOLUME_FIRST_SECTOR}, size={sectors}, name=ROOT\n"
-              f"start={VOLUME_FIRST_SECTOR + sectors}, size={sectors}, name=DATA\n")
-    subprocess.run(["sfdisk", "--quiet", img], input=script, text=True, check=True)
-    with open(img, "r+b") as out:
-        for i, one in enumerate(parts):
-            out.seek((VOLUME_FIRST_SECTOR + i * sectors) * 512)
-            with open(one, "rb") as src:
-                while True:
-                    chunk = src.read(1 << 20)
-                    if not chunk:
-                        break
-                    out.write(chunk)
-    return img
+    volumes = [(label, _labelled_xfs(at, label, data)) for label in ("ROOT", "DATA")]
+    return _gpt_image(os.path.join(at, "twovol.img"), volumes)
+
+
+# A boot partition big enough to hold a kernel and small enough to stage.
+BOOT_MB = 64
+
+
+def boot_partition_first(at):
+    """**FAT as partition 1**, then ROOT, then DATA: the layout a disk that
+    boots locally has, because U-Boot cannot read XFS (docs/BOOTING.md).
+
+    The root must be found by its label, not by being partition 1 — the
+    kernel used to mount partition 1 as the root and would have tried the
+    FAT here.
+    """
+    os.makedirs(at, exist_ok=True)
+    data = payload(at)
+    volumes = [("BOOT", _boot_fat(at))]
+    volumes += [(label, _labelled_xfs(at, label, data)) for label in ("ROOT", "DATA")]
+    return _gpt_image(os.path.join(at, "bootfirst.img"), volumes)
 
 
 # A page file big enough to be worth having and small enough to stage: 64

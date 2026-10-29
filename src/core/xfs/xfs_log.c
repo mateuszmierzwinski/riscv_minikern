@@ -170,7 +170,6 @@ static int walk_to_newest(struct xfs *fs, uint64_t blocks, uint32_t cycle, uint6
     uint64_t bb = 0;
     bool any = false;
     while (bb < blocks) {
-        uint64_t len;
         int rc = read_bb(fs, bb, scratch);
         if (rc != KERR_OK) {
             return rc;
@@ -180,8 +179,7 @@ static int walk_to_newest(struct xfs *fs, uint64_t blocks, uint32_t cycle, uint6
         }
         *at = bb;
         any = true;
-        len = xfs_be32(scratch + XLOG_REC_LEN);
-        bb += 1u + (len + XLOG_SECTOR - 1u) / XLOG_SECTOR;
+        bb += xfs_log_record_blocks(scratch);
     }
     return any ? KERR_OK : KERR_NOENT;
 }
@@ -210,6 +208,40 @@ static int find_newest(struct xfs *fs, uint64_t blocks, uint32_t cycle, uint64_t
         kprintf("xfs: the log's head at %u has no record before it\n", (uint32_t)head);
     }
     return rc;
+}
+
+uint64_t xfs_log_record_blocks(const uint8_t *hdr) {
+    uint32_t size = xfs_be32(hdr + XLOG_REC_SIZE);
+    uint32_t len = xfs_be32(hdr + XLOG_REC_LEN);
+    uint32_t hblks = xfs_be32(hdr + XLOG_REC_VERSION) == 2u && size > XLOG_HEADER_CYCLE_SIZE
+                         ? (size + XLOG_HEADER_CYCLE_SIZE - 1u) / XLOG_HEADER_CYCLE_SIZE
+                         : 1u;
+    return hblks + (len + XLOG_SECTOR - 1u) / XLOG_SECTOR;
+}
+
+/* Where the log goes on after its newest record, in a log of `blocks`: the
+ * block after it, in the cycle after it when it reached the end; and the
+ * tail it names, which is where recovery would begin. */
+static int take_position(struct xfs *fs, uint64_t newest, uint64_t blocks, uint32_t cycle) {
+    uint64_t next;
+    int rc = read_bb(fs, newest, scratch);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    next = newest + xfs_log_record_blocks(scratch);
+    fs->log_last = newest;
+    fs->log_tail = xfs_be64(scratch + XLOG_REC_TAIL_LSN) & 0xffffffffu;
+    fs->log_cycle = next >= blocks ? cycle + 1u : cycle;
+    fs->log_head = next >= blocks ? next - blocks : next;
+    return fs->log_tail < blocks ? KERR_OK : KERR_IO;
+}
+
+/* A log nothing has written: the first record goes at block 0, cycle 1. */
+static void fresh_position(struct xfs *fs) {
+    fs->log_head = 0;
+    fs->log_tail = 0;
+    fs->log_last = 0;
+    fs->log_cycle = 1;
 }
 
 int xfs_log_check(struct xfs *fs) {
@@ -243,6 +275,7 @@ int xfs_log_check(struct xfs *fs) {
     }
     cycle = bb_cycle(scratch);
     if (cycle == 0) {
+        fresh_position(fs);
         return KERR_OK; /* never written: there is nothing to replay */
     }
     rc = find_newest(fs, blocks, cycle, &newest);
@@ -250,6 +283,7 @@ int xfs_log_check(struct xfs *fs) {
         kprintf("xfs: the log carries cycle %u but no record this reader can find\n", cycle);
         return KERR_NOTSUP;
     }
+    rc = rc != KERR_OK ? rc : take_position(fs, newest, blocks, cycle);
     if (rc == KERR_OK) {
         rc = record_is_unmount(fs, newest, &unmount);
     }

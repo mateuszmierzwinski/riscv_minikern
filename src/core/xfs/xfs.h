@@ -156,10 +156,20 @@ struct xfs_inode {
      * paying for the rare case in every one of them. */
     uint8_t aformat;
     uint8_t forkoff;
+    /* `XFS_DIFLAG2_REFLINK`: some of this file's blocks may be another
+     * file's too. Rewriting or freeing one would change the other file, so
+     * the writer refuses to touch such a file's blocks. */
+    bool shares_blocks;
     /* This file's data is on the realtime device (`XFS_DIFLAG_REALTIME`).
      * Its extent records are indistinguishable from any other file's, so
      * this flag is the only thing that says where they point. */
     bool realtime;
+    /* How many records an extent-format attribute fork holds: the count,
+     * not a zero record, is what ends the list. Last, where the four bytes
+     * fit in what the flags above leave: placed beside `forkoff` it padded
+     * the struct by eight, and four frames that hold an inode went past the
+     * kernel's 1 KiB limit. */
+    uint32_t naextents;
 };
 
 /* The hash pairs of a block directory under conversion: one pair per entry,
@@ -217,6 +227,21 @@ struct xfs {
      * read: the filesystem is still readable and must not be written, for
      * the same reason a dirty log makes it read-only. */
     bool log_detached;
+    /* **Where the log goes on.** The next record is written at `log_head`
+     * in cycle `log_cycle`; `log_last` is the newest record and `log_tail`
+     * the block its tail names, where recovery starts. Found by the log
+     * check at mount and moved by every record written after it — the log
+     * is a ring, and a writer that always started at block 0 left a log
+     * Linux had wrapped looking dirty, and its own replay walked from block
+     * 0 instead of from the tail. All four are in 512-byte basic blocks. */
+    uint64_t log_head;
+    uint64_t log_tail;
+    uint64_t log_last;
+    uint32_t log_cycle;
+    /* What a record's length is rounded up to, in basic blocks: the log's
+     * stripe unit, or its sector size if larger. Linux pads every record so,
+     * which keeps the head aligned for a drive with 4 KiB sectors. */
+    uint32_t log_roundoff;
     /* Quotas: which kinds this filesystem counts and enforces, and the
      * three files that hold the records. The inode numbers are **zero on a
      * fresh quota filesystem** — `mkfs.xfs` records the intent and a kernel
@@ -307,6 +332,10 @@ struct xfs {
      * 328), so reading it returns whatever follows in the sector. Every
      * path that touches the tree has to ask first. */
     bool has_finobt;
+    bool sparse_inodes; /* inode b-tree records carry a hole mask (`SPINODES`) */
+    bool inobt_counts;  /* the AGI counts the inode trees' blocks (`INOBTCNT`) */
+    bool has_rmapbt;    /* every block in use is in the reverse map, which writes keep */
+    bool has_reflink;   /* files may share blocks; one flagged as sharing is not rewritten */
     uint64_t dir_leaf_block; /* directory data lives below this logical block */
     uint64_t dir_free_block; /* and the free blocks of a node directory above */
     uint32_t blocksize;
@@ -318,6 +347,7 @@ struct xfs {
     uint32_t logblocks;
     uint32_t dirblocks;    /* blocks per directory block (1 << sb_dirblklog) */
     uint32_t dirblocksize; /* and that in bytes, which is what parsing uses */
+    uint32_t inoalign;     /* a new inode chunk starts at a multiple of this block */
     uint8_t blocklog;
     uint8_t inopblog;
     uint8_t agblklog;
@@ -355,11 +385,12 @@ struct xfs {
     bool skip_unmount_record;
     bool ftype;           /* directory entries carry a type byte */
     bool mounted;
-    /* The filesystem uses read-only-compatible features this reader does not
-     * implement — reverse mapping, reflink — so it can be read but must
-     * never be written: a writer is what those features place obligations
-     * on. `xfs_writable` refuses on it, which is the enforcement of the
-     * promise `check_features` makes when it allows the mount. */
+    /* The filesystem uses read-only-compatible features the writer does not
+     * maintain, so it can be read but must never be written: a writer is
+     * what those features place obligations on. `xfs_writable` refuses on
+     * it, which is the enforcement of the promise `check_features` makes
+     * when it allows the mount. (Reverse mapping and reflink were the two;
+     * both are kept now.) */
     bool write_refused;
     /* The inode's extent counts are 64-bit and live at different offsets
      * (`XFS_DI_BIG_NEXTENTS`). From the superblock, because it is a property
@@ -440,6 +471,10 @@ struct xfs {
 #define XFS_DIR3_FT_UNKNOWN 0u
 #define XFS_DIR3_FT_REG     1u
 #define XFS_DIR3_FT_DIR     2u
+#define XFS_DIR3_FT_CHRDEV  3u
+#define XFS_DIR3_FT_BLKDEV  4u
+#define XFS_DIR3_FT_FIFO    5u
+#define XFS_DIR3_FT_SOCK    6u
 #define XFS_DIR3_FT_SYMLINK 7u
 
 /* One directory entry, as a listing sees it. name points into a cached
@@ -464,6 +499,12 @@ typedef int (*xfs_dirent_fn)(void *self, const struct xfs_dirent *entry);
  * structure that failed its checksum, KERR_BUSY-shaped KERR_NOTSUP for a
  * dirty log. The filesystem is left unmounted on any failure. */
 int xfs_mount(struct xfs *fs, struct bcache *cache);
+
+/* The label of the XFS whose superblock is in `sb` (`len` bytes of block 0),
+ * without mounting it: true and the label in `out` when the magic says XFS,
+ * false and an empty `out` otherwise. Enough to choose a root by label
+ * before anything is mounted. */
+bool xfs_superblock_label(const uint8_t *sb, uint32_t len, char out[XFS_LABEL_BYTES]);
 
 /* Installs the wall clock. Called from the composition root before anything
  * can charge a quota — a port installed late is a port that was not

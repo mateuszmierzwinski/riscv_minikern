@@ -43,6 +43,19 @@ static int fake_write(void *self, uint64_t lba, uint32_t count, const void *buf)
 
 static struct blockdev dev;
 
+/* The next `failing_reads` reads of LBA `failing_lba` fail, as the board's SD
+ * controller's first reads sometimes do. */
+static uint64_t failing_lba;
+static uint32_t failing_reads;
+
+static int flaky_read(void *self, uint64_t lba, uint32_t count, void *buf) {
+    if (lba == failing_lba && failing_reads > 0) {
+        failing_reads--;
+        return KERR_IO;
+    }
+    return fake_read(self, lba, count, buf);
+}
+
 static void fresh(void) {
     for (uint32_t i = 0; i < sizeof disk; i++) {
         disk[i] = 0;
@@ -126,6 +139,31 @@ static void test_a_protective_mbr_alone_yields_nothing(void) {
     KTEST_CHECK(partition_scan(&dev, p, PARTITION_MAX) == 0);
 }
 
+/* **An unreadable table is not an absent one.** The GPT header's read fails
+ * and the protective MBR alone yields nothing — which `partition_scan` has
+ * to call "no table", and the checked scan must call an error. On the board
+ * the first answer made a GPT card look like one whole-disk volume, and the
+ * FAT boot partition was mounted as the root. */
+static void test_an_unreadable_table_is_an_error(void) {
+    struct partition p[PARTITION_MAX];
+    uint32_t found = 99;
+    fresh();
+    write_mbr_entry(0, 0xeeu, 1u, SECTORS - 1u);
+    write_gpt(2048u, 4095u);
+    dev.read = flaky_read;
+    failing_lba = 1u;
+    failing_reads = 1u;
+    KTEST_CHECK(partition_scan_checked(&dev, p, PARTITION_MAX, &found) == KERR_IO);
+    KTEST_CHECK(found == 0);
+    /* Read again, it is found: the error was the read's, not the disk's. */
+    KTEST_CHECK(partition_scan_checked(&dev, p, PARTITION_MAX, &found) == KERR_OK);
+    KTEST_CHECK(found == 1 && p[0].first == 2048u);
+    /* And a disk that genuinely has no table is still not an error. */
+    fresh();
+    KTEST_CHECK(partition_scan_checked(&dev, p, PARTITION_MAX, &found) == KERR_OK);
+    KTEST_CHECK(found == 0);
+}
+
 static void test_wrapping_shifts_every_access(void) {
     struct partition p = {.first = 4u, .sectors = 8u, .present = true};
     struct partdev state;
@@ -175,6 +213,7 @@ int main(void) {
     KTEST_RUN(test_mbr_entry_is_found);
     KTEST_RUN(test_gpt_is_preferred_over_its_protective_mbr);
     KTEST_RUN(test_a_protective_mbr_alone_yields_nothing);
+    KTEST_RUN(test_an_unreadable_table_is_an_error);
     KTEST_RUN(test_wrapping_shifts_every_access);
     KTEST_RUN(test_reading_past_the_end_is_refused);
     KTEST_RUN(test_a_partition_outside_the_disk_is_refused);

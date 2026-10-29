@@ -1,4 +1,4 @@
-load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
 load("//:version.bzl", "MINIKERN_VERSION")
 load(":riscv_minikern.bzl", "kernel_binary", "kernel_image", "user_binary", "user_image")
@@ -276,6 +276,53 @@ cc_test(
         ":ktest",
         ":xfs",
     ],
+)
+
+# FAT12/16/32 with long names: the boot partition U-Boot reads, mounted at
+# /boot. Pure over the buffer cache, like XFS.
+cc_library(
+    name = "fat",
+    srcs = glob(["src/core/fat/*.c"]),
+    hdrs = glob(["src/core/fat/*.h"]),
+    strip_include_prefix = "src",
+    deps = [
+        ":console",
+        ":core_boot",
+        ":storage",
+    ],
+)
+
+# The FAT driver judged by `fsck.fat -n` and read back with mtools, on
+# images `mkfs.vfat` made. Needs dosfstools and mtools on the host.
+cc_binary(
+    name = "fat_writecheck",
+    srcs = ["test/fat_writecheck.c"],
+    deps = [":fat"],
+)
+
+sh_test(
+    name = "fat_write_test",
+    size = "medium",
+    srcs = ["test/fat_write_test.sh"],
+    args = ["$(rootpath :fat_writecheck)"],
+    data = [":fat_writecheck"],
+)
+
+# The writer judged by `xfs_repair` on filesystems `mkfs.xfs` made, with its
+# default features and without. Needs both tools on the host, as the
+# clang-tidy test needs clang-tidy.
+cc_binary(
+    name = "xfs_writecheck",
+    srcs = ["test/xfs_writecheck.c"],
+    deps = [":xfs"],
+)
+
+sh_test(
+    name = "xfs_write_test",
+    size = "large",
+    srcs = ["test/xfs_write_test.sh"],
+    args = ["$(rootpath :xfs_writecheck)"],
+    data = [":xfs_writecheck"],
 )
 
 cc_test(
@@ -1052,6 +1099,7 @@ cc_library(
         ":kernel_mem",
         ":partition",
         ":storage",
+        ":xfs",
     ],
 )
 
@@ -1090,7 +1138,8 @@ cc_library(
 )
 
 # The mount table: which filesystem is mounted where, and automount by the
-# filesystem's label. ROOT becomes /, anything else a volume under /volumes.
+# filesystem's label. ROOT becomes /, the FAT boot partition /boot, anything
+# else a volume under /volumes.
 cc_library(
     name = "kernel_volumes",
     srcs = ["src/kernel/volumes.c"],
@@ -1099,6 +1148,7 @@ cc_library(
     target_compatible_with = ["//platforms:riscv64"],
     deps = [
         ":console",
+        ":fat",
         ":kernel_disk",
         ":kernel_mem",
         ":xfs",
@@ -1108,8 +1158,14 @@ cc_library(
 # The filesystem on the disk: the carried-over XFS over the live cache.
 cc_library(
     name = "kernel_xfs",
-    srcs = ["src/kernel/xfsmount.c"],
-    hdrs = ["src/kernel/xfsmount.h"],
+    srcs = [
+        "src/kernel/fatmount.c",
+        "src/kernel/xfsmount.c",
+    ],
+    hdrs = [
+        "src/kernel/fatmount.h",
+        "src/kernel/xfsmount.h",
+    ],
     strip_include_prefix = "src",
     target_compatible_with = ["//platforms:riscv64"],
     deps = [
@@ -1119,6 +1175,7 @@ cc_library(
         ":kernel_mem",
         ":kernel_wallclock",
         ":kernel_volumes",
+        ":fat",
         ":xfs",
     ],
 )

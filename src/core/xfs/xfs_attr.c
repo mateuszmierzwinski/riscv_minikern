@@ -126,6 +126,9 @@ static int load_afork(struct xfs *fs, const struct xfs_inode *ip, uint8_t *fork,
     if (*len > XFS_AFORK_MAX) {
         return KERR_IO;
     }
+    if (ip->aformat == XFS_DINODE_FMT_EXTENTS && ip->naextents * XFS_EXTENT_BYTES < *len) {
+        *len = ip->naextents * XFS_EXTENT_BYTES; /* the records past the count are not records */
+    }
     xfs_inode_place(fs, ip->ino, &block, &boffset);
     rc = bcache_get(fs->cache, block, &b);
     if (rc != KERR_OK) {
@@ -234,7 +237,6 @@ static int rmt_read(struct xfs *fs, const struct xfs_inode *ip, uint32_t valuebl
                     uint32_t valuelen, uint8_t *out, uint32_t room);
 static bool leaf_take_out(struct xfs *fs, const char *name, uint32_t namelen,
                           uint8_t flags);
-static int xfs_attr_leaf_store(struct xfs *fs, uint64_t fsb);
 static int xfs_attr_to_leaf(struct xfs *fs, const struct xfs_inode *ip, const char *name,
                             uint32_t namelen, const uint8_t *value, uint32_t valuelen,
                             uint8_t flags, uint64_t now_s);
@@ -336,6 +338,24 @@ static int store_fork(struct xfs *fs, const struct xfs_inode *ip, const uint8_t 
     bcache_dirty(b);
     bcache_put(fs->cache, b);
     return KERR_OK;
+}
+
+/* Gives an inode with no attributes an empty shortform fork, placed as a
+ * shortform set would place it.
+ *
+ * What a remote value needs first: it is converted to a leaf, and the
+ * conversion turns a shortform fork into one — on an inode that had no fork
+ * at all there was nothing to convert, and the first large attribute a file
+ * was ever given came back `KERR_NOENT`. */
+static int empty_fork(struct xfs *fs, const struct xfs_inode *ip, uint64_t now_s) {
+    uint8_t fork[SF_HDR] = {0};
+    uint32_t forkoff = 0, room = 0;
+    int rc = choose_forkoff(fs, ip, &forkoff, &room);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    xfs_put_be16(fork + SF_TOTSIZE, SF_HDR);
+    return store_fork(fs, ip, fork, SF_HDR, forkoff, now_s);
 }
 
 int xfs_attr_set(struct xfs *fs, const struct xfs_inode *ip, const char *name,
@@ -494,7 +514,7 @@ int xfs_attr_remove(struct xfs *fs, const struct xfs_inode *ip, const char *name
             return KERR_NOENT;
         }
         xfs_reseal(fs, fs->dirblock, fs->blocksize, XFS_DA3_CRC_OFF);
-        return xfs_attr_leaf_store(fs, fsb);
+        return xfs_dir_raw_store(fs, fsb);
     }
     if (ip->aformat != XFS_DINODE_FMT_LOCAL) {
         return KERR_NOTSUP;
@@ -530,6 +550,24 @@ int xfs_attr_remove(struct xfs *fs, const struct xfs_inode *ip, const char *name
  * answer for it, and reading an attribute block through `xfs_bmap` would
  * return a block of the file's own contents. Extents only: a b-tree
  * attribute fork is refused. */
+int xfs_attr_free_blocks(struct xfs *fs, const struct xfs_inode *ip) {
+    static uint8_t fork[XFS_AFORK_MAX]; /* static: CLAUDE.md §10, as above */
+    uint32_t len = 0;
+    int rc;
+    if (ip->forkoff == 0 || ip->aformat != XFS_DINODE_FMT_EXTENTS) {
+        return KERR_OK;
+    }
+    rc = load_afork(fs, ip, fork, &len);
+    for (uint32_t i = 0; rc == KERR_OK && i < len / XFS_EXTENT_BYTES; i++) {
+        struct xfs_extent e;
+        xfs_extent_unpack(fork + i * XFS_EXTENT_BYTES, &e);
+        rc = e.blockcount == 0 ? KERR_OK
+                               : xfs_free_owned(fs, e.startblock, e.blockcount, ip->ino,
+                                                e.startoff | XFS_RMAP_OFF_ATTR);
+    }
+    return rc;
+}
+
 int xfs_attr_bmap(struct xfs *fs, const struct xfs_inode *ip, uint64_t logical,
                   struct xfs_extent *out) {
     /* Static for the reason every outsized buffer here is (`CLAUDE.md`
@@ -723,19 +761,6 @@ int xfs_attr_leaf_list(struct xfs *fs, const struct xfs_inode *ip, xfs_attr_fn f
 
 /* ── the leaf format, written ─────────────────────────────────────────── */
 
-/* Writes the buffer back to the attribute fork's block. */
-static int xfs_attr_leaf_store(struct xfs *fs, uint64_t fsb) {
-    struct bbuf *b;
-    int rc = bcache_get(fs->cache, xfs_fsb_to_block(fs, fsb), &b);
-    if (rc != KERR_OK) {
-        return rc;
-    }
-    xfs_copy_bytes(b->data, fs->dirblock, fs->blocksize);
-    bcache_dirty(b);
-    bcache_put(fs->cache, b);
-    return KERR_OK;
-}
-
 /* Takes one entry out of the leaf in the buffer, leaving its name and value
  * where they are.
  *
@@ -795,6 +820,11 @@ static int store_attr_extent(struct xfs *fs, const struct xfs_inode *ip, uint64_
     if (rc != KERR_OK) {
         return rc;
     }
+    rc = xfs_rmap_map(fs, fsb, 1u, ip->ino, XFS_RMAP_OFF_ATTR);
+    if (rc != KERR_OK) {
+        bcache_put(fs->cache, b);
+        return rc;
+    }
     di = b->data + boffset;
     /* **The whole fork is cleared, not just the record being written.**
      * Its format is changing from shortform to extents, so every byte that
@@ -814,6 +844,7 @@ static int store_attr_extent(struct xfs *fs, const struct xfs_inode *ip, uint64_
         xfs_extent_pack(di + at, &e);
     }
     di[XFS_DI_AFORMAT] = XFS_DINODE_FMT_EXTENTS;
+    xfs_dinode_set_attr_extents(fs, di, 1u);
     xfs_put_be64(di + XFS_DI_NBLOCKS, ip->nblocks + 1u);
     xfs_put_be32(di + XFS_DI_MTIME, (uint32_t)now_s);
     xfs_put_be32(di + XFS_DI_CTIME, (uint32_t)now_s);
@@ -830,13 +861,12 @@ static int store_attr_extent(struct xfs *fs, const struct xfs_inode *ip, uint64_
  * the same arrangement a directory's leaf uses, and the free map records
  * the gap between them. A free map left wrong is the structure `xfs_repair`
  * reads to decide whether a block has room. */
-static void empty_attr_leaf(struct xfs *fs, uint64_t ino, uint64_t blkno) {
+static void empty_attr_leaf(struct xfs *fs, uint64_t ino) {
     for (uint32_t i = 0; i < fs->blocksize; i++) {
         fs->dirblock[i] = 0;
     }
     xfs_put_be16(fs->dirblock + XFS_DA3_MAGIC_OFF, xfs_magic_for(fs, XFS_BLK_ATTR_LEAF));
-    xfs_stamp_owner(fs, fs->dirblock, XFS_DA3_BLKNO_OFF, XFS_DA3_UUID_OFF, XFS_DA3_OWNER_OFF,
-                    blkno, ino);
+    xfs_stamp_owner(fs, fs->dirblock, 0, XFS_DA3_UUID_OFF, XFS_DA3_OWNER_OFF, 0, ino);
     xfs_put_be16(fs->dirblock + (fs->attr_base + 4u), (uint16_t)fs->blocksize);
     xfs_put_be16(fs->dirblock + (fs->attr_base + 8u), fs->attr_hdr);
     xfs_put_be16(fs->dirblock + (fs->attr_base + 8u) + 2u,
@@ -921,7 +951,7 @@ int xfs_attr_to_leaf(struct xfs *fs, const struct xfs_inode *ip, const char *nam
         return rc;
     }
     fsb = ((uint64_t)agno << fs->agblklog) | agbno;
-    empty_attr_leaf(fs, ip->ino, 0);
+    empty_attr_leaf(fs, ip->ino);
     /* Every attribute that was in the inode, then the one that would not
      * fit. **The new one last**, so that a failure to place it leaves the
      * block holding exactly what the inode already held — and the inode
@@ -946,7 +976,7 @@ int xfs_attr_to_leaf(struct xfs *fs, const struct xfs_inode *ip, const char *nam
         return rc;
     }
     xfs_reseal(fs, fs->dirblock, fs->blocksize, XFS_DA3_CRC_OFF);
-    rc = xfs_attr_leaf_store(fs, fsb);
+    rc = xfs_dir_raw_store(fs, fsb);
     return rc != KERR_OK ? rc : store_attr_extent(fs, ip, fsb, now_s);
 }
 
@@ -970,7 +1000,7 @@ int xfs_attr_leaf_set(struct xfs *fs, const struct xfs_inode *ip, const char *na
         return rc; /* the block is unchanged on disk: nothing was stored */
     }
     xfs_reseal(fs, fs->dirblock, fs->blocksize, XFS_DA3_CRC_OFF);
-    rc = xfs_attr_leaf_store(fs, fsb);
+    rc = xfs_dir_raw_store(fs, fsb);
     (void)now_s;
     return rc;
 }
@@ -1017,7 +1047,7 @@ static int attr_fork_append(struct xfs *fs, const struct xfs_inode *ip, uint32_t
                             uint64_t fsb, uint32_t blocks, uint64_t now_s) {
     struct xfs_extent e = {.startoff = logical, .startblock = fsb, .blockcount = blocks};
     uint64_t block;
-    uint32_t boffset, at = 0, room;
+    uint32_t boffset, at, room, n;
     struct bbuf *b;
     uint8_t *di, *fork;
     int rc;
@@ -1029,19 +1059,19 @@ static int attr_fork_append(struct xfs *fs, const struct xfs_inode *ip, uint32_t
     di = b->data + boffset;
     room = fs->inodesize - fs->dinode_size - (uint32_t)di[XFS_DI_FORKOFF] * 8u;
     fork = di + fs->dinode_size + (uint32_t)di[XFS_DI_FORKOFF] * 8u;
-    while (at + XFS_EXTENT_BYTES <= room) {
-        struct xfs_extent have;
-        xfs_extent_unpack(fork + at, &have);
-        if (have.blockcount == 0) {
-            break;
-        }
-        at += XFS_EXTENT_BYTES;
-    }
+    n = xfs_dinode_attr_extents(fs, di);
+    at = n * XFS_EXTENT_BYTES;
     if (at + XFS_EXTENT_BYTES > room) {
         bcache_put(fs->cache, b);
         return KERR_NOSPC; /* a b-tree attribute fork: not written */
     }
+    rc = xfs_rmap_map(fs, fsb, blocks, ip->ino, logical | XFS_RMAP_OFF_ATTR);
+    if (rc != KERR_OK) {
+        bcache_put(fs->cache, b);
+        return rc;
+    }
     xfs_extent_pack(fork + at, &e);
+    xfs_dinode_set_attr_extents(fs, di, n + 1u);
     xfs_put_be64(di + XFS_DI_NBLOCKS, xfs_be64(di + XFS_DI_NBLOCKS) + blocks);
     xfs_put_be32(di + XFS_DI_MTIME, (uint32_t)now_s);
     xfs_put_be32(di + XFS_DI_CTIME, (uint32_t)now_s);
@@ -1127,7 +1157,7 @@ static int rmt_read(struct xfs *fs, const struct xfs_inode *ip, uint32_t valuebl
  * reader meeting one of them can always say whether it is the block it
  * wanted. */
 static int rmt_write(struct xfs *fs, const struct xfs_inode *ip, const uint8_t *value,
-                     uint32_t valuelen, uint32_t at_block, uint64_t *fsb) {
+                     uint32_t valuelen, uint64_t *fsb) {
     uint32_t per = rmt_payload(fs);
     uint32_t blocks = (valuelen + per - 1u) / per;
     uint32_t agno = xfs_fsb_ag(fs, ip->ino >> fs->inopblog);
@@ -1154,7 +1184,7 @@ static int rmt_write(struct xfs *fs, const struct xfs_inode *ip, const uint8_t *
                 b->data[ATTR_RMT_UUID + k] = fs->uuid[k];
             }
             xfs_put_be64(b->data + ATTR_RMT_OWNER, ip->ino);
-            xfs_put_be64(b->data + ATTR_RMT_BLKNO, (uint64_t)at_block + i);
+            xfs_put_be64(b->data + ATTR_RMT_BLKNO, xfs_fsb_to_daddr(fs, *fsb + i));
             xfs_put_be32(b->data + ATTR_RMT_OFFSET, done);
             xfs_put_be32(b->data + ATTR_RMT_BYTES, want);
         }
@@ -1224,9 +1254,28 @@ static int leaf_put_remote(struct xfs *fs, const char *name, uint32_t namelen,
  * met three times in the directory code before it was given a name, and the
  * shape here is identical.
  *
- * Runs to 29 lines: it is one sequence in which every step depends on the
- * inode the one before it rewrote, and splitting it would hand half a
- * sequence a name it cannot honestly have (Rule 11, Naming). */
+ * The first step — giving the inode a leaf to hold the entry — is its own
+ * function, because it has two shapes to start from and rereads the inode
+ * after each. */
+/* Makes the inode's attribute fork a leaf, from no fork or a shortform
+ * one, and leaves `here` as the inode now is. */
+static int fork_as_leaf(struct xfs *fs, struct xfs_inode *here, uint64_t now_s) {
+    int rc = KERR_OK;
+    if (here->forkoff != 0 && here->aformat != XFS_DINODE_FMT_LOCAL &&
+        here->aformat != XFS_DINODE_FMT_EXTENTS) {
+        return KERR_NOTSUP; /* a b-tree attribute fork */
+    }
+    if (here->forkoff == 0) {
+        rc = empty_fork(fs, here, now_s);
+        rc = rc != KERR_OK ? rc : xfs_inode_read(fs, here->ino, here);
+    }
+    if (rc == KERR_OK && here->aformat == XFS_DINODE_FMT_LOCAL) {
+        rc = xfs_attr_to_leaf(fs, here, NULL, 0, NULL, 0, 0, now_s);
+        rc = rc != KERR_OK ? rc : xfs_inode_read(fs, here->ino, here);
+    }
+    return rc;
+}
+
 static int attr_set_remote(struct xfs *fs, const struct xfs_inode *ip, const char *name,
                            uint32_t namelen, const uint8_t *value, uint32_t valuelen,
                            uint8_t flags, uint64_t now_s) {
@@ -1234,20 +1283,9 @@ static int attr_set_remote(struct xfs *fs, const struct xfs_inode *ip, const cha
     uint32_t at_block = 0, blocks;
     uint64_t fsb = 0, leaf_fsb = 0;
     uint8_t *leaf = NULL;
-    int rc = KERR_OK;
-    if (here.forkoff != 0 && here.aformat != XFS_DINODE_FMT_LOCAL &&
-        here.aformat != XFS_DINODE_FMT_EXTENTS) {
-        return KERR_NOTSUP; /* a b-tree attribute fork */
-    }
-    if (here.forkoff == 0 || here.aformat == XFS_DINODE_FMT_LOCAL) {
-        rc = xfs_attr_to_leaf(fs, &here, NULL, 0, NULL, 0, 0, now_s);
-        rc = rc != KERR_OK ? rc : xfs_inode_read(fs, here.ino, &here);
-        if (rc != KERR_OK) {
-            return rc;
-        }
-    }
-    rc = attr_fork_end(fs, &here, &at_block);
-    rc = rc != KERR_OK ? rc : rmt_write(fs, &here, value, valuelen, at_block, &fsb);
+    int rc = fork_as_leaf(fs, &here, now_s);
+    rc = rc != KERR_OK ? rc : attr_fork_end(fs, &here, &at_block);
+    rc = rc != KERR_OK ? rc : rmt_write(fs, &here, value, valuelen, &fsb);
     if (rc != KERR_OK) {
         kprintf("xfs: attr remote: writing the blocks: rc %d\n", rc);
         return rc;
@@ -1270,5 +1308,5 @@ static int attr_set_remote(struct xfs *fs, const struct xfs_inode *ip, const cha
         return rc; /* the leaf is unchanged on disk */
     }
     xfs_reseal(fs, fs->dirblock, fs->blocksize, XFS_DA3_CRC_OFF);
-    return xfs_attr_leaf_store(fs, leaf_fsb);
+    return xfs_dir_raw_store(fs, leaf_fsb);
 }

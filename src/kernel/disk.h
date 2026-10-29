@@ -42,6 +42,11 @@ int disk_attach(const struct fdt *fdt);
  * Separate from `disk_cache`, which is the one the kernel boots from.
  * Automount walks these to find out what is actually on the machine. */
 uint32_t disk_volume_count(void);
+
+/* Which of the volumes above is the root filesystem: the XFS labelled
+ * `ROOT`, or volume 0 when nothing is. `xfsmount` mounts it; automount
+ * mounts the others. */
+uint32_t disk_root_volume(void);
 const struct blockdev *disk_volume(uint32_t i);
 
 struct bcache *disk_cache(void);

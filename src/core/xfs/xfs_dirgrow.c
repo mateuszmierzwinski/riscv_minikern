@@ -95,8 +95,6 @@ static void seal_block(struct xfs *fs, uint8_t *block, uint64_t ino, uint32_t us
                        count * XFS_DIR2_LEAF_ENTRY_SIZE;
     if (leaf_at > used) {
         xfs_dir_put_free(block, used, leaf_at - used);
-        xfs_put_be16(block + 48u, (uint16_t)used);            /* best free: offset */
-        xfs_put_be16(block + 50u, (uint16_t)(leaf_at - used)); /* and its length */
     }
     for (uint32_t i = 0; i < count; i++) {
         uint8_t *e = block + leaf_at + i * XFS_DIR2_LEAF_ENTRY_SIZE;
@@ -191,28 +189,18 @@ static int repoint_inode(struct xfs *fs, const struct xfs_inode *dir, uint64_t f
     if (rc != KERR_OK) {
         return rc;
     }
+    if ((rc = xfs_dir_map_block(fs, b, fsb, dir->ino, 0)) != KERR_OK) {
+        return rc;
+    }
     di = b->data + boffset;
     di[XFS_DI_FORMAT] = XFS_DINODE_FMT_EXTENTS;
     xfs_extent_pack(di + fs->dinode_size, &e);
-    xfs_put_be32(di + XFS_DI_NEXTENTS, 1u);
+    xfs_dinode_set_data_extents(fs, di, 1u);
     xfs_put_be64(di + XFS_DI_NBLOCKS, 1u);
     xfs_put_be64(di + XFS_DI_SIZE, fs->dirblocksize);
     xfs_put_be32(di + XFS_DI_MTIME, (uint32_t)now_s);
     xfs_put_be32(di + XFS_DI_CTIME, (uint32_t)now_s);
     xfs_reseal(fs, di, fs->inodesize, XFS_DI_CRC);
-    bcache_dirty(b);
-    bcache_put(fs->cache, b);
-    return KERR_OK;
-}
-
-/* Writes the built block out to the device. */
-static int store_block(struct xfs *fs, uint64_t fsb) {
-    struct bbuf *b;
-    int rc = bcache_get(fs->cache, xfs_fsb_to_block(fs, fsb), &b);
-    if (rc != KERR_OK) {
-        return rc;
-    }
-    xfs_copy_bytes(b->data, fs->dirblock, fs->blocksize);
     bcache_dirty(b);
     bcache_put(fs->cache, b);
     return KERR_OK;
@@ -262,7 +250,7 @@ int xfs_dir_to_block(struct xfs *fs, const struct xfs_inode *dir, const char *na
         return rc;
     }
     seal_block(fs, fs->dirblock, dir->ino, at, ents, nents);
-    rc = store_block(fs, fsb);
+    rc = xfs_dir_raw_store(fs, fsb);
     return rc != KERR_OK ? rc : repoint_inode(fs, dir, fsb, now_s);
 }
 
@@ -398,18 +386,10 @@ static void index_remove(struct xfs *fs, uint32_t address) {
 
 /* Writes the buffer back and reseals it. */
 static int flush_block(struct xfs *fs, const struct xfs_inode *dir, uint64_t fsb, uint64_t now_s) {
-    struct bbuf *b;
     int rc;
     xfs_stamp_owner(fs, fs->dirblock, 0, 0, XFS_DIR3_HDR_OWNER, 0, dir->ino);
-    xfs_reseal(fs, fs->dirblock, fs->dirblocksize, XFS_DIR3_HDR_CRC);
-    rc = bcache_get(fs->cache, xfs_fsb_to_block(fs, fsb), &b);
-    if (rc != KERR_OK) {
-        return rc;
-    }
-    xfs_copy_bytes(b->data, fs->dirblock, fs->blocksize);
-    bcache_dirty(b);
-    bcache_put(fs->cache, b);
-    return xfs_dir_touch(fs, dir, now_s);
+    rc = xfs_dir_raw_store(fs, fsb);
+    return rc != KERR_OK ? rc : xfs_dir_touch(fs, dir, now_s);
 }
 
 int xfs_dir_block_add(struct xfs *fs, const struct xfs_inode *dir, const char *name,
@@ -477,6 +457,11 @@ int xfs_dir_block_remove(struct xfs *fs, const struct xfs_inode *dir, const char
             *ino = xfs_be64(fs->dirblock + at);
             index_remove(fs, at / XFS_DIR2_DATA_ALIGN);
             xfs_dir_put_free(fs->dirblock, at, size);
+            /* The pair the array gave up is free space now as well: left
+             * as it was, its stale bytes sat between the entries and the
+             * array where a walker expects an entry or a span. */
+            xfs_dir_put_free(fs->dirblock, end, XFS_DIR2_LEAF_ENTRY_SIZE);
+            xfs_dir_seal_free(fs, fs->dirblock);
             return flush_block(fs, dir, fsb, now_s);
         }
         at += size;

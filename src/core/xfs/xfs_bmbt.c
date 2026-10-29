@@ -129,7 +129,7 @@ static int step_down(const struct xfs *fs, uint64_t fsb, uint32_t below, uint64_
                      struct xfs_extent *out, uint64_t *next) {
     struct bbuf *b;
     uint32_t level = 0, nrecs = 0;
-    uint32_t max = (fs->blocksize - XFS_BMBT_BLOCK_BYTES) / XFS_EXTENT_BYTES;
+    uint32_t max = (fs->blocksize - xfs_bmbt_hdr(fs)) / XFS_EXTENT_BYTES;
     int rc;
     *next = 0;
     if (!xfs_fsb_valid(fs, fsb, 1)) {
@@ -141,9 +141,9 @@ static int step_down(const struct xfs *fs, uint64_t fsb, uint32_t below, uint64_
     }
     rc = check_node(fs, b, below, max, &level, &nrecs);
     if (rc == KERR_OK && level == 0) {
-        rc = scan_leaf(fs, b->data + XFS_BMBT_BLOCK_BYTES, nrecs, off, out);
+        rc = scan_leaf(fs, b->data + xfs_bmbt_hdr(fs), nrecs, off, out);
     } else if (rc == KERR_OK) {
-        *next = child_pointer(b->data + XFS_BMBT_BLOCK_BYTES, max, nrecs, off);
+        *next = child_pointer(b->data + xfs_bmbt_hdr(fs), max, nrecs, off);
     }
     bcache_put(fs->cache, b);
     return rc;

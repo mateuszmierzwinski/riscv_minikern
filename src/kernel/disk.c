@@ -4,6 +4,7 @@
 
 #include "core/blockscale.h"
 #include "core/partition.h"
+#include "core/xfs/xfs.h"
 #include "core/console.h"
 #include "core/errno.h"
 #include "drivers/nvme.h"
@@ -29,7 +30,7 @@
 
 static struct blockdev raw;
 static struct partition parts[PARTITION_MAX];
-static struct partdev part;
+static uint32_t parts_found;
 static struct blockdev whole;
 static struct blockscale scale;
 static struct blockdev device;
@@ -37,9 +38,8 @@ static struct bcache cache;
 static bool present;
 
 /* **Every candidate the disk offers**, not just the one the kernel boots
- * from. `adopt_partition_or_whole` picks the first partition because that
- * is where an operator puts the root filesystem; automount has to try them
- * all, because a second partition with a label is a volume the machine
+ * from. `adopt_the_root` picks the one labelled `ROOT`; automount has to try
+ * the rest, because another partition with a label is a volume the machine
  * should mount somewhere.
  *
  * The wrapping structures live here rather than in the caller because each
@@ -60,10 +60,6 @@ const char *disk_kind(void) {
     return attached_kind;
 }
 
-/* Tries the devices in the order a user would want them: **NVMe first**,
- * because on a board with an M.2 drive that is the storage worth having, and
- * virtio second, which is the emulator's. A board with neither is the
- * ordinary case for a kernel that netboots. */
 /* The kind the operator asked for, empty for "whatever is there". */
 static char wanted[8];
 
@@ -99,39 +95,67 @@ void disk_use_ram(phys_t at, uint64_t bytes) {
     ram_bytes = bytes;
 }
 
-static int attach_any(const struct fdt *fdt) {
-    bool pci;
-    /* **Memory first**, because asking for it is unambiguous. A filesystem
-     * image in DRAM is there because a test put it there, and a test that
-     * silently read the card instead would be worse than one that failed:
-     * it would pass against the wrong filesystem. */
-    if (allowed("ram") && ram_bytes != 0 && ramdisk_init(ram_at, ram_bytes, &raw) == KERR_OK) {
-        attached_kind = "ram";
-        return KERR_OK;
+/* One kind of device the kernel can attach, wrapped so every kind has the
+ * same shape. The order of `ways` is the order they are tried: memory, then
+ * **NVMe**, because on a board with an M.2 drive that is the storage worth
+ * having, then SD, then virtio, which is the emulator's. */
+struct attach_way {
+    const char *kind;
+    int (*init)(const struct fdt *fdt, struct blockdev *out);
+};
+
+/* **Memory first**, because asking for it is unambiguous: a filesystem image
+ * in DRAM is there because a test put it there. */
+static int attach_ram(const struct fdt *fdt, struct blockdev *out) {
+    (void)fdt;
+    return ram_bytes != 0 ? ramdisk_init(ram_at, ram_bytes, out) : KERR_NOENT;
+}
+
+/* NVMe sits behind PCIe, so the bus comes up first. */
+static int attach_nvme(const struct fdt *fdt, struct blockdev *out) {
+    return pci_init(fdt) == KERR_OK ? nvme_init(out) : KERR_NOENT;
+}
+
+/* SDHCI, which is what an emulator models; on the board it finds nothing. */
+static int attach_sdhci(const struct fdt *fdt, struct blockdev *out) {
+    return sdhci_init(fdt, out);
+}
+
+/* The **DesignWare** controller, which is what a real VisionFive 2 has
+ * where the documentation promised a Cadence SDHCI. */
+static int attach_dwmmc(const struct fdt *fdt, struct blockdev *out) {
+    return dwmmc_init(fdt, out);
+}
+
+static int attach_virtio(const struct fdt *fdt, struct blockdev *out) {
+    return virtio_blk_init(fdt, out);
+}
+
+static const struct attach_way ways[] = {
+    {"ram", attach_ram},     {"nvme", attach_nvme},     {"sd", attach_sdhci},
+    {"sd (designware)", attach_dwmmc}, {"virtio", attach_virtio},
+};
+#define WAYS (sizeof ways / sizeof ways[0])
+
+/* The devices that attached, in the order they did, and what each is. */
+static struct blockdev candidates[WAYS];
+static const char *candidate_kind[WAYS];
+static uint32_t candidate_count;
+
+/* Attaches the next device `ways` can offer after position `*from`, into
+ * the next candidate slot. False when none is left. */
+static bool attach_next(const struct fdt *fdt, uint32_t *from) {
+    for (; *from < WAYS; (*from)++) {
+        const struct attach_way *w = &ways[*from];
+        if (!allowed(w->kind) || w->init(fdt, &candidates[candidate_count]) != KERR_OK) {
+            continue;
+        }
+        candidate_kind[candidate_count] = w->init == attach_sdhci ? sdhci_kind() : w->kind;
+        candidate_count++;
+        (*from)++;
+        return true;
     }
-    pci = allowed("nvme") && pci_init(fdt) == KERR_OK;
-    if (pci && nvme_init(&raw) == KERR_OK) {
-        attached_kind = "nvme";
-        return KERR_OK;
-    }
-    if (allowed("sd") && sdhci_init(fdt, &raw) == KERR_OK) {
-        attached_kind = sdhci_kind();
-        return KERR_OK;
-    }
-    /* The **DesignWare** mobile-storage controller, which is what a real
-     * VisionFive 2 has where the documentation promised a Cadence SDHCI.
-     * After SDHCI rather than before it only because an emulator models the
-     * other one; on the board the SDHCI probe finds nothing and falls
-     * through to here. */
-    if (allowed("sd") && dwmmc_init(fdt, &raw) == KERR_OK) {
-        attached_kind = "sd (designware)";
-        return KERR_OK;
-    }
-    if (allowed("virtio") && virtio_blk_init(fdt, &raw) == KERR_OK) {
-        attached_kind = "virtio";
-        return KERR_OK;
-    }
-    return KERR_NOENT;
+    return false;
 }
 
 /* Presents each partition (or the whole disk) as a block device of
@@ -168,33 +192,133 @@ const struct blockdev *disk_volume(uint32_t i) {
     return i < vol_count ? &vol_dev[i] : NULL;
 }
 
-/* Picks what the filesystem is read from: the first partition if the disk has
- * a table, the whole disk if it does not.
- *
- * The first partition rather than a search for a filesystem, because
- * choosing by content would mean mounting each candidate to find out — and
- * the operator who partitioned the disk put the filesystem in partition 1.
- * A disk whose table is corrupt reports no partitions and is used whole,
- * which fails at the superblock rather than at a plausible offset. */
-static int adopt_partition_or_whole(void) {
-    uint32_t found = partition_scan(&raw, parts, PARTITION_MAX);
-    present_volumes(found);
-    if (found == 0) {
+/* Which presented volume is the root filesystem. */
+static uint32_t root_volume;
+
+uint32_t disk_root_volume(void) {
+    return root_volume;
+}
+
+/* Whether presented volume `i` is an XFS labelled `ROOT`. Only block 0 is
+ * read — into a page, because a controller's DMA rules apply to it — and
+ * nothing is mounted. */
+/* How often a read the root decision rests on is tried. The SD controller's
+ * first reads after bring-up fail now and then (ROADMAP §4); one failure
+ * must not decide which filesystem the machine runs on. */
+#define DECIDING_READS 3u
+
+static bool volume_is_root(uint32_t i, uint8_t *page) {
+    char label[XFS_LABEL_BYTES];
+    const struct blockdev *v = &vol_dev[i];
+    int rc = KERR_IO;
+    for (uint32_t a = 0; rc != KERR_OK && a < DECIDING_READS && v->block_size <= 4096u; a++) {
+        rc = v->read(v->self, 0, 1, page);
+    }
+    if (rc != KERR_OK) {
+        return false;
+    }
+    return xfs_superblock_label(page, v->block_size, label) &&
+           label[0] == 'R' && label[1] == 'O' && label[2] == 'O' && label[3] == 'T' &&
+           label[4] == '\0';
+}
+
+/* Makes candidate `c` the disk, presents its volumes, and says which of
+ * them is labelled `ROOT`, or `vol_count` for none. */
+/* Reads candidate `c`'s partition table into `parts`, again when a read
+ * failed: an unreadable table is not an absent one, and taking it for one
+ * presented a partitioned card as a single volume (its protective MBR). */
+static int scan_candidate(uint32_t c) {
+    int rc = KERR_IO;
+    raw = candidates[c];
+    for (uint32_t a = 0; rc == KERR_IO && a < DECIDING_READS; a++) {
+        rc = partition_scan_checked(&raw, parts, PARTITION_MAX, &parts_found);
+    }
+    if (rc != KERR_OK) {
+        kprintf("disk: %s's partition table could not be read\n", candidate_kind[c]);
+    }
+    return rc;
+}
+
+static uint32_t look_for_root(uint32_t c, uint8_t *page) {
+    uint32_t i = 0;
+    vol_count = 0;
+    if (scan_candidate(c) != KERR_OK) {
+        return 0; /* no volumes, so not a root either */
+    }
+    present_volumes(parts_found);
+    while (i < vol_count && !volume_is_root(i, page)) {
+        i++;
+    }
+    return i;
+}
+
+/* **The root is the XFS labelled `ROOT`, wherever it is.** Devices are
+ * attached in `ways` order and each one's volumes are looked at in turn, so
+ * the root can be partition 2 behind a FAT boot partition, or on the NVMe
+ * drive while the kernel came off the card. With no `ROOT` anywhere, the
+ * first device's first volume is used — the old rule, and what an unlabelled
+ * card or a test image still relies on. */
+static int choose_root(const struct fdt *fdt, uint8_t *page) {
+    uint32_t from = 0;
+    while (attach_next(fdt, &from)) {
+        uint32_t c = candidate_count - 1u;
+        root_volume = look_for_root(c, page);
+        if (root_volume < vol_count) {
+            attached_kind = candidate_kind[c];
+            kprintf("disk: the root is volume %u on %s, labelled ROOT\n", root_volume,
+                    attached_kind);
+            return KERR_OK;
+        }
+    }
+    if (candidate_count == 0) {
+        return KERR_NOENT;
+    }
+    /* **The second look decides too.** It used to be made only to present
+     * the first device's volumes again, and what it found was thrown away —
+     * so a first look spoiled by a failed read sent the machine to the FAT
+     * partition while this one was reading `ROOT` right beside it. */
+    root_volume = look_for_root(0, page);
+    attached_kind = candidate_kind[0];
+    if (vol_count == 0) {
+        return KERR_IO;
+    }
+    if (root_volume < vol_count) {
+        kprintf("disk: the root is volume %u on %s, labelled ROOT\n", root_volume, attached_kind);
+        return KERR_OK;
+    }
+    root_volume = 0;
+    kprintf("disk: no volume is labelled ROOT; using the first on %s\n", attached_kind);
+    return KERR_OK;
+}
+
+/* Attaches the disk the root lives on, and points `whole` at the root's
+ * partition — or at the whole device when it has no partition table. */
+static int adopt_the_root(const struct fdt *fdt) {
+    phys_t page = 0;
+    int rc;
+    if (mem_alloc_pages(1, 1, &page) != KERR_OK) {
+        return KERR_NOMEM;
+    }
+    rc = choose_root(fdt, (uint8_t *)(uintptr_t)page);
+    (void)mem_free_pages(page, 1);
+    if (dwmmc_read_retries() != 0) {
+        kprintf("disk: %llu SD read(s) needed a second attempt\n",
+                (unsigned long long)dwmmc_read_retries());
+    }
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    if (parts_found == 0) {
         whole = raw;
         return KERR_OK;
     }
-    kprintf("disk: %u partition%s; using the first, %llu sectors at %llu\n", found,
-            found == 1u ? "" : "s", (unsigned long long)parts[0].sectors,
-            (unsigned long long)parts[0].first);
-    return partition_wrap(&raw, &parts[0], &part, &whole);
+    whole = vol_over[root_volume];
+    return KERR_OK;
 }
 
 int disk_attach(const struct fdt *fdt) {
     void *mem;
-    int rc = attach_any(fdt);
-    if (rc != KERR_OK) {
-        return rc;
-    }
+    int rc;
     /* **The filesystem may not start at sector 0.** A card formatted whole
      * puts its superblock there and every disk this project had read was
      * made that way; a drive partitioned the ordinary way puts the first
@@ -204,7 +328,7 @@ int disk_attach(const struct fdt *fdt) {
      * No table is not an error — it is a whole-disk filesystem, which is
      * what the SD cards here are — so the raw device is used directly in
      * that case and the layers above never learn the difference. */
-    rc = adopt_partition_or_whole();
+    rc = adopt_the_root(fdt);
     if (rc != KERR_OK) {
         return rc;
     }

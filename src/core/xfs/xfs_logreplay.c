@@ -82,26 +82,35 @@ static uint64_t le64(const uint8_t *p) {
  * in `h_cycle_data`. Undoing that is not optional: without it, the first
  * operation header in the second sector has a length and a client id taken
  * from the middle of a cycle number. */
+static uint64_t log_blocks(const struct xfs *fs) {
+    return (uint64_t)fs->logblocks * (fs->blocksize / XLOG_SECTOR);
+}
+
+/* One basic block of the log into the record buffer at `at`, wherever the
+ * ring puts it: a record's data may continue at the log's start. */
+static int read_ring(struct xfs *fs, uint64_t bb, uint8_t *at) {
+    return bcache_pread(fs->log_cache, fs->log_base + (bb % log_blocks(fs)) * XLOG_SECTOR, at,
+                        XLOG_SECTOR);
+}
+
 static int read_record(struct xfs *fs, uint64_t bb, uint32_t *bytes, uint32_t *nops) {
     uint32_t len, sectors;
-    int rc = fs->log_cache == NULL
-                 ? KERR_NODEV
-                 : bcache_pread(fs->log_cache, fs->log_base + bb * XLOG_SECTOR, record,
-                                XLOG_SECTOR);
+    int rc = fs->log_cache == NULL ? KERR_NODEV : read_ring(fs, bb, record);
     if (rc != KERR_OK) {
         return rc;
     }
     if (xfs_be32(record + XLOG_REC_MAGIC) != XLOG_MAGIC) {
-        return KERR_NOENT; /* not a record: the walk has run off the end */
+        return KERR_NOENT; /* not a record where one has to be */
     }
     len = xfs_be32(record + XLOG_REC_LEN);
     sectors = (len + XLOG_SECTOR - 1u) / XLOG_SECTOR;
     if (len == 0 || sectors * XLOG_SECTOR > REPLAY_MAX_BYTES - XLOG_REC_HDR_SIZE ||
-        sectors > 64u) {
-        return KERR_NOTSUP; /* a record larger than this can hold */
+        sectors > XLOG_DATA_MAX_BB || xfs_log_record_blocks(record) != 1u + sectors) {
+        return KERR_NOTSUP; /* larger than this can hold, or more than one header block */
     }
-    rc = bcache_pread(fs->log_cache, fs->log_base + (bb + 1u) * XLOG_SECTOR,
-                      record + XLOG_REC_HDR_SIZE, sectors * XLOG_SECTOR);
+    for (uint32_t i = 0; rc == KERR_OK && i < sectors; i++) {
+        rc = read_ring(fs, bb + 1u + i, record + XLOG_REC_HDR_SIZE + i * XLOG_SECTOR);
+    }
     if (rc != KERR_OK) {
         return rc;
     }
@@ -289,33 +298,40 @@ static int walk_ops(struct xfs *fs, uint32_t bytes, uint32_t nops, struct pass *
     return KERR_OK;
 }
 
+/* Applies every record from the tail the newest one names up to the head,
+ * round the ring.
+ *
+ * **From the tail, not from block 0.** The walk used to start at block 0,
+ * which is right only for a log nobody has wrapped. On one Linux left dirty
+ * it would apply records already checkpointed — older metadata over newer
+ * — and miss the ones written before the wrap. A block that is not a
+ * record header where one must be ends the replay as a failure: the log
+ * then is not what its newest record says. */
+static int replay_ring(struct xfs *fs, struct pass *p) {
+    uint64_t blocks = log_blocks(fs), bb = fs->log_tail;
+    for (uint64_t guard = 0; bb != fs->log_head; guard++) {
+        uint32_t bytes = 0, nops = 0;
+        int rc = guard < blocks ? read_record(fs, bb, &bytes, &nops) : KERR_IO;
+        rc = rc == KERR_NOENT ? KERR_IO : rc;
+        rc = rc != KERR_OK ? rc : walk_ops(fs, bytes, nops, p);
+        if (rc != KERR_OK) {
+            return rc;
+        }
+        bb = (bb + xfs_log_record_blocks(record)) % blocks;
+    }
+    return KERR_OK;
+}
+
 int xfs_log_replay(struct xfs *fs) {
     struct pass p = {{0, 0, false}, 0, 0};
-    uint64_t bb = 0;
-    uint64_t blocks = (uint64_t)fs->logblocks * (fs->blocksize / XLOG_SECTOR);
-    int rc = KERR_OK;
+    int rc;
     /* **Applied as the walk goes, and committed only at the end.** The
      * writes land in the block cache and the cache is flushed once, after
      * the whole log has been read without complaint — so a replay that
      * aborts halfway has changed nothing on the disk. That is the
      * all-or-nothing rule this file opens with, and it is the cache that
      * makes it cheap enough to keep. */
-    while (bb + 1u < blocks) {
-        uint32_t bytes = 0, nops = 0;
-        rc = read_record(fs, bb, &bytes, &nops);
-        if (rc == KERR_NOENT) {
-            rc = KERR_OK;
-            break; /* the end of what was written */
-        }
-        if (rc != KERR_OK) {
-            break;
-        }
-        rc = walk_ops(fs, bytes, nops, &p);
-        if (rc != KERR_OK) {
-            break;
-        }
-        bb += 1u + (bytes + XLOG_SECTOR - 1u) / XLOG_SECTOR;
-    }
+    rc = replay_ring(fs, &p);
     if (rc != KERR_OK) {
         kprintf("xfs: replay abandoned after %u transaction(s): rc %d; nothing written\n",
                 p.applied, rc);

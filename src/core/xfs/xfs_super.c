@@ -76,6 +76,18 @@ int xfs_meta_block(struct xfs *fs, uint64_t fsb, uint32_t magic, uint32_t magic2
     return KERR_OK;
 }
 
+/* What a log record is padded to: the stripe unit on a version 2 log, and
+ * never less than the log's sector — Linux's `l_iclog_roundoff`. */
+static void take_log_roundoff(struct xfs *fs, const uint8_t *sb) {
+    uint32_t sunit = (xfs_be16(sb + XFS_SB_VERSIONNUM) & XFS_SB_V_LOGV2) != 0
+                         ? xfs_be32(sb + XFS_SB_LOGSUNIT)
+                         : 0;
+    uint32_t sect = xfs_be16(sb + XFS_SB_LOGSECTSIZE);
+    uint32_t bytes = sunit > 1u ? sunit : XLOG_SECTOR;
+    bytes = sect > bytes ? sect : bytes;
+    fs->log_roundoff = bytes / XLOG_SECTOR;
+}
+
 /* Reads the geometry out of the superblock image at sb. */
 static void take_geometry(struct xfs *fs, const uint8_t *sb) {
     fs->blocksize = xfs_be32(sb + XFS_SB_BLOCKSIZE);
@@ -95,6 +107,11 @@ static void take_geometry(struct xfs *fs, const uint8_t *sb) {
     fs->dirblocksize = fs->dirblocks * fs->blocksize;
     fs->dir_leaf_block = XFS_DIR2_LEAF_SPACE_BYTES >> fs->blocklog;
     fs->dir_free_block = XFS_DIR2_FREE_SPACE_BYTES >> fs->blocklog;
+    fs->inoalign = (xfs_be16(sb + XFS_SB_VERSIONNUM) & XFS_SB_V_ALIGNBIT) != 0
+                       ? xfs_be32(sb + XFS_SB_INOALIGNMT)
+                       : 1u;
+    fs->inoalign = fs->inoalign == 0 ? 1u : fs->inoalign;
+    take_log_roundoff(fs, sb);
 }
 
 /* The geometry has to be self-consistent before anything is read with it:
@@ -176,9 +193,13 @@ static int check_geometry(const struct xfs *fs) {
  * be built for my kernel" is not a filesystem reader.
  *
  * The obligation that comes with it is enforced rather than assumed: a
- * filesystem carrying `ro_compat` flags this reader does not implement is
+ * filesystem carrying `ro_compat` flags the *writer* does not maintain is
  * marked unwritable, so every write path refuses it (`xfs_writable`). The
- * `incompat` and `log_incompat` sets stay a strict whitelist. */
+ * reverse map and reflink are no longer among them — every allocation and
+ * free keeps the reverse map (xfs_rmap.c), and a file flagged as sharing
+ * blocks is refused on its own rather than the filesystem with it — so a
+ * filesystem made with the defaults mounts writable. The `incompat` and
+ * `log_incompat` sets stay a strict whitelist. */
 /* v4's features, which live in `versionnum` and `features2` rather than in
  * the three words v5 added.
  *
@@ -193,6 +214,10 @@ static int check_features_v4(struct xfs *fs, const uint8_t *sb) {
     fs->ftype = (f2 & XFS_SB_V2_FTYPE) != 0;
     fs->big_extent_counts = false; /* `nrext64` is v5's */
     fs->has_finobt = false;        /* so is the free-inode b-tree */
+    fs->sparse_inodes = false;     /* and sparse inode chunks */
+    fs->inobt_counts = false;      /* and the inode trees' block counts */
+    fs->has_rmapbt = false;        /* and the reverse map */
+    fs->has_reflink = false;       /* and shared extents */
     /* **`attr2` is a write capability, not a read one.** With it the
      * attribute fork's offset inside the inode may move as the fork grows;
      * without it `mkfs` fixed that offset once and nothing may change it.
@@ -231,6 +256,10 @@ static int check_features(struct xfs *fs, const uint8_t *sb) {
      * know it was set; one owner per field is the only thing that has
      * stopped it recurring. */
     fs->ftype = (in & XFS_FEAT_IN_FTYPE) != 0;
+    fs->sparse_inodes = (in & XFS_FEAT_IN_SPINODES) != 0;
+    fs->inobt_counts = (ro & XFS_FEAT_RO_INOBTCNT) != 0;
+    fs->has_rmapbt = (ro & XFS_FEAT_RO_RMAPBT) != 0;
+    fs->has_reflink = (ro & XFS_FEAT_RO_REFLINK) != 0;
     if ((ro & ~XFS_FEAT_RO_SUPPORTED) != 0) {
         kprintf("xfs: read-only features %08x not implemented here: no writing\n",
                 ro & ~XFS_FEAT_RO_SUPPORTED);
@@ -345,13 +374,26 @@ static void take_uuid(struct xfs *fs, const uint8_t *sb) {
  * is copied into a thirteenth byte of its own rather than pointed at, which
  * is the difference between a label and a label followed by whatever the
  * superblock keeps at offset 120. */
-static void take_label(struct xfs *fs, const uint8_t *sb) {
+static void copy_label(const uint8_t *sb, char *out) {
     uint32_t n = 0;
     while (n < XFS_SB_LABEL_MAX && sb[XFS_SB_FNAME + n] != '\0') {
-        fs->label[n] = (char)sb[XFS_SB_FNAME + n];
+        out[n] = (char)sb[XFS_SB_FNAME + n];
         n++;
     }
-    fs->label[n] = '\0';
+    out[n] = '\0';
+}
+
+static void take_label(struct xfs *fs, const uint8_t *sb) {
+    copy_label(sb, fs->label);
+}
+
+bool xfs_superblock_label(const uint8_t *sb, uint32_t len, char out[XFS_LABEL_BYTES]) {
+    out[0] = '\0';
+    if (sb == NULL || len < XFS_SB_FNAME + XFS_SB_LABEL_MAX || xfs_be32(sb) != XFS_SB_MAGIC) {
+        return false;
+    }
+    copy_label(sb, out);
+    return true;
 }
 
 /* The one copy of the directory scratch, handed to every mount.
@@ -598,6 +640,33 @@ uint32_t xfs_magic_for(const struct xfs *fs, enum xfs_blk kind) {
         return 0; /* no block carries zero, so this matches nothing */
     }
     return MAGICS[kind][fs->v5 ? 0 : 1];
+}
+
+uint64_t xfs_fsb_to_daddr(const struct xfs *fs, uint64_t fsb) {
+    return xfs_fsb_to_block(fs, fsb) << (fs->blocklog - 9u);
+}
+
+/* Whether a block of this 16-bit `da3` magic is one this stamps. */
+static bool is_da3(const struct xfs *fs, uint16_t magic) {
+    return magic == xfs_magic_for(fs, XFS_BLK_DIR_LEAF1) ||
+           magic == xfs_magic_for(fs, XFS_BLK_DIR_LEAFN) ||
+           magic == xfs_magic_for(fs, XFS_BLK_DA_NODE) ||
+           magic == xfs_magic_for(fs, XFS_BLK_ATTR_LEAF);
+}
+
+void xfs_stamp_daddr(const struct xfs *fs, uint8_t *block, uint64_t fsb) {
+    uint32_t m32 = xfs_be32(block + XFS_DIR3_HDR_MAGIC);
+    if (!fs->v5) {
+        return;
+    }
+    if (m32 == xfs_magic_for(fs, XFS_BLK_DIR_BLOCK) || m32 == xfs_magic_for(fs, XFS_BLK_DIR_DATA) ||
+        m32 == xfs_magic_for(fs, XFS_BLK_DIR_FREE)) {
+        xfs_put_be64(block + XFS_DIR3_HDR_BLKNO, xfs_fsb_to_daddr(fs, fsb));
+        xfs_reseal(fs, block, fs->dirblocksize, XFS_DIR3_HDR_CRC);
+    } else if (is_da3(fs, xfs_be16(block + XFS_DA3_MAGIC_OFF))) {
+        xfs_put_be64(block + XFS_DA3_BLKNO_OFF, xfs_fsb_to_daddr(fs, fsb));
+        xfs_reseal(fs, block, fs->blocksize, XFS_DA3_CRC_OFF);
+    }
 }
 
 void xfs_stamp_owner(const struct xfs *fs, uint8_t *at, uint32_t blkno_off, uint32_t uuid_off,
