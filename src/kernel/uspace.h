@@ -149,6 +149,7 @@ struct uproc {
     uint32_t gid;
     uint32_t euid;
     uint32_t egid;
+    uint32_t suid; /* saved: what an unprivileged setresuid may return to */
     /* **The supplementary groups, so that dropping privilege actually
      * drops it.** `setuid` and `setgid` move the primary identity and leave
      * these behind, which is the classic incomplete privilege drop: a

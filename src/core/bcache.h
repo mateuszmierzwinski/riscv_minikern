@@ -54,6 +54,10 @@ int bcache_init(struct bcache *c, const struct blockdev *dev, void *mem, uint32_
  * pinned). Every successful get needs a put. */
 int bcache_get(struct bcache *c, uint64_t lba, struct bbuf **out);
 
+/* The block at lba, pinned, as zeroes and dirty: for a block whose old
+ * contents nobody may see — one just allocated — so it is not read first. */
+int bcache_get_zeroed(struct bcache *c, uint64_t lba, struct bbuf **out);
+
 /* Releases a pin. A dirty buffer stays dirty and in the cache. */
 void bcache_put(struct bcache *c, struct bbuf *b);
 
@@ -66,6 +70,13 @@ int bcache_flush(struct bcache *c);
 /* Forgets every clean, unpinned buffer. For when something else may have
  * changed the device under us; dirty buffers are kept, not discarded. */
 void bcache_invalidate(struct bcache *c);
+
+/* Discards count blocks at lba on the device, and forgets any copy of them
+ * here, so a later read sees what the device now holds. KERR_NOTSUP when
+ * the device cannot discard; KERR_BUSY when one of them is dirty or pinned
+ * — a block somebody is writing is not free, and the caller (which flushed
+ * first) has made a mistake worth hearing about rather than a write lost. */
+int bcache_discard(struct bcache *c, uint64_t lba, uint32_t count);
 
 /* Byte-granular access, for a block device opened as a file: these do the
  * read-modify-write for partial blocks. off and n are bytes, and a transfer

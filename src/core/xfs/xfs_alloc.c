@@ -415,3 +415,28 @@ int xfs_free_extent(struct xfs *fs, uint32_t agno, uint32_t start, uint32_t coun
     rc = rc != KERR_OK ? rc : give_back(fs, agno, start, count);
     return rc != KERR_OK ? rc : xfs_count_blocks_free(fs, (int64_t)count);
 }
+
+/* The extent after `e` in block order, or the first when `e` is NULL. */
+static int free_after(struct xfs_btree_cur *cur, const struct ext *e, struct ext *out) {
+    const struct ext origin = {0, 0};
+    int rc = seek(cur, e != NULL ? e : &origin);
+    if (e == NULL) {
+        rc = rc != KERR_OK ? rc : here(cur, out);
+        if (rc == KERR_OK) {
+            return KERR_OK; /* a free extent at block 0 */
+        }
+    }
+    return rc != KERR_OK && rc != KERR_NOENT ? rc : after(cur, out);
+}
+
+int xfs_free_extents_each(struct xfs *fs, uint32_t agno, xfs_free_visit_fn visit, void *self) {
+    struct xfs_btree_cur cur;
+    struct ext e;
+    int rc = open_tree(fs, agno, false, &cur);
+    rc = rc != KERR_OK ? rc : free_after(&cur, NULL, &e);
+    while (rc == KERR_OK) {
+        rc = visit(self, agno, e.start, e.count);
+        rc = rc != KERR_OK ? rc : free_after(&cur, &e, &e);
+    }
+    return rc == KERR_NOENT ? KERR_OK : rc;
+}

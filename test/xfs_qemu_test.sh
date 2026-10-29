@@ -95,7 +95,7 @@ grep -qF "xfs: v5, 76800 blocks of 4096 bytes, 4 groups, 512-byte inodes, root 9
 for entry in "./" "../" "hello.txt" "notes.txt" "sub/"; do
     grep -qE "^xfs:   $entry\$" "$tmp/mount.log" || fail "the root listing lacks $entry"
 done
-grep -qF "xfs: mounted read-only, 5 entries in /" "$tmp/mount.log" ||
+grep -qE "xfs: mounted read-(only|write), 5 entries in /" "$tmp/mount.log" ||
     fail "the entry count is wrong"
 
 # And a file's contents, which is the data path rather than the metadata.

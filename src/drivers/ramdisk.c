@@ -50,6 +50,27 @@ static int ramdisk_flush(void *self) {
     return KERR_OK;
 }
 
+/* Zeroes the blocks, so a test can see exactly which were discarded: a
+ * flash drive forgets them, memory has nothing to forget and does the
+ * closest thing. Counted, for the same reason. */
+static uint64_t discarded;
+
+static int ramdisk_discard(void *self, uint64_t lba, uint32_t count) {
+    const struct blockdev *d = self;
+    if (!blockdev_in_range(d, lba, count)) {
+        return KERR_INVAL;
+    }
+    for (uint64_t i = 0; i < (uint64_t)count * SECTOR; i++) {
+        sector_at(lba)[i] = 0;
+    }
+    discarded += count;
+    return KERR_OK;
+}
+
+uint64_t ramdisk_discarded(void) {
+    return discarded;
+}
+
 int ramdisk_init(phys_t at, uint64_t bytes, struct blockdev *out) {
     if (at == 0 || bytes < SECTOR || (bytes % SECTOR) != 0) {
         return KERR_INVAL;
@@ -62,9 +83,11 @@ int ramdisk_init(phys_t at, uint64_t bytes, struct blockdev *out) {
     *out = (struct blockdev){.read = ramdisk_read,
                              .write = ramdisk_write,
                              .flush = ramdisk_flush,
+                             .discard = ramdisk_discard,
                              .self = out,
                              .block_size = SECTOR,
                              .blocks = disk.sectors,
-                             .read_only = false};
+                             .read_only = false,
+                             .discard_zeroes = true};
     return KERR_OK;
 }

@@ -26,24 +26,34 @@
 #include "core/errno.h"
 #include "core/xfs/xfs_internal.h"
 
+int xfs_zero_block(struct xfs *fs, uint64_t fsb) {
+    struct bbuf *b;
+    int rc = bcache_get_zeroed(fs->cache, xfs_fsb_to_block(fs, fsb), &b);
+    if (rc == KERR_OK) {
+        bcache_put(fs->cache, b);
+    }
+    return rc;
+}
+
 /* Copies block `from` over block `to`, or zeroes `to` when `from` is 0. */
 static int fill_block(struct xfs *fs, uint64_t to, uint64_t from) {
-    struct bbuf *src = NULL, *dst;
-    int rc = from != 0 ? bcache_get(fs->cache, xfs_fsb_to_block(fs, from), &src) : KERR_OK;
+    struct bbuf *src, *dst;
+    int rc;
+    if (from == 0) {
+        return xfs_zero_block(fs, to);
+    }
+    rc = bcache_get(fs->cache, xfs_fsb_to_block(fs, from), &src);
     if (rc != KERR_OK) {
         return rc;
     }
-    rc = bcache_get(fs->cache, xfs_fsb_to_block(fs, to), &dst);
+    rc = bcache_get_zeroed(fs->cache, xfs_fsb_to_block(fs, to), &dst);
     if (rc == KERR_OK) {
         for (uint32_t i = 0; i < fs->blocksize; i++) {
-            dst->data[i] = src != NULL ? src->data[i] : 0;
+            dst->data[i] = src->data[i];
         }
-        bcache_dirty(dst);
         bcache_put(fs->cache, dst);
     }
-    if (src != NULL) {
-        bcache_put(fs->cache, src);
-    }
+    bcache_put(fs->cache, src);
     return rc;
 }
 

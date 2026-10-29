@@ -1491,6 +1491,7 @@ int uspace_fork_shared(struct uproc *child, struct uproc *parent) {
     child->uid = parent->uid;
     child->gid = parent->gid;
     child->euid = parent->euid;
+    child->suid = parent->suid;
     child->egid = parent->egid;
     /* Capabilities and the syscall filter both cross `fork` unchanged: a
      * child that lost its parent's confinement would be an escape, and one
@@ -1745,6 +1746,7 @@ int uspace_exec(struct uproc *p, const uint8_t *image, uint32_t bytes, const cha
                             .uid = p->uid,
                             .gid = p->gid,
                             .euid = p->euid,
+                            .suid = p->suid,
                             .egid = p->egid,
                             .rlim_nofile_soft = p->rlim_nofile_soft,
                             .rlim_nofile_hard = p->rlim_nofile_hard,
@@ -3072,6 +3074,7 @@ int uspace_fork(struct uproc *child, struct uproc *parent) {
     child->uid = parent->uid;
     child->gid = parent->gid;
     child->euid = parent->euid;
+    child->suid = parent->suid;
     child->egid = parent->egid;
     /* Capabilities and the syscall filter both cross `fork` unchanged: a
      * child that lost its parent's confinement would be an escape, and one

@@ -70,4 +70,9 @@ const char *nvme_model(void);
 uint64_t nvme_blocks(void);
 uint32_t nvme_block_size(void);
 
+/* Whether the drive takes deallocate (TRIM), from Identify Controller's
+ * ONCS, and whether a deallocated block then reads as zeroes (DLFEAT). */
+bool nvme_can_deallocate(void);
+bool nvme_deallocated_reads_zero(void);
+
 #endif

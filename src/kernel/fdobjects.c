@@ -9,6 +9,7 @@
 #include "core/console.h"
 #include "core/errno.h"
 #include "core/access.h"
+#include "core/caps.h"
 #include "kernel/mem.h"
 #include "kernel/sched.h"
 #include "kernel/tty.h"
@@ -827,9 +828,45 @@ static void dirfile_release(struct file *f) {
     }
 }
 
+/* `FITRIM`, `_IOWR('X', 121, struct fstrim_range)`: what `fstrim` sends
+ * the mount point it opened. */
+#define FITRIM 0xc0185879u
+
+struct fstrim_range {
+    uint64_t start;
+    uint64_t len;    /* in: the range; out: the bytes trimmed */
+    uint64_t minlen;
+};
+
+/* A directory answers `FITRIM` for the volume it is on, and nothing else.
+ * `CAP_SYS_ADMIN`, as on Linux: telling a drive to forget blocks is the
+ * administrator's call, and costs every other user the device's time. */
+static int32_t dirfile_ioctl(struct file *f, uint32_t request, virt_t arg) {
+    const struct dirfile *d = f->priv;
+    struct fstrim_range r;
+    uint64_t trimmed = 0;
+    int rc;
+    if (request != FITRIM) {
+        return KERR_NOTTY;
+    }
+    if (!uspace_capable(CAP_SYS_ADMIN)) {
+        return KERR_PERM;
+    }
+    if (uspace_copy_in(&r, arg, sizeof r) != KERR_OK) {
+        return KERR_FAULT;
+    }
+    rc = xfsmount_trim(d->path, r.start, r.len, r.minlen, &trimmed);
+    r.len = trimmed;
+    if (rc == KERR_OK && uspace_copy_out(arg, &r, sizeof r) != KERR_OK) {
+        return KERR_FAULT;
+    }
+    return rc;
+}
+
 static const struct file_ops dirfile_ops = {
     .read = dirfile_read,
     .write = dirfile_write_refused,
+    .ioctl = dirfile_ioctl,
     .release = dirfile_release,
 };
 

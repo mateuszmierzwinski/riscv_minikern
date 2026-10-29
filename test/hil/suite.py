@@ -126,7 +126,7 @@ CASES = [
     # blocks is caught rather than merely a reader that fails.
     ("§3: a b-tree extent fork and a 3,000-entry directory",
      f"minikern.cat=/p{FIXTURE_ENTRIES - 1}",
-     [f"mounted read-only, {FIXTURE_ENTRIES + 2} entries in /",
+     [f", {FIXTURE_ENTRIES + 2} entries in /",
       f"cat: /p{FIXTURE_ENTRIES - 1} is {fixtures.PAYLOAD_BYTES} bytes, "
       f"checksum {fixtures.PAYLOAD_CHECKSUM}",
       # **And answered by the index, not by walking.** The two paths return
@@ -169,7 +169,7 @@ CASES = [
     # gathering, and the payload checksum proves it gathered them in order.
     ("§3: 8 KiB directory blocks",
      f"minikern.cat=/p{FIXTURE_ENTRIES - 1}",
-     [f"mounted read-only, {FIXTURE_ENTRIES + 2} entries in /",
+     [f", {FIXTURE_ENTRIES + 2} entries in /",
       f"cat: /p{FIXTURE_ENTRIES - 1} is {fixtures.PAYLOAD_BYTES} bytes, "
       f"checksum {fixtures.PAYLOAD_CHECKSUM}",
       " hashed, 0 walked)"],
@@ -617,6 +617,36 @@ CASES = [
       "the boot partition is read and written at /boot",
       "cat: /boot/minikern.bin is 48 bytes"],
      240, None, "bootfirst"),
+    # **Saved ids** (§1): `setresuid` with root kept as the saved uid is a
+    # drop that can be undone, and the privilege comes back with it; with
+    # all three ids dropped it cannot. 127 is all seven.
+    ("§1: saved ids — a privilege drop undone, and one that cannot be",
+     "",
+     ["exited with 127"],
+     200, "//:ids.elf"),
+    # **TRIM, judged by the device.** A file written and removed, then the
+    # root trimmed: the RAM disk counts what it was told to discard, and the
+    # kernel's figure must equal it — a trim that reports more than reached
+    # the drive, or discards a live block (the kept file would read back
+    # zeroed), fails. `minikern.autotrim` trims every volume at boot first.
+    # On a RAM disk because the board's NVMe drive holds the operator's data.
+    ("§4: TRIM on the RAM disk, judged by the device",
+     "minikern.trimtest minikern.autotrim",
+     ["KiB discarded",
+      "the device saw",
+      "the kept file reads back whole"],
+     240, None, "defaults"),
+    # **`fstrim`'s system call**: FITRIM on the root directory, from a
+    # program — the struct copied in and back, the minimum honoured, an
+    # unknown request ENOTTY, a non-root caller EPERM. 127 is all seven.
+    ("§4: fstrim through FITRIM, from a program",
+     "",
+     ["fstrim: / trimmed, bytes: ",
+      "fstrim: a long minimum trimmed nothing",
+      "fstrim: an unknown ioctl on a directory is ENOTTY",
+      "fstrim: an unprivileged caller is refused",
+      "exited with 127"],
+     240, "//:fstrim.elf", "defaults"),
 ]
 
 

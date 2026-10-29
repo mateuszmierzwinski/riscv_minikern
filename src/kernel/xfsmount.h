@@ -222,6 +222,13 @@ int xfsmount_truncate_path(const char *path, uint64_t size);
  * always did. */
 void xfsmount_set_umask_source(uint32_t (*source)(void));
 
+/* `FITRIM` on the volume holding `path`: every free extent at least
+ * `minlen` bytes long within [start, start + len) is discarded. *trimmed is
+ * the bytes that reached. KERR_NOTSUP on FAT, or on a device that cannot
+ * discard; KERR_INVAL for a range shorter than one block. */
+int xfsmount_trim(const char *path, uint64_t start, uint64_t len, uint64_t minlen,
+                  uint64_t *trimmed);
+
 /* The volume holding `path`, as block and inode counts. */
 int xfsmount_counters(const char *path, struct xfs_counters *out);
 

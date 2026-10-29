@@ -12,7 +12,7 @@
 /* A RAM-backed block device that counts what the cache asked of it. */
 struct ram {
     uint8_t data[DEV_BLOCKS * BS];
-    uint32_t reads, writes, flushes;
+    uint32_t reads, writes, flushes, discards;
     int fail_read, fail_write;
     struct blockdev dev;
 };
@@ -48,6 +48,14 @@ static int ram_flush(void *self) {
     return KERR_OK;
 }
 
+/* Discarded blocks read back as 0xee: anything but what was there. */
+static int ram_discard(void *self, uint64_t lba, uint32_t count) {
+    struct ram *r = self;
+    r->discards++;
+    memset(r->data + lba * BS, 0xee, count * BS);
+    return KERR_OK;
+}
+
 static struct ram ram;
 static struct bcache cache;
 static uint8_t cache_mem[SLOTS * BS];
@@ -57,6 +65,7 @@ static void setup(bool read_only) {
     ram.dev = (struct blockdev){.read = ram_read,
                                 .write = ram_write,
                                 .flush = ram_flush,
+                                .discard = ram_discard,
                                 .self = &ram,
                                 .block_size = BS,
                                 .blocks = DEV_BLOCKS,
@@ -245,6 +254,55 @@ static void test_invalidate_keeps_what_is_not_safe_to_drop(void) {
     bcache_put(&cache, pinned);
 }
 
+/* A discard reaches the device and the cached copy goes, so the next read
+ * sees what the device now holds rather than what it used to. */
+static void test_discard_forgets_the_cached_copy(void) {
+    struct bbuf *b;
+    setup(false);
+    KTEST_CHECK(bcache_get(&cache, 3, &b) == KERR_OK && b->data[0] == 3u);
+    bcache_put(&cache, b);
+    KTEST_CHECK(bcache_discard(&cache, 2, 3) == KERR_OK);
+    KTEST_CHECK(ram.discards == 1u);
+    KTEST_CHECK(bcache_get(&cache, 3, &b) == KERR_OK && b->data[0] == 0xeeu);
+    bcache_put(&cache, b);
+}
+
+/* A dirty or pinned block is somebody's, not free: refused, and the device
+ * is not asked. */
+static void test_discard_refuses_a_block_in_use(void) {
+    struct bbuf *b;
+    setup(false);
+    KTEST_CHECK(bcache_get(&cache, 5, &b) == KERR_OK);
+    KTEST_CHECK(bcache_discard(&cache, 4, 2) == KERR_BUSY);
+    bcache_dirty(b);
+    bcache_put(&cache, b);
+    KTEST_CHECK(bcache_discard(&cache, 5, 1) == KERR_BUSY);
+    KTEST_CHECK(ram.discards == 0);
+    KTEST_CHECK(bcache_flush(&cache) == KERR_OK);
+    KTEST_CHECK(bcache_discard(&cache, 5, 1) == KERR_OK);
+}
+
+static void test_discard_needs_a_device_that_can(void) {
+    setup(false);
+    ram.dev.discard = NULL;
+    KTEST_CHECK(bcache_discard(&cache, 0, 1) == KERR_NOTSUP);
+    setup(true);
+    KTEST_CHECK(bcache_discard(&cache, 0, 1) == KERR_NOTSUP);
+    setup(false);
+    KTEST_CHECK(bcache_discard(&cache, DEV_BLOCKS - 1u, 2) == KERR_INVAL);
+    KTEST_CHECK(ram.discards == 0);
+}
+
+/* A zeroed get is zeroes and dirty, and never reads the old block. */
+static void test_a_zeroed_get_does_not_read(void) {
+    struct bbuf *b;
+    setup(false);
+    KTEST_CHECK(bcache_get_zeroed(&cache, 7, &b) == KERR_OK);
+    KTEST_CHECK(ram.reads == 0 && b->dirty && b->data[0] == 0 && b->data[BS - 1u] == 0);
+    bcache_put(&cache, b);
+    KTEST_CHECK(bcache_flush(&cache) == KERR_OK && ram.data[7u * BS] == 0);
+}
+
 int main(void) {
     KTEST_RUN(test_init_checks_its_arguments);
     KTEST_RUN(test_a_second_read_is_free);
@@ -259,5 +317,9 @@ int main(void) {
     KTEST_RUN(test_byte_access_checks_the_end);
     KTEST_RUN(test_a_read_only_device_refuses_writes);
     KTEST_RUN(test_invalidate_keeps_what_is_not_safe_to_drop);
+    KTEST_RUN(test_discard_forgets_the_cached_copy);
+    KTEST_RUN(test_discard_refuses_a_block_in_use);
+    KTEST_RUN(test_discard_needs_a_device_that_can);
+    KTEST_RUN(test_a_zeroed_get_does_not_read);
     return ktest_failures();
 }

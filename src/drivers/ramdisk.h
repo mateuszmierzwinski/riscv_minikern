@@ -37,4 +37,8 @@
  * writes it in place, so the caller must have kept the allocator off it. */
 int ramdisk_init(phys_t at, uint64_t bytes, struct blockdev *out);
 
+/* How many sectors have been discarded since boot: the test's measure of
+ * what a trim reached. */
+uint64_t ramdisk_discarded(void);
+
 #endif

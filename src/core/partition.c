@@ -199,6 +199,12 @@ static int part_flush(void *self) {
     return p->under->flush == NULL ? KERR_OK : p->under->flush(p->under->self);
 }
 
+static int part_discard(void *self, uint64_t lba, uint32_t count) {
+    struct partdev *p = self;
+    return inside(p, lba, count) ? p->under->discard(p->under->self, p->first + lba, count)
+                                 : KERR_INVAL;
+}
+
 int partition_wrap(struct blockdev *dev, const struct partition *p, struct partdev *state,
                    struct blockdev *out) {
     if (!p->present || p->sectors == 0 || p->first >= dev->blocks ||
@@ -209,9 +215,11 @@ int partition_wrap(struct blockdev *dev, const struct partition *p, struct partd
     *out = (struct blockdev){.read = part_read,
                              .write = part_write,
                              .flush = part_flush,
+                             .discard = dev->discard != NULL ? part_discard : NULL,
                              .self = state,
                              .block_size = dev->block_size,
                              .blocks = p->sectors,
-                             .read_only = dev->read_only};
+                             .read_only = dev->read_only,
+                             .discard_zeroes = dev->discard_zeroes};
     return KERR_OK;
 }

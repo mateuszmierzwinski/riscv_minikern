@@ -48,6 +48,25 @@ static int img_flush(void *self) {
     return fsync(image_fd) == 0 ? KERR_OK : KERR_IO;
 }
 
+/* A discard poisons the blocks rather than zeroing them: this device says
+ * nothing of what a discarded block reads as, so a file or a tree block
+ * trimmed by mistake comes back as 0xdb — which `must_match` and
+ * `xfs_repair` both see — rather than as plausible zeroes. */
+static uint64_t discarded_blocks;
+
+static int img_discard(void *self, uint64_t lba, uint32_t count) {
+    static uint8_t poison[BS];
+    (void)self;
+    memset(poison, 0xdb, sizeof poison);
+    for (uint32_t i = 0; i < count; i++) {
+        if (pwrite(image_fd, poison, BS, (off_t)((lba + i) * BS)) != (ssize_t)BS) {
+            return KERR_IO;
+        }
+    }
+    discarded_blocks += count;
+    return KERR_OK;
+}
+
 /* The kernel's own messages, which say why a step refused. */
 static void to_stderr(void *self, const char *buf, size_t len) {
     (void)self;
@@ -535,6 +554,120 @@ static void step_boardgrow(struct xfs *fs) {
     }
 }
 
+/* Adds up a group's free blocks, as the trim's own walker sees them. */
+static int count_free(void *self, uint32_t agno, uint32_t start, uint32_t count) {
+    (void)agno;
+    (void)start;
+    *(uint64_t *)self += count;
+    return KERR_OK;
+}
+
+static uint64_t free_blocks(struct xfs *fs) {
+    uint64_t n = 0;
+    for (uint32_t agno = 0; agno < fs->agcount; agno++) {
+        must(xfs_free_extents_each(fs, agno, count_free, &n), "walk the free extents");
+    }
+    return n;
+}
+
+/* A file kept and a megabyte written and removed: free space the
+ * filesystem once used. Returns the kept file's inode. */
+static uint64_t trim_setup(struct xfs *fs) {
+    struct xfs_inode root, ip;
+    uint64_t keep, gone;
+    uint32_t put;
+    read_inode(fs, fs->rootino, &root);
+    must(xfs_create(fs, &root, "trimkeep", 8u, 0100644, NOW, &keep), "create trimkeep");
+    read_inode(fs, keep, &ip);
+    must(xfs_file_write(fs, &ip, 0, payload, 300000u, &put), "write trimkeep");
+    read_inode(fs, fs->rootino, &root);
+    must(xfs_create(fs, &root, "trimgone", 8u, 0100644, NOW, &gone), "create trimgone");
+    read_inode(fs, gone, &ip);
+    must(xfs_file_write(fs, &ip, 0, payload, 1000000u, &put), "write trimgone");
+    read_inode(fs, fs->rootino, &root);
+    must(xfs_unlink(fs, &root, "trimgone", 8u, NOW), "unlink trimgone");
+    return keep;
+}
+
+/* Everything free discarded, and nothing else: the walker's count, the
+ * trim's and the device's agree. */
+static void trim_everything(struct xfs *fs) {
+    struct xfs_trim_range all = {.start = 0, .len = fs->dblocks, .minlen = 1};
+    uint64_t trimmed = 0;
+    must(xfs_trim(fs, &all, &trimmed), "trim");
+    if (trimmed == 0 || trimmed != free_blocks(fs) || trimmed != discarded_blocks) {
+        fprintf(stderr, "trim: %llu trimmed, %llu free, %llu discarded\n",
+                (unsigned long long)trimmed, (unsigned long long)free_blocks(fs),
+                (unsigned long long)discarded_blocks);
+        exit(1);
+    }
+}
+
+/* A minimum longer than any free extent trims nothing; a range past the
+ * end is refused. */
+static void trim_limits(struct xfs *fs) {
+    struct xfs_trim_range none = {.start = 0, .len = fs->dblocks, .minlen = fs->dblocks};
+    struct xfs_trim_range past = {.start = fs->dblocks, .len = 1, .minlen = 1};
+    uint64_t trimmed = 0;
+    must(xfs_trim(fs, &none, &trimmed), "trim with a long minimum");
+    if (trimmed != 0 || xfs_trim(fs, &past, &trimmed) != KERR_INVAL) {
+        fprintf(stderr, "trim: a long minimum trimmed %llu, or a range past the end ran\n",
+                (unsigned long long)trimmed);
+        exit(1);
+    }
+}
+
+/* A file written over trimmed blocks, with part of one block left
+ * unwritten between two writes: zeroes there, not the poison. */
+static void write_over_trimmed(struct xfs *fs) {
+    static const uint8_t zeroes[4000];
+    struct xfs_inode root, ip;
+    uint64_t ino;
+    uint32_t put;
+    read_inode(fs, fs->rootino, &root);
+    must(xfs_create(fs, &root, "trimnew", 7u, 0100644, NOW, &ino), "create trimnew");
+    read_inode(fs, ino, &ip);
+    must(xfs_file_write(fs, &ip, 0, payload, 5000u, &put), "write trimnew");
+    read_inode(fs, ino, &ip);
+    must(xfs_file_write(fs, &ip, 9000u, payload, 5000u, &put), "write trimnew past a gap");
+    must_match(fs, ino, 5000u, zeroes, sizeof zeroes, "the gap over trimmed blocks");
+    must_match(fs, ino, 9000u, payload, 5000u, "the write past the gap");
+}
+
+/* Trim, as `fstrim` asks for it: every free block discarded and nothing
+ * else. The kept file is read back from the device (the cache forgotten),
+ * the limits are honoured, and a file written afterwards over trimmed
+ * blocks reads zeroes where it was not written. Then `xfs_repair` judges
+ * every tree. */
+static void step_trim(struct xfs *fs) {
+    uint64_t keep = trim_setup(fs);
+    trim_everything(fs);
+    bcache_invalidate(fs->cache);
+    must_match(fs, keep, 0, payload, 300000u, "the kept file after the trim");
+    trim_limits(fs);
+    write_over_trimmed(fs);
+}
+
+/* What lies past the end of a file is not the file's: a truncate into the
+ * middle of a block, then a write further on, must read zeroes in between,
+ * not the bytes the truncate cut off. */
+static void step_eofzero(struct xfs *fs) {
+    static const uint8_t zeroes[4000];
+    struct xfs_inode root, ip;
+    uint64_t ino;
+    uint32_t put;
+    read_inode(fs, fs->rootino, &root);
+    must(xfs_create(fs, &root, "eofzero", 7u, 0100644, NOW, &ino), "create eofzero");
+    read_inode(fs, ino, &ip);
+    must(xfs_file_write(fs, &ip, 0, payload, 12000u, &put), "write eofzero");
+    read_inode(fs, ino, &ip);
+    must(xfs_truncate(fs, &ip, 5000u, NOW), "truncate into a block");
+    read_inode(fs, ino, &ip);
+    must(xfs_file_write(fs, &ip, 9000u, payload, 100u, &put), "write past the cut");
+    must_match(fs, ino, 0, payload, 5000u, "what the truncate kept");
+    must_match(fs, ino, 5000u, zeroes, sizeof zeroes, "what the truncate cut off");
+}
+
 struct step {
     const char *name;
     void (*run)(struct xfs *fs);
@@ -550,6 +683,7 @@ static const struct step steps[] = {
     {"fixture", step_fixture},  {"unlinkproto", step_unlinkproto},
     {"inodes", step_inodes},    {"noinodes", step_noinodes},
     {"reflink", step_reflink},  {"holes", step_holes},     {"boardgrow", step_boardgrow},
+    {"trim", step_trim},        {"eofzero", step_eofzero},
 };
 
 /* Runs the named steps, or every one when none is named. */
@@ -584,7 +718,8 @@ int main(int argc, char **argv) {
         payload[i] = (uint8_t)(i * 31u + 7u);
     }
     dev = (struct blockdev){.read = img_read, .write = img_write, .flush = img_flush,
-                            .block_size = BS, .blocks = (uint64_t)st.st_size / BS};
+                            .discard = img_discard, .block_size = BS,
+                            .blocks = (uint64_t)st.st_size / BS};
     must(bcache_init(&cache, &dev, cache_mem, SLOTS), "bcache_init");
     must(xfs_mount(&fs, &cache), "mount");
     if (!xfs_writable(&fs)) {

@@ -37,6 +37,12 @@
 /* I/O commands. */
 #define IO_WRITE 0x01u
 #define IO_READ 0x02u
+#define IO_DSM 0x09u          /* Dataset Management: here, deallocate */
+#define DSM_DEALLOCATE 4u     /* cdw11 bit 2, "AD" */
+#define ONCS_DSM 4u           /* Identify Controller ONCS bit 2: DSM supported */
+#define IDENTIFY_ONCS 520u    /* offset of ONCS, 16 bits */
+#define IDENTIFY_DLFEAT 33u   /* namespace: what a deallocated block reads as */
+#define DLFEAT_READS_ZERO 1u  /* bits 2:0 = 001b */
 
 #define QUEUE_ENTRIES 32u
 #define ADMIN_QUEUE 0u
@@ -159,6 +165,8 @@ static struct {
     char model[41];
     uint16_t next_command_id;
     bool up;
+    bool can_deallocate;   /* ONCS says Dataset Management is there */
+    bool dealloc_zeroes;   /* DLFEAT says a deallocated block reads as zeroes */
 } nvme;
 
 static void write_reg(uint32_t off, uint32_t v) {
@@ -612,6 +620,15 @@ static void take_model(const uint8_t *identify_page) {
     nvme.model[end] = '\0';
 }
 
+/* Whether the drive takes deallocate (TRIM) at all: the controller's
+ * optional-command bits. A drive that lacks it answers the command with an
+ * error, so it is never sent to one. */
+static void take_capabilities(const uint8_t *identify_page) {
+    uint16_t oncs = (uint16_t)(identify_page[IDENTIFY_ONCS] |
+                               (identify_page[IDENTIFY_ONCS + 1u] << 8));
+    nvme.can_deallocate = (oncs & ONCS_DSM) != 0;
+}
+
 /* Namespace 1's geometry: how many blocks, and how big each is. The size is
  * reported as a log2 in a table of formats, indexed by the format the
  * namespace is currently using. */
@@ -625,6 +642,7 @@ static void take_geometry(const uint8_t *ns_page) {
     lbaf = (uint32_t)ns_page[128u + format_index * 4u + 2u];
     nvme.blocks = blocks;
     nvme.block_size = 1u << lbaf;
+    nvme.dealloc_zeroes = (ns_page[IDENTIFY_DLFEAT] & 7u) == DLFEAT_READS_ZERO;
 }
 
 static int create_io_queues(void) {
@@ -772,6 +790,56 @@ static int nvme_flush(void *self) {
     return nvme.up ? KERR_OK : KERR_NODEV;
 }
 
+/* One Dataset Management range, as the controller reads it. */
+struct dsm_range {
+    uint32_t attributes;
+    uint32_t blocks;
+    uint64_t lba;
+};
+
+/* The range list, page-aligned for the reason `identify_buffer` is. One
+ * range per command: a filesystem's free extents arrive one at a time. */
+static struct dsm_range dsm_ranges[PAGE_BYTES / sizeof(struct dsm_range)]
+    __attribute__((aligned(4096)));
+
+static int deallocate(uint64_t lba, uint32_t blocks) {
+    struct nvme_command cmd = {0};
+    dsm_ranges[0] = (struct dsm_range){.attributes = 0, .blocks = blocks, .lba = lba};
+    cmd.opcode = IO_DSM;
+    cmd.namespace_id = 1;
+    cmd.prp1 = (uint64_t)mmu_virt_to_phys(dsm_ranges);
+    cmd.cdw10 = 0; /* one range, zero-based */
+    cmd.cdw11 = DSM_DEALLOCATE;
+    return submit(&nvme.io, &cmd, NULL);
+}
+
+static int nvme_discard(void *self, uint64_t lba, uint32_t count) {
+    (void)self;
+    if (!nvme.up || !nvme.can_deallocate || count == 0 || lba + count > nvme.blocks) {
+        return KERR_INVAL;
+    }
+    return deallocate(lba, count);
+}
+
+/* What the drive said about TRIM, in the boot log: whether a filesystem's
+ * trim will reach it is otherwise invisible. */
+static void say_deallocate(void) {
+    if (!nvme.can_deallocate) {
+        kprintf("nvme: deallocate not supported\n");
+        return;
+    }
+    kprintf("nvme: deallocate supported, a deallocated block reads back %s\n",
+            nvme.dealloc_zeroes ? "as zeroes" : "undefined");
+}
+
+bool nvme_can_deallocate(void) {
+    return nvme.up && nvme.can_deallocate;
+}
+
+bool nvme_deallocated_reads_zero(void) {
+    return nvme.dealloc_zeroes;
+}
+
 /* Brings the controller up: reset, admin queues, enable, identify. */
 static int start_controller(void) {
     uint64_t cap = (uint64_t)read_reg(NVME_CAP) | ((uint64_t)read_reg(NVME_CAP + 4u) << 32);
@@ -815,6 +883,26 @@ static int start_controller(void) {
  * one a later edit cannot quietly lose. */
 static uint8_t identify_buffer[4096] __attribute__((aligned(4096)));
 
+/* What the drive is — model, optional commands, namespace 1's geometry —
+ * and then the I/O queues it will be used through. */
+static int identify_drive(uint8_t *page) {
+    int rc;
+    for (uint32_t i = 0; i < sizeof identify_buffer; i++) {
+        identify_buffer[i] = 0;
+    }
+    rc = identify(1u, 0, page); /* the controller */
+    if (rc == KERR_OK) {
+        take_model(page);
+        take_capabilities(page);
+        rc = identify(0u, 1u, page); /* namespace 1 */
+    }
+    if (rc == KERR_OK) {
+        take_geometry(page);
+        rc = create_io_queues();
+    }
+    return rc;
+}
+
 int nvme_init(struct blockdev *out) {
     uint8_t *page = identify_buffer;
     int rc = pci_find_class(NVME_PCI_CLASS, NVME_PCI_CLASS_MASK, &nvme.pci);
@@ -836,26 +924,17 @@ int nvme_init(struct blockdev *out) {
         kprintf("nvme: the controller would not start (rc %d)\n", rc);
         return rc;
     }
-    for (uint32_t i = 0; i < sizeof identify_buffer; i++) {
-        identify_buffer[i] = 0;
-    }
-    rc = identify(1u, 0, page); /* the controller */
-    if (rc == KERR_OK) {
-        take_model(page);
-        rc = identify(0u, 1u, page); /* namespace 1 */
-    }
-    if (rc == KERR_OK) {
-        take_geometry(page);
-        rc = create_io_queues();
-    }
+    rc = identify_drive(page);
     if (rc != KERR_OK) {
         kprintf("nvme: identify or queue setup failed (rc %d)\n", rc);
         return rc;
     }
     nvme.up = true;
+    say_deallocate();
     *out = (struct blockdev){.read = nvme_read, .write = nvme_write, .flush = nvme_flush,
+                             .discard = nvme.can_deallocate ? nvme_discard : NULL,
                              .self = NULL, .block_size = nvme.block_size, .blocks = nvme.blocks,
-                             .read_only = false};
+                             .read_only = false, .discard_zeroes = nvme.dealloc_zeroes};
     return KERR_OK;
 }
 

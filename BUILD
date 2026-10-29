@@ -1426,6 +1426,37 @@ user_image(
     program = ":netlinkask",
 )
 
+# Saved ids: a privilege drop undone through the saved uid, and one that
+# cannot be. Exits with a bitmask of the checks that passed.
+user_binary(
+    name = "ids",
+    srcs = [
+        "src/userland/ids/main.c",
+        "src/userland/start.S",
+    ],
+)
+
+user_image(
+    name = "ids.elf",
+    program = ":ids",
+)
+
+# `fstrim` through FITRIM: the system-call contract around a trim, on a
+# RAM-disk XFS so no real drive is touched. Exits with a bitmask of the
+# checks that passed.
+user_binary(
+    name = "fstrim",
+    srcs = [
+        "src/userland/fstrim/main.c",
+        "src/userland/start.S",
+    ],
+)
+
+user_image(
+    name = "fstrim.elf",
+    program = ":fstrim",
+)
+
 user_binary(
     name = "unixsock",
     srcs = [

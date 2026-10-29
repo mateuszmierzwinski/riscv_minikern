@@ -39,11 +39,12 @@ None known; the open XFS read failure is in §3.
 
 ### Open
 
-- [ ] **Saved ids and unprivileged `setuid`** (S) — `setresuid`/`getresuid` and saved set-user-IDs are missing, and an unprivileged `setuid` back to a uid the process already holds is refused. Programs that drop and restore privilege cannot work without these. Next step: add a saved id to the process, then extend `minikern.uid=1`.
 - [ ] **Process-wide pending signals** (S) — `kill` raises a signal on the process's first live thread, because there is no process-wide pending set. This is right for job control but wrong for a multi-threaded program that catches the signal. Next step: add a per-process pending set that any thread with the signal unblocked can take.
 - [ ] **`nanosleep` never reports the remaining time** (S) — `rem` is not written on an interrupted sleep. Write it (null-tolerant) when returning `EINTR`.
 
 ### Done
+
+- [x] **Saved ids and unprivileged `setuid`** — `setresuid`/`getresuid` (syscalls 147/148, both missing) and a saved uid. Capabilities follow Linux's rule: cleared for good when all three ids are non-zero, only the effective set when the effective uid leaves 0, restored from the permitted set when it returns. An unprivileged `setuid` may move to its real or saved uid. Board: `§1: saved ids` (127), `process model self-tests`, `hostile syscall arguments`.
 
 - [x] **QuokkaOS init on the board** — three runlevels up, a dying service restarted, `rc list` answered every round (the `quokka:` suite case).
 - [x] **`execve` started programs one instruction late** — `execve` was missing from `syscall_steps_over_ecall`'s exceptions; proven by `minikern.execone` and `/bin/tiny` on the board.
@@ -158,10 +159,8 @@ None known; the open XFS read failure is in §3.
 ## 4. Drivers and board hardware
 
 ### Open
-- [ ] **TRIM / discard** (M, operator priority 2026-10-28) — Nothing tells a drive which blocks are free. Steps:
-  1. `discard(lba, count)` on the block-device port, a no-op where unsupported, and an XFS trim pass over each group's free-space tree. `FITRIM` semantics: periodic and through the ioctl, not a discard per free.
-  2. NVMe Dataset Management (deallocate), gated on Identify Controller `ONCS` bit 2; record `DLFEAT` (whether deallocated blocks read as zeroes).
-  3. USB drives, after USB mass storage: SCSI `UNMAP` or `WRITE SAME(16)` per `READ CAPACITY(16)` `LBPME` and VPD `B0h`/`B2h`, as Linux's `sd` driver chooses. Fallback: ATA TRIM through SAT `ATA PASS-THROUGH(16)` (the channel SMART uses through a bridge), gated on IDENTIFY word 169 bit 0. Plus a deny-list by USB VID:PID, because some bridges advertise `UNMAP` and mishandle it.
+- [~] **TRIM on the NVMe drive — needs the operator** (S) — Deallocate is built and gated on `ONCS`. The board's drive reports it supported, with deallocated blocks reading back undefined (`DLFEAT`). But the command itself has not run on silicon: the drive is one XFS holding the operator's data (`2026-09-12 20-49-06.mp4`), and a trim bug there loses it. **Needed from the operator:** a scratch partition or drive, or permission to trim this drive's free space. Then: `minikern.disk=nvme minikern.autotrim` on the board, and make `autotrim` the default.
+- [ ] **TRIM on USB drives** (M) — After USB mass storage (below). Use SCSI `UNMAP` or `WRITE SAME(16)` per `READ CAPACITY(16)` `LBPME` and VPD `B0h`/`B2h`, as Linux's `sd` driver chooses. Fallback: ATA TRIM through SAT `ATA PASS-THROUGH(16)` (the channel SMART uses through a bridge), gated on IDENTIFY word 169 bit 0. Plus a deny-list by USB VID:PID, because some bridges advertise `UNMAP` and mishandle it. The block port's `discard` is what it plugs into.
 - [ ] **USB mass storage** (L) — BOT and UAS, and a SCSI layer, after the XHCI port leaves Polling (below). USB discard depends on it.
 - [ ] **GPIO pad-function selection (pinmux)** (M) — Only pins the firmware already left as GPIO can be driven. Claiming a pad's function means the `sys_iomux` registers; measure them on the board (dump the window) rather than trust the datasheet.
 - [ ] **Voltage scaling** (M) — Three of four operating points want 800 mV but run at 1040 mV, so every low point wastes power. I²C and the PMIC (chip id `0x54`) work, but no register holds the core-rail value (`0x36`). A wrong write can destroy the part, so this waits for an authoritative AXP15060 register map (`minikern.probe=1` dumps it).
@@ -173,6 +172,8 @@ None known; the open XFS read failure is in §3.
 - [ ] **RTC, watchdog, SPI, I²C, PWM beyond the probe** — Deferred by the operator until thermals are done. The board has no RTC, and the watchdog's reset stays unarmed because nothing feeds it.
 
 ### Done
+
+- [x] **TRIM** — a `discard` operation on the block port (through partitions and scaling), NVMe Dataset Management deallocate (gated on `ONCS`, `DLFEAT` recorded), an XFS trim pass over each group's free-space tree (flushed first, so only blocks free on disk are trimmed), `FITRIM` on a directory (`CAP_SYS_ADMIN`), and `minikern.autotrim` at boot (opt-in until the NVMe item above). No kernel threads, so a running system trims with `FITRIM` from user space, as `fstrim.timer` does. Host: `xfs_write_test` checks every free block is discarded and nothing else (the fake drive poisons what it discards). Board: `§4: TRIM on the RAM disk, judged by the device` and `§4: fstrim through FITRIM, from a program`. Writing it found two stale-data leaks, now fixed: a new block, and a block's tail after a truncate, showed the disk's old bytes.
 - [x] **Ethernet driver (DesignWare GMAC 5.20)** — Link up at 1 Gbit/s on `@16040000`. The YT8531 PHY address is found by search, the MAC address is the one the firmware set, and MAC loopback works both ways (proved on the board, `drivers/dwmac.c`).
 - [x] **Network stack over the GMAC** — `bring_up_network` falls back from virtio to dwmac. The board takes a real DHCP lease (192.168.86.247, 86400 s).
 - [x] **SoC temperature sensor via `/proc`** — `starfive,jh7110-temp` reads ~38 °C. Out-of-range values are refused. `/proc` is a table of generators that snapshot at open (`kernel/procfs.c`, plausibility verdict checked on the board).

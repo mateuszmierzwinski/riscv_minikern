@@ -164,6 +164,37 @@ static int shrink_file(struct xfs *fs, struct xfs_inode *ip, uint64_t size, uint
     return rc == KERR_OK ? xfs_inode_read(fs, ip->ino, ip) : rc;
 }
 
+/* Zeroes the last kept block from `size` to its end.
+ *
+ * **What a truncate cuts off must not come back.** The bytes stay on disk
+ * in the block the file keeps, and a later write further on makes them part
+ * of the file again unless they are zeroes — the old contents of a file
+ * shrunk to hide them. A hole or an unwritten block already reads as
+ * zeroes; a shared one is copied first, since the other file still has it. */
+static int zero_tail(struct xfs *fs, struct xfs_inode *ip, uint64_t size) {
+    uint32_t from = (uint32_t)(size & (fs->blocksize - 1u));
+    uint64_t logical = size >> fs->blocklog;
+    struct xfs_extent e;
+    struct bbuf *b;
+    int rc = from == 0 ? KERR_NOENT : xfs_bmap(fs, ip, logical, &e);
+    if (rc == KERR_NOENT || (rc == KERR_OK && e.unwritten)) {
+        return KERR_OK;
+    }
+    rc = rc != KERR_OK ? rc : xfs_file_prepare_block(fs, ip, logical);
+    rc = rc != KERR_OK ? rc : xfs_bmap(fs, ip, logical, &e);
+    rc = rc != KERR_OK ? rc
+                       : bcache_get(fs->cache, xfs_fsb_to_block(fs, e.startblock + (logical - e.startoff)), &b);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    for (uint32_t i = from; i < fs->blocksize; i++) {
+        b->data[i] = 0;
+    }
+    bcache_dirty(b);
+    bcache_put(fs->cache, b);
+    return KERR_OK;
+}
+
 int xfs_truncate(struct xfs *fs, struct xfs_inode *ip, uint64_t size, uint64_t now_s) {
     int rc = ip == NULL ? KERR_INVAL : refuse_truncate(fs, ip);
     if (rc != KERR_OK) {
@@ -182,5 +213,6 @@ int xfs_truncate(struct xfs *fs, struct xfs_inode *ip, uint64_t size, uint64_t n
          * drops instead (xfs_free_data). */
         return KERR_NOTSUP;
     }
-    return shrink_file(fs, ip, size, now_s);
+    rc = zero_tail(fs, ip, size);
+    return rc != KERR_OK ? rc : shrink_file(fs, ip, size, now_s);
 }

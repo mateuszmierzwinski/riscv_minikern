@@ -321,37 +321,100 @@ static int64_t sys_getegid(struct trapframe *tf) {
     return (int64_t)uspace_egid();
 }
 
-/* `setuid`: root may become anybody, and the change is to **both** ids.
+/* What the capability sets do when the uids change — Linux's rule, so a
+ * program written for it behaves the same here:
+ *   - every one of real, effective and saved non-zero: privilege is gone
+ *     for good, all sets cleared;
+ *   - the effective uid leaving 0: the effective set cleared, the
+ *     permitted one kept, so a temporary drop can be undone;
+ *   - the effective uid returning to 0: the effective set restored from
+ *     the permitted one — which a full drop has emptied, so it cannot
+ *     come back that way. */
+static void caps_follow_ids(struct uproc *me, uint32_t old_euid) {
+    if (me->uid != ACCESS_ROOT && me->euid != ACCESS_ROOT && me->suid != ACCESS_ROOT) {
+        me->caps.permitted = 0;
+        me->caps.effective = 0;
+        me->caps.ambient = 0;
+    } else if (old_euid == ACCESS_ROOT && me->euid != ACCESS_ROOT) {
+        me->caps.effective = 0;
+    } else if (old_euid != ACCESS_ROOT && me->euid == ACCESS_ROOT) {
+        me->caps.effective = me->caps.permitted;
+    }
+}
+
+/* `setuid`: root may become anybody, and the change is to **all three**
+ * ids.
  *
  * Setting only the effective one would leave the real uid as 0, and a
  * process that has dropped privilege but kept a real uid of 0 can take it
  * back — which is the difference between dropping privilege and appearing
- * to. Anybody who is not root is refused rather than silently ignored. */
+ * to. Anybody else may only move the effective uid to its real or saved
+ * one, as on Linux; any other id is refused rather than silently ignored.
+ * The capabilities follow (`caps_follow_ids`): becoming somebody else for
+ * good empties them, and nothing here can raise a set above `permitted`. */
 static int64_t sys_setuid(struct trapframe *tf) {
     uint32_t want = (uint32_t)sysarg(tf, 0);
     struct uproc *me = uspace_current();
+    uint32_t old_euid;
     if (me == NULL) {
         return KERR_SRCH;
     }
-    if (!uspace_capable(CAP_SETUID)) {
+    old_euid = me->euid;
+    if (uspace_capable(CAP_SETUID)) {
+        me->uid = want;
+        me->suid = want;
+    } else if (want != me->uid && want != me->suid) {
         return KERR_PERM;
     }
-    me->uid = want;
     me->euid = want;
-    /* **Becoming somebody else drops the capabilities.** Changing the uid
-     * away from root and keeping a full effective set would make `setuid`
-     * a way to look unprivileged while staying privileged, which is the
-     * opposite of what every caller uses it for. Linux's rule is the same:
-     * when the effective uid leaves zero, the permitted set is cleared.
-     *
-     * Becoming root does *not* grant them back — a process that has
-     * dropped `CAP_SYS_ADMIN` must not regain it by passing through
-     * `setuid(0)`. Capabilities are only ever raised by `execve`, which is
-     * where a new program's rights are decided. */
-    if (want != ACCESS_ROOT) {
-        me->caps.permitted = 0;
-        me->caps.effective = 0;
-        me->caps.ambient = 0;
+    caps_follow_ids(me, old_euid);
+    return 0;
+}
+
+#define UID_KEEP 0xffffffffu /* -1: this one stays as it is */
+
+/* Whether an unprivileged caller may set an id to `want`: only to one of
+ * the three it already has. */
+static bool uid_is_ours(const struct uproc *me, uint32_t want) {
+    return want == UID_KEEP || want == me->uid || want == me->euid || want == me->suid;
+}
+
+/* `setresuid(real, effective, saved)`, each -1 to keep. Root (CAP_SETUID)
+ * may set any; anybody else may only shuffle the three it has — which is
+ * how a daemon drops privilege for good, or for a while. Go's
+ * `syscall.Setresuid` is this call. */
+static int64_t sys_setresuid(struct trapframe *tf) {
+    uint32_t r = (uint32_t)sysarg(tf, 0), e = (uint32_t)sysarg(tf, 1), s = (uint32_t)sysarg(tf, 2);
+    struct uproc *me = uspace_current();
+    uint32_t old_euid;
+    if (me == NULL) {
+        return KERR_SRCH;
+    }
+    if (!uspace_capable(CAP_SETUID) &&
+        !(uid_is_ours(me, r) && uid_is_ours(me, e) && uid_is_ours(me, s))) {
+        return KERR_PERM;
+    }
+    old_euid = me->euid;
+    me->uid = r != UID_KEEP ? r : me->uid;
+    me->euid = e != UID_KEEP ? e : me->euid;
+    me->suid = s != UID_KEEP ? s : me->suid;
+    caps_follow_ids(me, old_euid);
+    return 0;
+}
+
+/* `getresuid(&real, &effective, &saved)`. */
+static int64_t sys_getresuid(struct trapframe *tf) {
+    const struct uproc *me = uspace_current();
+    uint32_t ids[3] = {0, 0, 0};
+    if (me != NULL) {
+        ids[0] = me->uid;
+        ids[1] = me->euid;
+        ids[2] = me->suid;
+    }
+    for (uint32_t i = 0; i < 3u; i++) {
+        if (uspace_copy_out((virt_t)sysarg(tf, i), &ids[i], sizeof ids[i]) != KERR_OK) {
+            return KERR_FAULT;
+        }
     }
     return 0;
 }
@@ -886,6 +949,8 @@ const struct syscall_entry sys_proc_table[] = {
     {176, "getgid", sys_getgid},
     {177, "getegid", sys_getegid},
     {146, "setuid", sys_setuid},
+    {147, "setresuid", sys_setresuid},
+    {148, "getresuid", sys_getresuid},
     {144, "setgid", sys_setgid},
     {159, "setgroups", sys_setgroups},
     {142, "reboot", sys_reboot},

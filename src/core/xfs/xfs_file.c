@@ -206,6 +206,16 @@ static uint64_t allocated_bytes(const struct xfs *fs, const struct xfs_inode *ip
  * at block `n * rextsize`. With the common `rextsize` of 1 those are the
  * same number, which is exactly the coincidence that would hide a missing
  * multiplication — so it is written out rather than assumed away. */
+/* A realtime block, zeroed for the reason `xfs_zero_block` gives. */
+static int zero_realtime(struct xfs *fs, uint64_t block) {
+    struct bbuf *b;
+    int rc = bcache_get_zeroed(fs->rt_cache, block, &b);
+    if (rc == KERR_OK) {
+        bcache_put(fs->rt_cache, b);
+    }
+    return rc;
+}
+
 static int grow_realtime(struct xfs *fs, struct xfs_fork_map *m, uint64_t logical) {
     uint64_t extent = 0;
     struct xfs_extent e;
@@ -222,7 +232,8 @@ static int grow_realtime(struct xfs *fs, struct xfs_fork_map *m, uint64_t logica
     }
     e = (struct xfs_extent){.startoff = logical, .startblock = extent * fs->rextsize,
                             .blockcount = 1};
-    rc = xfs_fork_map_add(m, &e);
+    rc = zero_realtime(fs, e.startblock);
+    rc = rc != KERR_OK ? rc : xfs_fork_map_add(m, &e);
     if (rc != KERR_OK) {
         /* The extent was taken but the map would not hold it: give it back,
          * or the bitmap says used and no inode refers to it — a leak only a
@@ -255,7 +266,8 @@ static int grow_from_group(struct xfs *fs, const struct xfs_inode *ip, struct xf
     }
     fsb = ((uint64_t)agno << fs->agblklog) | got;
     e = (struct xfs_extent){.startoff = logical, .startblock = fsb, .blockcount = 1};
-    rc = xfs_rmap_map(fs, fsb, 1u, ip->ino, logical);
+    rc = xfs_zero_block(fs, fsb);
+    rc = rc != KERR_OK ? rc : xfs_rmap_map(fs, fsb, 1u, ip->ino, logical);
     if (rc == KERR_OK && (rc = xfs_fork_map_add(m, &e)) != KERR_OK) {
         (void)xfs_rmap_unmap(fs, fsb, 1u, ip->ino, logical);
     }

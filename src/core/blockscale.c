@@ -19,6 +19,11 @@ static int scaled_flush(void *self) {
     return s->under->flush(s->under->self);
 }
 
+static int scaled_discard(void *self, uint64_t lba, uint32_t count) {
+    const struct blockscale *s = self;
+    return s->under->discard(s->under->self, lba * s->factor, count * s->factor);
+}
+
 int blockscale_wrap(const struct blockdev *under, uint32_t logical_block, struct blockscale *state,
                     struct blockdev *out) {
     uint32_t factor;
@@ -33,6 +38,7 @@ int blockscale_wrap(const struct blockdev *under, uint32_t logical_block, struct
         .read = scaled_read,
         .write = scaled_write,
         .flush = scaled_flush,
+        .discard = under->discard != NULL ? scaled_discard : NULL,
         .self = state,
         .block_size = logical_block,
         /* Whole blocks only. A device whose sector count is not a multiple
@@ -40,6 +46,7 @@ int blockscale_wrap(const struct blockdev *under, uint32_t logical_block, struct
          * otherwise would put the last partial block past the end. */
         .blocks = under->blocks / factor,
         .read_only = under->read_only,
+        .discard_zeroes = under->discard_zeroes,
     };
     return KERR_OK;
 }

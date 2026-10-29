@@ -1355,6 +1355,40 @@ int xfsmount_flush(void) {
     return bcache_flush(vol->cache);
 }
 
+/* A byte range in whole blocks: the start rounded down, the end too (a
+ * partial block at the end is not wholly in the range), and the minimum
+ * rounded up — at least one block. An end past the top of the address space
+ * means "to the end". */
+static struct xfs_trim_range trim_blocks(const struct xfs *vol, uint64_t start, uint64_t len,
+                                         uint64_t minlen) {
+    uint64_t end = len > UINT64_MAX - start ? UINT64_MAX : start + len;
+    uint64_t first = start >> vol->blocklog, last = end >> vol->blocklog;
+    uint64_t min = (minlen + vol->blocksize - 1u) >> vol->blocklog;
+    return (struct xfs_trim_range){.start = first, .len = last > first ? last - first : 0,
+                                   .minlen = min > 0 ? min : 1u};
+}
+
+int xfsmount_trim(const char *path, uint64_t start, uint64_t len, uint64_t minlen,
+                  uint64_t *trimmed) {
+    const char *fat_within = NULL, *within = path;
+    struct xfs *vol;
+    struct xfs_trim_range r;
+    uint64_t blocks = 0;
+    int rc;
+    *trimmed = 0;
+    if (fat_for(path, &fat_within) != NULL) {
+        return KERR_NOTSUP;
+    }
+    vol = owner_of(path, &within);
+    if (vol == NULL) {
+        return KERR_NODEV;
+    }
+    r = trim_blocks(vol, start, len, minlen);
+    rc = r.len == 0 ? KERR_INVAL : xfs_trim(vol, &r, &blocks);
+    *trimmed = blocks << vol->blocklog;
+    return rc;
+}
+
 int xfsmount_counters(const char *path, struct xfs_counters *out) {
     const char *fat_within = NULL;
     struct fat *fat = fat_for(path, &fat_within);

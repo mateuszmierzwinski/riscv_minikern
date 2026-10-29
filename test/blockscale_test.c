@@ -24,6 +24,7 @@ static struct {
     uint32_t reads;
     uint32_t writes;
     uint32_t flushes;
+    uint32_t discards;
 } seen;
 
 static int fake_read(void *self, uint64_t lba, uint32_t count, void *buf) {
@@ -55,8 +56,17 @@ static int fake_flush(void *self) {
     return KERR_OK;
 }
 
+static int fake_discard(void *self, uint64_t lba, uint32_t count) {
+    (void)self;
+    seen.last_lba = lba;
+    seen.last_count = count;
+    seen.discards++;
+    return KERR_OK;
+}
+
 static const struct blockdev fake = {
-    .read = fake_read, .write = fake_write, .flush = fake_flush, .self = NULL,
+    .read = fake_read, .write = fake_write, .flush = fake_flush, .discard = fake_discard,
+    .self = NULL,
     .block_size = FAKE_SECTOR, .blocks = FAKE_SECTORS, .read_only = false,
 };
 
@@ -120,10 +130,26 @@ static void test_flush_and_read_only_pass_through(void) {
     KTEST_CHECK(scaled.flush(scaled.self) == KERR_OK && seen.flushes == 1u);
 }
 
+/* A discard is scaled like any other access, and absent when the device
+ * beneath cannot discard. */
+static void test_discard_is_scaled_or_absent(void) {
+    struct blockscale state;
+    struct blockdev view, plain = fake;
+    memset(&seen, 0, sizeof seen);
+    KTEST_CHECK(blockscale_wrap(&fake, 4096u, &state, &view) == KERR_OK);
+    KTEST_CHECK(view.discard != NULL);
+    KTEST_CHECK(view.discard(view.self, 3u, 2u) == KERR_OK);
+    KTEST_CHECK(seen.last_lba == 24u && seen.last_count == 16u && seen.discards == 1u);
+    plain.discard = NULL;
+    KTEST_CHECK(blockscale_wrap(&plain, 4096u, &state, &view) == KERR_OK);
+    KTEST_CHECK(view.discard == NULL);
+}
+
 int main(void) {
     KTEST_RUN(test_four_kibibyte_blocks_over_sectors);
     KTEST_RUN(test_impossible_ratios_are_refused);
     KTEST_RUN(test_a_partial_last_block_is_dropped);
     KTEST_RUN(test_flush_and_read_only_pass_through);
+    KTEST_RUN(test_discard_is_scaled_or_absent);
     return ktest_failures();
 }

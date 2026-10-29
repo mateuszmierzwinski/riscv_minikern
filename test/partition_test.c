@@ -43,6 +43,15 @@ static int fake_write(void *self, uint64_t lba, uint32_t count, const void *buf)
 
 static struct blockdev dev;
 
+static uint64_t discarded_at;
+
+static int fake_discard(void *self, uint64_t lba, uint32_t count) {
+    (void)self;
+    (void)count;
+    discarded_at = lba;
+    return KERR_OK;
+}
+
 /* The next `failing_reads` reads of LBA `failing_lba` fail, as the board's SD
  * controller's first reads sometimes do. */
 static uint64_t failing_lba;
@@ -208,6 +217,22 @@ static void test_a_corrupt_gpt_header_reports_nothing(void) {
     KTEST_CHECK(partition_scan(&dev, p, PARTITION_MAX) == 0);
 }
 
+/* A discard is shifted to the partition and kept inside it, and absent
+ * when the disk cannot discard: a trim of one partition must never reach
+ * the next one's blocks. */
+static void test_discard_is_shifted_and_bounded(void) {
+    struct partition p = {.first = 4u, .sectors = 8u, .present = true};
+    struct partdev state;
+    struct blockdev view;
+    fresh();
+    KTEST_CHECK(partition_wrap(&dev, &p, &state, &view) == KERR_OK);
+    KTEST_CHECK(view.discard == NULL);
+    dev.discard = fake_discard;
+    KTEST_CHECK(partition_wrap(&dev, &p, &state, &view) == KERR_OK);
+    KTEST_CHECK(view.discard(view.self, 2u, 3u) == KERR_OK && discarded_at == 6u);
+    KTEST_CHECK(view.discard(view.self, 7u, 2u) == KERR_INVAL);
+}
+
 int main(void) {
     KTEST_RUN(test_no_table_is_not_an_error);
     KTEST_RUN(test_mbr_entry_is_found);
@@ -218,5 +243,6 @@ int main(void) {
     KTEST_RUN(test_reading_past_the_end_is_refused);
     KTEST_RUN(test_a_partition_outside_the_disk_is_refused);
     KTEST_RUN(test_a_corrupt_gpt_header_reports_nothing);
+    KTEST_RUN(test_discard_is_shifted_and_bounded);
     return ktest_failures();
 }

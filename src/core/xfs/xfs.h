@@ -809,6 +809,21 @@ int xfs_file_write(struct xfs *fs, struct xfs_inode *ip, uint64_t off, const voi
 /* Makes everything written durable: the cache, then the device. */
 int xfs_flush(struct xfs *fs);
 
+/* A trim's range, in filesystem blocks counted from the start of the device
+ * (`FITRIM`'s byte range, divided by the block size), and the shortest free
+ * extent worth a discard. */
+struct xfs_trim_range {
+    uint64_t start;
+    uint64_t len;
+    uint64_t minlen;
+};
+
+/* Discards every free extent in the range that is at least minlen blocks
+ * long, after flushing; *trimmed is how many blocks that reached, also on
+ * failure. KERR_NOTSUP on a device that cannot discard, KERR_ROFS on a
+ * read-only mount, KERR_INVAL for a range past the end. */
+int xfs_trim(struct xfs *fs, const struct xfs_trim_range *r, uint64_t *trimmed);
+
 /* Whether this filesystem may be written at all (the device decides). */
 bool xfs_writable(const struct xfs *fs);
 

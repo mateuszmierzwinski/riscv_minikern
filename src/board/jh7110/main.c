@@ -25,6 +25,7 @@
 #include "board/jh7110/console.h"
 #include "board/jh7110/selftest.h"
 #include "board/jh7110/uart.h"
+#include "drivers/ramdisk.h"
 #include "drivers/crg_jh7110.h"
 #include "drivers/gpio_jh7110.h"
 #include "drivers/nvme.h"
@@ -321,6 +322,12 @@ static void put_the_boot_log_on_disk(void) {
     uint32_t n;
     int rc;
     if (klog_entries() == 0) {
+        return;
+    }
+    /* `minikern.nodisklog`: for a boot that must not write to the disk it
+     * mounted — a probe of a drive that holds somebody's data. */
+    if (cmdline_has(boot_cmdline, "minikern.nodisklog")) {
+        kprintf("klog: kept in memory (minikern.nodisklog)\n");
         return;
     }
     /* Rotate downwards from the oldest, so that nothing is overwritten
@@ -694,6 +701,66 @@ static void run_boot_selftest(void) {
             ok ? "the boot partition is read and written at /boot" : "FAILED");
 }
 
+/* Trims every writable volume once (`minikern.autotrim`).
+ *
+ * **At boot, because there is nowhere else yet.** Linux leaves the periodic
+ * trim to `fstrim.timer`; this kernel has no kernel threads to run one on,
+ * and the timer's housekeeping runs where filesystem I/O cannot. A boot is
+ * the natural point the kernel itself has, and `FITRIM` is there for a
+ * system that stays up. Opt-in until deallocate has been verified on a
+ * drive whose data nobody minds losing (ROADMAP §4). */
+static void run_autotrim(void) {
+    for (uint32_t i = 0; i < volumes_count(); i++) {
+        uint64_t bytes = 0;
+        int rc = volumes_readonly(i) ? KERR_ROFS
+                                     : xfsmount_trim(volumes_at(i), 0, UINT64_MAX, 0, &bytes);
+        if (rc == KERR_OK) {
+            kprintf("trim: %s: %llu KiB discarded\n", volumes_at(i),
+                    (unsigned long long)(bytes >> 10));
+        } else {
+            kprintf("trim: %s: not trimmed (rc %d)\n", volumes_at(i), rc);
+        }
+    }
+}
+
+/* Whether `path` holds exactly `len` bytes of `want`. */
+static bool holds_large(const char *path, const uint8_t *want, uint32_t len) {
+    uint8_t *bytes = NULL;
+    uint32_t size = 0;
+    bool same = xfsmount_read_file(path, len + 1u, &bytes, &size) == KERR_OK && size == len;
+    for (uint32_t i = 0; same && i < len; i++) {
+        same = bytes[i] == want[i];
+    }
+    kfree(bytes);
+    return same;
+}
+
+/* A trim on the RAM disk, judged by the device (`minikern.trimtest`).
+ *
+ * A file written and removed leaves free space the filesystem once used;
+ * the trim must reach the device for exactly the bytes it reports — the RAM
+ * disk counts what it was told to discard — and a file kept must read back
+ * whole, since a trim that discarded a live block would zero it. */
+static uint8_t trim_payload[262144];
+
+static void run_trim_selftest(void) {
+    uint64_t before = ramdisk_discarded(), bytes = 0, none = 1, seen = 0;
+    bool ok;
+    for (uint32_t i = 0; i < sizeof trim_payload; i++) {
+        trim_payload[i] = (uint8_t)(i * 13u + 5u);
+    }
+    ok = xfsmount_write_into("/", "trimgone", trim_payload, sizeof trim_payload) == KERR_OK &&
+         xfsmount_write_into("/", "trimkeep", trim_payload, 65536u) == KERR_OK &&
+         xfsmount_unlink_path("/trimgone") == KERR_OK;
+    ok = ok && xfsmount_trim("/", 0, UINT64_MAX, 0, &bytes) == KERR_OK && bytes > 0;
+    seen = (ramdisk_discarded() - before) * 512u;
+    ok = ok && bytes == seen;
+    ok = ok && holds_large("/trimkeep", trim_payload, 65536u);
+    ok = ok && xfsmount_trim("/", 0, UINT64_MAX, (uint64_t)1 << 40, &none) == KERR_OK && none == 0;
+    kprintf("trim: %llu bytes discarded, the device saw %llu; %s\n", (unsigned long long)bytes,
+            (unsigned long long)seen, ok ? "the kept file reads back whole" : "FAILED");
+}
+
 /* Checks automount put each volume where its label says.
  *
  * **The decision, not the mounting.** That both filesystems mount is the
@@ -751,7 +818,8 @@ static void bring_up_filesystem(void) {
         kprintf("xfs: mounted, but the root directory would not read (rc %d)\n", entries);
         return;
     }
-    kprintf("xfs: mounted read-only, %d entries in /\n", entries);
+    kprintf("xfs: mounted %s, %d entries in /\n",
+            xfs_writable(xfsmount_fs()) ? "read-write" : "read-only", entries);
     if (xfs_quota_soft_exceeded(xfsmount_fs()) != 0) {
         /* **Reported, since it cannot be enforced.** A soft limit's grace
          * period needs a wall clock and this board has no real-time clock,
@@ -3911,6 +3979,9 @@ static void run_user_programs(void) {
     if (cmdline_has(boot_cmdline, "minikern.bootwrite")) {
         run_boot_selftest();
     }
+    if (cmdline_has(boot_cmdline, "minikern.trimtest")) {
+        run_trim_selftest();
+    }
     /* `minikern.cat=<path>` — lookup and extent reading, in one answer. */
     {
         size_t len = 0;
@@ -4141,6 +4212,9 @@ static void kmain_high(uint64_t hart, uint64_t dtb) {
      * failure this tree has recorded seven times. */
     xfsmount_set_umask_source(uspace_current_umask);
     bring_up_filesystem();
+    if (cmdline_has(boot_cmdline, "minikern.autotrim")) {
+        run_autotrim();
+    }
     {
         /* **Did the device's interrupt ever reach the kernel?** The one
          * question that separates "the wait is wrong" from "the source,

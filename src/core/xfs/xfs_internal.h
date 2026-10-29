@@ -374,6 +374,17 @@ int xfs_attr_free_blocks(struct xfs *fs, const struct xfs_inode *ip);
 /* Gives an extent back, joined to whatever it abuts. */
 int xfs_free_extent(struct xfs *fs, uint32_t agno, uint32_t start, uint32_t count);
 
+/* Makes block `fsb` all zeroes, without reading it: a block just given to a
+ * file must not show the file whatever it held before — a deleted file's
+ * bytes, or what a drive returns for a trimmed block. */
+int xfs_zero_block(struct xfs *fs, uint64_t fsb);
+
+/* Calls `visit` with every free extent of group `agno`, in block order, from
+ * the by-block tree; stops at the first error it returns. The tree must not
+ * change while it runs. */
+typedef int (*xfs_free_visit_fn)(void *self, uint32_t agno, uint32_t start, uint32_t count);
+int xfs_free_extents_each(struct xfs *fs, uint32_t agno, xfs_free_visit_fn visit, void *self);
+
 /* Writes these inodes to the log as one committed transaction, then an
  * unmount record after it so the log is clean again (xfs_logwrite.c).
  *

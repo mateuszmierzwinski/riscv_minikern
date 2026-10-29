@@ -64,7 +64,10 @@ static struct bbuf *victim(struct bcache *c) {
     return best;
 }
 
-int bcache_get(struct bcache *c, uint64_t lba, struct bbuf **out) {
+/* A slot for block lba: the cached one, or a victim given to it — read
+ * from the device when `fill` says so, left as it is when the caller is
+ * about to overwrite every byte. */
+static int claim(struct bcache *c, uint64_t lba, bool fill, struct bbuf **out) {
     struct bbuf *b = find(c, lba);
     int rc;
     if (!blockdev_in_range(c->dev, lba, 1)) {
@@ -78,7 +81,7 @@ int bcache_get(struct bcache *c, uint64_t lba, struct bbuf **out) {
         if (b->valid && b->dirty && (rc = write_back(c, b)) != KERR_OK) {
             return rc;
         }
-        if ((rc = c->dev->read(c->dev->self, lba, 1, b->data)) != KERR_OK) {
+        if (fill && (rc = c->dev->read(c->dev->self, lba, 1, b->data)) != KERR_OK) {
             b->valid = false;
             return rc;
         }
@@ -91,6 +94,21 @@ int bcache_get(struct bcache *c, uint64_t lba, struct bbuf **out) {
     b->used = ++c->clock;
     *out = b;
     return KERR_OK;
+}
+
+int bcache_get(struct bcache *c, uint64_t lba, struct bbuf **out) {
+    return claim(c, lba, true, out);
+}
+
+int bcache_get_zeroed(struct bcache *c, uint64_t lba, struct bbuf **out) {
+    int rc = claim(c, lba, false, out);
+    if (rc == KERR_OK) {
+        for (uint32_t i = 0; i < c->dev->block_size; i++) {
+            (*out)->data[i] = 0;
+        }
+        bcache_dirty(*out);
+    }
+    return rc;
 }
 
 void bcache_put(struct bcache *c, struct bbuf *b) {
@@ -123,6 +141,35 @@ void bcache_invalidate(struct bcache *c) {
             c->slots[i].valid = false;
         }
     }
+}
+
+/* True when a buffer in [lba, lba+count) is in use. */
+static bool busy_in(const struct bcache *c, uint64_t lba, uint32_t count) {
+    for (uint32_t i = 0; i < c->nslots; i++) {
+        const struct bbuf *b = &c->slots[i];
+        if (b->valid && b->lba - lba < count && (b->dirty || b->refs != 0)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+int bcache_discard(struct bcache *c, uint64_t lba, uint32_t count) {
+    if (c->dev->discard == NULL || c->dev->read_only) {
+        return KERR_NOTSUP;
+    }
+    if (!blockdev_in_range(c->dev, lba, count)) {
+        return KERR_INVAL;
+    }
+    if (busy_in(c, lba, count)) {
+        return KERR_BUSY;
+    }
+    for (uint32_t i = 0; i < c->nslots; i++) {
+        if (c->slots[i].valid && c->slots[i].lba - lba < count) {
+            c->slots[i].valid = false;
+        }
+    }
+    return c->dev->discard(c->dev->self, lba, count);
 }
 
 /* True when [off, off+n) is inside the device. */
