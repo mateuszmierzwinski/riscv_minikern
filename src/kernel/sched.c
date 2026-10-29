@@ -1033,25 +1033,50 @@ uint32_t sched_stop_process(uint32_t pid) {
 
 bool sched_signal_pending(void) {
     const struct thread *t = running_thread();
-    return t != NULL && (t->signals.pending & ~t->signals.blocked) != 0;
+    return t != NULL && signal_deliverable_for(&t->signals, t->proc) != 0;
 }
 
-bool sched_raise_on_process(uint32_t pid, uint32_t signo) {
+/* Whether thread `i` is a live thread of process `pid`. */
+static bool live_thread_of(uint32_t i, uint32_t pid) {
+    return threads[i].state != THREAD_FREE && threads[i].state != THREAD_DYING &&
+           threads[i].proc != NULL && uspace_pid_of(threads[i].proc) == pid;
+}
+
+/* The thread of `pid` to wake for `signo`: the first that does not block
+ * it, or the first at all when every one does (it is the one that would
+ * see `SIGKILL`'s and a stop's effect). SCHED_MAX_THREADS for none. */
+static uint32_t thread_to_wake(uint32_t pid, uint32_t signo) {
+    uint32_t first = SCHED_MAX_THREADS;
     for (uint32_t i = 0; i < SCHED_MAX_THREADS; i++) {
-        if (threads[i].state == THREAD_FREE || threads[i].state == THREAD_DYING ||
-            threads[i].proc == NULL || uspace_pid_of(threads[i].proc) != pid) {
+        if (!live_thread_of(i, pid)) {
             continue;
         }
-        signal_raise_on(&threads[i].signals, signo, 0, 0);
-        /* A thread that is blocked or stopped has to be made runnable or the
-         * signal waits for an event that a stopped process will not see. */
-        if (threads[i].state == THREAD_BLOCKED || threads[i].state == THREAD_STOPPED) {
-            place_on_runqueue(i);
-            poke_idle_harts();
+        if (signal_unblocked_in(&threads[i].signals, signo)) {
+            return i;
         }
-        return true;
+        first = first == SCHED_MAX_THREADS ? i : first;
     }
-    return false;
+    return first;
+}
+
+/* **The process's pending set, not a thread's.** The signal waits there
+ * until a thread with it unblocked takes it — at once, if one exists, which
+ * is the thread woken here; otherwise the first to unblock it. Putting it
+ * on the first thread instead lost it whenever that thread blocked it: a
+ * Go program's main thread, a server's non-signal threads. */
+bool sched_raise_on_process(uint32_t pid, uint32_t signo) {
+    uint32_t i = thread_to_wake(pid, signo);
+    if (i == SCHED_MAX_THREADS) {
+        return false;
+    }
+    signal_raise_shared(threads[i].proc, signo);
+    /* A thread that is blocked or stopped has to be made runnable or the
+     * signal waits for an event that a stopped process will not see. */
+    if (threads[i].state == THREAD_BLOCKED || threads[i].state == THREAD_STOPPED) {
+        place_on_runqueue(i);
+        poke_idle_harts();
+    }
+    return true;
 }
 
 uint32_t sched_continue_process(uint32_t pid) {

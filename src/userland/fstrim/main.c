@@ -15,6 +15,7 @@
  *   16  a minimum longer than any free extent trimmed nothing
  *   32  an unknown ioctl on a directory was ENOTTY
  *   64  FITRIM from a non-root caller was EPERM
+ *   128 FITRIM with its range in the kernel's memory was EFAULT (Rule 25)
  */
 #include <stdint.h>
 
@@ -34,6 +35,8 @@
 #define FITRIM 0xc0185879u /* _IOWR('X', 121, struct fstrim_range) */
 #define ENOTTY 25
 #define EPERM 1
+#define EFAULT 14
+#define KERNEL_TEXT 0xffffffc000200000ul
 
 struct fstrim_range {
     uint64_t start;
@@ -99,7 +102,7 @@ static uint32_t write_megabyte(const char *path) {
     return put == 16 * (long)sizeof chunk ? 2u : 0u;
 }
 
-/* The checks a root caller can make: bits 8, 16 and 32. */
+/* The checks a root caller can make: bits 8, 16, 32 and 128. */
 static uint32_t root_checks(long dir) {
     struct fstrim_range r;
     uint32_t passed = 0;
@@ -111,6 +114,10 @@ static uint32_t root_checks(long dir) {
     if (trim(dir, (uint64_t)1 << 40, &r) == 0 && r.len == 0) {
         passed |= 16u;
         say("fstrim: a long minimum trimmed nothing\n");
+    }
+    if (syscall4(SYS_IOCTL, dir, (long)FITRIM, (long)KERNEL_TEXT, 0) == -EFAULT) {
+        passed |= 128u;
+        say("fstrim: a range in the kernel's memory is EFAULT\n");
     }
     if (syscall4(SYS_IOCTL, dir, 0x5401, (long)&r, 0) == -ENOTTY) {
         passed |= 32u;

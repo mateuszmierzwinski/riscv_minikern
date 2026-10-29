@@ -140,6 +140,20 @@ void signal_raise_fault(uint32_t signo, virt_t fault_address, int32_t code);
  * `tgkill`, which says which thread it means, and means it: a runtime
  * preempting a specific goroutine has chosen the thread on purpose. */
 struct thread_signals;
+struct uproc;
+
+/* Raises a signal on the process: it waits in the process's pending set
+ * until a thread with it unblocked takes it. */
+void signal_raise_shared(struct uproc *p, uint32_t signo);
+
+/* Whether `who`, a thread of `p`, could take signal `signo` now: it does
+ * not block it. */
+bool signal_unblocked_in(const struct thread_signals *who, uint32_t signo);
+
+/* The signals waiting for `who` that it does not block: its own and the
+ * process's. */
+uint64_t signal_deliverable_for(const struct thread_signals *who, const struct uproc *p);
+
 void signal_raise_on(struct thread_signals *who, uint32_t signo, virt_t fault_address,
                      int32_t code);
 

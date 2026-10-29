@@ -197,6 +197,10 @@ struct uproc {
      * processes. A thread's own signal state stays in the thread. */
     struct file *fds[FD_MAX];
     struct user_sigaction actions[SIG_COUNT];
+    /* Signals sent to the process (`kill`) rather than to a thread: any
+     * thread with one unblocked takes it. Kept across `execve`, cleared for
+     * a fork's child — as on Linux. */
+    uint64_t shared_pending;
 
     /* ── the address space ─────────────────────────────────────────────── */
     /* `shares_pt` says the tables belong to another process: a `vfork` child

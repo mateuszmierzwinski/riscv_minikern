@@ -578,6 +578,26 @@ user_hostile_start:
     bltz    a0, 7f
     ori     s1, s1, 64
 7:
+    /* 8: the calls added since — `getresuid` writing its three ids into
+     * the kernel, and `clock_nanosleep` reading its request from it, at
+     * the address the kernel now actually runs at (its top-half text).
+     * They share bit 128: the status is eight bits wide. */
+    li      a0, 0xffffffc000200000
+    li      a1, 0xffffffc000200000
+    li      a2, 0xffffffc000200000
+    li      a7, 148              /* getresuid */
+    ecall
+    bgez    a0, 81f
+    li      a0, 1                /* CLOCK_MONOTONIC */
+    li      a1, 0
+    li      a2, 0xffffffc000200000
+    li      a3, 0
+    li      a7, 115              /* clock_nanosleep */
+    ecall
+    bgez    a0, 81f
+    j       8f
+81: ori     s1, s1, 128
+8:
     /* Surviving to here is most of the result: the kernel refused each one
      * rather than faulting inside itself. */
     mv      a0, s1

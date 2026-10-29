@@ -1426,6 +1426,38 @@ user_image(
     program = ":netlinkask",
 )
 
+# `nanosleep` interrupted by a signal: EINTR and the time left. Exits with a
+# bitmask of the checks that passed.
+user_binary(
+    name = "sleepintr",
+    srcs = [
+        "src/userland/race/clone.S",
+        "src/userland/sleepintr/main.c",
+        "src/userland/start.S",
+    ],
+)
+
+user_image(
+    name = "sleepintr.elf",
+    program = ":sleepintr",
+)
+
+# A signal to the process taken by the thread that can take it: the
+# process-wide pending set. Exits with a bitmask of the checks that passed.
+user_binary(
+    name = "sigshared",
+    srcs = [
+        "src/userland/race/clone.S",
+        "src/userland/sigshared/main.c",
+        "src/userland/start.S",
+    ],
+)
+
+user_image(
+    name = "sigshared.elf",
+    program = ":sigshared",
+)
+
 # Saved ids: a privilege drop undone through the saved uid, and one that
 # cannot be. Exits with a bitmask of the checks that passed.
 user_binary(

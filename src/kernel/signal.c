@@ -224,12 +224,41 @@ void signal_raise_on(struct thread_signals *who, uint32_t signo, virt_t fault_ad
     }
 }
 
-/* The lowest-numbered signal that is pending and not blocked, or 0. Lowest
- * first because that is the order the ABI promises, and a runtime that
- * expects SIGSEGV before SIGURG gets it. */
+void signal_raise_shared(struct uproc *p, uint32_t signo) {
+    if (p != NULL && valid_signal(signo)) {
+        p->shared_pending |= bit_of(signo);
+    }
+}
+
+bool signal_unblocked_in(const struct thread_signals *who, uint32_t signo) {
+    return valid_signal(signo) && (who->blocked & bit_of(signo)) == 0;
+}
+
+uint64_t signal_deliverable_for(const struct thread_signals *who, const struct uproc *p) {
+    uint64_t shared = p != NULL ? p->shared_pending : 0;
+    return (who->pending | shared) & ~who->blocked;
+}
+
+/* Takes signal `signo` off what is waiting for the running thread: its own
+ * copy first, the process's otherwise — so one `kill` is delivered once,
+ * to one thread. */
+static void take(struct thread_signals *me, uint32_t signo) {
+    struct uproc *p = uspace_current();
+    if ((me->pending & bit_of(signo)) != 0) {
+        me->pending &= ~bit_of(signo);
+    } else if (p != NULL) {
+        p->shared_pending &= ~bit_of(signo);
+    }
+}
+
+/* The lowest-numbered signal that is pending — for this thread or for its
+ * process — and not blocked, or 0. Lowest first because that is the order
+ * the ABI promises, and a runtime that expects SIGSEGV before SIGURG gets
+ * it. */
 static uint32_t next_deliverable(const struct thread_signals *me) {
+    uint64_t ready = signal_deliverable_for(me, uspace_current());
     for (uint32_t signo = 1; signo < SIG_COUNT; signo++) {
-        if ((me->pending & bit_of(signo)) != 0 && (me->blocked & bit_of(signo)) == 0) {
+        if ((ready & bit_of(signo)) != 0) {
             return signo;
         }
     }
@@ -266,7 +295,7 @@ bool signal_is_fatal(uint32_t *signo) {
      * raises the default action is to end the process. Ignoring is the one
      * exception and is handled by clearing it here. */
     if (a[s].sa_handler == SIG_IGN) {
-        me->pending &= ~bit_of(s);
+        take(me, s);
         return signal_is_fatal(signo);
     }
     if (a[s].sa_handler == SIG_DFL) {
@@ -363,7 +392,7 @@ bool signal_deliver(struct trapframe *tf) {
     sp = (handler_stack(me, a, tf) - sizeof(struct rt_sigframe)) & ~15ull;
     frame = (struct rt_sigframe *)(uintptr_t)sp;
     save_context(me, frame, tf, signo);
-    me->pending &= ~bit_of(signo);
+    take(me, signo);
     /* Blocked while the handler runs, plus whatever it asked to block, so a
      * fault inside a SIGSEGV handler does not recurse for ever. */
     me->blocked |= a->sa_mask | ((a->sa_flags & SA_NODEFER) != 0 ? 0u : bit_of(signo));

@@ -13,7 +13,7 @@ git, and the pitfalls are in `CLAUDE.md` §5.
 
 ### Open
 
-None known; the open XFS read failure is in §3.
+- [ ] **The SD card's `/init` is no longer the Go test binary — needs the operator** — `a stock Go binary off the card` fails because `/init` on the card is a 9,760-byte C program that exits 42 (seen 2026-10-29); the kernel ran it correctly. Needed: put the Go test binary (`src/userland/gotest`) back as `/init` on the card's ROOT, or say which `/init` the card should carry and the case will follow it.
 
 ### Done
 
@@ -39,10 +39,11 @@ None known; the open XFS read failure is in §3.
 
 ### Open
 
-- [ ] **Process-wide pending signals** (S) — `kill` raises a signal on the process's first live thread, because there is no process-wide pending set. This is right for job control but wrong for a multi-threaded program that catches the signal. Next step: add a per-process pending set that any thread with the signal unblocked can take.
-- [ ] **`nanosleep` never reports the remaining time** (S) — `rem` is not written on an interrupted sleep. Write it (null-tolerant) when returning `EINTR`.
 
 ### Done
+
+- [x] **Process-wide pending signals** — `kill` raises on the process's pending set, and the thread woken is one with the signal unblocked; a thread that unblocks it later takes it. It used to go to the first thread, so a program whose main thread blocks a signal never received it. Board: `§1: a signal to the process is taken by a thread that can take it` (15).
+- [x] **`nanosleep` interrupted, `clock_nanosleep`, `CLOCK_REALTIME`** — an interrupted sleep returned 0 after sleeping short, and now returns `EINTR` with `rem`. `clock_nanosleep` (relative and `TIMER_ABSTIME`) was missing. `CLOCK_REALTIME` returned time since boot, not the date. Board: `§1: nanosleep interrupted…` (255); hostile cases for `getresuid` and `clock_nanosleep`.
 
 - [x] **Saved ids and unprivileged `setuid`** — `setresuid`/`getresuid` (syscalls 147/148, both missing) and a saved uid. Capabilities follow Linux's rule: cleared for good when all three ids are non-zero, only the effective set when the effective uid leaves 0, restored from the permitted set when it returns. An unprivileged `setuid` may move to its real or saved uid. Board: `§1: saved ids` (127), `process model self-tests`, `hostile syscall arguments`.
 

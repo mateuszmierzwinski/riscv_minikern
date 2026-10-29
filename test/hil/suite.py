@@ -617,6 +617,20 @@ CASES = [
       "the boot partition is read and written at /boot",
       "cat: /boot/minikern.bin is 48 bytes"],
      240, None, "bootfirst"),
+    # **`nanosleep` interrupted** (§1): EINTR with the time left in `rem`,
+    # not a silent 0 after a short sleep; `clock_nanosleep`, relative and
+    # absolute; `CLOCK_REALTIME` a date, not the time since boot. 255 is all.
+    ("§1: nanosleep interrupted by a signal reports EINTR and the time left",
+     "",
+     ["exited with 255"],
+     200, "//:sleepintr.elf"),
+    # **A signal to the process** (§1): the main thread blocks SIGUSR1, a
+    # second thread does not; `kill` must run the handler on the second
+    # thread, also when it was sent while both blocked it. 15 is all four.
+    ("§1: a signal to the process is taken by a thread that can take it",
+     "",
+     ["exited with 15"],
+     200, "//:sigshared.elf"),
     # **Saved ids** (§1): `setresuid` with root kept as the saved uid is a
     # drop that can be undone, and the privilege comes back with it; with
     # all three ids dropped it cannot. 127 is all seven.
@@ -638,14 +652,16 @@ CASES = [
      240, None, "defaults"),
     # **`fstrim`'s system call**: FITRIM on the root directory, from a
     # program — the struct copied in and back, the minimum honoured, an
-    # unknown request ENOTTY, a non-root caller EPERM. 127 is all seven.
+    # unknown request ENOTTY, a non-root caller EPERM, a range in kernel
+    # memory EFAULT. 255 is all eight.
     ("§4: fstrim through FITRIM, from a program",
      "",
      ["fstrim: / trimmed, bytes: ",
       "fstrim: a long minimum trimmed nothing",
       "fstrim: an unknown ioctl on a directory is ENOTTY",
       "fstrim: an unprivileged caller is refused",
-      "exited with 127"],
+      "fstrim: a range in the kernel's memory is EFAULT",
+      "exited with 255"],
      240, "//:fstrim.elf", "defaults"),
 ]
 

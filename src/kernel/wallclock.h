@@ -45,4 +45,7 @@ bool wallclock_is_real(void);
  * is how a caller tells which it has. */
 uint64_t wallclock_seconds(void);
 
+/* The same, in nanoseconds: `CLOCK_REALTIME`. */
+uint64_t wallclock_ns(void);
+
 #endif

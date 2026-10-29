@@ -426,9 +426,12 @@ static int64_t sys_mprotect(struct trapframe *tf) {
     return uspace_protect(uspace_current(), sysarg(tf, 0), sysarg(tf, 1), (uint32_t)sysarg(tf, 2));
 }
 
+/* `clock_gettime`. **`CLOCK_REALTIME` is the date**, from the epoch the
+ * command line gave (`wallclock_ns`); it was the time since boot, so a Go
+ * program's `time.Now()` said 1970 on a kernel that knew the date. */
 static int64_t sys_clock_gettime(struct trapframe *tf) {
     struct user_timespec *out = (struct user_timespec *)(uintptr_t)sysarg(tf, 1);
-    uint64_t ns = timer_ns();
+    uint64_t ns = sysarg(tf, 0) == CLOCK_REALTIME ? wallclock_ns() : timer_ns();
     if (sysarg(tf, 0) != CLOCK_REALTIME && sysarg(tf, 0) != CLOCK_MONOTONIC) {
         return KERR_INVAL;
     }
@@ -1733,16 +1736,91 @@ static int64_t sys_riscv_hwprobe(struct trapframe *tf) {
  * that sleeps forever on a kernel with no way to wake it is a hang with no
  * diagnosis, and a bounded sleep that returns early is something a caller
  * must already handle — `nanosleep` returns `EINTR` with time remaining. */
-static int64_t sys_nanosleep(struct trapframe *tf) {
-    const struct user_timespec *req = (const struct user_timespec *)(uintptr_t)sysarg(tf, 0);
-    uint64_t want, deadline;
+/* Reports what a sleep had left, into `rem` when the caller gave one. */
+static int64_t interrupted_sleep(uint64_t deadline, struct user_timespec *rem) {
+    uint64_t now = timer_ns(), left = deadline > now ? deadline - now : 0;
+    if (rem != NULL) {
+        if (!may_write(rem, sizeof *rem)) {
+            return KERR_FAULT;
+        }
+        rem->sec = (int64_t)(left / 1000000000ull);
+        rem->nsec = (int64_t)(left % 1000000000ull);
+    }
+    return KERR_INTR;
+}
+
+/* Sleeps to `deadline`. **A signal ends it early, and says so**: `EINTR`
+ * and the time left, which is how a program that sleeps in a loop keeps its
+ * interval. Returning 0 there — as this did — told the program the whole
+ * time had passed. A wake-up with no signal behind it sleeps again. */
+static int64_t sleep_until_or_signal(uint64_t deadline, struct user_timespec *rem) {
+    while (timer_ns() < deadline) {
+        if (!sched_sleep_until(deadline)) {
+            /* No thread to block — before the scheduler is running. Then
+             * the clock is the only thing to wait on. */
+            __asm__ volatile("wfi");
+            continue;
+        }
+        if (timer_ns() < deadline && sched_signal_pending()) {
+            return interrupted_sleep(deadline, rem);
+        }
+    }
+    return 0;
+}
+
+/* A sleep's request, in nanoseconds: KERR_FAULT or KERR_INVAL for one a
+ * program could not have meant. */
+static int read_request(const struct user_timespec *req, uint64_t *ns) {
     if (!may_read(req, sizeof *req)) {
         return KERR_FAULT;
     }
     if (req->sec < 0 || req->nsec < 0 || req->nsec >= 1000000000) {
         return KERR_INVAL;
     }
-    want = (uint64_t)req->sec * 1000000000ull + (uint64_t)req->nsec;
+    *ns = (uint64_t)req->sec * 1000000000ull + (uint64_t)req->nsec;
+    return KERR_OK;
+}
+
+#define TIMER_ABSTIME 1u
+
+/* The monotonic deadline for an absolute time on `clock`. A realtime one
+ * moves with the epoch; one already past is now. */
+static uint64_t absolute_deadline(uint64_t clock, uint64_t at) {
+    uint64_t now = timer_ns();
+    if (clock == CLOCK_MONOTONIC) {
+        return at;
+    }
+    return at > wallclock_ns() ? now + (at - wallclock_ns()) : now;
+}
+
+/* `clock_nanosleep(clock, flags, req, rem)`: what `sleep()` and `usleep()`
+ * call through a libc, and it was missing. Relative or `TIMER_ABSTIME`, on
+ * the two clocks this kernel has; `rem` only for a relative sleep, as on
+ * Linux. */
+static int64_t sys_clock_nanosleep(struct trapframe *tf) {
+    uint64_t clock = sysarg(tf, 0), want = 0;
+    bool absolute = (sysarg(tf, 1) & TIMER_ABSTIME) != 0;
+    int rc = read_request((const struct user_timespec *)(uintptr_t)sysarg(tf, 2), &want);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    if (clock != CLOCK_REALTIME && clock != CLOCK_MONOTONIC) {
+        return KERR_INVAL;
+    }
+    if (absolute) {
+        return sleep_until_or_signal(absolute_deadline(clock, want), NULL);
+    }
+    return sleep_until_or_signal(timer_ns() + want,
+                                 (struct user_timespec *)(uintptr_t)sysarg(tf, 3));
+}
+
+static int64_t sys_nanosleep(struct trapframe *tf) {
+    const struct user_timespec *req = (const struct user_timespec *)(uintptr_t)sysarg(tf, 0);
+    uint64_t want, deadline;
+    int rc = read_request(req, &want);
+    if (rc != KERR_OK) {
+        return rc;
+    }
     trace_sleep("nanosleep", want);
     /* **A sleep sleeps for as long as it was asked.** This clamped it to one
      * second, with no reason written down, and that is not a cautious
@@ -1753,14 +1831,7 @@ static int64_t sys_nanosleep(struct trapframe *tf) {
      * so the thing it was waiting for had not happened either, and the test
      * passed for a reason that had nothing to do with what it checked. */
     deadline = timer_ns() + want;
-    if (!sched_sleep_until(deadline)) {
-        /* No thread to block — before the scheduler is running. Then the
-         * clock is the only thing to wait on. */
-        while (timer_ns() < deadline) {
-            __asm__ volatile("wfi");
-        }
-    }
-    return 0;
+    return sleep_until_or_signal(deadline, (struct user_timespec *)(uintptr_t)sysarg(tf, 1));
 }
 
 /* `clone`'s flags. Only what distinguishes a thread from a process is
@@ -2166,6 +2237,7 @@ static const struct syscall_entry table[] = {
     {54u, "fchownat", sys_fchownat},
     {SYS_RISCV_HWPROBE, "riscv_hwprobe", sys_riscv_hwprobe},
     {SYS_NANOSLEEP, "nanosleep", sys_nanosleep},
+    {115u, "clock_nanosleep", sys_clock_nanosleep},
     {SYS_RSEQ, "rseq", sys_ok},
 };
 

@@ -30,6 +30,11 @@ bool wallclock_is_real(void) {
     return have_epoch;
 }
 
+uint64_t wallclock_ns(void) {
+    uint64_t now = timer_ns();
+    return have_epoch ? epoch_seconds * 1000000000ull + (now - epoch_at_ns) : now;
+}
+
 uint64_t wallclock_seconds(void) {
     uint64_t now = timer_ns();
     if (!have_epoch) {

@@ -1747,6 +1747,7 @@ int uspace_exec(struct uproc *p, const uint8_t *image, uint32_t bytes, const cha
                             .gid = p->gid,
                             .euid = p->euid,
                             .suid = p->suid,
+                            .shared_pending = p->shared_pending,
                             .egid = p->egid,
                             .rlim_nofile_soft = p->rlim_nofile_soft,
                             .rlim_nofile_hard = p->rlim_nofile_hard,
