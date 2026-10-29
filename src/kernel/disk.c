@@ -6,6 +6,7 @@
 #include "core/partition.h"
 #include "core/xfs/xfs.h"
 #include "core/console.h"
+#include "arch/riscv/mmu.h"
 #include "core/errno.h"
 #include "drivers/nvme.h"
 #include "drivers/ramdisk.h"
@@ -299,7 +300,7 @@ static int adopt_the_root(const struct fdt *fdt) {
     if (mem_alloc_pages(1, 1, &page) != KERR_OK) {
         return KERR_NOMEM;
     }
-    rc = choose_root(fdt, (uint8_t *)(uintptr_t)page);
+    rc = choose_root(fdt, (uint8_t *)mmu_phys_to_virt(page));
     (void)mem_free_pages(page, 1);
     if (dwmmc_read_retries() != 0) {
         kprintf("disk: %llu SD read(s) needed a second attempt\n",
@@ -359,7 +360,7 @@ int disk_attach(const struct fdt *fdt) {
     if (mem_alloc_pages(npages, 1, &pages) != KERR_OK) {
         return KERR_NOMEM;
     }
-    mem = (void *)(uintptr_t)pages;
+    mem = mmu_phys_to_virt(pages); /* never the identity alias (step C) */
     for (uint32_t i = 0; i < npages * 4096u; i++) {
         ((volatile uint8_t *)mem)[i] = 0;
     }

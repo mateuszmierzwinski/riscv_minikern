@@ -124,4 +124,8 @@ uint32_t trap_most_harts_inside(void);
  * taken as traps, which is not the same as how many were sent. */
 uint64_t trap_software_interrupts(void);
 
+/* Prints what the hart at `index` last trapped on, and whether it got the
+ * kernel lock: for a hart that will not answer. */
+void trap_report_hart(uint32_t index);
+
 #endif

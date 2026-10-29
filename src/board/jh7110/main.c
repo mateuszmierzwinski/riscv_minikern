@@ -2322,6 +2322,8 @@ static bool swap_has_slots(void) {
 
 static void report_mapping_counters(void) {
     kprintf("mem: %llu frames freed by unmapping\n", (unsigned long long)uspace_freed_frames());
+    kprintf("mmu: %llu identity addresses converted after the switch\n",
+            (unsigned long long)mmu_identity_conversions());
     kprintf("mem: %llu transparent huge pages, %llu megapages split, %llu from a file\n",
             (unsigned long long)uspace_transparent_pages(),
             (unsigned long long)uspace_split_megapages(),
@@ -3794,6 +3796,7 @@ static void run_user_programs(void) {
     /* The fork fix, on unless the control asks for it off. */
     uspace_set_fork_leaves(!cmdline_has(boot_cmdline, "minikern.noforkleaves"));
     uspace_set_transparent_huge(!cmdline_has(boot_cmdline, "minikern.nothp"));
+    uspace_set_low_mappings(cmdline_has(boot_cmdline, "minikern.lowmap"));
     uspace_install_hooks();
     start_swap_if_asked();
     /* The controlling terminal, before anything can read it. */
@@ -4021,7 +4024,7 @@ static void run_user_programs(void) {
      * is read straight out of DRAM: `uspace_build_elf` wants a buffer, and
      * the filesystem path differs only in how it obtains one. */
     if (loaded_bytes != 0 && cmdline_has(boot_cmdline, "minikern.runloaded")) {
-        run_program_from_memory((const uint8_t *)(uintptr_t)loaded_at,
+        run_program_from_memory((const uint8_t *)mmu_phys_to_virt(loaded_at),
                                 (uint32_t)loaded_bytes, "loaded");
     }
     /* **Any program on the card, named on the command line.**
@@ -4109,8 +4112,8 @@ static void swap_selftest(void) {
         return;
     }
     for (uint32_t i = 0; i < 4096u; i++) {
-        ((volatile uint8_t *)(uintptr_t)out)[i] = (uint8_t)(i * 7u + 1u);
-        ((volatile uint8_t *)(uintptr_t)back)[i] = 0xff;
+        ((volatile uint8_t *)mmu_phys_to_virt(out))[i] = (uint8_t)(i * 7u + 1u);
+        ((volatile uint8_t *)mmu_phys_to_virt(back))[i] = 0xff;
     }
     rc = swap_out(out, &slot);
     if (rc != KERR_OK) {
@@ -4123,7 +4126,7 @@ static void swap_selftest(void) {
         return;
     }
     for (uint32_t i = 0; i < 4096u; i++) {
-        if (((volatile uint8_t *)(uintptr_t)back)[i] != (uint8_t)(i * 7u + 1u)) {
+        if (((volatile uint8_t *)mmu_phys_to_virt(back))[i] != (uint8_t)(i * 7u + 1u)) {
             kprintf("swap: **slot %u came back wrong at byte %u**\n", slot, i);
             return;
         }
@@ -4300,8 +4303,11 @@ void kmain(uint64_t hart, uint64_t dtb) {
     klog_time_source(timer_ns);
     bring_up_translation(&info);
     /* The rest of the boot. There is no jump here any more: `start.S` put
-     * the kernel at its linked address before `kmain` was called. */
-    kmain_high(hart, dtb);
+     * the kernel at its linked address before `kmain` was called. The
+     * device tree goes on **through the direct map**: it is read for the
+     * whole boot, `boot_cmdline` points into it, and both are read while a
+     * program's table is loaded — which has no identity alias (step C). */
+    kmain_high(hart, (uint64_t)(uintptr_t)mmu_phys_to_virt(dtb));
 }
 
 /* The boot from the point where the devices are up — shared, because

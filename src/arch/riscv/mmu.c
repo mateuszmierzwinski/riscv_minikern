@@ -43,16 +43,18 @@ void mmu_set_table_arena(phys_t base, uint64_t bytes) {
     arena.used = 0;
 }
 
-/* Table memory. Identity-mapped while translation is off, and still
- * identity-mapped afterwards, so one pointer is valid throughout — which is
- * what makes the switch survivable. */
+/* Table memory, reached through `mmu_phys_to_virt`: the physical address
+ * while translation is off, the direct map once it is on — **never the
+ * identity alias after that**, which a process's table does not have (step
+ * C). The root, taken while translation was off, is moved over in
+ * `mmu_init`. */
 static int arena_alloc(void *self, void **virt, phys_t *phys) {
     (void)self;
     if (arena.at + PT_BYTES > arena.bytes) {
         return KERR_NOMEM;
     }
     *phys = arena.base + arena.at;
-    *virt = (void *)(uintptr_t)*phys;
+    *virt = mmu_phys_to_virt(*phys);
     arena.at += PT_BYTES;
     arena.used++;
     for (uint32_t i = 0; i < PT_BYTES; i++) {
@@ -68,7 +70,7 @@ static void arena_free(void *self, void *virt) {
 
 static void *arena_to_virt(void *self, phys_t phys) {
     (void)self;
-    return (void *)(uintptr_t)phys;
+    return mmu_phys_to_virt(phys);
 }
 
 /* Rounds a physical address down and a length up to whole pages, because a
@@ -186,8 +188,13 @@ int mmu_init(phys_t ram_base, uint64_t ram_bytes) {
     }
     enable_translation(pgtable_satp(&kernel_table, 0));
     enabled = true;
+    /* The root pointer was taken through the identity map; from here on it
+     * is read while a process's table is loaded, which has none. */
+    kernel_table.root = mmu_phys_to_virt(kernel_table.root_phys);
     return KERR_OK;
 }
+
+static uint64_t identity_conversions;
 
 void *mmu_phys_to_virt(phys_t phys) {
     /* **Before translation is on, a physical address is already usable.**
@@ -212,8 +219,18 @@ phys_t mmu_virt_to_phys(const void *virt) {
         return (phys_t)(ram_origin + KERNEL_VIRT_OFFSET + (v - KERNEL_VIRT_BASE -
                                                            KERNEL_VIRT_OFFSET));
     }
-    /* Identity, which is what every address is until the kernel moves. */
+    /* Identity, which is what every address is until the kernel moves —
+     * and **after it, a missed conversion**: a physical address someone
+     * used as a pointer. Counted, because a process's table has no such
+     * alias (step C) and the next use of that pointer there faults. */
+    if (enabled && v >= ram_origin && v < ram_origin + ram_span) {
+        identity_conversions++;
+    }
     return (phys_t)v;
+}
+
+uint64_t mmu_identity_conversions(void) {
+    return identity_conversions;
 }
 
 void *mmu_map_device(phys_t base, uint64_t bytes) {

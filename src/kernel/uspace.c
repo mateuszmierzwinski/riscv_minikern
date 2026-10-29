@@ -99,22 +99,57 @@ static int proc_alloc(void *self, void **virt, phys_t *phys) {
     if (rc != KERR_OK) {
         return rc;
     }
+    *virt = mmu_phys_to_virt(page);
     for (uint32_t i = 0; i < PAGE_SIZE; i++) {
-        ((volatile uint8_t *)(uintptr_t)page)[i] = 0;
+        ((volatile uint8_t *)*virt)[i] = 0;
     }
-    *virt = (void *)(uintptr_t)page;
     *phys = page;
     return KERR_OK;
 }
 
+/* A frame's bytes, through the direct map. **Never the physical address as
+ * a pointer**: that is the identity alias, which a process's table does not
+ * have (step C) — the conversion is made once per call, outside the loops
+ * that use it, because a conversion per byte made zeroing 2 MiB look like a
+ * hang. */
+static volatile uint8_t *frame_at(phys_t at) {
+    return (volatile uint8_t *)mmu_phys_to_virt(at);
+}
+
+static void zero_frames(phys_t at, uint64_t bytes) {
+    volatile uint8_t *to = frame_at(at);
+    for (uint64_t i = 0; i < bytes; i++) {
+        to[i] = 0;
+    }
+}
+
+static void copy_to_frames(phys_t at, const volatile uint8_t *from, uint64_t bytes) {
+    volatile uint8_t *to = frame_at(at);
+    for (uint64_t i = 0; i < bytes; i++) {
+        to[i] = from[i];
+    }
+}
+
 static void proc_free(void *self, void *virt) {
     (void)self;
-    (void)mem_free_pages((phys_t)(uintptr_t)virt, 1);
+    (void)mem_free_pages(mmu_virt_to_phys(virt), 1);
 }
 
 static void *proc_to_virt(void *self, phys_t phys) {
     (void)self;
-    return (void *)(uintptr_t)phys;
+    return mmu_phys_to_virt(phys);
+}
+
+/* Whether a process's table also carries the kernel's low half (`minikern.lowmap`). */
+static bool share_low_half;
+
+void uspace_set_low_mappings(bool on) {
+    share_low_half = on;
+}
+
+/* The first root entry a process borrows from the kernel. */
+static uint32_t first_shared_entry(void) {
+    return share_low_half ? 0u : PT_ENTRIES / 2u;
 }
 
 /* Shares the kernel's mappings into a process's table.
@@ -141,13 +176,17 @@ static void *proc_to_virt(void *self, phys_t phys) {
  * collision deeper than that cannot be resolved this way and is refused
  * rather than papered over.
  *
- * **This whole function disappears when the kernel moves to the top half**
- * (docs/DEVELOPMENT_PROGRESS.md P0.4): with the kernel above the sign-extension
- * hole and user space below it, the two cannot share a root entry at all,
- * and sharing becomes copying 256 entries that can never collide. */
+ * **Only the top half, now that the kernel runs there (step C).** The kernel
+ * above the sign-extension hole and user space below it cannot share a root
+ * entry, so sharing is copying 256 entries that never collide, and the
+ * kernel's identity map of RAM is no longer reachable from a process's
+ * table at all — a physical address used as a pointer now faults instead of
+ * working by accident (`mmu_identity_conversions` counts the ones that
+ * would). `minikern.lowmap` shares the low half too, as before: the control,
+ * and the only path on which the collision handling below still runs. */
 static int share_kernel_mappings(struct pgtable *pt) {
     const struct pgtable *kernel = mmu_kernel_table();
-    for (uint32_t i = 0; i < PT_ENTRIES; i++) {
+    for (uint32_t i = first_shared_entry(); i < PT_ENTRIES; i++) {
         uint64_t theirs = kernel->root[i];
         if (theirs == 0) {
             continue;
@@ -208,9 +247,7 @@ int uspace_build(struct uproc *p, const void *program, uint32_t bytes) {
     if (rc != KERR_OK) {
         return rc;
     }
-    for (uint32_t i = 0; i < bytes; i++) {
-        ((volatile uint8_t *)(uintptr_t)text)[i] = ((const uint8_t *)program)[i];
-    }
+    copy_to_frames(text, (const uint8_t *)program, bytes);
     /* Read, write and execute for the program's page: this is one page of
      * hand-written instructions with no data section, and splitting it would
      * need an ELF to say where the split is. */
@@ -304,7 +341,7 @@ int uspace_build(struct uproc *p, const void *program, uint32_t bytes) {
  */
 static void unshare_kernel_mappings(struct pgtable *pt) {
     const struct pgtable *kernel = mmu_kernel_table();
-    for (uint32_t i = 0; i < PT_ENTRIES; i++) {
+    for (uint32_t i = first_shared_entry(); i < PT_ENTRIES; i++) {
         uint64_t *ours_l1;
         const uint64_t *kernel_l1;
         if (pt->root[i] == 0 || kernel->root[i] == 0) {
@@ -556,9 +593,7 @@ bool uspace_break_cow(struct uproc *me, virt_t va) {
     if (mem_alloc_pages(1, 1, &fresh) != KERR_OK) {
         return false;
     }
-    for (uint32_t i = 0; i < PAGE_SIZE; i++) {
-        ((volatile uint8_t *)(uintptr_t)fresh)[i] = ((const volatile uint8_t *)(uintptr_t)phys)[i];
-    }
+    copy_to_frames(fresh, frame_at(phys), PAGE_SIZE);
     (void)pgtable_unmap(&me->pt, va);
     if (pgtable_map(&me->pt, va, fresh, PAGE_SIZE, (prot & ~PTE_COW) | PTE_W) != KERR_OK) {
         (void)mem_free_pages(fresh, 1);
@@ -1155,9 +1190,7 @@ static int load_segment(struct uproc *p, const struct elf_load *l, const uint8_t
         } else {
             rc = mem_alloc_pages(1, 1, &page);
             if (rc == KERR_OK) {
-                for (uint32_t i = 0; i < PAGE_SIZE; i++) {
-                    ((volatile uint8_t *)(uintptr_t)page)[i] = 0;
-                }
+                zero_frames(page, PAGE_SIZE);
                 rc = pgtable_map(&p->pt, va, page, PAGE_SIZE, prot_bits(l->prot));
             }
         }
@@ -1165,10 +1198,11 @@ static int load_segment(struct uproc *p, const struct elf_load *l, const uint8_t
             return rc;
         }
         /* Copy whatever of the file belongs on this page. */
+        volatile uint8_t *dst = frame_at(page);
         for (uint64_t i = 0; i < PAGE_SIZE; i++) {
             uint64_t at = va + i;
             if (at >= l->vaddr && at < l->vaddr + l->filesz) {
-                ((volatile uint8_t *)(uintptr_t)page)[i] = image[l->offset + (at - l->vaddr)];
+                dst[i] = image[l->offset + (at - l->vaddr)];
             }
         }
         (void)want;
@@ -1224,9 +1258,8 @@ static int map_signal_trampoline(struct uproc *p) {
     if (rc != KERR_OK) {
         return rc;
     }
-    for (uint32_t i = 0; i < PAGE_SIZE; i++) {
-        ((volatile uint8_t *)(uintptr_t)page)[i] = i < bytes ? code[i] : 0u;
-    }
+    zero_frames(page, PAGE_SIZE);
+    copy_to_frames(page, code, bytes);
     return pgtable_map(&p->pt, p->trampoline, page, PAGE_SIZE, PTE_R | PTE_X | PTE_U);
 }
 
@@ -1296,7 +1329,7 @@ int uspace_poke_user_words(struct uproc *p, uint64_t at, const uint32_t *words, 
         if (!pgtable_lookup(&p->pt, va & ~(PAGE_SIZE - 1u), &page, &flags, &size)) {
             return KERR_FAULT;
         }
-        *(volatile uint32_t *)(uintptr_t)(page + (va & (PAGE_SIZE - 1u))) = words[i];
+        *(volatile uint32_t *)(frame_at(page) + (va & (PAGE_SIZE - 1u))) = words[i];
     }
     return KERR_OK;
 }
@@ -1325,13 +1358,11 @@ static int build_start_state(struct uproc *p, const struct elf_image *img, const
     if (rc != KERR_OK) {
         return rc;
     }
-    for (uint32_t i = 0; i < USER_STACK_PAGES * PAGE_SIZE; i++) {
-        ((volatile uint8_t *)(uintptr_t)stack)[i] = 0;
-    }
+    zero_frames(stack, USER_STACK_PAGES * PAGE_SIZE);
     /* The block lands at the very top of the stack, so it is built into the
      * last page's worth of the allocation. */
     record_fixed_regions(p);
-    rc = ustack_build((uint8_t *)(uintptr_t)stack, USER_STACK_PAGES * PAGE_SIZE, p->stack_top,
+    rc = ustack_build((uint8_t *)frame_at(stack), USER_STACK_PAGES * PAGE_SIZE, p->stack_top,
                       &args, &sp, &used);
     if (rc != KERR_OK) {
         return rc;
@@ -2519,7 +2550,7 @@ void uspace_set_paranoid(bool on) {
  * catch. It reported exactly that once, and the §0 hunt chased it for a
  * long time. */
 static void check_the_frame_is_clean(phys_t page, virt_t va) {
-    const volatile uint64_t *words = (const volatile uint64_t *)(uintptr_t)page;
+    const volatile uint64_t *words = (const volatile uint64_t *)frame_at(page);
     if (!paranoid) {
         return;
     }
@@ -2678,9 +2709,7 @@ static int back_one_page(struct uproc *p, virt_t va, uint32_t prot) {
     if (rc != KERR_OK) {
         return rc;
     }
-    for (uint32_t i = 0; i < PAGE_SIZE; i++) {
-        ((volatile uint8_t *)(uintptr_t)page)[i] = 0;
-    }
+    zero_frames(page, PAGE_SIZE);
     rc = pgtable_map(&p->pt, va, page, PAGE_SIZE, prot_bits(prot));
     if (rc != KERR_OK) {
         mem_free_pages(page, 1);
@@ -2719,9 +2748,7 @@ static int back_one_megapage(struct uproc *p, virt_t base, uint32_t prot) {
     if (rc != KERR_OK) {
         return rc;
     }
-    for (uint64_t i = 0; i < MEGAPAGE_SIZE; i++) {
-        ((volatile uint8_t *)(uintptr_t)block)[i] = 0;
-    }
+    zero_frames(block, MEGAPAGE_SIZE);
     rc = pgtable_map(&p->pt, base, block, MEGAPAGE_SIZE, prot_bits(prot));
     if (rc != KERR_OK) {
         mem_free_pages(block, MEGAPAGE_PAGES);
@@ -2843,9 +2870,7 @@ static void fill_from_file(struct uproc *p, const struct vma *r, virt_t page) {
     }
     {
         uint64_t take = size - at < PAGE_SIZE ? size - at : PAGE_SIZE;
-        for (uint64_t i = 0; i < take; i++) {
-            ((volatile uint8_t *)(uintptr_t)(phys & ~(phys_t)(PAGE_SIZE - 1u)))[i] = bytes[at + i];
-        }
+        copy_to_frames(phys & ~(phys_t)(PAGE_SIZE - 1u), bytes + at, take);
     }
     file_pages++;
 }
@@ -2881,9 +2906,7 @@ static int back_file_megapage(struct uproc *p, const struct vma *r, virt_t base)
     if (rc != KERR_OK || !pgtable_lookup(&p->pt, base, &phys, &flags, &span)) {
         return rc != KERR_OK ? rc : KERR_IO;
     }
-    for (uint64_t i = 0; i < MEGAPAGE_SIZE; i++) {
-        ((volatile uint8_t *)(uintptr_t)phys)[i] = bytes[at + i];
-    }
+    copy_to_frames(phys, bytes + at, MEGAPAGE_SIZE);
     file_megapages++;
     return KERR_OK;
 }
@@ -3107,9 +3130,7 @@ static int give_megapage(struct uproc *child, struct uproc *parent, virt_t at, u
     if (rc != KERR_OK) {
         return rc;
     }
-    for (uint64_t i = 0; i < MEGAPAGE_SIZE; i++) {
-        ((volatile uint8_t *)(uintptr_t)to)[i] = ((const volatile uint8_t *)(uintptr_t)from)[i];
-    }
+    copy_to_frames(to, frame_at(from), MEGAPAGE_SIZE);
     rc = pgtable_map(&child->pt, at, to, MEGAPAGE_SIZE, prot_bits(prot));
     if (rc != KERR_OK) {
         mem_free_pages(to, MEGAPAGE_PAGES);

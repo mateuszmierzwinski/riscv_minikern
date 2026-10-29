@@ -5,6 +5,7 @@
 #include <stddef.h>
 
 #include "core/console.h"
+#include "arch/riscv/mmu.h"
 #include "core/errno.h"
 #include "kernel/disk.h"
 #include "kernel/xfsmount.h"
@@ -164,7 +165,7 @@ int swap_out(phys_t page, uint32_t *slot) {
      * still sitting dirty in the cache is read back correctly. Swap needs
      * the page to survive until it is wanted again, not to survive a crash:
      * there is nothing to recover a swapped page *into* after a reboot. */
-    rc = bcache_pwrite(cache, swap.at[chosen], (const void *)(uintptr_t)page, SWAP_PAGE_BYTES);
+    rc = bcache_pwrite(cache, swap.at[chosen], mmu_phys_to_virt(page), SWAP_PAGE_BYTES);
     if (rc != KERR_OK) {
         return rc;
     }
@@ -187,7 +188,7 @@ int swap_in(uint32_t slot, phys_t page) {
          * rather than serving whatever is in the file at that offset. */
         return KERR_INVAL;
     }
-    rc = bcache_pread(cache, swap.at[slot], (void *)(uintptr_t)page, SWAP_PAGE_BYTES);
+    rc = bcache_pread(cache, swap.at[slot], mmu_phys_to_virt(page), SWAP_PAGE_BYTES);
     if (rc != KERR_OK) {
         return rc;
     }

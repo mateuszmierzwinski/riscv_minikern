@@ -5,7 +5,9 @@
 #include "arch/riscv/sbi.h"
 #include "arch/riscv/smp.h"
 #include "arch/riscv/timer.h"
+#include "arch/riscv/trap.h"
 #include "core/console.h"
+#include "arch/riscv/mmu.h"
 #include "core/errno.h"
 #include "core/fair.h"
 #include "kernel/klock.h"
@@ -333,8 +335,17 @@ static uint32_t find_free_slot(void) {
  * the trampoline — a thread that has never run and one that was preempted
  * are then resumed by the same instruction, with no special case in the
  * scheduler. */
+/* Where a kernel stack is, as the kernel addresses it: through the direct
+ * map. `kstack` stays the frame's physical address — that is what is freed
+ * — and **the trap frame and `sscratch` must never be its identity alias**,
+ * which a process's table does not have (step C); a trap on a user table
+ * would then fault on its own stack. Callers test `kstack` for no stack. */
+static uint64_t kstack_base(const struct thread *t) {
+    return (uint64_t)(uintptr_t)mmu_phys_to_virt(t->kstack);
+}
+
 static struct trapframe *initial_frame_of(const struct thread *t) {
-    return (struct trapframe *)(uintptr_t)(t->kstack + KSTACK_PAGES * PAGE_SIZE - FRAME_BYTES);
+    return (struct trapframe *)(uintptr_t)(kstack_base(t) + KSTACK_PAGES * PAGE_SIZE - FRAME_BYTES);
 }
 
 static void prepare_stack(struct thread *t, const struct trapframe *frame, uint64_t sp,
@@ -415,7 +426,7 @@ static int spawn(struct uproc *proc, const struct trapframe *frame, uint64_t sp,
     if (rc != KERR_OK) {
         return rc;
     }
-    *(volatile uint64_t *)(uintptr_t)stack = KSTACK_CANARY;
+    *(volatile uint64_t *)mmu_phys_to_virt(stack) = KSTACK_CANARY;
     threads[slot] = (struct thread){.kstack = stack,
                                     .tid = next_tid++,
                                     .state = THREAD_RUNNABLE,
@@ -599,6 +610,17 @@ static uint32_t siblings_on_harts(const struct uproc *proc) {
     return n;
 }
 
+/* Names what each hart still running a thread of `proc` last trapped on. */
+static void report_harts_still_in(const struct uproc *proc) {
+    for (uint32_t h = 0; h < SMP_MAX_HARTS; h++) {
+        uint32_t slot = harts[h].current;
+        if (slot < SCHED_MAX_THREADS && threads[slot].proc == proc &&
+            &threads[slot] != running_thread()) {
+            trap_report_hart(h);
+        }
+    }
+}
+
 /* How many threads have had to be waited off a hart, and the longest wait.
  *
  * These are what make the race's closing a measurement rather than an
@@ -658,6 +680,9 @@ uint32_t sched_await_siblings(const struct uproc *proc) {
     {
         uint64_t took = timer_ns() - started;
         worst_await_ns = took > worst_await_ns ? took : worst_await_ns;
+    }
+    if (left != 0) {
+        report_harts_still_in(proc);
     }
     return left;
 }
@@ -1260,7 +1285,7 @@ uint32_t sched_bad_resumes(void) {
  * watch the machine misbehave somewhere else, which is what has been
  * happening. */
 static bool resume_is_sane(uint32_t t) {
-    uint64_t base = threads[t].kstack;
+    uint64_t base = kstack_base(&threads[t]);
     uint64_t sp = threads[t].ksp;
     /* **Is anybody else already running it?**
      *
@@ -1296,7 +1321,7 @@ static bool resume_is_sane(uint32_t t) {
 
 static void check_kernel_stack(uint32_t t) {
     if (threads[t].kstack == 0 ||
-        *(volatile uint64_t *)(uintptr_t)threads[t].kstack == KSTACK_CANARY) {
+        *(volatile uint64_t *)(uintptr_t)kstack_base(&threads[t]) == KSTACK_CANARY) {
         return;
     }
     stack_overflows++;
@@ -1338,9 +1363,9 @@ uint32_t sched_slot_aliases(void) {
  * slot records, and a reused slot has a different allocation. */
 static bool slot_is_still_ours(uint32_t was) {
     uint64_t sp;
-    uint64_t base = threads[was].kstack;
+    uint64_t base = kstack_base(&threads[was]);
     __asm__ volatile("mv %0, sp" : "=r"(sp));
-    if (base == 0) {
+    if (threads[was].kstack == 0) {
         return true; /* the canary already reported this one */
     }
     return sp > base && sp <= base + KSTACK_PAGES * PAGE_SIZE;

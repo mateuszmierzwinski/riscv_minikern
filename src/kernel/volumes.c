@@ -3,6 +3,7 @@
 
 #include "core/bcache.h"
 #include "core/console.h"
+#include "arch/riscv/mmu.h"
 #include "core/errno.h"
 #include "core/fat/fat.h"
 #include "core/xfs/xfs.h"
@@ -121,7 +122,7 @@ static int cache_for(struct volume *v, const struct blockdev *dev) {
     if (mem_alloc_pages(npages, 1, &pages) != KERR_OK) {
         return KERR_NOMEM;
     }
-    mem = (void *)(uintptr_t)pages;
+    mem = mmu_phys_to_virt(pages); /* never the identity alias (step C) */
     for (uint32_t i = 0; i < npages * 4096u; i++) {
         ((volatile uint8_t *)mem)[i] = 0;
     }

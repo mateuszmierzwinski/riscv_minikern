@@ -750,6 +750,10 @@ uint64_t uspace_freed_frames(void);
  * ordinary anonymous memory, and how many were made and later split. */
 void uspace_set_transparent_huge(bool on);
 
+/* Shares the kernel's low half (its identity map of RAM) into every process's
+ * table as well as the top half: `minikern.lowmap`, the control for step C. */
+void uspace_set_low_mappings(bool on);
+
 /* Installs the region record's split hook (each half of a cut file mapping
  * holds its own file reference). Once, at boot, before any process. */
 void uspace_install_hooks(void);

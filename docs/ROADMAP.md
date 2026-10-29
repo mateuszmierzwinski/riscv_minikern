@@ -66,7 +66,7 @@ git, and the pitfalls are in `CLAUDE.md` §5.
 ### Open
 
 
-- [ ] **`pgtable_map` can write through a borrowed kernel table** (S once §7 step C is done) — `share_kernel_mappings` hands a process the kernel's own level-1 table and `walk_to` cannot tell. Counted every boot (`pgtable: no process wrote into the kernel's tables`, currently 0); step C makes it unrepresentable.
+- [x] **`pgtable_map` could write through a borrowed kernel table** — since step C a process borrows only the kernel's top half, and its own mappings are all below `USER_TOP`, so no walk for a user address reaches a kernel table. The boot counter stays (`pgtable: no process wrote into the kernel's tables`).
 - [ ] **ELF segments are not in the region record** (S) — text and data are mapped but unrecorded, so placement could see them as free (`uspace_stale_records` counts it). Recording them in `load_segment` broke the board twice under the old layout; retry after step C.
 
 ### Done
@@ -221,7 +221,7 @@ git, and the pitfalls are in `CLAUDE.md` §5.
 ### Open
 - [~] **Local boot from SD or NVMe** (M) — U-Boot cannot read XFS, so the kernel sits on a FAT partition (or a raw one) beside the `ROOT` XFS; booted end to end from a FAT partition on the board, recipe in `docs/BOOTING.md`. Left: a saved `bootcmd` so it boots unattended, and the raw-partition variant.
 - [ ] **Own netboot** (M) — The ARM project's authenticated MKNB protocol (Ed25519-verified offers) came over as code, but nothing is wired to it.
-- [~] **Kernel in the top half** (M) — The kernel now runs only high: linked at `0xffffffc000200000` and loaded low, `start.S` enables a boot table and jumps high before any C, and the secondaries jump high in assembly. What remains is step C: drop the kernel's identity/low mappings from user page tables, after converting the remaining physical-address-as-pointer uses (process page-table allocation, page zeroing, thread kernel stacks, ELF loader, `copy_in`/`copy_out`, swap). An earlier attempt broke `fork` 10/10. Keep conversions out of hot loops. `docs/kernel-top-half-step-c.patch` is stale.
+- [x] **Kernel in the top half** (M) — The kernel runs only high (linked at `0xffffffc000200000`), and since step C a process's table carries only the kernel's top-half root entries: the identity map of RAM is not reachable from user tables at all. Every physical-address-as-pointer use goes through `mmu_phys_to_virt` (page tables, frames, kernel stacks, the loader, swap, disk buffers); `mmu: N identity addresses converted after the switch` counts any that are missed (0 on every board case). `minikern.lowmap` restores the old sharing as the control. `copy_in`/`copy_out` take user addresses and were rightly left alone — converting them was the likely cause of the old attempt's `fork` hang.
 - [ ] **Describe an unknown board** (S) — A device-tree overlay or a command-line way to describe a board this kernel hasn't met.
 
 ---

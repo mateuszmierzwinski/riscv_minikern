@@ -3,6 +3,7 @@
 
 #include "arch/riscv/frame.h"
 #include "arch/riscv/plic.h"
+#include "arch/riscv/smp.h"
 #include "arch/riscv/timer.h"
 #include "core/console.h"
 #include "kernel/irq.h"
@@ -269,8 +270,44 @@ uint32_t trap_most_harts_inside(void) {
     return most_inside;
 }
 
+/* What each hart last brought into the kernel, read by `trap_report_hart`.
+ * `entered` and `locked` differ while a hart waits for the kernel lock;
+ * neither moving means the hart never reached C at all. */
+static struct {
+    uint64_t scause, sepc, stval;
+    uint32_t entered, locked;
+} last_trap[SMP_MAX_HARTS];
+
+void trap_report_hart(uint32_t index) {
+    if (index >= SMP_MAX_HARTS) {
+        return;
+    }
+    kprintf("trap: hart index %u entered %u locked %u; last %s sepc %016llx stval %016llx\n",
+            index, last_trap[index].entered, last_trap[index].locked,
+            trap_cause_name(last_trap[index].scause),
+            (unsigned long long)last_trap[index].sepc, (unsigned long long)last_trap[index].stval);
+}
+
+/* Records a trap against the hart taking it, before and after the lock. */
+static void note_trap(const struct trapframe *tf, bool after_lock) {
+    uint32_t h = smp_hart_index();
+    if (h >= SMP_MAX_HARTS) {
+        return;
+    }
+    if (!after_lock) {
+        last_trap[h].scause = tf->scause;
+        last_trap[h].sepc = tf->sepc;
+        last_trap[h].stval = tf->stval;
+        last_trap[h].entered++;
+        return;
+    }
+    last_trap[h].locked++;
+}
+
 void trap_handle(struct trapframe *tf) {
+    note_trap(tf, false);
     bool took = lock_enter != NULL && lock_enter();
+    note_trap(tf, true);
     /* The cause, so that the longest hold can be attributed to a kind of trap
      * rather than to `trap_handle`, which is where every one of them takes
      * the lock. A syscall overwrites this with its own number. */

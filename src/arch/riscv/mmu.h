@@ -122,4 +122,8 @@ void mmu_flush_tlb_local(void);
  * kernel. */
 bool mmu_can_flush_remotely(void);
 
+/* How many identity (physical-as-pointer) addresses `mmu_virt_to_phys` was
+ * handed after translation came on: each one a conversion missed. Want 0. */
+uint64_t mmu_identity_conversions(void);
+
 #endif
