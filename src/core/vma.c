@@ -91,19 +91,30 @@ static uint32_t splits_needed(const struct vma_set *s, virt_t start, virt_t end)
     return (a != 0 && a->start < start ? 1u : 0u) + (b != 0 && b->start < end ? 1u : 0u);
 }
 
+/* Called with the new half of every file-backed region that is cut. */
+static void (*split_hook)(const struct vma *half);
+
+void vma_set_split_hook(void (*hook)(const struct vma *half)) {
+    split_hook = hook;
+}
+
 /* Splits the region at index i at addr (strictly inside it).
  *
  * The upper half's `offset` moves with its start, so a file-backed region
- * cut in two still reads from the right place in the file. (The kernel
- * refuses to cut one, because the *reference* it holds cannot be split
- * here — but the arithmetic is right either way, and a value that is right
- * only because nobody uses it is how the next defect gets in.) */
+ * cut in two still reads from the right place in the file. **And it holds
+ * its own reference to the file**, through the hook: each region gives one
+ * back when it goes, so two halves sharing one reference gave back two —
+ * which a partial `mprotect` of a file mapping did, freeing the file under
+ * the regions still using it. */
 static void split_at(struct vma_set *s, uint32_t i, virt_t addr) {
     open_slot(s, i + 1);
     s->v[i + 1] = s->v[i];
     s->v[i].end = addr;
     s->v[i + 1].start = addr;
     s->v[i + 1].offset += addr - s->v[i].start;
+    if (s->v[i + 1].file != 0 && split_hook != 0) {
+        split_hook(&s->v[i + 1]);
+    }
 }
 
 /* Splits regions so that start and end fall on region boundaries. */

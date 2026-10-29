@@ -2310,8 +2310,25 @@ extern const char user_mapchurn_start[], user_mapchurn_end[];
  * touch, up front because the caller asked, and re-pointed by a move. They
  * are what turn "demand paging works" and "nothing is copied" into
  * measurements rather than claims, so they are printed together. */
+static void report_swap(void);
+
+/* Whether swap is on at all: a swap file was attached. */
+static bool swap_has_slots(void) {
+    uint32_t slots = 0, used = 0;
+    uint64_t written = 0, read_back = 0;
+    swap_report(&slots, &used, &written, &read_back);
+    return slots > 0;
+}
+
 static void report_mapping_counters(void) {
     kprintf("mem: %llu frames freed by unmapping\n", (unsigned long long)uspace_freed_frames());
+    kprintf("mem: %llu transparent huge pages, %llu megapages split, %llu from a file\n",
+            (unsigned long long)uspace_transparent_pages(),
+            (unsigned long long)uspace_split_megapages(),
+            (unsigned long long)uspace_file_megapages());
+    if (swap_has_slots()) {
+        report_swap(); /* whatever ran, the only evidence of what swap did */
+    }
     kprintf("mem: %llu pages backed on demand, %llu populated up front, %llu moved by mremap,"
             " %llu huge, %llu from a file\n",
             (unsigned long long)uspace_demand_pages(), (unsigned long long)uspace_populated_pages(),
@@ -3776,6 +3793,8 @@ static void run_user_programs(void) {
     uspace_set_paranoid(cmdline_has(boot_cmdline, "minikern.paranoid"));
     /* The fork fix, on unless the control asks for it off. */
     uspace_set_fork_leaves(!cmdline_has(boot_cmdline, "minikern.noforkleaves"));
+    uspace_set_transparent_huge(!cmdline_has(boot_cmdline, "minikern.nothp"));
+    uspace_install_hooks();
     start_swap_if_asked();
     /* The controlling terminal, before anything can read it. */
     {

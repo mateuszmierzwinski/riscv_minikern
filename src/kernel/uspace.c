@@ -2731,6 +2731,89 @@ static int back_one_megapage(struct uproc *p, virt_t base, uint32_t prot) {
     return KERR_OK;
 }
 
+static void published_removal(void);
+
+/* Megapages split into 4 KiB pages, and transparent ones made. */
+static uint64_t split_megapages;
+static uint64_t transparent_pages;
+static bool transparent_on = true;
+
+void uspace_set_transparent_huge(bool on) {
+    transparent_on = on;
+}
+
+uint64_t uspace_split_megapages(void) {
+    return split_megapages;
+}
+
+uint64_t uspace_transparent_pages(void) {
+    return transparent_pages;
+}
+
+/* Turns the 2 MiB leaf covering `va`, if there is one, into 512 4 KiB
+ * leaves over **the same frames with the same rights** — so no byte a
+ * program can read changes, and every page-by-page operation (discard,
+ * unmap, protect, move, swap, fork) is correct on what follows. The frames
+ * can be freed one at a time afterwards: the allocator keeps no block size.
+ *
+ * Only the level-0 table can run out; then the megapage is put back as it
+ * was and the caller is refused. */
+static int split_huge(struct uproc *p, virt_t va) {
+    virt_t base = va & ~(virt_t)(MEGAPAGE_SIZE - 1u);
+    phys_t phys = 0;
+    uint64_t flags = 0, size = 0;
+    int rc = KERR_OK;
+    if (!pgtable_lookup(&p->pt, va, &phys, &flags, &size) || size != MEGAPAGE_SIZE) {
+        return KERR_OK;
+    }
+    phys &= ~(phys_t)(MEGAPAGE_SIZE - 1u);
+    (void)pgtable_unmap(&p->pt, base);
+    published_removal();
+    for (uint32_t i = 0; rc == KERR_OK && i < MEGAPAGE_PAGES; i++) {
+        rc = pgtable_map(&p->pt, base + i * PAGE_SIZE, phys + i * PAGE_SIZE, PAGE_SIZE, flags);
+    }
+    if (rc != KERR_OK) {
+        for (uint32_t i = 0; i < MEGAPAGE_PAGES; i++) {
+            (void)pgtable_unmap(&p->pt, base + i * PAGE_SIZE);
+        }
+        published_removal();
+        (void)pgtable_map(&p->pt, base, phys, MEGAPAGE_SIZE, flags);
+        return rc;
+    }
+    split_megapages++;
+    return KERR_OK;
+}
+
+/* Splits the megapages that [at, end) covers only in part, so an operation
+ * on the range cannot reach past either end of it. */
+static int split_huge_edges(struct uproc *p, virt_t at, virt_t end) {
+    int rc = (at & (MEGAPAGE_SIZE - 1u)) != 0 ? split_huge(p, at) : KERR_OK;
+    if (rc == KERR_OK && end > at && (end & (MEGAPAGE_SIZE - 1u)) != 0) {
+        rc = split_huge(p, end - 1u);
+    }
+    return rc;
+}
+
+/* Splits every megapage in [at, end). */
+static int split_huge_in(struct uproc *p, virt_t at, virt_t end) {
+    int rc = KERR_OK;
+    for (virt_t va = at & ~(virt_t)(MEGAPAGE_SIZE - 1u); rc == KERR_OK && va < end;
+         va += MEGAPAGE_SIZE) {
+        rc = split_huge(p, va > at ? va : at);
+    }
+    return rc;
+}
+
+/* Whether the 2 MiB window around `va` may get a transparent megapage: an
+ * anonymous, private region that is not the growing stack covers all of
+ * it. A window with any page already in it is refused by `pgtable_map`
+ * (its level-0 table exists), so 4 KiB pages are never replaced. */
+static bool transparent_window(const struct vma *r, virt_t base) {
+    return transparent_on && r->file == NULL && r->prot != 0 &&
+           (r->flags & (VMA_HUGE | VMA_GROWSDOWN)) == 0 && base >= r->start &&
+           r->end - base >= MEGAPAGE_SIZE;
+}
+
 /* How many pages have been filled from a file at their first touch. */
 static uint64_t file_pages;
 
@@ -2767,6 +2850,44 @@ static void fill_from_file(struct uproc *p, const struct vma *r, virt_t page) {
     file_pages++;
 }
 
+/* Huge pages filled from a file. */
+static uint64_t file_megapages;
+
+uint64_t uspace_file_megapages(void) {
+    return file_megapages;
+}
+
+/* A 2 MiB page for a file mapping's window, filled from the file.
+ *
+ * Only where it is the same memory a page at a time would have been: the
+ * window lies inside the region, its offset in the file is 2 MiB aligned
+ * (the address is, so the two line up), and **the whole window is file
+ * data** — a window running past the end would need its tail zeroed and
+ * buys little. Every file mapping is private here (`MAP_SHARED` is
+ * refused), so the page is the process's own copy, as each small one is. */
+static int back_file_megapage(struct uproc *p, const struct vma *r, virt_t base) {
+    const uint8_t *bytes = NULL;
+    uint32_t size = 0;
+    uint64_t at = r->offset + (base - r->start);
+    phys_t phys = 0;
+    uint64_t flags = 0, span = 0;
+    int rc;
+    if (!transparent_on || r->prot == 0 || base < r->start || r->end - base < MEGAPAGE_SIZE ||
+        (at & (MEGAPAGE_SIZE - 1u)) != 0 || !pgtable_megapage_free(&p->pt, base) ||
+        fdobjects_file_of_object(r->file, &bytes, &size) != KERR_OK || at + MEGAPAGE_SIZE > size) {
+        return KERR_NOTSUP;
+    }
+    rc = back_one_megapage(p, base, r->prot);
+    if (rc != KERR_OK || !pgtable_lookup(&p->pt, base, &phys, &flags, &span)) {
+        return rc != KERR_OK ? rc : KERR_IO;
+    }
+    for (uint64_t i = 0; i < MEGAPAGE_SIZE; i++) {
+        ((volatile uint8_t *)(uintptr_t)phys)[i] = bytes[at + i];
+    }
+    file_megapages++;
+    return KERR_OK;
+}
+
 /* Backs whatever the region says belongs at `va`: a 2 MiB block for a
  * region that asked for huge pages and has room for a whole one, a 4 KiB
  * page otherwise.
@@ -2780,7 +2901,21 @@ static int back_for_region(struct uproc *p, const struct vma *r, virt_t va) {
     virt_t page = va & ~(virt_t)(PAGE_SIZE - 1u);
     int rc;
     if (r->file == NULL && (r->flags & VMA_HUGE) != 0 && base >= r->start &&
-        r->end - base >= MEGAPAGE_SIZE && back_one_megapage(p, base, r->prot) == KERR_OK) {
+        r->end - base >= MEGAPAGE_SIZE && pgtable_megapage_free(&p->pt, base) &&
+        back_one_megapage(p, base, r->prot) == KERR_OK) {
+        return KERR_OK;
+    }
+    /* **Transparent huge pages**: the same 2 MiB page, unasked, wherever an
+     * ordinary anonymous region covers a whole aligned window that nothing
+     * has touched yet — Linux's `always`. One TLB entry where there would
+     * be 512, for a Go heap that never says `MAP_HUGETLB`. Everything that
+     * works page by page splits it first (`split_huge`). */
+    if (transparent_window(r, base) && pgtable_megapage_free(&p->pt, base) &&
+        back_one_megapage(p, base, r->prot) == KERR_OK) {
+        transparent_pages++;
+        return KERR_OK;
+    }
+    if (r->file != NULL && back_file_megapage(p, r, base) == KERR_OK) {
         return KERR_OK;
     }
     rc = back_one_page(p, page, r->prot);
@@ -2996,6 +3131,11 @@ static int give_address_space(struct uproc *child, struct uproc *parent) {
          * the file's bytes out from under the other. */
         if (parent->vmas.v[i].file != NULL) {
             (void)file_get((struct file *)parent->vmas.v[i].file);
+        }
+        /* Copy-on-write works page by page, so a transparent megapage is
+         * split before it is shared: the child gets each of its pages. */
+        if (!huge && split_huge_in(parent, at, end) != KERR_OK) {
+            return KERR_NOMEM;
         }
         for (; at < end;) {
             int rc = huge ? give_megapage(child, parent, at, prot)
@@ -3333,6 +3473,15 @@ static void clear_the_range(struct uproc *p, bool fixed, virt_t base, uint64_t p
  * that forgets is the one that frees a file's bytes while a mapping is
  * still faulting pages out of them. The core calls it with the region
  * rather than its range for exactly this reason. */
+/* The other half of a file-backed region `vma.c` cut: its own reference. */
+static void hold_the_half(const struct vma *half) {
+    (void)file_get((struct file *)half->file);
+}
+
+void uspace_install_hooks(void) {
+    vma_set_split_hook(hold_the_half);
+}
+
 static void drop_the_file(void *ctx, const struct vma *v) {
     (void)ctx;
     if (v->file != NULL) {
@@ -3404,8 +3553,16 @@ int uspace_map(struct uproc *p, const struct uspace_mapping *m, virt_t *out) {
  * wants both, and that is `uspace_unmap`. */
 static int drop_pages(struct uproc *p, virt_t at, uint64_t bytes) {
     uint64_t pages = 0;
+    int rc;
     if ((at & (PAGE_SIZE - 1u)) != 0 || !page_count(bytes, &pages)) {
         return KERR_INVAL;
+    }
+    /* A megapage named in part is split first: dropping it whole took the
+     * program's neighbouring data with it (`MADV_DONTNEED` of 4 KiB zeroed
+     * 2 MiB). One named whole is dropped whole below. */
+    rc = split_huge_edges(p, at, at + pages * PAGE_SIZE);
+    if (rc != KERR_OK) {
+        return rc;
     }
     for (virt_t va = at; va < at + pages * PAGE_SIZE;) {
         phys_t phys = 0;
@@ -3468,23 +3625,15 @@ static int drop_pages(struct uproc *p, virt_t at, uint64_t bytes) {
  * nothing (a partial unmap splits a region, and the split needs a slot), so
  * doing it first means a refusal leaves the mapping intact rather than
  * leaving pages freed under a record that still promises them. */
-/* Whether a range would cut in half a region that has to stay whole.
- *
- * Two kinds, for two reasons that happen to have the same answer. A **huge**
- * region is one table entry over 2 MiB: there is no such thing as unmapping
- * a quarter of it, and the alternatives are to split it into 4 KiB pages —
- * the opposite of what the caller asked for — or to refuse. A
- * **file-backed** region holds one reference to the file it reads from, and
- * splitting it would make two regions sharing one reference: the first to
- * be unmapped would drop it and the other would go on faulting pages out of
- * freed memory. Splitting one properly means taking another reference at
- * the split, which the pure record cannot do.
- *
- * So both are unmapped and moved whole, and a program that asks for less is
- * told `EINVAL` rather than given a quiet half-measure. */
+/* Whether a range would cut in half a region that has to stay whole: a
+ * `MAP_HUGETLB` one, whose 2 MiB pages the program asked for and must keep
+ * — unmapping a quarter of one is refused rather than splitting it into
+ * the small pages it was asked not to be. A file-backed region may be cut:
+ * each half takes its own reference to the file (`uspace_install_hooks`).
+ * It used to be refused for want of that, and `mprotect` cut one anyway. */
 static bool must_be_whole(struct uproc *p, virt_t at, uint64_t bytes) {
     const struct vma *r = vma_find(&p->vmas, at);
-    if (r == NULL || ((r->flags & VMA_HUGE) == 0 && r->file == NULL)) {
+    if (r == NULL || (r->flags & VMA_HUGE) == 0) {
         return false;
     }
     return at != r->start || bytes != r->end - r->start;
@@ -3594,7 +3743,11 @@ static bool page_out_one(struct uproc *p, virt_t va) {
     phys_t phys = 0;
     uint64_t flags = 0, span = 0;
     uint32_t slot = 0;
-    if (!pgtable_lookup(&p->pt, va, &phys, &flags, &span) || span != PAGE_SIZE) {
+    /* **A megapage is split on its way out**, as Linux does: only the page
+     * chosen goes to swap, and the other 511 stay where they are. */
+    if (!pgtable_lookup(&p->pt, va, &phys, &flags, &span) ||
+        (span != PAGE_SIZE && (split_huge(p, va) != KERR_OK ||
+                               !pgtable_lookup(&p->pt, va, &phys, &flags, &span)))) {
         return false;
     }
     phys &= ~(phys_t)(PAGE_SIZE - 1u);
@@ -3788,6 +3941,14 @@ static int move_one_frame(struct uproc *p, virt_t from, virt_t to) {
     if (!pgtable_lookup(&p->pt, from, &phys, &flags, &size)) {
         return KERR_OK;
     }
+    if (size != PAGE_SIZE) {
+        /* A transparent megapage moves as its 512 pages: the destination
+         * is not necessarily 2 MiB aligned. */
+        rc = split_huge(p, from);
+        if (rc != KERR_OK || !pgtable_lookup(&p->pt, from, &phys, &flags, &size)) {
+            return rc != KERR_OK ? rc : KERR_IO;
+        }
+    }
     rc = pgtable_map(&p->pt, to, phys, PAGE_SIZE, flags);
     if (rc != KERR_OK) {
         return rc;
@@ -3931,6 +4092,57 @@ int uspace_remap(struct uproc *p, virt_t at, uint64_t old_bytes, uint64_t new_by
     return move_mapping(p, at, old_bytes, new_bytes, prot, to, out);
 }
 
+/* One 4 KiB page's new rights — or, for a megapage the range covered whole
+ * (`protect_megapages` left it), nothing: it was done there. */
+static int protect_one(struct uproc *p, virt_t va, uint32_t prot) {
+    phys_t phys = 0;
+    uint64_t flags = 0, size = 0;
+    if (!pgtable_lookup(&p->pt, va, &phys, &flags, &size)) {
+        /* Making a reservation usable: there is nothing there yet, so
+         * this is the moment it gets a page. `PROT_NONE` needs none. */
+        return prot == 0 ? KERR_OK : back_one_page(p, va, prot);
+    }
+    if (size != PAGE_SIZE) {
+        return KERR_OK;
+    }
+    if (prot == 0) {
+        return drop_pages(p, va, PAGE_SIZE);
+    }
+    (void)pgtable_unmap(&p->pt, va);
+    return pgtable_map(&p->pt, va, phys, PAGE_SIZE, prot_bits(prot));
+}
+
+/* The megapages in [at, end), before the page-by-page pass.
+ *
+ * One covered whole keeps its 2 MiB and takes the new rights (or goes, for
+ * `PROT_NONE`). One covered in part is split, so the pass below changes
+ * only what was named — except in a `MAP_HUGETLB` region, which Linux too
+ * only protects in whole pages: `EINVAL` there. Re-mapping 4 KiB over a
+ * megapage, as this did, dropped the other 511 pages' contents. */
+static int protect_megapages(struct uproc *p, virt_t at, virt_t end, uint32_t prot) {
+    int rc = KERR_OK;
+    for (virt_t va = at & ~(virt_t)(MEGAPAGE_SIZE - 1u); rc == KERR_OK && va < end;
+         va += MEGAPAGE_SIZE) {
+        phys_t phys = 0;
+        uint64_t flags = 0, size = 0;
+        const struct vma *r = vma_find(&p->vmas, va > at ? va : at);
+        if (!pgtable_lookup(&p->pt, va > at ? va : at, &phys, &flags, &size) ||
+            size != MEGAPAGE_SIZE) {
+            continue;
+        }
+        if (va < at || va + MEGAPAGE_SIZE > end) {
+            rc = r != NULL && (r->flags & VMA_HUGE) != 0 ? KERR_INVAL : split_huge(p, at > va ? at : va);
+        } else if (prot == 0) {
+            rc = drop_pages(p, va, MEGAPAGE_SIZE);
+        } else {
+            (void)pgtable_unmap(&p->pt, va);
+            rc = pgtable_map(&p->pt, va, phys & ~(phys_t)(MEGAPAGE_SIZE - 1u), MEGAPAGE_SIZE,
+                             prot_bits(prot));
+        }
+    }
+    return rc;
+}
+
 int uspace_protect(struct uproc *p, virt_t at, uint64_t bytes, uint32_t prot) {
     uint64_t pages = 0;
     /* The record follows the rights, not only the ranges: a region whose
@@ -3940,21 +4152,14 @@ int uspace_protect(struct uproc *p, virt_t at, uint64_t bytes, uint32_t prot) {
     if ((at & (PAGE_SIZE - 1u)) != 0 || !page_count(bytes, &pages)) {
         return KERR_INVAL;
     }
-    for (uint64_t i = 0; i < pages; i++) {
-        virt_t va = at + i * PAGE_SIZE;
-        phys_t phys = 0;
-        uint64_t flags = 0, size = 0;
-        int rc;
-        if (!pgtable_lookup(&p->pt, va, &phys, &flags, &size)) {
-            /* Making a reservation usable: there is nothing there yet, so
-             * this is the moment it gets a page. */
-            rc = back_one_page(p, va, prot);
-        } else if (prot == 0) {
-            rc = drop_pages(p, va, PAGE_SIZE);
-        } else {
-            (void)pgtable_unmap(&p->pt, va);
-            rc = pgtable_map(&p->pt, va, phys, PAGE_SIZE, prot_bits(prot));
+    {
+        int rc = protect_megapages(p, at, at + pages * PAGE_SIZE, prot);
+        if (rc != KERR_OK) {
+            return rc;
         }
+    }
+    for (uint64_t i = 0; i < pages; i++) {
+        int rc = protect_one(p, at + i * PAGE_SIZE, prot);
         if (rc != KERR_OK) {
             return rc;
         }

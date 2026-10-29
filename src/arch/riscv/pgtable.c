@@ -323,6 +323,23 @@ int pgtable_map_range(struct pgtable *pt, virt_t va, phys_t pa, uint64_t bytes, 
     return KERR_OK;
 }
 
+bool pgtable_megapage_free(const struct pgtable *pt, virt_t va) {
+    const uint64_t *table = pt->root;
+    uint64_t pte;
+    if (!pgtable_va_is_canonical(va)) {
+        return false;
+    }
+    pte = table[index_at(va, 2)];
+    if (pte_is_leaf(pte)) {
+        return false;
+    }
+    if (!pte_is_table(pte)) {
+        return true;
+    }
+    table = pt->mem.to_virt(pt->mem.self, pte_phys(pte));
+    return table[index_at(va, 1)] == 0;
+}
+
 bool pgtable_lookup(const struct pgtable *pt, virt_t va, phys_t *pa, uint64_t *prot, uint64_t *size) {
     const uint64_t *table = pt->root;
     if (!pgtable_va_is_canonical(va)) {

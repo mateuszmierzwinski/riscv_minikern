@@ -103,4 +103,9 @@ bool vma_range_free(const struct vma_set *s, virt_t start, virt_t end);
 int vma_find_free(const struct vma_set *s, virt_t len, virt_t hint, virt_t lo, virt_t hi,
                   virt_t align, virt_t *addr);
 
+/* Installs what is called with the new half of every file-backed region
+ * that is cut: the kernel takes a second reference to the file there, so
+ * each half owns one. None by default (the host tests). */
+void vma_set_split_hook(void (*hook)(const struct vma *half));
+
 #endif

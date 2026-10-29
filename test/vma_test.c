@@ -239,6 +239,40 @@ static void test_an_aligned_gap_is_found_or_refused(void) {
     KTEST_CHECK(at == WINDOW_LO + mega + PAGE);
 }
 
+/* References a file-backed region holds, as the kernel's hook and `gone`
+ * would count them: one per region, taken at a cut, given back on removal. */
+static int refs;
+
+static void take_ref(const struct vma *half) {
+    (void)half;
+    refs++;
+}
+
+static void give_ref(void *ctx, const struct vma *v) {
+    (void)ctx;
+    refs -= v->file != NULL ? 1 : 0;
+}
+
+/* Cutting a file-backed region gives the new half its own reference, so a
+ * partial protect then a removal of every piece ends at zero — never
+ * below, which is a file freed while a region still reads it. */
+static void test_each_half_of_a_cut_file_region_holds_a_reference(void) {
+    static int file;
+    fresh();
+    refs = 1;
+    vma_set_split_hook(take_ref);
+    KTEST_CHECK(vma_insert_backed(&set, WINDOW_LO, WINDOW_LO + 8u * PAGE, 3u, 0, &file, 0) ==
+                KERR_OK);
+    KTEST_CHECK(vma_protect(&set, WINDOW_LO + 2u * PAGE, WINDOW_LO + 3u * PAGE, 1u) == KERR_OK);
+    KTEST_CHECK(set.n == 3u && refs == 3);
+    KTEST_CHECK(vma_remove(&set, WINDOW_LO + 5u * PAGE, WINDOW_LO + 6u * PAGE, give_ref, NULL) ==
+                KERR_OK);
+    KTEST_CHECK(set.n == 4u && refs == 4);
+    KTEST_CHECK(vma_remove(&set, WINDOW_LO, WINDOW_LO + 8u * PAGE, give_ref, NULL) == KERR_OK);
+    KTEST_CHECK(set.n == 0 && refs == 0);
+    vma_set_split_hook(NULL);
+}
+
 int main(void) {
     KTEST_RUN(test_insert_and_find);
     KTEST_RUN(test_overlap_is_refused);
@@ -256,5 +290,6 @@ int main(void) {
     KTEST_RUN(test_a_removed_range_is_offered_again);
     KTEST_RUN(test_a_range_is_free_only_if_all_of_it_is);
     KTEST_RUN(test_an_aligned_gap_is_found_or_refused);
+    KTEST_RUN(test_each_half_of_a_cut_file_region_holds_a_reference);
     return ktest_failures();
 }

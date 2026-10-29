@@ -617,6 +617,37 @@ CASES = [
       "the boot partition is read and written at /boot",
       "cat: /boot/minikern.bin is 48 bytes"],
      240, None, "bootfirst"),
+    # **Transparent huge pages** (§2): an aligned window of an ordinary
+    # mapping becomes one 2 MiB page, and discard, protect, unmap, fork and
+    # move of *part* of one must leave the rest of it alone. 63 is all six;
+    # the kernel's count shows the pages were really huge. The control:
+    # `minikern.nothp` must pass too, with no transparent pages at all.
+    ("§2: transparent huge pages, and partial operations on them",
+     "",
+     ["exited with 127", "mem: 7 transparent huge pages, 5 megapages split"],
+     200, "//:thp.elf"),
+    ("§2: the same program with transparent huge pages off",
+     "minikern.nothp",
+     ["exited with 127", "mem: 0 transparent huge pages"],
+     200, "//:thp.elf"),
+    # **Huge file mappings** (§2): a file mapped privately at an aligned
+    # address gets megapages filled from the file. The bytes are the file's,
+    # a write stays the mapping's, a partial mprotect splits one and keeps
+    # every byte, and a partial munmap — refused until each cut region held
+    # its own file reference — keeps the rest. 63 is all six; two windows
+    # filled from the file, both split.
+    ("§2: a file mapped in 2 MiB pages",
+     "",
+     ["exited with 63", "0 transparent huge pages, 2 megapages split, 2 from a file"],
+     240, "//:hugefile.elf", "defaults"),
+    # **Huge pages in swap** (§2): with swap on the card, the page named by
+    # MADV_PAGEOUT inside a megapage is split off and sent out alone — one
+    # page out, one fault back — and the other 511 never move.
+    ("§2: part of a transparent huge page sent to swap and back",
+     "minikern.disk=sd minikern.swap=/swapfile:70",
+     ["exited with 127", "mem: 7 transparent huge pages, 6 megapages split",
+      "swap: 1 pages sent out by a process, 1 faulted back in"],
+     200, "//:thp.elf"),
     # **`nanosleep` interrupted** (§1): EINTR with the time left in `rem`,
     # not a silent 0 after a short sleep; `clock_nanosleep`, relative and
     # absolute; `CLOCK_REALTIME` a date, not the time since boot. 255 is all.

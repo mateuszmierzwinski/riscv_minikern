@@ -183,6 +183,12 @@ int pgtable_map(struct pgtable *pt, virt_t va, phys_t pa, uint64_t size, uint64_
  * is one entry instead of 262144. */
 int pgtable_map_range(struct pgtable *pt, virt_t va, phys_t pa, uint64_t bytes, uint64_t prot);
 
+/* Whether a 2 MiB leaf could be put at `va`'s window: its level-1 entry is
+ * empty — no megapage, and no level-0 table (even an emptied one, which
+ * unmapping leaves behind). Asked **before** allocating 2 MiB for one: the
+ * refusal after allocating cost a zeroed megapage per 4 KiB fault. */
+bool pgtable_megapage_free(const struct pgtable *pt, virt_t va);
+
 /* What `va` translates to, and with what permissions. False when unmapped.
  * `size` reports whether it was found as a page, a megapage or a gigapage. */
 bool pgtable_lookup(const struct pgtable *pt, virt_t va, phys_t *pa, uint64_t *prot, uint64_t *size);

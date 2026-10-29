@@ -65,15 +65,18 @@ git, and the pitfalls are in `CLAUDE.md` §5.
 
 ### Open
 
-**Priority, after XFS is bullet-proof (operator, 2026-10-28):**
-- [ ] **Transparent huge pages** (M) — Ordinary anonymous memory is never promoted, so Go's heap runs on 4 KiB pages; only `MAP_HUGETLB` gets 2 MiB. Next: back an aligned, wholly covered 2 MiB anonymous range with a megapage on first touch, then add collapse of an already-populated range.
-- [ ] **Huge file mappings** (M) — `MAP_PRIVATE` file mappings are 4 KiB only. Next: a megapage where the file range and the address are both 2 MiB-aligned.
-- [ ] **Huge pages in swap** (M) — 2 MiB pages are never swapped out. Next: split to 4 KiB on eviction (as Linux does), or swap the 512 pages as one unit.
 
 - [ ] **`pgtable_map` can write through a borrowed kernel table** (S once §7 step C is done) — `share_kernel_mappings` hands a process the kernel's own level-1 table and `walk_to` cannot tell. Counted every boot (`pgtable: no process wrote into the kernel's tables`, currently 0); step C makes it unrepresentable.
 - [ ] **ELF segments are not in the region record** (S) — text and data are mapped but unrecorded, so placement could see them as free (`uspace_stale_records` counts it). Recording them in `load_segment` broke the board twice under the old layout; retry after step C.
 
 ### Done
+
+- [x] **Cutting a file mapping: one file reference per piece** — a partial `mprotect` cut a file region into pieces sharing one reference, and each piece gave it back when it went: the file was freed under the regions still reading it. Now each new half takes its own (`vma_set_split_hook`), and partial `munmap` of a file mapping, which was refused for want of this, works. Host: `vma_test`. Board: `§2: a file mapped in 2 MiB pages` (63).
+
+- [x] **Transparent huge pages** (operator priority 2026-10-28) — an ordinary anonymous private region gets a 2 MiB page on first touch of an aligned window it covers whole and nothing has touched (Linux's `always`; `minikern.nothp` turns it off). Discard, unmap, `MAP_FIXED`, `mprotect`, `mremap`, `fork` and swap split a megapage they cover only in part (`split_huge`: same frames, same rights), so no byte a program reads can change. A first version allocated and zeroed 2 MiB before asking whether the window was free: Go's stress ran 15× slower. Now `pgtable_megapage_free` is asked first, and the run takes the same 33 s as with THP off. Board: `§2: transparent huge pages…` (127, 7 huge, 5 split), the `nothp` control, the 2,500-round §0 reproducer.
+- [x] **Huge file mappings** — a private file mapping's window, 2 MiB aligned in address and file and wholly inside the file, gets one megapage filled from the file. Board: `§2: a file mapped in 2 MiB pages` (15; 2 from a file).
+- [x] **Huge pages in swap** — swap-out splits a megapage and sends out only the page chosen; the other 511 stay. Board: `§2: part of a transparent huge page sent to swap and back` (1 out, 1 back in).
+- [x] **`mprotect` of part of a huge page** — re-mapped 4 KiB over the 2 MiB leaf, which dropped the other 511 pages' contents. This affected `MAP_HUGETLB` too. Now a megapage covered whole is changed in place, and one covered in part is split, or refused (`EINVAL`) in a `MAP_HUGETLB` region.
 
 - [x] **`fence.i` after loading code** — issued after segments are loaded, behind a data fence; board-verified on exec.
 - [x] **Leaf walker read swapped-out PTEs as addresses** — `pgtable_for_each_leaf` requires `PTE_V` itself.

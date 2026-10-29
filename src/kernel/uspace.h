@@ -746,6 +746,17 @@ uint64_t uspace_freed_frames(void);
  * to tell a huge mapping from an ordinary one from outside: the program
  * cannot see the difference, and a kernel that quietly used 4 KiB pages
  * would look identical in every other respect. */
+/* Transparent huge pages (on unless `minikern.nothp`): 2 MiB pages for
+ * ordinary anonymous memory, and how many were made and later split. */
+void uspace_set_transparent_huge(bool on);
+
+/* Installs the region record's split hook (each half of a cut file mapping
+ * holds its own file reference). Once, at boot, before any process. */
+void uspace_install_hooks(void);
+uint64_t uspace_transparent_pages(void);
+uint64_t uspace_split_megapages(void);
+uint64_t uspace_file_megapages(void); /* of those, filled from a file */
+
 uint64_t uspace_huge_pages(void);
 
 /* A child with an address space of its own, made of the parent's pages

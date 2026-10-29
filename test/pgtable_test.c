@@ -234,6 +234,27 @@ static void test_a_swapped_page_is_remembered_but_not_mapped(void) {
     pgtable_destroy(&pt);
 }
 
+/* A megapage's window is free only while nothing at all is in it: a 4 KiB
+ * page, the level-0 table it left behind after an unmap, or a megapage
+ * already there each make it taken — the question THP asks before it
+ * allocates 2 MiB. */
+static void test_a_megapage_window_is_free_only_when_empty(void) {
+    struct pgtable pt = fresh();
+    const virt_t w = 0x40000000ull;
+    KTEST_CHECK(pgtable_megapage_free(&pt, w));
+    KTEST_CHECK(pgtable_megapage_free(&pt, w + 0x5000));
+    KTEST_CHECK(pgtable_map(&pt, w + 0x3000, 0x80000000ull, PAGE_SIZE, PT_PROT_RW) == KERR_OK);
+    KTEST_CHECK(!pgtable_megapage_free(&pt, w));
+    KTEST_CHECK(pgtable_unmap(&pt, w + 0x3000) == PAGE_SIZE);
+    KTEST_CHECK(!pgtable_megapage_free(&pt, w)); /* the table stays */
+    KTEST_CHECK(pgtable_megapage_free(&pt, w + MEGAPAGE_SIZE));
+    KTEST_CHECK(pgtable_map(&pt, w + MEGAPAGE_SIZE, 0x40000000ull, MEGAPAGE_SIZE, PT_PROT_RW) ==
+                KERR_OK);
+    KTEST_CHECK(!pgtable_megapage_free(&pt, w + MEGAPAGE_SIZE + 0x1000));
+    KTEST_CHECK(!pgtable_megapage_free(&pt, 0x0000800000000000ull)); /* not canonical */
+    pgtable_destroy(&pt);
+}
+
 int main(void) {
     KTEST_RUN(test_canonical_addresses);
     KTEST_RUN(test_a_swapped_page_is_remembered_but_not_mapped);
@@ -246,5 +267,6 @@ int main(void) {
     KTEST_RUN(test_a_range_fills_its_edges);
     KTEST_RUN(test_satp_value);
     KTEST_RUN(test_exhaustion_is_reported);
+    KTEST_RUN(test_a_megapage_window_is_free_only_when_empty);
     return ktest_failures();
 }

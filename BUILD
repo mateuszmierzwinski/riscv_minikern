@@ -1426,6 +1426,36 @@ user_image(
     program = ":netlinkask",
 )
 
+# A private file mapping in 2 MiB pages. Exits with a bitmask of the checks
+# that passed.
+user_binary(
+    name = "hugefile",
+    srcs = [
+        "src/userland/hugefile/main.c",
+        "src/userland/start.S",
+    ],
+)
+
+user_image(
+    name = "hugefile.elf",
+    program = ":hugefile",
+)
+
+# Transparent huge pages, and the page-by-page operations on them. Exits
+# with a bitmask of the checks that passed.
+user_binary(
+    name = "thp",
+    srcs = [
+        "src/userland/start.S",
+        "src/userland/thp/main.c",
+    ],
+)
+
+user_image(
+    name = "thp.elf",
+    program = ":thp",
+)
+
 # `nanosleep` interrupted by a signal: EINTR and the time left. Exits with a
 # bitmask of the checks that passed.
 user_binary(
