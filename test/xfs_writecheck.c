@@ -28,6 +28,9 @@
 #define NOW 1761609600u /* 2025-10-28, any fixed instant */
 
 static int image_fd = -1;
+static int rt_fd = -1; /* the realtime device's image, when XFS_WRITECHECK_RT names one */
+
+static void must(int rc, const char *what);
 static uint8_t cache_mem[SLOTS * BS];
 static uint8_t payload[4u * 1024u * 1024u];
 
@@ -46,6 +49,44 @@ static int img_write(void *self, uint64_t lba, uint32_t count, const void *buf) 
 static int img_flush(void *self) {
     (void)self;
     return fsync(image_fd) == 0 ? KERR_OK : KERR_IO;
+}
+
+static int rt_read(void *self, uint64_t lba, uint32_t count, void *buf) {
+    (void)self;
+    ssize_t n = pread(rt_fd, buf, (size_t)count * BS, (off_t)(lba * BS));
+    return n == (ssize_t)((size_t)count * BS) ? KERR_OK : KERR_IO;
+}
+
+static int rt_write(void *self, uint64_t lba, uint32_t count, const void *buf) {
+    (void)self;
+    ssize_t n = pwrite(rt_fd, buf, (size_t)count * BS, (off_t)(lba * BS));
+    return n == (ssize_t)((size_t)count * BS) ? KERR_OK : KERR_IO;
+}
+
+static int rt_flush(void *self) {
+    (void)self;
+    return fsync(rt_fd) == 0 ? KERR_OK : KERR_IO;
+}
+
+/* Attaches the realtime device XFS_WRITECHECK_RT names, if any. */
+static void attach_realtime(struct xfs *fs) {
+    static uint8_t rt_mem[16u * BS];
+    static struct blockdev rtdev;
+    static struct bcache rtcache;
+    struct stat st;
+    const char *path = getenv("XFS_WRITECHECK_RT");
+    if (path == NULL || path[0] == '\0') {
+        return;
+    }
+    rt_fd = open(path, O_RDWR);
+    if (rt_fd < 0 || fstat(rt_fd, &st) != 0) {
+        perror(path);
+        exit(2);
+    }
+    rtdev = (struct blockdev){.read = rt_read, .write = rt_write, .flush = rt_flush,
+                              .block_size = BS, .blocks = (uint64_t)st.st_size / BS};
+    must(bcache_init(&rtcache, &rtdev, rt_mem, 16u), "bcache_init (realtime)");
+    must(xfs_attach_rt(fs, &rtcache), "attaching the realtime device");
 }
 
 /* A discard poisons the blocks rather than zeroing them: this device says
@@ -300,9 +341,41 @@ static void step_defragment(struct xfs *fs) {
  * its blocks and its tree's leaves. */
 #define BTREE_FILE_BYTES (4u * 1024u * 1024u)
 
+/* The b-tree step on inodes over 512 bytes, whose data fork is larger than
+ * this reader caches: a file may not go past the extents that cache holds
+ * (`xfs_data_extents_cap`), so a fragmenting write must stop with
+ * KERR_NOTSUP — before allocating, or `xfs_repair` finds the block it took
+ * — and what was written must read back. The file is then removed. */
+static void btree_refused(struct xfs *fs) {
+    struct xfs_inode root, ip;
+    uint64_t ino, done = 0;
+    uint32_t put = 0;
+    int rc = KERR_OK;
+    read_inode(fs, fs->rootino, &root);
+    must(xfs_create(fs, &root, "fragmented", 10u, 0100644, NOW, &ino), "create fragmented");
+    for (; rc == KERR_OK && done < BTREE_FILE_BYTES; done += put) {
+        read_inode(fs, ino, &ip);
+        put = 0;
+        rc = xfs_file_write(fs, &ip, done, payload + done % (sizeof payload - 65536u), 65536u, &put);
+    }
+    if (rc != KERR_OK && rc != KERR_NOTSUP) {
+        fprintf(stderr, "xfs_writecheck: a fragmenting write answered %d, want ok or %d\n", rc,
+                KERR_NOTSUP);
+        exit(1);
+    }
+    printf("xfs_writecheck: large inodes: %llu bytes written before %s\n",
+           (unsigned long long)done, rc == KERR_NOTSUP ? "the extent cap" : "the end");
+    read_inode(fs, fs->rootino, &root);
+    must(xfs_unlink(fs, &root, "fragmented", 10u, NOW), "unlink fragmented");
+}
+
 static void step_btreefile(struct xfs *fs) {
     struct xfs_inode root, ip;
     uint64_t ino;
+    if (fs->inodesize - fs->dinode_size > XFS_FORK_MAX) {
+        btree_refused(fs);
+        return;
+    }
     read_inode(fs, fs->rootino, &root);
     ino = make_file(fs, &root, "fragmented", BTREE_FILE_BYTES, 65536u);
     read_inode(fs, ino, &ip);
@@ -337,6 +410,70 @@ static void step_replay(struct xfs *fs) {
     }
     must_read_back(&again, lookup(&again, "/after-the-crash"), 9000u);
     *fs = again;
+}
+
+/* Logs a size change for `ino` WITHOUT writing it in place, committed or
+ * not: after a crash the log is the only place the change exists, so what
+ * the next mount does with it is the whole of what is being judged. */
+static void log_size_only(struct xfs *fs, uint64_t ino, uint64_t size, bool committed) {
+    static uint8_t core[2048];
+    struct xfs_log_inode_item item = {.ino = ino, .core = core};
+    struct bbuf *b;
+    uint64_t block;
+    xfs_inode_place(fs, ino, &block, &item.boffset);
+    item.chunk_block = block;
+    must(bcache_get(fs->cache, block, &b), "reading the inode to log");
+    memcpy(core, b->data + item.boffset, fs->inodesize);
+    bcache_put(fs->cache, b);
+    xfs_put_be64(core + XFS_DI_SIZE, size);
+    xfs_reseal(fs, core, fs->inodesize, XFS_DI_CRC);
+    fs->skip_commit_record = !committed;
+    must(xfs_log_inodes(fs, &item, 1u), "logging the size change");
+}
+
+static uint64_t size_of(struct xfs *fs, uint64_t ino) {
+    struct xfs_inode ip;
+    read_inode(fs, ino, &ip);
+    return ip.size;
+}
+
+/* Logs a size change (not written in place), crashes, remounts, and
+ * returns the file's size as the replayed filesystem sees it. */
+static uint64_t crash_after_logging(struct xfs *fs, uint64_t ino, uint64_t size, bool committed) {
+    static struct xfs again;
+    uint64_t seen;
+    must(xfs_flush(fs), "flush before the logging");
+    fs->skip_unmount_record = true;
+    log_size_only(fs, ino, size, committed);
+    must(xfs_flush(fs), "flush before the crash");
+    bcache_invalidate(fs->cache);
+    must(xfs_mount(&again, fs->cache), "mount after the crash");
+    seen = size_of(&again, ino);
+    *fs = again;
+    return seen;
+}
+
+/* A crash after a transaction was written to the log but before its
+ * COMMIT_TRANS — a record cut off mid-transaction. Replay must leave that
+ * change out; the same change committed must be applied, which is the
+ * control that shows the first result is the commit's doing. One crash
+ * each, so each time the transaction judged is the newest in the log. */
+static void step_uncommitted(struct xfs *fs) {
+    struct xfs_inode root;
+    uint64_t cut, kept, kept_size, cut_size;
+    read_inode(fs, fs->rootino, &root);
+    cut = make_file(fs, &root, "cut-off", 9000u, 4096u);
+    read_inode(fs, fs->rootino, &root);
+    kept = make_file(fs, &root, "committed", 9000u, 4096u);
+    kept_size = crash_after_logging(fs, kept, 4000u, true);
+    cut_size = crash_after_logging(fs, cut, 1u, false);
+    if (kept_size != 4000u || cut_size != 9000u) {
+        fprintf(stderr, "xfs_writecheck: after replay the committed file is %llu bytes (want 4000), "
+                "the cut-off one %llu (want 9000)\n", (unsigned long long)kept_size,
+                (unsigned long long)cut_size);
+        exit(1);
+    }
+    must(xfs_log_mark_clean(fs), "closing the log after the last replay");
 }
 
 /* Appends to one file a byte at a time — each a logged size change — until
@@ -673,6 +810,87 @@ struct step {
     void (*run)(struct xfs *fs);
 };
 
+/* Marks an empty file realtime, as `chattr +r` does: the flag is only ever
+ * set on a file with no blocks, since its blocks would then be on the wrong
+ * device. */
+static void make_realtime(struct xfs *fs, uint64_t ino) {
+    uint64_t block;
+    uint32_t boffset;
+    struct bbuf *b;
+    uint8_t *di;
+    xfs_inode_place(fs, ino, &block, &boffset);
+    must(bcache_get(fs->cache, block, &b), "reading the inode to mark it realtime");
+    di = b->data + boffset;
+    xfs_put_be16(di + XFS_DI_FLAGS, (uint16_t)(xfs_be16(di + XFS_DI_FLAGS) | XFS_DIFLAG_REALTIME));
+    xfs_reseal(fs, di, fs->inodesize, XFS_DI_CRC);
+    bcache_dirty(b);
+    bcache_put(fs->cache, b);
+}
+
+static uint64_t realtime_file(struct xfs *fs, struct xfs_inode *root, const char *name) {
+    uint64_t ino;
+    must(xfs_create(fs, root, name, (uint32_t)strlen(name), 0100644, NOW, &ino), "create realtime");
+    make_realtime(fs, ino);
+    return ino;
+}
+
+/* Realtime files, which only a filesystem with a realtime device has (run
+ * with XFS_WRITECHECK_RT): grown block by block, written past the end and
+ * into the hole left, truncated, and one removed — so the bitmap, the
+ * summary and `sb_frextents` all change and `xfs_repair -n` judges them. */
+static void step_realtime(struct xfs *fs) {
+    static uint8_t zeroes[65536];
+    struct xfs_inode root, ip;
+    uint64_t keep, gone;
+    uint32_t put;
+    if (fs->rt_cache == NULL) {
+        return; /* no realtime device given: nothing to judge */
+    }
+    read_inode(fs, fs->rootino, &root);
+    keep = realtime_file(fs, &root, "rtkeep");
+    read_inode(fs, keep, &ip);
+    for (uint32_t i = 0; i < 5u; i++) {
+        must(xfs_file_write(fs, &ip, (uint64_t)i * 3000u, payload + i * 3000u, 3000u, &put),
+             "realtime append");
+        read_inode(fs, keep, &ip);
+    }
+    must(xfs_file_write(fs, &ip, 200000u, payload, 5000u, &put), "realtime write past the end");
+    read_inode(fs, keep, &ip);
+    must(xfs_file_write(fs, &ip, 90000u, payload, 9000u, &put), "realtime write into the hole");
+    must_match(fs, keep, 0, payload, 15000u, "the realtime appends");
+    must_match(fs, keep, 90000u, payload, 9000u, "the filled realtime hole");
+    must_match(fs, keep, 30000u, zeroes, 60000u, "the realtime hole before it");
+    read_inode(fs, keep, &ip);
+    must(xfs_truncate(fs, &ip, 100000u, NOW), "realtime truncate");
+    read_inode(fs, fs->rootino, &root);
+    gone = realtime_file(fs, &root, "rtgone");
+    read_inode(fs, gone, &ip);
+    must(xfs_file_write(fs, &ip, 0, payload, 70000u, &put), "realtime file to remove");
+    read_inode(fs, fs->rootino, &root);
+    must(xfs_unlink(fs, &root, "rtgone", 6u, NOW), "realtime unlink");
+}
+
+/* On a `-i size=1024` image made with /big (a shortform directory whose
+ * fork is past XFS_FORK_MAX) and /beside: the big directory is refused —
+ * per inode, KERR_NOTSUP — and everything else on the filesystem still
+ * reads and writes. Skipped on images without /big. */
+static void step_bigfork(struct xfs *fs) {
+    struct xfs_inode ip, root;
+    int rc = xfs_path_lookup(fs, "/big", &ip);
+    if (rc == KERR_NOENT) {
+        return;
+    }
+    if (rc != KERR_NOTSUP) {
+        fprintf(stderr, "xfs_writecheck: /big (a fork over %u bytes) answered %d, want %d\n",
+                XFS_FORK_MAX, rc, KERR_NOTSUP);
+        exit(1);
+    }
+    must(xfs_path_lookup(fs, "/beside/s1", &ip), "a small directory beside the big one");
+    read_inode(fs, fs->rootino, &root);
+    (void)make_file(fs, &root, "after-big", 9000u, 4096u);
+    must_read_back(fs, lookup(fs, "/after-big"), 9000u);
+}
+
 static const struct step steps[] = {
     {"files", step_files},     {"dir", step_dir},       {"many", step_many},
     {"truncate", step_truncate}, {"unlink", step_unlink}, {"attr", step_attr},
@@ -683,7 +901,8 @@ static const struct step steps[] = {
     {"fixture", step_fixture},  {"unlinkproto", step_unlinkproto},
     {"inodes", step_inodes},    {"noinodes", step_noinodes},
     {"reflink", step_reflink},  {"holes", step_holes},     {"boardgrow", step_boardgrow},
-    {"trim", step_trim},        {"eofzero", step_eofzero},
+    {"trim", step_trim},        {"eofzero", step_eofzero},  {"realtime", step_realtime},
+    {"uncommitted", step_uncommitted}, {"bigfork", step_bigfork},
 };
 
 /* Runs the named steps, or every one when none is named. */
@@ -726,6 +945,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "xfs_writecheck: the filesystem mounted read-only\n");
         return 1;
     }
+    attach_realtime(&fs);
     exercise(&fs, argc, argv);
     must(xfs_flush(&fs), "flush");
     printf("xfs_writecheck: every write succeeded\n");

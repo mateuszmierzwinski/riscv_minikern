@@ -36,6 +36,7 @@
  * their allowance and the filesystem is otherwise fine. */
 #define KERR_DQUOT   (-122) /* EDQUOT: over an owner's quota */
 #define KERR_RANGE   (-34)
+#define KERR_NOLCK   (-37)  /* no record locks left */
 #define KERR_2BIG        (-7)   /* the argument list is too long */
 #define KERR_NAMETOOLONG (-36)
 #define KERR_LOOP        (-40)  /* too many symbolic links */

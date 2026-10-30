@@ -14,6 +14,7 @@
 #include "kernel/disk.h"
 #include "kernel/mem.h"
 #include "kernel/fatmount.h"
+#include "core/vfs.h"
 #include "kernel/volumes.h"
 
 static struct xfs fs;
@@ -232,8 +233,8 @@ static uint32_t create_permissions(uint32_t base) {
  *
  * NULL for a path on a FAT volume, which `volumes_resolve` marks by leaving
  * `within` NULL: falling back to the root there would answer for `/boot`
- * out of the root filesystem. Every call that can take a FAT path asks
- * `fat_for` first; one that cannot reports no such device. */
+ * out of the root filesystem. Every call asks the mount table
+ * (`vfs_resolve`) first; one a mounted filesystem cannot serve says so. */
 static struct xfs *owner_of(const char *path, const char **within) {
     struct xfs *v = volumes_resolve(path, within);
     if (v != NULL || *within == NULL) {
@@ -243,48 +244,26 @@ static struct xfs *owner_of(const char *path, const char **within) {
     return mounted ? &fs : NULL;
 }
 
-/* The FAT volume a path is on, or NULL. */
-static struct fat *fat_for(const char *path, const char **within) {
-    return volumes_resolve_fat(path, within);
-}
-
-/* FAT's answers to the questions it has no fields for: every file is
- * root's, and its mode is the one `fatmount` reports. */
-static int fat_stat(struct fat *vol, const char *within, uint32_t *uid, uint32_t *gid,
-                    uint32_t *mode) {
+/* A mounted filesystem's answer to stat's owner question: its own, or
+ * root's when it keeps no owners. */
+static int other_stat(const struct vfs_mount *mount, const char *in, uint32_t *uid,
+                      uint32_t *gid, uint32_t *mode) {
+    const struct vfs_ops *ops = mount->ops; /* copied: an umount may move the slot while this sleeps */
+    void *self = mount->self;
     uint64_t size = 0;
-    uint32_t nlink = 0, m = 0;
-    int rc = fatmount_stat_full(vol, within, &m, &size, &nlink);
+    uint32_t nlink = 0, got_mode = 0, u = 0, g = 0;
+    int rc = ops->stat_full(self, in, &got_mode, &size, &nlink);
+    rc = rc != KERR_OK ? rc : ops->owner(self, in, &u, &g);
     if (rc == KERR_OK && uid != NULL) {
-        *uid = 0;
+        *uid = u;
     }
     if (rc == KERR_OK && gid != NULL) {
-        *gid = 0;
+        *gid = g;
     }
     if (rc == KERR_OK && mode != NULL) {
-        *mode = m;
+        *mode = got_mode;
     }
     return rc;
-}
-
-static int fat_owner(struct fat *vol, const char *within, uint32_t *uid, uint32_t *gid) {
-    return fat_stat(vol, within, uid, gid, NULL);
-}
-
-static int fat_exists(struct fat *vol, const char *within) {
-    return fat_stat(vol, within, NULL, NULL, NULL);
-}
-
-/* Two paths and where each is: a rename or link across two volumes is
- * `EXDEV`, as it is between any two filesystems. */
-static int fat_pair(const char *from, const char *to, struct fat **vol, const char **a,
-                    const char **b) {
-    struct fat *x = fat_for(from, a), *y = fat_for(to, b);
-    *vol = x;
-    if (x == NULL && y == NULL) {
-        return KERR_NOENT; /* neither is FAT: the XFS path answers */
-    }
-    return x == y ? KERR_OK : KERR_XDEV;
 }
 
 int xfsmount_show_file(const char *path) {
@@ -319,10 +298,10 @@ int xfsmount_show_file(const char *path) {
 }
 
 int xfsmount_stat_full(const char *path, uint32_t *mode, uint64_t *size, uint32_t *nlink) {
-    const char *fat_within = NULL;
-    struct fat *fat = fat_for(path, &fat_within);
-    if (fat != NULL) {
-        return fatmount_stat_full(fat, fat_within, mode, size, nlink);
+    const char *in = NULL;
+    const struct vfs_mount *m = vfs_resolve(path, &in);
+    if (m != NULL) {
+        return m->ops->stat_full(m->self, in, mode, size, nlink);
     }
     struct xfs_inode ip;
     const char *within = path;
@@ -342,10 +321,10 @@ int xfsmount_stat_full(const char *path, uint32_t *mode, uint64_t *size, uint32_
 }
 
 int xfsmount_list(const char *path, xfs_dirent_fn fn, void *self) {
-    const char *fat_within = NULL;
-    struct fat *fat = fat_for(path, &fat_within);
-    if (fat != NULL) {
-        return fatmount_list(fat, fat_within, fn, self);
+    const char *in = NULL;
+    const struct vfs_mount *m = vfs_resolve(path, &in);
+    if (m != NULL) {
+        return m->ops->list(m->self, in, fn, self);
     }
     struct xfs_inode dir;
     const char *within = path;
@@ -379,10 +358,10 @@ int xfsmount_list(const char *path, xfs_dirent_fn fn, void *self) {
  * caller yet — regular-file `openat` is §3 of the roadmap — which is stated
  * rather than papered over with a check that only ever sees root. */
 int xfsmount_stat(const char *path, uint32_t *uid, uint32_t *gid, uint32_t *mode) {
-    const char *fat_within = NULL;
-    struct fat *fat = fat_for(path, &fat_within);
-    if (fat != NULL) {
-        return fat_stat(fat, fat_within, uid, gid, mode);
+    const char *in = NULL;
+    const struct vfs_mount *m = vfs_resolve(path, &in);
+    if (m != NULL) {
+        return other_stat(m, in, uid, gid, mode);
     }
     struct xfs_inode ip;
     int rc;
@@ -455,10 +434,10 @@ int xfsmount_map_file(const char *path, uint64_t *offsets, uint32_t max, uint32_
 }
 
 int xfsmount_read_file(const char *path, uint32_t limit, uint8_t **out, uint32_t *size) {
-    const char *fat_within = NULL;
-    struct fat *fat = fat_for(path, &fat_within);
-    if (fat != NULL) {
-        return fatmount_read_file(fat, fat_within, limit, out, size);
+    const char *in = NULL;
+    const struct vfs_mount *m = vfs_resolve(path, &in);
+    if (m != NULL) {
+        return m->ops->read_file(m->self, in, limit, out, size);
     }
     struct xfs_inode ip;
     uint8_t *buf;
@@ -476,7 +455,7 @@ int xfsmount_read_file(const char *path, uint32_t limit, uint8_t **out, uint32_t
     if (ip.size > limit) {
         return KERR_FBIG;
     }
-    buf = kzalloc((uint32_t)ip.size);
+    buf = kzalloc(((uint32_t)ip.size) == 0 ? 1u : ((uint32_t)ip.size));
     if (buf == NULL) {
         return KERR_NOMEM;
     }
@@ -494,6 +473,57 @@ int xfsmount_read_file(const char *path, uint32_t limit, uint8_t **out, uint32_t
     *out = buf;
     *size = (uint32_t)ip.size;
     return KERR_OK;
+}
+
+/* A range of a mounted file whose filesystem reads only whole files: read it
+ * and take the range. The mounts without `read_at` hold small generated
+ * files, so the whole-file read is the honest cost rather than a waste. */
+static int read_range_of_whole(const struct vfs_mount *m, const char *in, uint64_t off, void *buf,
+                               uint32_t len, uint32_t *got) {
+    uint8_t *bytes = NULL;
+    uint32_t size = 0;
+    int rc = m->ops->read_file(m->self, in, XFSMOUNT_RANGE_WHOLE_MAX, &bytes, &size);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    *got = off >= size ? 0u : (size - off < len ? (uint32_t)(size - off) : len);
+    for (uint32_t i = 0; i < *got; i++) {
+        ((uint8_t *)buf)[i] = bytes[off + i];
+    }
+    kfree(bytes);
+    return KERR_OK;
+}
+
+/* The same range from this kernel's own XFS, in whatever pieces the
+ * filesystem gives: a read may stop at an extent boundary. */
+static int read_range_native(const char *path, uint64_t off, void *buf, uint32_t len,
+                             uint32_t *got) {
+    struct xfs_inode ip;
+    const char *within = path;
+    struct xfs *vol = owner_of(path, &within);
+    int rc = vol == NULL ? KERR_NODEV : xfs_path_lookup(vol, within, &ip);
+    *got = 0;
+    while (rc == KERR_OK && *got < len && off + *got < ip.size) {
+        uint32_t n = 0;
+        rc = xfs_file_read(vol, &ip, off + *got, (uint8_t *)buf + *got, len - *got, &n);
+        if (rc == KERR_OK && n == 0) {
+            break;
+        }
+        *got += n;
+    }
+    return rc;
+}
+
+int xfsmount_read_path_at(const char *path, uint64_t off, void *buf, uint32_t len,
+                          uint32_t *got) {
+    const char *in = NULL;
+    const struct vfs_mount *m = vfs_resolve(path, &in);
+    *got = 0;
+    if (m == NULL) {
+        return read_range_native(path, off, buf, len, got);
+    }
+    return m->ops->read_at != NULL ? m->ops->read_at(m->self, in, off, buf, len, got)
+                                   : read_range_of_whole(m, in, off, buf, len, got);
 }
 
 void xfsmount_lookup_counts(uint64_t *hashed, uint64_t *walked) {
@@ -746,10 +776,10 @@ int xfsmount_unlink(const char *name) {
  * refused by `xfs_unlink` with `EISDIR`, which is right: removing one is
  * `rmdir`, and this is not it. */
 int xfsmount_unlink_path(const char *path) {
-    const char *fat_within = NULL;
-    struct fat *fat = fat_for(path, &fat_within);
-    if (fat != NULL) {
-        return fatmount_unlink_path(fat, fat_within);
+    const char *in = NULL;
+    const struct vfs_mount *m = vfs_resolve(path, &in);
+    if (m != NULL) {
+        return m->ops->unlink(m->self, in);
     }
     struct xfs_inode dir;
     const char *within = path;
@@ -825,10 +855,10 @@ void xfsmount_root_shape(void) {
  * would be doing this loop itself. An existing component is not an error —
  * that is what makes this safe to call on every boot. */
 int xfsmount_mkdir_p(const char *path) {
-    const char *fat_within = NULL;
-    struct fat *fat = fat_for(path, &fat_within);
-    if (fat != NULL) {
-        return fatmount_mkdir_p(fat, fat_within, now_seconds());
+    const char *in = NULL;
+    const struct vfs_mount *m = vfs_resolve(path, &in);
+    if (m != NULL) {
+        return m->ops->mkdir_p(m->self, in);
     }
     struct xfs_inode here;
     const char *within = path;
@@ -957,10 +987,10 @@ __attribute__((noinline)) static int find_or_make_leaf(struct xfs *vol, const ch
 
 int xfsmount_write_at(const char *dir, const char *leaf, uint64_t off, const void *bytes,
                       uint32_t len) {
-    const char *fat_within = NULL;
-    struct fat *fat = fat_for(dir, &fat_within);
-    if (fat != NULL) {
-        return fatmount_write_at(fat, fat_within, leaf, off, bytes, len, now_seconds());
+    const char *in = NULL;
+    const struct vfs_mount *m = vfs_resolve(dir, &in);
+    if (m != NULL) {
+        return m->ops->write_at(m->self, in, leaf, off, bytes, len);
     }
     struct xfs_inode file;
     uint64_t ino = 0;
@@ -1029,10 +1059,10 @@ static __attribute__((noinline)) int write_into_xfs(const char *dir, const char 
 }
 
 int xfsmount_write_into(const char *dir, const char *leaf, const void *bytes, uint32_t len) {
-    const char *fat_within = NULL;
-    struct fat *fat = fat_for(dir, &fat_within);
-    if (fat != NULL) {
-        return fatmount_write_at(fat, fat_within, leaf, 0, bytes, len, now_seconds());
+    const char *in = NULL;
+    const struct vfs_mount *m = vfs_resolve(dir, &in);
+    if (m != NULL) {
+        return m->ops->write_at(m->self, in, leaf, 0, bytes, len);
     }
     return write_into_xfs(dir, leaf, bytes, len);
 }
@@ -1074,10 +1104,10 @@ static int split_parent(const char *within, char *dir, uint32_t dirmax, const ch
 }
 
 int xfsmount_symlink(const char *path, const char *target) {
-    const char *fat_within = NULL;
-    struct fat *fat = fat_for(path, &fat_within);
-    if (fat != NULL) {
-        return KERR_PERM /* FAT has no symbolic links */;
+    const char *in = NULL;
+    const struct vfs_mount *m = vfs_resolve(path, &in);
+    if (m != NULL) {
+        return KERR_PERM; /* nor makes them */
     }
     struct xfs_inode dir;
     const char *within = path;
@@ -1108,10 +1138,11 @@ int xfsmount_symlink(const char *path, const char *target) {
 }
 
 int xfsmount_readlink(const char *path, char *out, uint32_t max, uint32_t *got) {
-    const char *fat_within = NULL;
-    struct fat *fat = fat_for(path, &fat_within);
-    if (fat != NULL) {
-        return KERR_INVAL /* nothing on FAT is a link */;
+    const char *in = NULL;
+    const struct vfs_mount *m = vfs_resolve(path, &in);
+    if (m != NULL) {
+        return m->ops->readlink != NULL ? m->ops->readlink(m->self, in, out, max, got)
+                                        : KERR_INVAL; /* a filesystem with no links */
     }
     struct xfs_inode ip;
     const char *within = path;
@@ -1153,10 +1184,10 @@ static __attribute__((noinline)) int ino_of(struct xfs *vol, const char *within,
 
 int xfsmount_link_path(const char *from, const char *to) {
     const char *fa = NULL, *fb = NULL;
-    struct fat *fat = NULL;
-    int frc = fat_pair(from, to, &fat, &fa, &fb);
+    const struct vfs_mount *m = NULL;
+    int frc = vfs_resolve_pair(from, to, &m, &fa, &fb);
     if (frc != KERR_NOENT) {
-        return frc != KERR_OK ? frc : KERR_PERM; /* FAT has no hard links */
+        return frc != KERR_OK ? frc : KERR_PERM; /* no hard links off the root */
     }
     uint64_t existing = 0;
     struct xfs_inode dir;
@@ -1249,10 +1280,10 @@ static __attribute__((noinline)) int rename_resolved(struct xfs *vol, const char
 
 int xfsmount_rename_path(const char *from, const char *to) {
     const char *fa = NULL, *fb = NULL;
-    struct fat *fat = NULL;
-    int frc = fat_pair(from, to, &fat, &fa, &fb);
+    const struct vfs_mount *m = NULL;
+    int frc = vfs_resolve_pair(from, to, &m, &fa, &fb);
     if (frc != KERR_NOENT) {
-        return frc != KERR_OK ? frc : fatmount_rename_path(fat, fa, fb, now_seconds());
+        return frc != KERR_OK ? frc : m->ops->rename(m->self, fa, fb);
     }
     const char *fromwithin = from;
     const char *towithin = to;
@@ -1299,10 +1330,10 @@ static __attribute__((noinline)) int resolve_for_attrs(const char *path, struct 
 }
 
 int xfsmount_chmod_path(const char *path, uint32_t mode) {
-    const char *fat_within = NULL;
-    struct fat *fat = fat_for(path, &fat_within);
-    if (fat != NULL) {
-        return KERR_PERM /* FAT keeps no permission bits */;
+    const char *in = NULL;
+    const struct vfs_mount *m = vfs_resolve(path, &in);
+    if (m != NULL) {
+        return KERR_PERM; /* their files are root's, mode as served */
     }
     struct xfs *vol = NULL;
     struct xfs_inode ip;
@@ -1311,10 +1342,10 @@ int xfsmount_chmod_path(const char *path, uint32_t mode) {
 }
 
 int xfsmount_chown_path(const char *path, uint32_t uid, uint32_t gid) {
-    const char *fat_within = NULL;
-    struct fat *fat = fat_for(path, &fat_within);
-    if (fat != NULL) {
-        return KERR_PERM /* nor owners */;
+    const char *in = NULL;
+    const struct vfs_mount *m = vfs_resolve(path, &in);
+    if (m != NULL) {
+        return KERR_PERM;
     }
     struct xfs *vol = NULL;
     struct xfs_inode ip;
@@ -1323,10 +1354,10 @@ int xfsmount_chown_path(const char *path, uint32_t uid, uint32_t gid) {
 }
 
 int xfsmount_owner_of(const char *path, uint32_t *uid, uint32_t *gid) {
-    const char *fat_within = NULL;
-    struct fat *fat = fat_for(path, &fat_within);
-    if (fat != NULL) {
-        return fat_owner(fat, fat_within, uid, gid);
+    const char *in = NULL;
+    const struct vfs_mount *m = vfs_resolve(path, &in);
+    if (m != NULL) {
+        return m->ops->owner(m->self, in, uid, gid);
     }
     struct xfs *vol = NULL;
     struct xfs_inode ip;
@@ -1337,6 +1368,11 @@ int xfsmount_owner_of(const char *path, uint32_t *uid, uint32_t *gid) {
     *uid = ip.uid;
     *gid = ip.gid;
     return KERR_OK;
+}
+
+int xfsmount_sync_path(const char *path) {
+    const char *in = NULL;
+    return vfs_resolve(path, &in) != NULL ? KERR_OK : xfsmount_flush();
 }
 
 int xfsmount_flush(void) {
@@ -1370,13 +1406,13 @@ static struct xfs_trim_range trim_blocks(const struct xfs *vol, uint64_t start, 
 
 int xfsmount_trim(const char *path, uint64_t start, uint64_t len, uint64_t minlen,
                   uint64_t *trimmed) {
-    const char *fat_within = NULL, *within = path;
+    const char *in = NULL, *within = path;
     struct xfs *vol;
     struct xfs_trim_range r;
     uint64_t blocks = 0;
     int rc;
     *trimmed = 0;
-    if (fat_for(path, &fat_within) != NULL) {
+    if (vfs_resolve(path, &in) != NULL) {
         return KERR_NOTSUP;
     }
     vol = owner_of(path, &within);
@@ -1390,21 +1426,40 @@ int xfsmount_trim(const char *path, uint64_t start, uint64_t len, uint64_t minle
 }
 
 int xfsmount_counters(const char *path, struct xfs_counters *out) {
-    const char *fat_within = NULL;
-    struct fat *fat = fat_for(path, &fat_within);
-    if (fat != NULL) {
-        return fatmount_counters(fat, out);
+    const char *in = NULL;
+    const struct vfs_mount *m = vfs_resolve(path, &in);
+    if (m != NULL) {
+        return m->ops->counters != NULL ? m->ops->counters(m->self, out) : KERR_NOTSUP;
     }
     const char *within = path;
     struct xfs *vol = owner_of(path, &within);
     return vol == NULL ? KERR_NODEV : xfs_counters(vol, out);
 }
 
+int xfsmount_times(const char *path, uint64_t *atime_s, uint64_t *mtime_s, uint64_t *ctime_s) {
+    const char *in = NULL;
+    struct xfs *vol = NULL;
+    struct xfs_inode ip;
+    int rc;
+    *atime_s = 0;
+    *mtime_s = 0;
+    *ctime_s = 0;
+    const struct vfs_mount *m = vfs_resolve(path, &in);
+    if (m != NULL) {
+        return m->ops->times != NULL ? m->ops->times(m->self, in, atime_s, mtime_s, ctime_s)
+                                     : KERR_NOTSUP;
+    }
+    rc = resolve_for_attrs(path, &vol, &ip);
+    return rc != KERR_OK ? rc : xfs_times(vol, &ip, atime_s, mtime_s, ctime_s);
+}
+
 int xfsmount_utimes_path(const char *path, uint64_t atime_s, uint64_t mtime_s) {
-    const char *fat_within = NULL;
-    struct fat *fat = fat_for(path, &fat_within);
-    if (fat != NULL) {
-        return fat_exists(fat, fat_within); /* FAT keeps one time, set as a file is written */
+    const char *in = NULL;
+    const struct vfs_mount *m = vfs_resolve(path, &in);
+    if (m != NULL) {
+        uint32_t mode = 0, nlink = 0;
+        uint64_t size = 0;
+        return m->ops->stat_full(m->self, in, &mode, &size, &nlink); /* one time, kept by the server */
     }
     struct xfs *vol = NULL;
     struct xfs_inode ip;
@@ -1413,10 +1468,10 @@ int xfsmount_utimes_path(const char *path, uint64_t atime_s, uint64_t mtime_s) {
 }
 
 int xfsmount_truncate_path(const char *path, uint64_t size) {
-    const char *fat_within = NULL;
-    struct fat *fat = fat_for(path, &fat_within);
-    if (fat != NULL) {
-        return fatmount_truncate_path(fat, fat_within, size, now_seconds());
+    const char *in = NULL;
+    const struct vfs_mount *m = vfs_resolve(path, &in);
+    if (m != NULL) {
+        return m->ops->truncate(m->self, in, size);
     }
     struct xfs *vol = NULL;
     struct xfs_inode ip;

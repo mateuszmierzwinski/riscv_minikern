@@ -15,13 +15,34 @@
  * same wherever they come from. */
 #define SIGINT 2
 
-/* How long a blocked reader waits before looking again. Short enough that a
- * lost wake costs a keystroke's delay rather than a hang, long enough to be
- * free: 50 ms is five housekeeping beats. */
-#define TTY_WAIT_BACKSTOP_NS 50000000ull
+/* How long a blocked reader waits before draining the wire itself. With
+ * dynamic ticks an idle machine runs no housekeeping beat, so this poll is
+ * what a keystroke waits for: 20 ms is below what a typist notices. */
+#define TTY_WAIT_BACKSTOP_NS 20000000ull
+
+#define T_ISIG 0000001u
+#define T_ICANON 0000002u
+#define T_ECHO 0000010u
+#define T_ECHOE 0000020u
+#define T_ECHOK 0000040u
+#define T_IEXTEN 0100000u
+#define T_ICRNL 0000400u
+#define T_OPOST 0000001u
+#define T_ONLCR 0000004u
+#define T_B115200 0010002u
+#define T_CS8 0000060u
+#define T_CREAD 0000200u
+#define T_IFLAGS_HONOURED T_ICRNL
+#define T_OFLAGS_HONOURED (T_OPOST | T_ONLCR)
+#define T_LFLAGS_HONOURED (T_ISIG | T_ICANON | T_ECHO | T_ECHOE | T_ECHOK | T_IEXTEN)
+#define T_CFLAGS (T_B115200 | T_CS8 | T_CREAD)
+
+/* ^C ^\ DEL ^U ^D, VTIME 0, VMIN 1, ^Q ^S ^Z: what a terminal starts with. */
+static const uint8_t default_cc[KTTY_NCC] = {3, 0x1c, 0x7f, 0x15, 4, 0, 1, 0, 0x11, 0x13, 0x1a};
 
 static struct {
     struct tty line;
+    struct ktty_mode mode;
     struct console_input_port input;
     uint32_t session_pid;
     uint32_t foreground; /* the process group that owns the keyboard */
@@ -39,6 +60,12 @@ void ktty_init(const struct console_input_port *input, uint32_t session_pid) {
      * told 0x0 lays itself out for a window with no room in it. */
     term.rows = 24u;
     term.cols = 80u;
+    term.mode = (struct ktty_mode){.iflag = T_ICRNL, .oflag = T_OPOST | T_ONLCR, .cflag = T_CFLAGS,
+                                   .lflag = T_ISIG | T_ICANON | T_ECHO | T_ECHOE | T_ECHOK |
+                                            T_IEXTEN};
+    for (uint32_t i = 0; i < KTTY_NCC; i++) {
+        term.mode.cc[i] = default_cc[i];
+    }
     term.up = input != NULL && input->read != NULL;
 }
 
@@ -65,7 +92,63 @@ void ktty_set_window(uint16_t rows, uint16_t cols) {
 }
 
 bool ktty_ready(void) {
+    ktty_poll();
     return tty_has_line(&term.line);
+}
+
+uint32_t ktty_pending(void) {
+    ktty_poll();
+    return term.line.ready;
+}
+
+bool ktty_echo(void) {
+    return term.line.echo;
+}
+
+void ktty_set_echo(bool on) {
+    term.line.echo = on;
+    term.mode.lflag = on ? term.mode.lflag | T_ECHO : term.mode.lflag & ~T_ECHO;
+}
+
+void ktty_get_mode(struct ktty_mode *out) {
+    *out = term.mode;
+    out->lflag = term.line.echo ? out->lflag | T_ECHO : out->lflag & ~T_ECHO;
+}
+
+/* Whether a mode asks only for what this terminal does. */
+static bool mode_honoured(const struct ktty_mode *m) {
+    bool raw_output = (m->oflag & (T_OPOST | T_ONLCR)) != (T_OPOST | T_ONLCR);
+    if ((m->iflag & ~T_IFLAGS_HONOURED) != 0 || (m->oflag & ~T_OFLAGS_HONOURED) != 0 ||
+        (m->lflag & ~T_LFLAGS_HONOURED) != 0 || m->cflag != T_CFLAGS ||
+        (raw_output && !console_untranslated())) {
+        return false;
+    }
+    for (uint32_t i = 0; i < KTTY_NCC; i++) {
+        if (i != KTTY_VMIN && i != KTTY_VTIME && m->cc[i] != default_cc[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+int ktty_set_mode(const struct ktty_mode *mode) {
+    if (!mode_honoured(mode)) {
+        return KERR_INVAL;
+    }
+    term.mode = *mode;
+    term.line.echo = (mode->lflag & T_ECHO) != 0;
+    tty_set_mode(&term.line, (mode->lflag & T_ICANON) != 0, (mode->lflag & T_ISIG) != 0,
+                 (mode->iflag & T_ICRNL) != 0);
+    return KERR_OK;
+}
+
+void ktty_write(const void *buf, uint32_t n) {
+    bool onlcr = (term.mode.oflag & (T_OPOST | T_ONLCR)) == (T_OPOST | T_ONLCR);
+    if (onlcr) {
+        console_write(buf, (size_t)n);
+    } else {
+        console_write_untranslated(buf, (size_t)n);
+    }
 }
 
 /* A signal from a key, to the group that owns the keyboard.
@@ -81,9 +164,10 @@ static void raise_on_foreground(uint32_t signo) {
     (void)uspace_signal_group(term.foreground, signo);
 }
 
+/* Echo goes out the way a program's output does, so ONLCR applies to it. */
 static void echo(const uint8_t *bytes, uint32_t n) {
     if (n != 0) {
-        console_write((const char *)bytes, (size_t)n);
+        ktty_write(bytes, n);
     }
 }
 
@@ -152,6 +236,58 @@ static bool may_read_keyboard(void) {
     return false;
 }
 
+/* A canonical read: blocks until a line is ready. */
+static int32_t read_line(void *buf, uint32_t n) {
+    for (;;) {
+        ktty_poll(); /* the reader drains the wire: an idle machine may run no beat */
+        uint32_t got = tty_take_line(&term.line, buf, n);
+        if (got != 0) {
+            return (int32_t)got;
+        }
+        /* With a deadline anyway: a wake only one path delivers is one that
+         * path can lose, and the deadlock detector must see a reader the
+         * beat will wake. An expired wait is not an interruption — a
+         * signal is, and is asked separately. */
+        (void)sched_wait_on(&term, timer_ns() + TTY_WAIT_BACKSTOP_NS);
+        if (sched_signal_pending()) {
+            return KERR_INTR;
+        }
+    }
+}
+
+/* Whether a raw read is satisfied: VMIN bytes (or as many as asked for);
+ * with VMIN 0, at once; with VTIME, once its timer has run out — counted
+ * from the read with VMIN 0, from the last byte to arrive otherwise. */
+static bool raw_satisfied(uint32_t want, uint64_t vtime_ns, uint64_t timer_from) {
+    ktty_poll();
+    uint32_t ready = term.line.ready;
+    if (want != 0 ? ready >= want : (vtime_ns == 0 || ready != 0)) {
+        return true;
+    }
+    return vtime_ns != 0 && (want == 0 || ready != 0) && timer_ns() >= timer_from + vtime_ns;
+}
+
+/* A read with ICANON off, as `VMIN` and `VTIME` say. */
+static int32_t read_raw(void *buf, uint32_t n) {
+    uint32_t vmin = term.mode.cc[KTTY_VMIN];
+    uint32_t want = vmin < n ? vmin : n;
+    uint64_t vtime_ns = (uint64_t)term.mode.cc[KTTY_VTIME] * 100000000ull;
+    uint64_t timer_from = timer_ns();
+    uint32_t seen = term.line.ready;
+    while (!raw_satisfied(want, vtime_ns, timer_from)) {
+        uint64_t until = vtime_ns != 0 ? timer_from + vtime_ns : timer_ns() + TTY_WAIT_BACKSTOP_NS;
+        (void)sched_wait_on(&term, until);
+        if (sched_signal_pending()) {
+            return KERR_INTR;
+        }
+        if (want != 0 && term.line.ready != seen) {
+            seen = term.line.ready;
+            timer_from = timer_ns(); /* VMIN > 0: the timer is between bytes */
+        }
+    }
+    return (int32_t)tty_take_line(&term.line, buf, n);
+}
+
 int32_t ktty_read(void *buf, uint32_t n) {
     if (buf == NULL || n == 0) {
         return 0;
@@ -162,35 +298,5 @@ int32_t ktty_read(void *buf, uint32_t n) {
     if (!may_read_keyboard()) {
         return KERR_AGAIN;
     }
-    for (;;) {
-        uint32_t got = tty_take_line(&term.line, buf, n);
-        if (got != 0) {
-            return (int32_t)got;
-        }
-        /* Nothing yet. The beat is what fills the line, and it wakes this
-         * channel when a line completes — but **with a deadline anyway**,
-         * for the same reason an idle hart has a backstop: a wake that is
-         * only ever delivered by one path is a wake that path can lose.
-         *
-         * It is also what the kernel's own deadlock detector needs to see.
-         * Without it the detector was right by its own rules and wrong
-         * about this thread: "blocked with no deadline and no runnable
-         * peers" meant unwakeable before anything could be woken by a
-         * housekeeping hook, and a terminal read is exactly that. A thread
-         * that can be woken only by a beat has to say so, and a deadline
-         * is how it says it. */
-        /* The wait's own return is **not** the interruption test: a timed
-         * wait that simply expires reports that it expired, and treating
-         * that as "interrupted" made a blocking read return after one
-         * backstop with nothing to show — a read that does not block at
-         * all, which is indistinguishable from end of file to its caller.
-         * What interrupts a read is a signal, and that is asked
-         * separately. */
-        (void)sched_wait_on(&term, timer_ns() + TTY_WAIT_BACKSTOP_NS);
-        if (sched_signal_pending()) {
-            /* A signal arrived — `^C`, or `SIGTTIN` — and a read
-             * interrupted by one returns to let the handler run. */
-            return KERR_INTR;
-        }
-    }
+    return term.line.canonical ? read_line(buf, n) : read_raw(buf, n);
 }

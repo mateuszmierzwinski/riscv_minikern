@@ -49,6 +49,11 @@ static uint64_t blocks_past(const struct xfs_extent *e, uint64_t from) {
 static int give_back(struct xfs *fs, const struct xfs_inode *ip, const struct xfs_extent *e,
                      uint64_t past) {
     uint64_t keep = e->blockcount - past;
+    if (ip->realtime) {
+        /* To the realtime bitmap, whole realtime extents: the truncate
+         * point was rounded up to one (`realtime_end`). */
+        return xfs_rt_release(fs, (e->startblock + keep) / fs->rextsize, past / fs->rextsize);
+    }
     return xfs_free_data(fs, ip, e->startblock + keep, (uint32_t)past,
                          xfs_rmap_offset_of(e, keep));
 }
@@ -109,8 +114,8 @@ static int set_size_only(struct xfs *fs, struct xfs_inode *ip, uint64_t size, ui
     }
     di = b->data + boffset;
     xfs_put_be64(di + XFS_DI_SIZE, size);
-    xfs_put_be32(di + XFS_DI_MTIME, (uint32_t)now_s);
-    xfs_put_be32(di + XFS_DI_CTIME, (uint32_t)now_s);
+    xfs_put_time(di, XFS_DI_MTIME, now_s);
+    xfs_put_time(di, XFS_DI_CTIME, now_s);
     xfs_reseal(fs, di, fs->inodesize, XFS_DI_CRC);
     bcache_dirty(b);
     bcache_put(fs->cache, b);
@@ -132,6 +137,40 @@ static int refuse_truncate(const struct xfs *fs, const struct xfs_inode *ip) {
 
 /* Frees what lies past the new end and records the size, the block count
  * and the extent count together. */
+/* How many of the file's blocks a truncate to `size` keeps. **Rounded up**:
+ * a file of 100 bytes with a 4 KiB block keeps its only block, and
+ * truncating to 1 byte must not free the block holding it. A realtime file
+ * rounds further, to a whole realtime extent — the bitmap allocates and
+ * frees nothing smaller, as Linux's truncate keeps the partial extent. */
+static uint64_t kept_blocks(const struct xfs *fs, const struct xfs_inode *ip, uint64_t size) {
+    uint64_t blocks = (size + fs->blocksize - 1u) >> fs->blocklog;
+    if (ip->realtime && fs->rextsize > 1u) {
+        blocks = (blocks + fs->rextsize - 1u) / fs->rextsize * fs->rextsize;
+    }
+    return blocks;
+}
+
+/* Whether every extent of a realtime file is whole realtime extents, which
+ * is what freeing its tail to the bitmap assumes. */
+static bool realtime_aligned(struct xfs *fs, const struct xfs_inode *ip) {
+    uint64_t block;
+    uint32_t boffset;
+    struct bbuf *b;
+    struct xfs_fork_map m;
+    bool whole = fs->rextsize != 0;
+    xfs_inode_place(fs, ip->ino, &block, &boffset);
+    if (!whole || bcache_get(fs->cache, block, &b) != KERR_OK) {
+        return false;
+    }
+    whole = xfs_fork_load(fs, b->data + boffset, &m) == KERR_OK;
+    for (uint32_t i = 0; whole && i < m.count; i++) {
+        whole = m.e[i].startblock % fs->rextsize == 0 && m.e[i].startoff % fs->rextsize == 0 &&
+                m.e[i].blockcount % fs->rextsize == 0;
+    }
+    bcache_put(fs->cache, b);
+    return whole;
+}
+
 static int shrink_file(struct xfs *fs, struct xfs_inode *ip, uint64_t size, uint64_t now_s) {
     uint64_t block, freed = 0;
     uint32_t boffset;
@@ -148,13 +187,13 @@ static int shrink_file(struct xfs *fs, struct xfs_inode *ip, uint64_t size, uint
      * block, and truncating to 1 byte must not free the block holding it.
      * Rounding down would free the block the surviving data is in, which
      * reads back as zeroes — a silent loss of the data the caller kept. */
-    rc = shrink_fork(fs, ip, di, (size + fs->blocksize - 1u) >> fs->blocklog, &freed);
+    rc = shrink_fork(fs, ip, di, kept_blocks(fs, ip, size), &freed);
     if (rc == KERR_OK) {
         xfs_put_be64(di + XFS_DI_SIZE, size);
         xfs_put_be64(di + XFS_DI_NBLOCKS, xfs_be64(di + XFS_DI_NBLOCKS) - freed);
         xfs_dinode_set_data_extents(fs, di, ip->nextents);
-        xfs_put_be32(di + XFS_DI_MTIME, (uint32_t)now_s);
-        xfs_put_be32(di + XFS_DI_CTIME, (uint32_t)now_s);
+        xfs_put_time(di, XFS_DI_MTIME, now_s);
+        xfs_put_time(di, XFS_DI_CTIME, now_s);
         xfs_reseal(fs, di, fs->inodesize, XFS_DI_CRC);
         bcache_dirty(b);
         ip->size = size;
@@ -206,11 +245,11 @@ int xfs_truncate(struct xfs *fs, struct xfs_inode *ip, uint64_t size, uint64_t n
     if (ip->format == XFS_DINODE_FMT_LOCAL || size >= ip->size) {
         return set_size_only(fs, ip, size, now_s);
     }
-    if (ip->realtime) {
-        /* A realtime block would be freed into a group it never belonged to
-         * — which this did, until the header's promise was checked. A
-         * shared block is not freed from under the other file: its count
-         * drops instead (xfs_free_data). */
+    if (ip->realtime && !realtime_aligned(fs, ip)) {
+        /* Freed to the realtime bitmap in whole realtime extents; a file
+         * whose extents are not whole ones is refused rather than half
+         * freed. (A realtime block once went into a group's free space
+         * here, until the header's promise was checked.) */
         return KERR_NOTSUP;
     }
     rc = zero_tail(fs, ip, size);

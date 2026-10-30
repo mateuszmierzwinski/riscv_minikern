@@ -146,7 +146,9 @@ int tcp_emit(struct tcp_conn *c, uint32_t seq, uint8_t flags, const uint8_t *dat
 }
 
 void tcp_send_ack(struct tcp_conn *c) {
-    (void)tcp_emit(c, c->snd_nxt, TCP_ACK, NULL, 0, false);
+    if (tcp_emit(c, c->snd_nxt, TCP_ACK, NULL, 0, false) != KERR_OK) {
+        c->stack->stats.acks_unsent++;
+    }
 }
 
 /* A reset for a segment that belongs to no connection: built from the

@@ -75,6 +75,37 @@ int32_t ktty_read(void *buf, uint32_t n);
 /* Whether a read would return immediately, for `poll`. */
 bool ktty_ready(void);
 
+/* How many bytes of completed line a read would take now (`FIONREAD`). */
+uint32_t ktty_pending(void);
+
+/* Whether typed bytes are echoed, and switching it (`TCSETS` with or
+ * without `ECHO`, which is how a password prompt hides what is typed). */
+bool ktty_echo(void);
+void ktty_set_echo(bool on);
+
+/* The terminal's mode, as `TCGETS`/`TCSETS` carry it (Linux's flag words
+ * and nineteen control characters). */
+#define KTTY_NCC 19u
+#define KTTY_VTIME 5u
+#define KTTY_VMIN 6u
+
+struct ktty_mode {
+    uint32_t iflag, oflag, cflag, lflag;
+    uint8_t cc[KTTY_NCC];
+};
+
+void ktty_get_mode(struct ktty_mode *out);
+
+/* Adopts a mode. **Every bit is honoured or the call is refused**
+ * (`KERR_INVAL`), never accepted and ignored: ICANON, ECHO, ISIG, ICRNL,
+ * OPOST/ONLCR (off only where the console can write untranslated), VMIN and
+ * VTIME. The line settings and the other control characters are fixed. */
+int ktty_set_mode(const struct ktty_mode *mode);
+
+/* Writes a program's output, with or without the CR-before-LF `ONLCR` asks
+ * for. */
+void ktty_write(const void *buf, uint32_t n);
+
 /* The window size, for `TIOCGWINSZ`. There is no way to ask a serial line
  * how big the window is, so these are the values a program is told; 80x24
  * is the convention a program expects when nothing knows better, and

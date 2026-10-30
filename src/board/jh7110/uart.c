@@ -120,6 +120,14 @@ static void uart_write(void *self, const char *data, size_t len) {
     }
 }
 
+static void uart_write_untranslated(void *self, const char *data, size_t len) {
+    (void)self;
+    for (size_t i = 0; i < len; i++) {
+        wait_for_room();
+        put(UART_THR, (uint8_t)data[i]);
+    }
+}
+
 /* Copies a path into the driver's own storage: the one the finder filled
  * points into a caller's buffer. */
 static void remember_path(const char *path) {
@@ -144,6 +152,11 @@ static int find_uart(const struct fdt *fdt, char *path, uint32_t cap, phys_t *ba
     return KERR_NOENT;
 }
 
+/* Maps the registers and starts the port: what both ways of finding the
+ * UART share. */
+static int start_at(phys_t base, uint64_t size, uint32_t shift, uint32_t width,
+                    struct console_port *out);
+
 int jh7110_uart_init(const struct fdt *fdt, struct console_port *out) {
     char path[64];
     phys_t base = 0;
@@ -152,6 +165,24 @@ int jh7110_uart_init(const struct fdt *fdt, struct console_port *out) {
     if (rc != KERR_OK) {
         return rc;
     }
+    /* **How the registers are laid out, from the tree rather than assumed.**
+     * `reg-shift` is how far apart they are as a power of two and
+     * `reg-io-width` how wide each access must be; both default to the
+     * generic 16550's one-byte arrangement, which is what an emulator
+     * describes and what this driver used to hard-code. The JH7110 says 2
+     * and 4. */
+    remember_path(path);
+    return start_at(base, size, fdt_get_u32(fdt, path, "reg-shift", 0u),
+                    fdt_get_u32(fdt, path, "reg-io-width", 1u), out);
+}
+
+int jh7110_uart_init_at(phys_t base, uint32_t shift, uint32_t width, struct console_port *out) {
+    remember_path("earlycon");
+    return start_at(base, 8u << shift, shift, width, out);
+}
+
+static int start_at(phys_t base, uint64_t size, uint32_t shift, uint32_t width,
+                    struct console_port *out) {
     {
         void *at = mmu_map_device(base, size);
         if (at == NULL) {
@@ -160,15 +191,8 @@ int jh7110_uart_init(const struct fdt *fdt, struct console_port *out) {
         uart.regs = (volatile uint8_t *)at;
     }
     uart.base = base;
-    /* **How the registers are laid out, from the tree rather than assumed.**
-     * `reg-shift` is how far apart they are as a power of two and
-     * `reg-io-width` how wide each access must be; both default to the
-     * generic 16550's one-byte arrangement, which is what an emulator
-     * describes and what this driver used to hard-code. The JH7110 says 2
-     * and 4. */
-    uart.reg_shift = fdt_get_u32(fdt, path, "reg-shift", 0u);
-    uart.io_width = fdt_get_u32(fdt, path, "reg-io-width", 1u);
-    remember_path(path);
+    uart.reg_shift = shift;
+    uart.io_width = width;
     /* The FIFOs on and receive interrupts off: this console is polled, and a
      * device left asserting an interrupt nobody handles is how a board hangs
      * the moment interrupts are enabled. The baud rate is left exactly as the
@@ -181,7 +205,8 @@ int jh7110_uart_init(const struct fdt *fdt, struct console_port *out) {
      * garbled output to read. */
     kprintf("uart: registers %u bytes apart, %u-byte accesses\n",
             1u << uart.reg_shift, uart.io_width);
-    *out = (struct console_port){.write = uart_write, .self = NULL};
+    *out = (struct console_port){
+        .write = uart_write, .write_untranslated = uart_write_untranslated, .self = NULL};
     return KERR_OK;
 }
 

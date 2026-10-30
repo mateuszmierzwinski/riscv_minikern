@@ -1,3 +1,4 @@
+#include "arch/riscv/trap.h"
 #include "kernel/klock.h"
 
 #include "arch/riscv/smp.h"
@@ -189,7 +190,7 @@ void klock_idle_wait(void) {
     /* Interrupts on only here, and only around the wait itself. The tick is
      * what wakes this: a hart with nothing to do must still take its timer
      * interrupt, or it would sleep through the moment work appeared. */
-    __asm__ volatile("csrsi sstatus, 2\n\twfi\n\tcsrci sstatus, 2" : : : "memory");
+    trap_wait_for_interrupt();
     if (held) {
         (void)klock_enter();
     }

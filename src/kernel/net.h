@@ -56,4 +56,15 @@ struct tcp_stack *knet_tcp(void);
 /* Prints the interface and TCP counters (minikern.netstat=1). */
 void knet_report(void);
 
+/* Polls the device (`poll`, or virtio's when NULL) and runs the stack's
+ * timers **holding the kernel lock** — taken here when this hart does not
+ * already hold it. The stack belongs to the lock's holder: a boot-time loop
+ * that polled without it raced another hart's housekeeping beat polling the
+ * same ring (`dwmac: … overlapping polls`). */
+void knet_poll_locked(void (*poll)(void));
+
+/* What `knet_report` adds about the device underneath — the composition
+ * root's to install, since this layer does not know which device it is. */
+void knet_set_device_report(void (*report)(void));
+
 #endif

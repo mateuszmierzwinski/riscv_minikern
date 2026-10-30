@@ -1,4 +1,9 @@
 #include "kernel/syscall.h"
+#include "kernel/mem.h"
+
+#include "core/pathres.h"
+#include "kernel/perm.h"
+#include "core/vfs.h"
 #include "kernel/procfs.h"
 #include "kernel/wallclock.h"
 #include "kernel/xfsmount.h"
@@ -21,6 +26,8 @@
 #include "core/errno.h"
 #include "kernel/random.h"
 #include "kernel/fdobjects.h"
+#include "kernel/flock.h"
+#include "core/reclock.h"
 #include "kernel/file.h"
 #include "kernel/sched.h"
 #include "kernel/swap.h"
@@ -64,8 +71,24 @@ static bool may_write(const volatile void *p, uint64_t n) {
 static uint64_t calls;
 static uint32_t trace_budget;
 
+static uint32_t trace_pid; /* 0: every process's calls count */
+
 void syscall_set_trace(uint32_t budget) {
     trace_budget = budget;
+}
+
+void syscall_set_trace_pid(uint32_t pid) {
+    trace_pid = pid;
+}
+
+/* Whether this call is one the trace budget is spent on. */
+static bool traced(void) {
+    const struct uproc *me;
+    if (trace_budget == 0) {
+        return false;
+    }
+    me = trace_pid != 0 ? uspace_current() : NULL;
+    return trace_pid == 0 || (me != NULL && me->pid == trace_pid);
 }
 
 /* The three calls a runtime sleeps in, logged with the duration they asked
@@ -686,17 +709,45 @@ static int64_t sys_sched_get_priority_min(struct trapframe *tf) {
  * rather than 0. A program uses exactly this to find out whether its output
  * is a terminal, so answering 0 for a pipe would have every pipe claim to
  * be one — and then the program emits escape sequences into a file. */
+#define FIONBIO 0x5421u
+#define FIONCLEX 0x5450u
+#define FIOCLEX 0x5451u
+
+/* The requests every descriptor answers, whatever it is: close-on-exec and
+ * non-blocking, the same state `fcntl` sets. 1 when `request` is not one. */
+static int64_t descriptor_ioctl(int32_t fd, struct file *f, uint32_t request, virt_t arg) {
+    int32_t on = 0;
+    switch (request) {
+    case FIOCLEX:
+        fd_set_cloexec(fd, true);
+        return 0;
+    case FIONCLEX:
+        fd_set_cloexec(fd, false);
+        return 0;
+    case FIONBIO:
+        if (uspace_copy_in(&on, arg, sizeof on) != KERR_OK) {
+            return KERR_FAULT;
+        }
+        f->flags = on != 0 ? (f->flags | O_NONBLOCK) : (f->flags & ~O_NONBLOCK);
+        return 0;
+    default:
+        return 1;
+    }
+}
+
 static int64_t sys_ioctl(struct trapframe *tf) {
     struct file *f = fd_get((int32_t)sysarg(tf, 0));
     uint32_t request = (uint32_t)sysarg(tf, 1);
     virt_t arg = (virt_t)sysarg(tf, 2);
+    int64_t rc;
     if (f == NULL) {
         return KERR_BADF;
     }
-    if (f->ops->ioctl == NULL) {
-        return KERR_NOTTY;
+    rc = descriptor_ioctl((int32_t)sysarg(tf, 0), f, request, arg);
+    if (rc != 1) {
+        return rc;
     }
-    return f->ops->ioctl(f, request, arg);
+    return f->ops->ioctl == NULL ? KERR_NOTTY : f->ops->ioctl(f, request, arg);
 }
 
 /* ── descriptors ───────────────────────────────────────────────────────────
@@ -727,19 +778,22 @@ static int64_t sys_fcntl(struct trapframe *tf) {
     case F_DUPFD:
         return fd_dup((int32_t)sysarg(tf, 0));
     case F_GETFD:
-        return (f->flags & O_CLOEXEC) != 0 ? 1 : 0;
+        return fd_cloexec((int32_t)sysarg(tf, 0)) ? 1 : 0;
     case F_SETFD:
-        f->flags = (f->flags & ~O_CLOEXEC) | ((sysarg(tf, 2) & 1u) != 0 ? O_CLOEXEC : 0u);
+        fd_set_cloexec((int32_t)sysarg(tf, 0), (sysarg(tf, 2) & 1u) != 0);
         return 0;
     case F_GETFL:
-        return (int64_t)(f->flags & (O_NONBLOCK | O_CLOEXEC)) | 2; /* O_RDWR */
+        return (int64_t)(f->flags & O_NONBLOCK) | 2; /* O_RDWR */
     case F_SETFL:
         /* Only the status flags a caller may change. A runtime sets
          * O_NONBLOCK on every socket it opens, so this is not optional. */
         f->flags = (f->flags & ~O_NONBLOCK) | (sysarg(tf, 2) & O_NONBLOCK);
         return 0;
     default:
-        return KERR_INVAL;
+        /* Record locks (kernel/flock.c); anything else is unknown. */
+        return flock_handles(sysarg(tf, 1))
+                   ? flock_fcntl((int32_t)sysarg(tf, 0), (uint32_t)sysarg(tf, 1), sysarg(tf, 2))
+                   : KERR_INVAL;
     }
 }
 
@@ -796,6 +850,36 @@ static int64_t sys_read(struct trapframe *tf) {
     }
 }
 
+/* pread64(fd, buf, count, offset) and pwrite64: a transfer at a position,
+ * leaving the descriptor's own offset alone — how SQLite reads and writes
+ * every page of a database. An object with no positions is ESPIPE, as on
+ * Linux; the buffer is checked by the copy that uses it. */
+static int64_t positional(struct trapframe *tf, bool writing) {
+    struct file *f = fd_get((int32_t)sysarg(tf, 0));
+    uint64_t n = sysarg(tf, 2);
+    int64_t off = (int64_t)sysarg(tf, 3);
+    uint32_t room = (uint32_t)(n > (1u << 20) ? (1u << 20) : n);
+    if (f == NULL) {
+        return KERR_BADF;
+    }
+    if (writing ? f->ops->pwrite == NULL : f->ops->pread == NULL) {
+        return KERR_SPIPE;
+    }
+    if (off < 0) {
+        return KERR_INVAL;
+    }
+    return writing ? f->ops->pwrite(f, (const void *)(uintptr_t)sysarg(tf, 1), room, (uint64_t)off)
+                   : f->ops->pread(f, (void *)(uintptr_t)sysarg(tf, 1), room, (uint64_t)off);
+}
+
+static int64_t sys_pread64(struct trapframe *tf) {
+    return positional(tf, false);
+}
+
+static int64_t sys_pwrite64(struct trapframe *tf) {
+    return positional(tf, true);
+}
+
 static int64_t sys_write(struct trapframe *tf) {
     struct file *f = fd_get((int32_t)sysarg(tf, 0));
     const void *from = (const void *)(uintptr_t)sysarg(tf, 1);
@@ -845,6 +929,7 @@ static int64_t sys_writev(struct trapframe *tf) {
 }
 
 static int64_t sys_close(struct trapframe *tf) {
+    flock_closing((int32_t)sysarg(tf, 0)); /* POSIX: any close drops the file's locks */
     return fd_close((int32_t)sysarg(tf, 0));
 }
 
@@ -858,10 +943,16 @@ static int64_t sys_dup(struct trapframe *tf) {
  * apart. */
 static int64_t sys_dup3(struct trapframe *tf) {
     int32_t from = (int32_t)sysarg(tf, 0), to = (int32_t)sysarg(tf, 1);
-    if (from == to) {
+    uint64_t flags = sysarg(tf, 2);
+    int rc;
+    if (from == to || (flags & ~(uint64_t)O_CLOEXEC) != 0) {
         return KERR_INVAL;
     }
-    return fd_dup_to(from, to);
+    rc = fd_dup_to(from, to);
+    if (rc >= 0 && (flags & O_CLOEXEC) != 0) {
+        fd_set_cloexec(to, true);
+    }
+    return rc;
 }
 
 static int64_t sys_pipe2(struct trapframe *tf) {
@@ -888,31 +979,24 @@ static int64_t sys_pipe2(struct trapframe *tf) {
  * program at all without it. */
 #define OPEN_MAX_PATH 128u
 
+/* Defined with the other path helpers, below. */
+static int copy_in_path_at(struct trapframe *tf, uint32_t dirfd_argno, uint32_t argno,
+                           char *path);
+
+/* **The access mode has to get through.** This once masked the flags down
+ * to `O_NONBLOCK | O_CLOEXEC`, so `flags & 3` was always `O_RDONLY` and the
+ * descriptor layer's write path could never be reached. `O_CREAT` and
+ * `O_TRUNC` come through for the same reason: the layer below decides what
+ * they mean. The path resolves against `dirfd` like every *at call's. */
 static int64_t sys_openat(struct trapframe *tf) {
     char path[OPEN_MAX_PATH];
-    virt_t at = sysarg(tf, 1);
-    for (uint32_t i = 0; i < OPEN_MAX_PATH; i++) {
-        if (uspace_copy_in(&path[i], at + i, 1) != KERR_OK) {
-            return KERR_FAULT;
-        }
-        if (path[i] == '\0') {
-            /* **The access mode has to get through.** This masked the flags
-             * down to `O_NONBLOCK | O_CLOEXEC`, so `flags & 3` was always
-             * `O_RDONLY` whatever the caller asked for — and the descriptor
-             * layer's write path, which reads exactly that, could never be
-             * reached. A mechanism wired up and unreachable is the shape
-             * this project keeps paying for; here it made a tool able to
-             * read the board and unable to replace anything on it.
-             *
-             * `O_CREAT` and `O_TRUNC` come through for the same reason: the
-             * layer below decides what they mean, and it cannot if it
-             * cannot see them. */
-            return fdobjects_open_path(path, (uint32_t)sysarg(tf, 2) &
-                                                 (O_ACCMODE | O_CREAT | O_TRUNC | O_APPEND |
-                                                  O_NONBLOCK | O_CLOEXEC));
-        }
+    int rc = copy_in_path_at(tf, 0, 1, path);
+    if (rc != KERR_OK) {
+        return rc;
     }
-    return KERR_NAMETOOLONG;
+    return fdobjects_open_path(path, (uint32_t)sysarg(tf, 2) &
+                                         (O_ACCMODE | O_CREAT | O_EXCL | O_TRUNC | O_APPEND |
+                                          O_NONBLOCK | O_CLOEXEC));
 }
 
 /* `struct stat` as the generic ABI lays it out — which is what riscv64 uses,
@@ -935,6 +1019,9 @@ static int64_t sys_openat(struct trapframe *tf) {
 #define STAT_SIZE 48u
 #define STAT_BLKSIZE 56u
 #define STAT_BLOCKS 64u
+#define STAT_ATIME 72u /* each a seconds then a nanoseconds field, eight bytes apiece */
+#define STAT_MTIME 88u
+#define STAT_CTIME 104u
 
 /* The block size reported. A program that divides a size by this to size a
  * buffer gets a sensible answer, and `st_blocks` is in 512-byte units
@@ -954,33 +1041,32 @@ static void put_stat_u64(uint8_t *at, uint32_t off, uint64_t v) {
     }
 }
 
-/* `newfstatat(dirfd, path, statbuf, flags)`.
- *
- * Only an absolute path is served: this kernel has no per-process working
- * directory to resolve a relative one against, so `dirfd` is accepted and
- * ignored for `AT_FDCWD` and a relative path is refused rather than guessed
- * at. Guessing would make `os.Stat("x")` answer about some other file.
+/* The three times into a stat at the offsets of their seconds fields (the
+ * nanoseconds stay zero). True when the file has times. */
+static bool put_times(const char *path, uint8_t *out, uint32_t atime_at, uint32_t mtime_at,
+                      uint32_t ctime_at) {
+    uint64_t a = 0, m = 0, c = 0;
+    if (xfsmount_times(path, &a, &m, &c) != KERR_OK) {
+        return false;
+    }
+    put_stat_u64(out, atime_at, a);
+    put_stat_u64(out, mtime_at, m);
+    put_stat_u64(out, ctime_at, c);
+    return true;
+}
+
+/* `newfstatat(dirfd, path, statbuf, flags)`: a relative path resolves
+ * against `dirfd`, or the working directory for `AT_FDCWD`
+ * (`copy_in_path_at`).
  */
 static int64_t sys_newfstatat(struct trapframe *tf) {
     char path[OPEN_MAX_PATH];
     uint8_t out[STAT_BYTES] = {0};
     uint32_t mode = 0, nlink = 0;
     uint64_t size = 0;
-    virt_t at = sysarg(tf, 1);
-    int rc;
-    for (uint32_t i = 0;; i++) {
-        if (i == OPEN_MAX_PATH) {
-            return KERR_NAMETOOLONG;
-        }
-        if (uspace_copy_in(&path[i], at + i, 1) != KERR_OK) {
-            return KERR_FAULT;
-        }
-        if (path[i] == '\0') {
-            break;
-        }
-    }
-    if (path[0] != '/') {
-        return KERR_NOENT; /* no working directory to resolve against */
+    int rc = copy_in_path_at(tf, 0, 1, path);
+    if (rc != KERR_OK) {
+        return rc;
     }
     if (procfs_has(path)) {
         /* **`/proc` has to answer a stat as well as an open.**
@@ -1018,8 +1104,9 @@ static int64_t sys_newfstatat(struct trapframe *tf) {
      * `st_blksize`. Rounded up, because a file of one byte occupies a block
      * and reporting zero would have `du` call it empty. */
     put_stat_u64(out, STAT_BLOCKS, (size + 511u) / 512u);
-    put_stat_u64(out, STAT_INO, 0u);
+    put_stat_u64(out, STAT_INO, reclock_identity(path)); /* see put_fstat */
     put_stat_u64(out, STAT_DEV, 1u);
+    (void)put_times(path, out, STAT_ATIME, STAT_MTIME, STAT_CTIME);
     return uspace_copy_out(sysarg(tf, 2), out, STAT_BYTES) == KERR_OK ? 0 : KERR_FAULT;
 }
 
@@ -1030,6 +1117,26 @@ static int64_t sys_newfstatat(struct trapframe *tf) {
  * is not allowed to. This is the same rule every other syscall here follows
  * and the reason `uspace_can_write` exists — a bound against a constant is
  * not a permission check, which cost this kernel two security holes. */
+/* How much one getdents64 fills at most: what Go asks for is 8 KiB. */
+#define GETDENTS_BOUNCE 65536u
+
+/* **Through a kernel buffer**: a listing over netfs sleeps between entries,
+ * and a sibling thread could unmap the caller's buffer meanwhile — the
+ * kernel would then fault on a user address, which is a panic. */
+static int64_t getdents_bounced(struct file *f, virt_t to, uint32_t room) {
+    uint8_t *bounce = kzalloc(room);
+    int32_t n;
+    if (bounce == NULL) {
+        return KERR_NOMEM;
+    }
+    n = fdobjects_getdents(f, bounce, room);
+    if (n > 0 && uspace_copy_out(to, bounce, (uint32_t)n) != KERR_OK) {
+        n = KERR_FAULT;
+    }
+    kfree(bounce);
+    return n;
+}
+
 static int64_t sys_getdents64(struct trapframe *tf) {
     struct file *f = fd_get((int32_t)sysarg(tf, 0));
     void *to = (void *)(uintptr_t)sysarg(tf, 1);
@@ -1043,7 +1150,8 @@ static int64_t sys_getdents64(struct trapframe *tf) {
     if (!may_write(to, (uint32_t)room)) {
         return KERR_FAULT;
     }
-    return fdobjects_getdents(f, to, (uint32_t)room);
+    return getdents_bounced(f, (virt_t)(uintptr_t)to, room > GETDENTS_BOUNCE ? GETDENTS_BOUNCE
+                                                                             : (uint32_t)room);
 }
 
 /* `mkdirat(dirfd, path, mode)` and `unlinkat(dirfd, path, flags)`.
@@ -1063,26 +1171,19 @@ static int64_t sys_getdents64(struct trapframe *tf) {
  * times. Every path-taking syscall goes through `copy_in_path`, so doing it
  * here does it once.
  *
- * `.` and `..` are **not** resolved, and that is a refusal rather than an
- * omission: collapsing `..` correctly needs the directory tree, because a
- * `..` through a symlink does not mean what the textual path says — and a
- * textual collapse is the classic way out of a sandbox. A path containing
- * either is answered `ENOENT` until the resolver understands them.
+ * `.` and `..` are resolved against the tree afterwards (`resolve_path`,
+ * core/pathres.c), never collapsed as text here.
  */
-static int join_onto_cwd(char *path) {
+static int join_onto(const char *cwd, char *path) {
     char joined[OPEN_MAX_PATH];
-    const char *cwd = uspace_current_cwd();
     uint32_t at = 0;
     uint32_t i;
-    for (i = 0; path[i] != '\0'; i++) {
-        if (path[i] == '.' && (i == 0 || path[i - 1u] == '/') &&
-            (path[i + 1u] == '/' || path[i + 1u] == '\0' || path[i + 1u] == '.')) {
-            return KERR_NOENT; /* a dot component: see above */
-        }
-    }
     while (cwd[at] != '\0' && at + 2u < sizeof joined) {
         joined[at] = cwd[at];
         at++;
+    }
+    if (cwd[at] != '\0') {
+        return KERR_NAMETOOLONG; /* a cwd too long to join: refused, not cut short */
     }
     if (at == 0 || joined[at - 1u] != '/') {
         joined[at++] = '/';
@@ -1098,6 +1199,39 @@ static int join_onto_cwd(char *path) {
         path[i] = joined[i];
     }
     return KERR_OK;
+}
+
+static int kernel_readlink(void *self, const char *path, char *buf, uint32_t max,
+                           uint32_t *got) {
+    (void)self;
+    return xfsmount_readlink(path, buf, max, got);
+}
+
+/* An absolute path with `.`, `..` and links before its last component
+ * resolved against the tree, in place (core/pathres.c says why it is not
+ * done as text). */
+static int resolve_path(char *path) {
+    char *scratch = kzalloc(PATHRES_SCRATCH + OPEN_MAX_PATH);
+    char *out;
+    int rc;
+    if (scratch == NULL) {
+        return KERR_NOMEM;
+    }
+    out = scratch + PATHRES_SCRATCH;
+    rc = path_resolve(path, out, OPEN_MAX_PATH, kernel_readlink, NULL, scratch);
+    for (uint32_t i = 0; rc == KERR_OK && i < OPEN_MAX_PATH; i++) {
+        path[i] = out[i];
+        if (out[i] == '\0') {
+            break;
+        }
+    }
+    kfree(scratch);
+    return rc;
+}
+
+static int join_onto_cwd(char *path) {
+    int rc = join_onto(uspace_current_cwd(), path);
+    return rc != KERR_OK ? rc : resolve_path(path);
 }
 
 static int copy_in_path(struct trapframe *tf, uint32_t argno, char *path) {
@@ -1116,7 +1250,7 @@ static int copy_in_path(struct trapframe *tf, uint32_t argno, char *path) {
              * `AT_EMPTY_PATH` is a different request this does not
              * implement. */
             if (path[0] == '/') {
-                return KERR_OK;
+                return resolve_path(path);
             }
             return path[0] == '\0' ? KERR_NOENT : join_onto_cwd(path);
         }
@@ -1125,14 +1259,56 @@ static int copy_in_path(struct trapframe *tf, uint32_t argno, char *path) {
 
 static int64_t sys_mkdirat(struct trapframe *tf) {
     char path[OPEN_MAX_PATH];
-    int rc = copy_in_path(tf, 1, path);
+    int rc = copy_in_path_at(tf, 0, 1, path);
+    rc = rc != KERR_OK ? rc : perm_may_change_entry(path);
     return rc != KERR_OK ? rc : xfsmount_mkdir_p(path);
 }
 
 static int64_t sys_unlinkat(struct trapframe *tf) {
     char path[OPEN_MAX_PATH];
-    int rc = copy_in_path(tf, 1, path);
-    return rc != KERR_OK ? rc : xfsmount_unlink_path(path);
+    int rc = copy_in_path_at(tf, 0, 1, path);
+    rc = rc != KERR_OK ? rc : perm_may_change_entry(path);
+    return rc != KERR_OK ? rc : fdobjects_unlink(path);
+}
+
+/* A NUL-terminated user string of fewer than `room` bytes, into out.
+ * KERR_FAULT for an unreadable byte, KERR_NAMETOOLONG for no terminator. */
+static int copy_in_string(virt_t at, char *out, uint32_t room) {
+    for (uint32_t i = 0; i < room; i++) {
+        if (uspace_copy_in(&out[i], at + i, 1) != KERR_OK) {
+            return KERR_FAULT;
+        }
+        if (out[i] == '\0') {
+            return KERR_OK;
+        }
+    }
+    return KERR_NAMETOOLONG;
+}
+
+/* `AT_FDCWD`: a *at call's "relative to the working directory". */
+#define AT_FDCWD_VALUE (-100)
+
+/* A *at call's path: absolute as given, or relative to the directory
+ * `dirfd` names (the working directory for `AT_FDCWD`). Go stats each entry
+ * of a listing this way — `fstatat(dirfd, "null")` — so refusing relative
+ * paths here made every untyped entry vanish from `os.ReadDir`. */
+static int copy_in_path_at(struct trapframe *tf, uint32_t dirfd_argno, uint32_t argno,
+                           char *path) {
+    int32_t dirfd = (int32_t)sysarg(tf, dirfd_argno);
+    const char *base;
+    int rc = copy_in_string(sysarg(tf, argno), path, OPEN_MAX_PATH);
+    if (rc != KERR_OK || path[0] == '/') {
+        return rc != KERR_OK ? rc : resolve_path(path);
+    }
+    if (path[0] == '\0') {
+        return KERR_NOENT;
+    }
+    if (dirfd == AT_FDCWD_VALUE) {
+        return join_onto_cwd(path);
+    }
+    base = fdobjects_dir_path(fd_get(dirfd));
+    rc = base == NULL ? KERR_NOTDIR : join_onto(base, path);
+    return rc != KERR_OK ? rc : resolve_path(path);
 }
 
 /* symlinkat(target, newdirfd, linkpath).
@@ -1147,22 +1323,71 @@ static int64_t sys_symlinkat(struct trapframe *tf) {
     char link[OPEN_MAX_PATH];
     virt_t at = sysarg(tf, 0);
     int rc;
-    for (uint32_t i = 0;; i++) {
-        if (i == OPEN_MAX_PATH) {
-            return KERR_NAMETOOLONG;
-        }
-        if (uspace_copy_in(&target[i], at + i, 1) != KERR_OK) {
-            return KERR_FAULT;
-        }
-        if (target[i] == '\0') {
-            break;
-        }
+    rc = copy_in_string(at, target, OPEN_MAX_PATH);
+    if (rc != KERR_OK) {
+        return rc;
     }
     if (target[0] == '\0') {
         return KERR_INVAL;
     }
-    rc = copy_in_path(tf, 2, link);
+    rc = copy_in_path_at(tf, 1, 2, link);
+    rc = rc != KERR_OK ? rc : perm_may_change_entry(link);
     return rc != KERR_OK ? rc : xfsmount_symlink(link, target);
+}
+
+/* What `mount` hands a filesystem type it does not know itself: the
+ * composition root's, because the transports (netfs over TCP) live above
+ * this layer. NULL: nothing but the boot-time mounts. */
+static int (*mount_hook)(const char *fstype, const char *source, const char *target,
+                         const char *data);
+
+void syscall_set_mount_hook(int (*hook)(const char *fstype, const char *source,
+                                        const char *target, const char *data)) {
+    mount_hook = hook;
+}
+
+/* The mount type and source are short: "netfs" and "a.b.c.d:port". */
+#define MOUNT_ARG_MAX 64u
+/* The option string: an overlay's two layer paths and their keys. */
+#define MOUNT_DATA_MAX 600u
+
+/* The fifth argument, a string of options, or "" when it is NULL. */
+static int copy_in_mount_data(virt_t at, char *out, uint32_t room) {
+    out[0] = '\0';
+    return at == 0 ? KERR_OK : copy_in_string(at, out, room);
+}
+
+/* mount(source, target, fstype, flags, data): `CAP_SYS_ADMIN`, as on Linux.
+ * The flags are not read; the data is handed to the type (an overlay's
+ * layers). */
+static int64_t sys_mount(struct trapframe *tf) {
+    char source[MOUNT_ARG_MAX], fstype[MOUNT_ARG_MAX], target[OPEN_MAX_PATH];
+    char *data;
+    int rc;
+    if (!uspace_capable(CAP_SYS_ADMIN)) {
+        return KERR_PERM;
+    }
+    data = kzalloc(MOUNT_DATA_MAX);
+    rc = data == NULL ? KERR_NOMEM : copy_in_string(sysarg(tf, 0), source, sizeof source);
+    rc = rc != KERR_OK ? rc : copy_in_path(tf, 1, target);
+    rc = rc != KERR_OK ? rc : copy_in_string(sysarg(tf, 2), fstype, sizeof fstype);
+    rc = rc != KERR_OK ? rc : copy_in_mount_data(sysarg(tf, 4), data, MOUNT_DATA_MAX);
+    rc = rc != KERR_OK ? rc : (mount_hook != NULL ? mount_hook(fstype, source, target, data)
+                                                  : KERR_NODEV);
+    kfree(data);
+    return rc;
+}
+
+/* umount2(target, flags): takes the mount at exactly `target` out of the
+ * table. The root XFS is not in it and cannot be unmounted. */
+static int64_t sys_umount2(struct trapframe *tf) {
+    char target[OPEN_MAX_PATH];
+    int rc;
+    if (!uspace_capable(CAP_SYS_ADMIN)) {
+        return KERR_PERM;
+    }
+    rc = copy_in_path(tf, 0, target);
+    return rc != KERR_OK ? rc : vfs_umount(target);
 }
 
 /* readlinkat(dirfd, path, buf, bufsiz).
@@ -1177,7 +1402,7 @@ static int64_t sys_readlinkat(struct trapframe *tf) {
     virt_t out = sysarg(tf, 2);
     uint64_t room = sysarg(tf, 3);
     uint32_t got = 0;
-    int rc = copy_in_path(tf, 1, path);
+    int rc = copy_in_path_at(tf, 0, 1, path);
     if (rc != KERR_OK) {
         return rc;
     }
@@ -1201,11 +1426,12 @@ static int64_t sys_readlinkat(struct trapframe *tf) {
 static int64_t sys_linkat(struct trapframe *tf) {
     char from[OPEN_MAX_PATH];
     char to[OPEN_MAX_PATH];
-    int rc = copy_in_path(tf, 1, from);
+    int rc = copy_in_path_at(tf, 0, 1, from);
     if (rc != KERR_OK) {
         return rc;
     }
-    rc = copy_in_path(tf, 3, to);
+    rc = copy_in_path_at(tf, 2, 3, to);
+    rc = rc != KERR_OK ? rc : perm_may_change_entry(to);
     return rc != KERR_OK ? rc : xfsmount_link_path(from, to);
 }
 
@@ -1222,11 +1448,13 @@ static int64_t sys_renameat2(struct trapframe *tf) {
     if (sysarg(tf, 4) != 0) {
         return KERR_NOTSUP;
     }
-    rc = copy_in_path(tf, 1, from);
+    rc = copy_in_path_at(tf, 0, 1, from);
     if (rc != KERR_OK) {
         return rc;
     }
-    rc = copy_in_path(tf, 3, to);
+    rc = copy_in_path_at(tf, 2, 3, to);
+    rc = rc != KERR_OK ? rc : perm_may_change_entry(from);
+    rc = rc != KERR_OK ? rc : perm_may_change_entry(to);
     return rc != KERR_OK ? rc : xfsmount_rename_path(from, to);
 }
 
@@ -1245,12 +1473,34 @@ static int64_t sys_renameat2(struct trapframe *tf) {
  * regular file for a pipe would be worse than this: a caller would then
  * believe a seek could work.
  */
-static int64_t sys_fstat(struct trapframe *tf) {
+/* Writes an `fstat` answer. A file opened for writing reports the file's
+ * real mode, size and links and its path identity as the inode — the same
+ * one `stat` reports, which SQLite checks to know its database was not
+ * moved; it used to say "character device, empty" for every one. */
+static int64_t put_fstat(virt_t to, uint32_t mode, uint64_t size, uint32_t nlink, uint64_t ino) {
     uint8_t out[STAT_BYTES] = {0};
+    put_stat_u32(out, STAT_MODE, mode);
+    put_stat_u32(out, STAT_NLINK, nlink);
+    put_stat_u64(out, STAT_SIZE, size);
+    put_stat_u32(out, STAT_BLKSIZE, STAT_REPORTED_BLKSIZE);
+    put_stat_u64(out, STAT_BLOCKS, (size + 511u) / 512u);
+    put_stat_u64(out, STAT_INO, ino);
+    put_stat_u64(out, STAT_DEV, 1u);
+    return uspace_copy_out(to, out, STAT_BYTES) == KERR_OK ? 0 : KERR_FAULT;
+}
+
+static int64_t sys_fstat(struct trapframe *tf) {
     const uint8_t *bytes = NULL;
-    uint32_t size = 0;
+    uint32_t size = 0, nlink = 1u;
     int32_t fd = (int32_t)sysarg(tf, 0);
     uint32_t mode = 0020666u; /* a character device, the honest default */
+    /* The descriptor number as an inode, widened before the addition
+     * rather than after it: `(uint64_t)(fd + 1)` overflows in `int` first,
+     * which clang-tidy objects to and is right to. */
+    uint64_t real_size = 0, ino = (uint64_t)fd + 1u;
+    if (fdobjects_stat_of(fd, &mode, &real_size, &nlink, &ino) == KERR_OK) {
+        return put_fstat(sysarg(tf, 1), mode, real_size, nlink, ino);
+    }
     if (fdobjects_file_of(fd) == NULL) {
         return KERR_BADF;
     }
@@ -1259,17 +1509,7 @@ static int64_t sys_fstat(struct trapframe *tf) {
     } else {
         size = 0;
     }
-    put_stat_u32(out, STAT_MODE, mode);
-    put_stat_u32(out, STAT_NLINK, 1u);
-    put_stat_u64(out, STAT_SIZE, size);
-    put_stat_u32(out, STAT_BLKSIZE, STAT_REPORTED_BLKSIZE);
-    put_stat_u64(out, STAT_BLOCKS, (size + 511u) / 512u);
-    /* The descriptor number as an inode, widened before the addition
-     * rather than after it: `(uint64_t)(fd + 1)` overflows in `int` first,
-     * which clang-tidy objects to and is right to. */
-    put_stat_u64(out, STAT_INO, (uint64_t)fd + 1u);
-    put_stat_u64(out, STAT_DEV, 1u);
-    return uspace_copy_out(sysarg(tf, 1), out, STAT_BYTES) == KERR_OK ? 0 : KERR_FAULT;
+    return put_fstat(sysarg(tf, 1), mode, size, 1u, ino);
 }
 
 /* uname(buf) — six 65-byte fields, in order.
@@ -1309,7 +1549,8 @@ static int64_t sys_fchmodat(struct trapframe *tf) {
     if (sysarg(tf, 3) != 0) {
         return KERR_NOTSUP;
     }
-    rc = copy_in_path(tf, 1, path);
+    rc = copy_in_path_at(tf, 0, 1, path);
+    rc = rc != KERR_OK ? rc : perm_may_chmod(path);
     return rc != KERR_OK ? rc : xfsmount_chmod_path(path, (uint32_t)sysarg(tf, 2));
 }
 
@@ -1319,7 +1560,8 @@ static int64_t sys_fchownat(struct trapframe *tf) {
     if (sysarg(tf, 4) != 0) {
         return KERR_NOTSUP;
     }
-    rc = copy_in_path(tf, 1, path);
+    rc = copy_in_path_at(tf, 0, 1, path);
+    rc = rc != KERR_OK ? rc : perm_may_chown(path, (uint32_t)sysarg(tf, 2), (uint32_t)sysarg(tf, 3));
     return rc != KERR_OK ? rc
                          : xfsmount_chown_path(path, (uint32_t)sysarg(tf, 2),
                                                (uint32_t)sysarg(tf, 3));
@@ -1350,12 +1592,11 @@ static int64_t sys_lseek(struct trapframe *tf) {
  *
  * The descriptor is checked so that a program syncing a closed or wrong fd
  * is told, rather than being given a success it can draw conclusions from.
+ * It used to be checked against read snapshots only, so every descriptor
+ * opened for writing — the only kind with anything to sync — was EBADF.
  */
 static int64_t sys_fsync(struct trapframe *tf) {
-    if (fdobjects_file_of((int32_t)sysarg(tf, 0)) == NULL) {
-        return KERR_BADF;
-    }
-    return xfsmount_flush();
+    return fdobjects_sync((int32_t)sysarg(tf, 0));
 }
 
 /* statfs(path, buf) — how much room is left.
@@ -1423,7 +1664,7 @@ static int64_t sys_faccessat(struct trapframe *tf) {
     uint64_t size = 0;
     uint32_t nlink = 0;
     uint32_t want = (uint32_t)sysarg(tf, 2);
-    int rc = copy_in_path(tf, 1, path);
+    int rc = copy_in_path_at(tf, 0, 1, path);
     if (rc != KERR_OK) {
         return rc;
     }
@@ -1476,7 +1717,7 @@ static int64_t sys_utimensat(struct trapframe *tf) {
     uint64_t now = wallclock_seconds();
     uint64_t atime = now;
     uint64_t mtime = now;
-    int rc = copy_in_path(tf, 1, path);
+    int rc = copy_in_path_at(tf, 0, 1, path);
     if (rc != KERR_OK) {
         return rc;
     }
@@ -1486,24 +1727,20 @@ static int64_t sys_utimensat(struct trapframe *tf) {
         }
         atime = pair[1] == UTIME_NOW ? now : pair[0];
         mtime = pair[3] == UTIME_NOW ? now : pair[2];
-        /* **`UTIME_OMIT` keeps what is there**, which needs the current
-         * value rather than a guess — so it is read back first. A version
-         * that wrote `now` for an omitted field would be the opposite of
-         * what the caller asked. */
+        /* **`UTIME_OMIT` keeps what is there**, read back first: writing
+         * `now` for an omitted field is the opposite of what was asked. */
         if (pair[1] == UTIME_OMIT || pair[3] == UTIME_OMIT) {
-            uint32_t mode = 0;
-            uint64_t size = 0;
-            uint32_t nlink = 0;
-            if (xfsmount_stat_full(path, &mode, &size, &nlink) != KERR_OK) {
-                return KERR_NOENT;
+            uint64_t a = 0, m = 0, c = 0;
+            rc = xfsmount_times(path, &a, &m, &c);
+            if (rc != KERR_OK) {
+                return rc;
             }
-            /* The timestamps are not in `stat_full`, so an omitted field
-             * keeps `now` — which is wrong, and is why this refuses rather
-             * than pretending. */
-            return KERR_NOTSUP;
+            atime = pair[1] == UTIME_OMIT ? a : atime;
+            mtime = pair[3] == UTIME_OMIT ? m : mtime;
         }
     }
-    return xfsmount_utimes_path(path, atime, mtime);
+    rc = perm_may_set_times(path, times != 0 && pair[1] != UTIME_NOW && pair[3] != UTIME_NOW);
+    return rc != KERR_OK ? rc : xfsmount_utimes_path(path, atime, mtime);
 }
 
 /* truncate(path, length) and ftruncate(fd, length).
@@ -1518,8 +1755,10 @@ static int64_t sys_utimensat(struct trapframe *tf) {
  */
 static int64_t sys_truncate(struct trapframe *tf) {
     char path[OPEN_MAX_PATH];
+    bool exists = false;
     int rc = copy_in_path(tf, 0, path);
-    return rc != KERR_OK ? rc : xfsmount_truncate_path(path, sysarg(tf, 1));
+    rc = rc != KERR_OK ? rc : perm_may_write(path, &exists);
+    return rc != KERR_OK ? rc : (exists ? xfsmount_truncate_path(path, sysarg(tf, 1)) : KERR_NOENT);
 }
 
 static int64_t sys_ftruncate(struct trapframe *tf) {
@@ -1601,8 +1840,12 @@ static int64_t sys_getcwd(struct trapframe *tf) {
 #define STATX_INO 32u
 #define STATX_SIZE 40u
 #define STATX_BLOCKS 48u
+#define STATX_ATIME 64u /* struct statx_timestamp: s64 seconds, u32 nanoseconds, pad */
+#define STATX_CTIME 96u
+#define STATX_MTIME 112u
 /* The bits for the fields below, from the ABI. */
 #define STATX_HAVE (0x001u | 0x002u | 0x004u | 0x008u | 0x100u | 0x200u)
+#define STATX_TIMES (0x020u | 0x040u | 0x080u) /* atime, mtime, ctime: when the file has them */
 
 static int64_t sys_statx(struct trapframe *tf) {
     char path[OPEN_MAX_PATH];
@@ -1612,7 +1855,7 @@ static int64_t sys_statx(struct trapframe *tf) {
     uint32_t nlink = 0;
     uint32_t uid = 0;
     uint32_t gid = 0;
-    int rc = copy_in_path(tf, 1, path);
+    int rc = copy_in_path_at(tf, 0, 1, path);
     if (rc != KERR_OK) {
         return rc;
     }
@@ -1626,7 +1869,10 @@ static int64_t sys_statx(struct trapframe *tf) {
         put_stat_u32(out, STATX_UID, uid);
         put_stat_u32(out, STATX_GID, gid);
     }
-    put_stat_u32(out, STATX_MASK, STATX_HAVE);
+    put_stat_u32(out, STATX_MASK,
+                 STATX_HAVE | (put_times(path, out, STATX_ATIME, STATX_MTIME, STATX_CTIME)
+                                   ? STATX_TIMES
+                                   : 0u));
     put_stat_u32(out, STATX_BLKSIZE, STAT_REPORTED_BLKSIZE);
     put_stat_u32(out, STATX_NLINK, nlink);
     /* `stx_mode` is sixteen bits at offset 28, with `stx_gid` before it —
@@ -1634,7 +1880,7 @@ static int64_t sys_statx(struct trapframe *tf) {
      * written offset gets wrong, so it is written as the 32-bit store the
      * little-endian layout makes equivalent. */
     put_stat_u32(out, STATX_MODE, mode & 0xffffu);
-    put_stat_u64(out, STATX_INO, 0u);
+    put_stat_u64(out, STATX_INO, reclock_identity(path)); /* see put_fstat */
     put_stat_u64(out, STATX_SIZE, size);
     put_stat_u64(out, STATX_BLOCKS, (size + 511u) / 512u);
     return uspace_copy_out(sysarg(tf, 4), out, STATX_BYTES) == KERR_OK ? 0 : KERR_FAULT;
@@ -1688,6 +1934,261 @@ static int64_t sys_epoll_pwait(struct trapframe *tf) {
      * own poller — ends it early. */
     (void)sched_futex_wait(SCHED_POLLER_KEY, deadline);
     return fdobjects_epoll_collect(epfd, out, max);
+}
+
+/* ── ppoll and pselect6 ────────────────────────────────────────────────────
+ *
+ * Both are the same question asked two ways — which of these descriptors is
+ * ready — and both answer it from each object's own `poll`, the readiness
+ * `epoll` already uses. An object without one (a regular file) is always
+ * ready, as on Linux. A wait sleeps in short slices on the poller key, so an
+ * eventfd write ends it at once and anything else within a millisecond.
+ */
+
+#define POLLNVAL 0x020u
+#define POLL_MAX_FDS 256u
+#define SELECT_MAX_FDS 1024u
+#define POLL_SLICE_NS 1000000ull
+
+struct user_pollfd {
+    int32_t fd;
+    int16_t events;
+    int16_t revents;
+};
+
+struct user_timespec_rq {
+    int64_t sec;
+    int64_t nsec;
+};
+
+/* What a descriptor is ready for now; POLLNVAL when it is not open. */
+static uint32_t ready_of(int32_t fd) {
+    struct file *f = fd_get(fd);
+    if (f == NULL) {
+        return POLLNVAL;
+    }
+    return f->ops->poll != NULL ? f->ops->poll(f) : (EPOLLIN | EPOLLOUT);
+}
+
+/* A scan of whatever is being waited on: how many are ready. */
+typedef int64_t (*ready_scan)(void *ctx);
+
+/* Scans until something is ready, the deadline passes (0 = never), or a
+ * signal is pending (KERR_INTR). */
+static int64_t wait_ready(ready_scan scan, void *ctx, uint64_t deadline) {
+    for (;;) {
+        int64_t found = scan(ctx);
+        uint64_t now = timer_ns(), until;
+        if (found != 0 || (deadline != 0 && now >= deadline)) {
+            return found;
+        }
+        if (sched_signal_pending()) {
+            return KERR_INTR;
+        }
+        until = now + POLL_SLICE_NS;
+        (void)sched_futex_wait(SCHED_POLLER_KEY, deadline != 0 && deadline < until ? deadline : until);
+    }
+}
+
+/* A timespec argument as a deadline: 0 for NULL (wait for ever), `now` for
+ * a zero timeout (only look). */
+static int deadline_from(virt_t at, uint64_t *deadline) {
+    struct user_timespec_rq ts;
+    *deadline = 0;
+    if (at == 0) {
+        return KERR_OK;
+    }
+    if (uspace_copy_in(&ts, at, sizeof ts) != KERR_OK) {
+        return KERR_FAULT;
+    }
+    if (ts.sec < 0 || ts.nsec < 0 || ts.nsec >= 1000000000) {
+        return KERR_INVAL;
+    }
+    if ((uint64_t)ts.sec > (UINT64_MAX / 2u) / 1000000000ull) {
+        return KERR_OK; /* longer than the machine will run: wait for ever */
+    }
+    *deadline = timer_ns() + (uint64_t)ts.sec * 1000000000ull + (uint64_t)ts.nsec;
+    return KERR_OK;
+}
+
+/* The time left until deadline, written back as Linux does for both calls. */
+static void write_back_left(virt_t at, uint64_t deadline) {
+    uint64_t now = timer_ns(), left = deadline > now ? deadline - now : 0;
+    struct user_timespec_rq ts = {(int64_t)(left / 1000000000ull), (int64_t)(left % 1000000000ull)};
+    if (at != 0) {
+        (void)uspace_copy_out(at, &ts, sizeof ts);
+    }
+}
+
+/* The mask a call asks to wait under, swapped in; its previous one in old.
+ * **Restored before the call returns**, which is an approximation: Linux
+ * keeps it until a handler runs, so a signal only the temporary mask lets
+ * through is reported here as EINTR and then delivered under the old mask. */
+static int swap_mask(virt_t at, uint64_t *old, bool *swapped) {
+    uint64_t set = 0;
+    *swapped = false;
+    if (at == 0) {
+        return KERR_OK;
+    }
+    if (uspace_copy_in(&set, at, sizeof set) != KERR_OK) {
+        return KERR_FAULT;
+    }
+    *swapped = true;
+    return signal_mask(SIG_SETMASK, &set, old);
+}
+
+struct poll_set {
+    struct user_pollfd *fds;
+    uint32_t n;
+};
+
+static int64_t scan_pollfds(void *ctx) {
+    struct poll_set *p = ctx;
+    int64_t found = 0;
+    for (uint32_t i = 0; i < p->n; i++) {
+        uint32_t want = (uint16_t)p->fds[i].events | EPOLLERR | EPOLLHUP | POLLNVAL;
+        uint32_t got = p->fds[i].fd < 0 ? 0u : ready_of(p->fds[i].fd) & want;
+        p->fds[i].revents = (int16_t)got;
+        found += got != 0 ? 1 : 0;
+    }
+    return found;
+}
+
+/* What both calls do once their arguments are in: swap the mask, wait,
+ * put the mask back, report the time left. */
+static int64_t wait_under_mask(ready_scan scan, void *ctx, virt_t timeout, virt_t mask) {
+    uint64_t deadline = 0, old = 0;
+    bool swapped = false;
+    int64_t rc = deadline_from(timeout, &deadline);
+    rc = rc != KERR_OK ? rc : swap_mask(mask, &old, &swapped);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    rc = wait_ready(scan, ctx, deadline);
+    if (swapped && rc == KERR_INTR) {
+        signal_restore_mask_later(old); /* until the interrupting signal's handler has run */
+    } else if (swapped) {
+        (void)signal_mask(SIG_SETMASK, &old, NULL);
+    }
+    if (timeout != 0) {
+        write_back_left(timeout, deadline);
+    }
+    return rc;
+}
+
+/* ppoll(fds, nfds, tmo_p, sigmask, sigsetsize). */
+static int64_t sys_ppoll(struct trapframe *tf) {
+    struct poll_set p = {.n = (uint32_t)sysarg(tf, 1)};
+    uint64_t bytes = (uint64_t)p.n * sizeof *p.fds;
+    int64_t rc;
+    if (p.n > POLL_MAX_FDS || (sysarg(tf, 3) != 0 && sysarg(tf, 4) != 8u)) {
+        return KERR_INVAL; /* sigsetsize is 8 on this architecture */
+    }
+    p.fds = kzalloc(bytes == 0 ? 1u : (uint32_t)bytes);
+    if (p.fds == NULL) {
+        return KERR_NOMEM;
+    }
+    rc = uspace_copy_in(p.fds, sysarg(tf, 0), (uint32_t)bytes) == KERR_OK ? KERR_OK : KERR_FAULT;
+    rc = rc != KERR_OK ? rc : wait_under_mask(scan_pollfds, &p, sysarg(tf, 2), sysarg(tf, 3));
+    if (rc >= 0 && uspace_copy_out(sysarg(tf, 0), p.fds, (uint32_t)bytes) != KERR_OK) {
+        rc = KERR_FAULT;
+    }
+    kfree(p.fds);
+    return rc;
+}
+
+/* The three sets select takes, in and out. A NULL set is absent. */
+struct select_set {
+    uint32_t n;
+    uint64_t in[3][SELECT_MAX_FDS / 64u];
+    uint64_t out[3][SELECT_MAX_FDS / 64u];
+};
+
+static int64_t scan_selects(void *ctx) {
+    static const uint32_t wants[3] = {EPOLLIN | EPOLLHUP | EPOLLERR, EPOLLOUT | EPOLLERR, EPOLLPRI};
+    struct select_set *s = ctx;
+    int64_t found = 0;
+    for (uint32_t k = 0; k < 3u; k++) {
+        for (uint32_t w = 0; w < SELECT_MAX_FDS / 64u; w++) {
+            s->out[k][w] = 0;
+        }
+    }
+    for (uint32_t fd = 0; fd < s->n; fd++) {
+        uint64_t bit = 1ull << (fd % 64u);
+        uint32_t ready = 0;
+        bool asked = false;
+        for (uint32_t k = 0; k < 3u; k++) {
+            asked = asked || (s->in[k][fd / 64u] & bit) != 0;
+        }
+        ready = asked ? ready_of((int32_t)fd) : 0u;
+        if ((ready & POLLNVAL) != 0) {
+            return KERR_BADF; /* select, unlike poll, fails on a closed descriptor */
+        }
+        for (uint32_t k = 0; k < 3u; k++) {
+            if ((s->in[k][fd / 64u] & bit) != 0 && (ready & wants[k]) != 0) {
+                s->out[k][fd / 64u] |= bit;
+                found++;
+            }
+        }
+    }
+    return found;
+}
+
+/* Copies the sets select was given in (absent ones stay empty). */
+static int copy_in_sets(struct trapframe *tf, struct select_set *s) {
+    uint32_t bytes = ((s->n + 63u) / 64u) * 8u;
+    for (uint32_t k = 0; k < 3u; k++) {
+        virt_t at = sysarg(tf, 1u + k);
+        if (at != 0 && uspace_copy_in(s->in[k], at, bytes) != KERR_OK) {
+            return KERR_FAULT;
+        }
+    }
+    return KERR_OK;
+}
+
+static int copy_out_sets(struct trapframe *tf, const struct select_set *s) {
+    uint32_t bytes = ((s->n + 63u) / 64u) * 8u;
+    for (uint32_t k = 0; k < 3u; k++) {
+        virt_t at = sysarg(tf, 1u + k);
+        if (at != 0 && uspace_copy_out(at, s->out[k], bytes) != KERR_OK) {
+            return KERR_FAULT;
+        }
+    }
+    return KERR_OK;
+}
+
+/* pselect6's last argument: {const sigset_t *ss; size_t ss_len}. */
+static int select_mask_of(virt_t at, virt_t *mask) {
+    uint64_t pair[2] = {0, 0};
+    *mask = 0;
+    if (at != 0 && uspace_copy_in(pair, at, sizeof pair) != KERR_OK) {
+        return KERR_FAULT;
+    }
+    *mask = (virt_t)pair[0];
+    return pair[0] != 0 && pair[1] != 8u ? KERR_INVAL : KERR_OK; /* sigsetsize is 8 here */
+}
+
+/* pselect6(nfds, readfds, writefds, exceptfds, timeout, sigmask_pair). */
+static int64_t sys_pselect6(struct trapframe *tf) {
+    struct select_set *s;
+    virt_t mask = 0;
+    int64_t rc;
+    if (sysarg(tf, 0) > SELECT_MAX_FDS) {
+        return KERR_INVAL;
+    }
+    s = kzalloc(sizeof *s);
+    if (s == NULL) {
+        return KERR_NOMEM;
+    }
+    s->n = (uint32_t)sysarg(tf, 0);
+    rc = copy_in_sets(tf, s);
+    rc = rc != KERR_OK ? rc : select_mask_of(sysarg(tf, 5), &mask);
+    rc = rc != KERR_OK ? rc : wait_under_mask(scan_selects, s, sysarg(tf, 4), mask);
+    if (rc >= 0 && copy_out_sets(tf, s) != KERR_OK) {
+        rc = KERR_FAULT;
+    }
+    kfree(s);
+    return rc;
 }
 
 /* `riscv_hwprobe` — the architecture's own feature query, and something the
@@ -1924,7 +2425,7 @@ static int64_t sys_futex(struct trapframe *tf) {
          * while the thread it meant to start sleeps for ever. It cost a
          * deadlock to find, and only a trace showing a wake and a wait on
          * the same address with nothing in between could show it. */
-        return sched_futex_wake(sysarg(tf, 0), (uint32_t)sysarg(tf, 2));
+        return sched_futex_wake_user(sysarg(tf, 0), (uint32_t)sysarg(tf, 2));
     }
     if (op != FUTEX_WAIT) {
         return KERR_NOSYS;
@@ -1940,7 +2441,7 @@ static int64_t sys_futex(struct trapframe *tf) {
         trace_sleep("futex", ns);
         deadline = timer_ns() + ns;
     }
-    return sched_futex_wait(sysarg(tf, 0), deadline) ? 0 : KERR_AGAIN;
+    return sched_futex_wait_user(sysarg(tf, 0), deadline) ? 0 : KERR_AGAIN;
 }
 
 /* One thread ending, as against the whole program. A Go runtime's worker
@@ -1985,8 +2486,7 @@ static int64_t sys_tgkill(struct trapframe *tf) {
     /* **The named thread**, not the process. A runtime preempting a
      * goroutine has chosen which thread to interrupt, and delivering to a
      * different one preempts the wrong goroutine. */
-    signal_raise_on(target, signo, 0, 0);
-    return 0;
+    return sched_raise_on_thread(tid, signo) ? 0 : KERR_SRCH;
 }
 
 /* Resource limits. A runtime reads the stack limit during initialisation to
@@ -2203,6 +2703,8 @@ static const struct syscall_entry table[] = {
     {SYS_EPOLL_CREATE1, "epoll_create1", sys_epoll_create1},
     {SYS_EPOLL_CTL, "epoll_ctl", sys_epoll_ctl},
     {SYS_EPOLL_PWAIT, "epoll_pwait", sys_epoll_pwait},
+    {73u, "ppoll", sys_ppoll},
+    {72u, "pselect6", sys_pselect6},
     {SYS_EVENTFD2, "eventfd2", sys_eventfd2},
     {SYS_FCNTL, "fcntl", sys_fcntl},
     {SYS_READ, "read", sys_read},
@@ -2223,6 +2725,8 @@ static const struct syscall_entry table[] = {
     {276u, "renameat2", sys_renameat2},
     {53u, "fchmodat", sys_fchmodat},
     {62u, "lseek", sys_lseek},
+    {SYS_PREAD64, "pread64", sys_pread64},
+    {68u, "pwrite64", sys_pwrite64},
     {43u, "statfs", sys_statfs},
     {45u, "truncate", sys_truncate},
     {49u, "chdir", sys_chdir},
@@ -2238,6 +2742,8 @@ static const struct syscall_entry table[] = {
     {SYS_RISCV_HWPROBE, "riscv_hwprobe", sys_riscv_hwprobe},
     {SYS_NANOSLEEP, "nanosleep", sys_nanosleep},
     {115u, "clock_nanosleep", sys_clock_nanosleep},
+    {40u, "mount", sys_mount},
+    {39u, "umount2", sys_umount2},
     {SYS_RSEQ, "rseq", sys_ok},
 };
 
@@ -2287,6 +2793,16 @@ static const char *name_of(uint64_t nr) {
     return e == NULL ? "?" : e->name;
 }
 
+static uint64_t calls_by_nr[SYSCALL_COUNTED];
+
+uint64_t syscall_calls_of(uint64_t nr) {
+    return nr < SYSCALL_COUNTED ? calls_by_nr[nr] : 0u;
+}
+
+const char *syscall_name(uint64_t nr) {
+    return name_of(nr);
+}
+
 /* Whether the dispatcher should step `sepc` past the `ecall` afterwards.
  *
  * Everything does, except `rt_sigreturn`: it has replaced `sepc` with the
@@ -2319,18 +2835,18 @@ bool syscall_steps_over_ecall(const struct trapframe *tf) {
      * word past where it was written.
      *
      * A failed `execve` must still step: the program carries on after a
-     * refused call, and its `ecall` has to be left behind. `KERR_OK` is the
-     * only answer that means `sepc` was replaced — but this is asked before
-     * the call, so the number is all there is to go on, and the dispatch
-     * leaves `sepc` alone when it fails. That is why the test below is on
-     * the number rather than on the result. */
+     * refused call, and its `ecall` has to be left behind. This is asked
+     * before the call, so the number is all there is to go on; the trap
+     * path steps a refused exec afterwards, by seeing `sepc` unmoved
+     * (`exec_refused` in uspace.c). */
     return tf->x[17] != SYS_RT_SIGRETURN && tf->x[17] != SYS_EXECVE;
 }
 
 bool syscall_dispatch(struct trapframe *tf) {
     uint64_t nr = tf->x[17]; /* a7 */
-    bool tracing = trace_budget > 0;
+    bool tracing = traced();
     calls++;
+    calls_by_nr[nr < SYSCALL_COUNTED ? nr : 0u]++;
     /* **Which call is holding the lock.** The trap path tags the cause, which
      * for every syscall is the same number; the number of the call is what
      * says *which* critical section ran long. Offset so that a tag can never
@@ -2338,7 +2854,8 @@ bool syscall_dispatch(struct trapframe *tf) {
     klock_tag(KLOCK_TAG_SYSCALL + nr);
     if (tracing) {
         trace_budget--;
-        kprintf("call: tid %llu %s(%llu) %llx %llx %llx\n",
+        kprintf("call: %llu us tid %llu %s(%llu) %llx %llx %llx\n",
+                (unsigned long long)(timer_ns() / 1000u),
                 (unsigned long long)sched_current_tid(), name_of(nr), (unsigned long long)nr,
                 (unsigned long long)sysarg(tf, 0), (unsigned long long)sysarg(tf, 1),
                 (unsigned long long)sysarg(tf, 2));

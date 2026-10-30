@@ -35,8 +35,15 @@ rewritten. Don't do it.
   block 0 of every partition and takes the first XFS labelled `ROOT`. So the boot
   partition can be partition 1, and the root can be on the card or on the NVMe
   drive. `minikern.disk=` limits the search to one kind of device.
-- With no `ROOT` anywhere, the first volume of the first device is the root. That
-  is the old rule, kept for unlabelled disks.
+- With no `ROOT` anywhere, the first volume of the first device is the root **only
+  if it is XFS** (unlabelled disks, test images). Otherwise the disk has no root:
+  its volumes are still mounted (the FAT at `/boot`) and `/` is the command line's.
+- **A card as bought works as it is**: one FAT partition (MBR, type `0c`) holding
+  `minikern.bin`, nothing else. The kernel boots from it and the root comes from
+  wherever the user points it — an XFS `ROOT` elsewhere (NVMe), or netfs:
+  `minikern.disk=sd minikern.netfs=<ip>:<port> minikern.netroot minikern.init`.
+  Verified on the board with a stock layout (2026-10-29): "no XFS root on sd …
+  / is the command line's", FAT at `/boot`, QuokkaOS from netfs.
 - **`mkfs.xfs`'s defaults are fine**, reverse map and reflink included: every
   write keeps both, and the result passes `xfs_repair` (`test/xfs_write_test.sh`).
   Files shared by `cp --reflink` are copied on write, as on Linux.

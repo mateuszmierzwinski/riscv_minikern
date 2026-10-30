@@ -15,6 +15,9 @@
  * the device's business, because a serial terminal and a file differ. */
 struct console_port {
     void (*write)(void *self, const char *buf, size_t len);
+    /* The bytes exactly as given — no CR before each LF. NULL when the
+     * device cannot (the SBI firmware adds the CR itself). */
+    void (*write_untranslated)(void *self, const char *buf, size_t len);
     void *self;
 };
 

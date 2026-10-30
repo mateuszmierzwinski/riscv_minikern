@@ -19,6 +19,26 @@ static struct file **table_of_current(void) {
     return p == NULL ? NULL : p->fds;
 }
 
+/* Sets or clears descriptor fd's close-on-exec bit. */
+static void mark_cloexec(int32_t fd, bool on) {
+    struct uproc *p = uspace_current();
+    uint64_t bit;
+    if (p == NULL || fd < 0 || (uint32_t)fd >= FD_MAX) {
+        return;
+    }
+    bit = 1ull << (uint32_t)fd;
+    p->fd_cloexec = on ? (p->fd_cloexec | bit) : (p->fd_cloexec & ~bit);
+}
+
+bool fd_cloexec(int32_t fd) {
+    struct uproc *p = uspace_current();
+    return p != NULL && fd >= 0 && (uint32_t)fd < FD_MAX && (p->fd_cloexec >> (uint32_t)fd & 1u) != 0;
+}
+
+void fd_set_cloexec(int32_t fd, bool on) {
+    mark_cloexec(fd, on);
+}
+
 /* Bumped by every readiness change anywhere. An epoll waiter reads it before
  * it sleeps and again when it wakes: unchanged means nothing could have
  * become ready, so there is nothing to re-scan. One counter rather than one
@@ -31,10 +51,9 @@ void fd_reset(void) {
         return;
     }
     for (uint32_t i = 0; i < FD_MAX; i++) {
-        if (table[i] != NULL) {
-            file_put(table[i]);
-            table[i] = NULL;
-        }
+        struct file *old = table[i];
+        table[i] = NULL;
+        file_put(old);
     }
 }
 
@@ -47,10 +66,24 @@ void fd_close_on_exec(void) {
      * close-on-exec: that is the whole point of the flag, and it is how a
      * shell stops a child inheriting the pipe ends it should not have. */
     for (uint32_t i = 0; i < FD_MAX; i++) {
-        if (table[i] != NULL && (table[i]->flags & O_CLOEXEC) != 0) {
+        if (table[i] != NULL && fd_cloexec((int32_t)i)) {
             file_put(table[i]);
             table[i] = NULL;
         }
+    }
+    uspace_current()->fd_cloexec = 0;
+}
+
+void fd_release_table(struct uproc *p) {
+    for (uint32_t i = 0; p != NULL && i < FD_MAX; i++) {
+        if (p->fds[i] != NULL) {
+            struct file *f = p->fds[i];
+            p->fds[i] = NULL;
+            file_put(f);
+        }
+    }
+    if (p != NULL) {
+        p->fd_cloexec = 0;
     }
 }
 
@@ -61,6 +94,7 @@ int fd_copy_table(struct uproc *to, const struct uproc *from) {
          * what inheriting a descriptor means. */
         to->fds[i] = from->fds[i] != NULL ? file_get(from->fds[i]) : NULL;
     }
+    to->fd_cloexec = from->fd_cloexec;
     return KERR_OK;
 }
 
@@ -114,6 +148,10 @@ int fd_install(struct file *f) {
     for (uint32_t i = 0; i < FD_MAX && i < limit; i++) {
         if (table[i] == NULL) {
             table[i] = f;
+            /* A new object brings the flag it was opened with; the flag
+             * then lives on the descriptor, not on the shared file. */
+            mark_cloexec((int32_t)i, (f->flags & O_CLOEXEC) != 0);
+            f->flags &= ~O_CLOEXEC;
             return (int)i;
         }
     }
@@ -142,7 +180,7 @@ int fd_dup(int32_t fd) {
     if (f == NULL) {
         return KERR_BADF;
     }
-    return fd_install(file_get(f));
+    return fd_install(file_get(f)); /* the copy is not close-on-exec */
 }
 
 int fd_dup_to(int32_t from, int32_t to) {
@@ -159,10 +197,12 @@ int fd_dup_to(int32_t from, int32_t to) {
     }
     /* Whatever was there is closed first, silently — that is what makes
      * `dup2` the tool for putting a pipe on descriptor 1. */
-    if (table[to] != NULL) {
-        file_put(table[to]);
+    {
+        struct file *old = table[to];
+        table[to] = file_get(f); /* replaced first: a release that sleeps must not find it */
+        file_put(old);
     }
-    table[to] = file_get(f);
+    mark_cloexec(to, false); /* `dup3` sets it afterwards when asked */
     return to;
 }
 

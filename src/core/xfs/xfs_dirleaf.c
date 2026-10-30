@@ -330,8 +330,8 @@ int xfs_dir_fork_insert(struct xfs *fs, const struct xfs_inode *dir, uint64_t lo
     xfs_put_be64(di + XFS_DI_SIZE, xfs_be64(di + XFS_DI_SIZE) + (grows_data ? fs->dirblocksize : 0u));
     xfs_put_be64(di + XFS_DI_NBLOCKS, xfs_be64(di + XFS_DI_NBLOCKS) + fs->dirblocks);
     rc = xfs_fork_store(fs, dir->ino, di, &m);
-    xfs_put_be32(di + XFS_DI_MTIME, (uint32_t)now_s);
-    xfs_put_be32(di + XFS_DI_CTIME, (uint32_t)now_s);
+    xfs_put_time(di, XFS_DI_MTIME, now_s);
+    xfs_put_time(di, XFS_DI_CTIME, now_s);
     xfs_reseal(fs, di, fs->inodesize, XFS_DI_CRC);
     bcache_dirty(b);
     bcache_put(fs->cache, b);
@@ -371,8 +371,8 @@ static int add_leaf_extent(struct xfs *fs, const struct xfs_inode *dir, uint64_t
     xfs_extent_pack(di + fs->dinode_size + XFS_EXTENT_BYTES, &e);
     xfs_dinode_set_data_extents(fs, di, 2u);
     xfs_put_be64(di + XFS_DI_NBLOCKS, 2u);
-    xfs_put_be32(di + XFS_DI_MTIME, (uint32_t)now_s);
-    xfs_put_be32(di + XFS_DI_CTIME, (uint32_t)now_s);
+    xfs_put_time(di, XFS_DI_MTIME, now_s);
+    xfs_put_time(di, XFS_DI_CTIME, now_s);
     xfs_reseal(fs, di, fs->inodesize, XFS_DI_CRC);
     bcache_dirty(b);
     bcache_put(fs->cache, b);
@@ -450,15 +450,79 @@ static int add_data_block(struct xfs *fs, const struct xfs_inode *dir, uint32_t 
     return rc;
 }
 
+/* Writes the entry at `at` of the data block in the buffer, splits off what
+ * is left of the free span, and stores the block; *best is its new largest
+ * free span, for the index. */
+static int write_placed(struct xfs *fs, uint64_t fsb, uint32_t at, uint32_t need, const char *name,
+                        uint32_t namelen, uint64_t ino, uint8_t ftype, uint32_t *best) {
+    uint32_t len = xfs_be16(fs->dirblock + at + 2u);
+    len = at + len > fs->dirblocksize ? fs->dirblocksize - at : len;
+    (void)xfs_dir_put_entry(fs, fs->dirblock, at, ino, name, namelen, ftype);
+    if (len - need >= XFS_DIR2_DATA_ALIGN) {
+        xfs_dir_put_free(fs->dirblock, at + need, len - need);
+    }
+    *best = xfs_dir_largest_free(fs, fs->dirblock);
+    xfs_reseal(fs, fs->dirblock, fs->dirblocksize, XFS_DIR3_HDR_CRC);
+    return xfs_dir_raw_store(fs, fsb);
+}
+
+/* The first data block `bests` says has a span of `need` bytes, from n
+ * values at `at` in the buffer; `have` when none does. */
+static uint32_t first_with_room(const struct xfs *fs, uint32_t at, uint32_t n, uint32_t need,
+                                uint32_t have) {
+    for (uint32_t i = 0; i < n && i < have; i++) {
+        uint32_t best = xfs_be16(fs->dirblock + at + i * XFS_DIR2_LEAF_BEST_SIZE);
+        if (best != XFS_DIR2_NULL_DATAOFF && best >= need) {
+            return i;
+        }
+    }
+    return have;
+}
+
+/* Which data block probably has room, from the directory's own index: the
+ * free block of a node directory, or the leaf's `bests` tail. A hint only —
+ * the caller still checks the block it names and falls back to the scan,
+ * so an index that is stale or absent costs time, never an entry. Without
+ * it every insert read every data block: 937,000 loads for 17,000 names. */
+static uint32_t room_hint(struct xfs *fs, const struct xfs_inode *dir, uint32_t need,
+                          uint32_t have) {
+    uint64_t fsb = 0;
+    if (xfs_dir_raw_load(fs, dir, fs->dir_free_block, &fsb) == KERR_OK &&
+        xfs_be32(fs->dirblock) == xfs_magic_for(fs, XFS_BLK_DIR_FREE)) {
+        uint32_t n = xfs_be32(fs->dirblock + (fs->v5 ? XFS_DIR3_FREE_FIRSTDB : XFS_DIR2_FREE_FIRSTDB) +
+                              4u);
+        return first_with_room(fs, fs->dir_free_hdr, n, need, have);
+    }
+    if (xfs_dir_raw_load(fs, dir, fs->dir_leaf_block, &fsb) == KERR_OK &&
+        xfs_be16(fs->dirblock + XFS_DA3_MAGIC_OFF) == xfs_magic_for(fs, XFS_BLK_DIR_LEAF1)) {
+        uint32_t n = xfs_be32(fs->dirblock + fs->dirblocksize - XFS_DIR2_LEAF_TAIL_SIZE);
+        return first_with_room(fs, bests_at(fs, n), n, need, have);
+    }
+    return have;
+}
+
+/* Tries the block `bests` names; true with *at set when it had room. */
+static bool try_hinted(struct xfs *fs, const struct xfs_inode *dir, uint32_t which, uint32_t need,
+                       uint64_t *fsb, uint32_t *at) {
+    if (xfs_dir_raw_load(fs, dir, (uint64_t)which * fs->dirblocks, fsb) != KERR_OK) {
+        return false;
+    }
+    *at = xfs_dir_find_room(fs, fs->dirblock, fs->dirblocksize, need);
+    return *at != 0;
+}
+
 int xfs_dir_place_entry(struct xfs *fs, const struct xfs_inode *dir, const char *name,
                        uint32_t namelen, uint64_t ino, uint8_t ftype, uint64_t now_s,
                        uint32_t *which, uint32_t *at, uint32_t *best, uint32_t *blocks) {
     uint32_t need = xfs_dir_entry_size(fs, namelen);
     uint32_t have = xfs_dir_data_count(fs, dir), hole = have;
     uint64_t fsb = 0;
-    uint32_t len;
     int rc = KERR_OK;
     *blocks = have;
+    *which = have > 1u ? room_hint(fs, dir, need, have) : have;
+    if (*which < have && try_hinted(fs, dir, *which, need, &fsb, at)) {
+        return write_placed(fs, fsb, *at, need, name, namelen, ino, ftype, best);
+    }
     for (*which = 0; *which < have; (*which)++) {
         rc = xfs_dir_raw_load(fs, dir, (uint64_t)*which * fs->dirblocks, &fsb);
         if (rc == KERR_NOENT) {
@@ -482,15 +546,7 @@ int xfs_dir_place_entry(struct xfs *fs, const struct xfs_inode *dir, const char 
         *blocks = hole >= have ? have + 1u : have;
         *at = fs->dir_data_hdr;
     }
-    len = xfs_be16(fs->dirblock + *at + 2u);
-    len = *at + len > fs->dirblocksize ? fs->dirblocksize - *at : len;
-    (void)xfs_dir_put_entry(fs, fs->dirblock, *at, ino, name, namelen, ftype);
-    if (len - need >= XFS_DIR2_DATA_ALIGN) {
-        xfs_dir_put_free(fs->dirblock, *at + need, len - need);
-    }
-    *best = xfs_dir_largest_free(fs, fs->dirblock);
-    xfs_reseal(fs, fs->dirblock, fs->dirblocksize, XFS_DIR3_HDR_CRC);
-    return xfs_dir_raw_store(fs, fsb);
+    return write_placed(fs, fsb, *at, need, name, namelen, ino, ftype, best);
 }
 
 /* Whether the leaf could take another hash, asked **before** anything is

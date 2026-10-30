@@ -302,6 +302,9 @@ int xfs_fork_store(struct xfs *fs, uint64_t ino, uint8_t *di, const struct xfs_f
     if (want > root_capacity(bytes) || want > XFS_FORK_LEAVES_MAX) {
         return KERR_NOSPC; /* a third level: not written */
     }
+    if (bytes > XFS_FORK_MAX && (!fits || m->count * XFS_EXTENT_BYTES > XFS_FORK_MAX)) {
+        return KERR_NOTSUP; /* the last guard: this reader would refuse the result */
+    }
     rc = fit_leaves(fs, ino, want, &delta);
     if (rc != KERR_OK) {
         return rc;

@@ -36,6 +36,10 @@
  * error from the mapping. */
 int jh7110_uart_init(const struct fdt *fdt, struct console_port *out);
 
+/* The same at a given address and layout (`earlycon=`, core/boardspec.h),
+ * for a board whose tree does not describe its console. */
+int jh7110_uart_init_at(phys_t base, uint32_t shift, uint32_t width, struct console_port *out);
+
 /* Where it was found, for the boot log: the node's path and its address. */
 /* One received byte, or **-1 when there is none**. Polled and
  * non-blocking: the caller is a line discipline with other work, and a

@@ -123,11 +123,12 @@ static int load_afork(struct xfs *fs, const struct xfs_inode *ip, uint8_t *fork,
         return KERR_NOENT; /* no attribute fork */
     }
     *len = area - at;
-    if (*len > XFS_AFORK_MAX) {
-        return KERR_IO;
-    }
     if (ip->aformat == XFS_DINODE_FMT_EXTENTS && ip->naextents * XFS_EXTENT_BYTES < *len) {
         *len = ip->naextents * XFS_EXTENT_BYTES; /* the records past the count are not records */
+    }
+    /* Checked after the trim: a large fork holding a few extents is read. */
+    if (*len > XFS_AFORK_MAX) {
+        return KERR_IO;
     }
     xfs_inode_place(fs, ip->ino, &block, &boffset);
     rc = bcache_get(fs->cache, block, &b);
@@ -298,7 +299,12 @@ static int choose_forkoff(const struct xfs *fs, const struct xfs_inode *ip,
         *forkoff = ip->forkoff;
     } else {
         uint32_t least = (need + 7u) / 8u;
+        /* Never a fork larger than the buffer it is read into: on an inode
+         * over 512 bytes half the area is more than that, and the fork this
+         * wrote was one the next read refused. */
+        uint32_t smallest = area > XFS_AFORK_MAX ? (area - XFS_AFORK_MAX + 7u) / 8u : 0u;
         *forkoff = least > half ? least : half;
+        *forkoff = *forkoff < smallest ? smallest : *forkoff;
         *forkoff = *forkoff == 0 ? 1u : *forkoff;
     }
     if (*forkoff * 8u >= area) {
@@ -332,8 +338,8 @@ static int store_fork(struct xfs *fs, const struct xfs_inode *ip, const uint8_t 
     }
     di[XFS_DI_FORKOFF] = (uint8_t)forkoff;
     di[XFS_DI_AFORMAT] = XFS_DINODE_FMT_LOCAL;
-    xfs_put_be32(di + XFS_DI_MTIME, (uint32_t)now_s);
-    xfs_put_be32(di + XFS_DI_CTIME, (uint32_t)now_s);
+    xfs_put_time(di, XFS_DI_MTIME, now_s);
+    xfs_put_time(di, XFS_DI_CTIME, now_s);
     xfs_reseal(fs, di, fs->inodesize, XFS_DI_CRC);
     bcache_dirty(b);
     bcache_put(fs->cache, b);
@@ -392,9 +398,13 @@ int xfs_attr_set(struct xfs *fs, const struct xfs_inode *ip, const char *name,
     if (rc != KERR_OK) {
         return rc;
     }
-    if (barelen > 255u || valuelen > XFS_ATTR_VALUE_MAX || room > sizeof fork) {
+    if (barelen > 255u || valuelen > XFS_ATTR_VALUE_MAX) {
         return KERR_NOSPC;
     }
+    /* A fork larger than this writer's buffer (inodes over 512 bytes) is
+     * used up to the buffer: it goes to a leaf block a little sooner, which
+     * the format allows, rather than refusing a filesystem with room. */
+    room = room > sizeof fork ? (uint32_t)sizeof fork : room;
     /* **Where the value goes is decided before the fork's shape is.** It is
      * a property of the value: too large to share a block with its name
      * means blocks of its own, whether the fork is still inside the inode
@@ -846,8 +856,8 @@ static int store_attr_extent(struct xfs *fs, const struct xfs_inode *ip, uint64_
     di[XFS_DI_AFORMAT] = XFS_DINODE_FMT_EXTENTS;
     xfs_dinode_set_attr_extents(fs, di, 1u);
     xfs_put_be64(di + XFS_DI_NBLOCKS, ip->nblocks + 1u);
-    xfs_put_be32(di + XFS_DI_MTIME, (uint32_t)now_s);
-    xfs_put_be32(di + XFS_DI_CTIME, (uint32_t)now_s);
+    xfs_put_time(di, XFS_DI_MTIME, now_s);
+    xfs_put_time(di, XFS_DI_CTIME, now_s);
     xfs_reseal(fs, di, fs->inodesize, XFS_DI_CRC);
     bcache_dirty(b);
     bcache_put(fs->cache, b);
@@ -1073,8 +1083,8 @@ static int attr_fork_append(struct xfs *fs, const struct xfs_inode *ip, uint32_t
     xfs_extent_pack(fork + at, &e);
     xfs_dinode_set_attr_extents(fs, di, n + 1u);
     xfs_put_be64(di + XFS_DI_NBLOCKS, xfs_be64(di + XFS_DI_NBLOCKS) + blocks);
-    xfs_put_be32(di + XFS_DI_MTIME, (uint32_t)now_s);
-    xfs_put_be32(di + XFS_DI_CTIME, (uint32_t)now_s);
+    xfs_put_time(di, XFS_DI_MTIME, now_s);
+    xfs_put_time(di, XFS_DI_CTIME, now_s);
     xfs_reseal(fs, di, fs->inodesize, XFS_DI_CRC);
     bcache_dirty(b);
     bcache_put(fs->cache, b);

@@ -47,4 +47,31 @@ bool procfs_has(const char *path);
  * answers rather than being empty. `index` walks from zero; NULL ends it. */
 const char *procfs_name_at(uint32_t index);
 
+/* The full path of the `index`th file, or NULL past the end: what a
+ * directory listing of `/proc`, `/sys` and below is built from. */
+const char *procfs_path_at(uint32_t index);
+
+/* The longest path a per-process translation produces. */
+#define PROCFS_PATH_MAX 128u
+
+/* Per-process paths are served by the `/proc/self/...` generators, run with
+ * `procfs_subject()` returning the pid (0 for the caller's own):
+ *   /proc/<pid>/X                     -> /proc/self/X
+ *   /proc/ps/by-pid/<pid>/X           -> /proc/self/ps/X
+ *   /proc/ps/by-user/<uid>/<pid>/X    -> /proc/self/ps/X (only that uid's)
+ * `uid_of` names a live pid's uid, UINT32_MAX for none; without it no
+ * per-process path exists. */
+void procfs_set_uid_of(uint32_t (*source)(uint32_t pid));
+
+/* `name_of` names a live pid's program (`uproc.name`), NULL for none:
+ *   /proc/ps/by-name/<name>/<pid>/X   -> /proc/self/ps/X (only that name) */
+void procfs_set_name_of(const char *(*source)(uint32_t pid));
+const char *procfs_name_of(uint32_t pid);
+uint32_t procfs_subject(void);
+uint32_t procfs_uid_of(uint32_t pid);
+
+/* The translation above: the /proc/self path in out (PROCFS_PATH_MAX) and
+ * the pid, or false when path is not a live process's. */
+bool procfs_translate(const char *path, char *out, uint32_t *pid);
+
 #endif

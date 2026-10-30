@@ -104,6 +104,17 @@ int xfsmount_map_file(const char *path, uint64_t *offsets, uint32_t max, uint32_
 
 int xfsmount_read_file(const char *path, uint32_t limit, uint8_t **out, uint32_t *size);
 
+/* Up to `len` bytes of a file at `off`, by path, through whichever
+ * filesystem the path is on — without the whole file in memory, which is
+ * what a read-write descriptor needs: a database is read a page at a time
+ * from wherever the page is. `*got` is short only at the end of the file. */
+int xfsmount_read_path_at(const char *path, uint64_t off, void *buf, uint32_t len,
+                          uint32_t *got);
+
+/* The largest file a range is taken from by reading it whole (a mount with
+ * no ranged read). */
+#define XFSMOUNT_RANGE_WHOLE_MAX (16u * 1024u * 1024u)
+
 /* Hashes a file **without holding it in memory**, and reports its size.
  *
  * Reading a file whole is the obvious way to checksum one and it stops
@@ -210,6 +221,12 @@ int xfsmount_owner_of(const char *path, uint32_t *uid, uint32_t *gid);
  * writes more than it had to. */
 int xfsmount_flush(void);
 
+/* `fsync` for a path. This kernel's own XFS flushes its whole cache (see
+ * xfsmount_flush). A mounted filesystem has nothing held here to flush:
+ * netfs sends every write and waits for the server to answer it, so what
+ * remains is the server's own durability, which no request can change. */
+int xfsmount_sync_path(const char *path);
+
 /* Makes a path's file `size` bytes, freeing the blocks it no longer needs. */
 int xfsmount_truncate_path(const char *path, uint64_t size);
 
@@ -234,6 +251,10 @@ int xfsmount_counters(const char *path, struct xfs_counters *out);
 
 /* Sets a path's access and modification times. */
 int xfsmount_utimes_path(const char *path, uint64_t atime_s, uint64_t mtime_s);
+
+/* A file's access, modification and change times, in seconds; KERR_NOTSUP
+ * off the root XFS's volumes. */
+int xfsmount_times(const char *path, uint64_t *atime_s, uint64_t *mtime_s, uint64_t *ctime_s);
 
 /* Moves a name within one volume. KERR_XDEV across two, because a rename is
  * not a copy. This is the mechanism a bounded log file rotates with: there

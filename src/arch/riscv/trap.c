@@ -288,6 +288,65 @@ void trap_report_hart(uint32_t index) {
             (unsigned long long)last_trap[index].sepc, (unsigned long long)last_trap[index].stval);
 }
 
+/* User time, per hart: when the hart last went to user mode (0: it is in
+ * the kernel), and the total. Each is written only by its own hart. */
+static struct {
+    uint64_t entered_user_at;
+    uint64_t user_ns;
+} user_time[SMP_MAX_HARTS];
+
+/* Trap counts by cause, written under the kernel lock (`note_trap`). */
+static uint64_t cause_counts[2][TRAP_CAUSES];
+static void (*user_time_sink)(uint64_t ns);
+
+uint64_t trap_cause_count(bool interrupt, uint32_t code) {
+    return code < TRAP_CAUSES ? cause_counts[interrupt ? 1 : 0][code] : 0u;
+}
+
+void trap_set_user_time_sink(void (*sink)(uint64_t ns)) {
+    user_time_sink = sink;
+}
+
+static void count_cause(uint64_t scause) {
+    uint64_t code = scause & ~SCAUSE_INTERRUPT;
+    cause_counts[(scause & SCAUSE_INTERRUPT) != 0 ? 1 : 0][code < TRAP_CAUSES ? code : 0u]++;
+}
+
+uint64_t trap_user_ns(uint32_t index) {
+    return index < SMP_MAX_HARTS ? user_time[index].user_ns : 0u;
+}
+
+void trap_note_entering_user(void) {
+    uint32_t h = smp_hart_index();
+    if (h < SMP_MAX_HARTS) {
+        user_time[h].entered_user_at = timer_ns();
+    }
+}
+
+/* Closes the stretch in user mode a trap from user mode ends. */
+static void note_leaving_user(const struct trapframe *tf) {
+    uint32_t h = smp_hart_index();
+    if (h >= SMP_MAX_HARTS || (tf->sstatus & (1ull << 8)) != 0 ||
+        user_time[h].entered_user_at == 0) {
+        return;
+    }
+    {
+        uint64_t ns = timer_ns() - user_time[h].entered_user_at;
+        user_time[h].user_ns += ns;
+        if (user_time_sink != NULL) {
+            user_time_sink(ns);
+        }
+    }
+    user_time[h].entered_user_at = 0;
+}
+
+/* Opens one on the way back, on whichever hart the thread now runs. */
+static void note_returning_to_user(const struct trapframe *tf) {
+    if ((tf->sstatus & (1ull << 8)) == 0) {
+        trap_note_entering_user();
+    }
+}
+
 /* Records a trap against the hart taking it, before and after the lock. */
 static void note_trap(const struct trapframe *tf, bool after_lock) {
     uint32_t h = smp_hart_index();
@@ -302,9 +361,11 @@ static void note_trap(const struct trapframe *tf, bool after_lock) {
         return;
     }
     last_trap[h].locked++;
+    count_cause(tf->scause);
 }
 
 void trap_handle(struct trapframe *tf) {
+    note_leaving_user(tf);
     note_trap(tf, false);
     bool took = lock_enter != NULL && lock_enter();
     note_trap(tf, true);
@@ -328,6 +389,7 @@ void trap_handle(struct trapframe *tf) {
         unexpected(tf);
     }
     __atomic_sub_fetch(&inside_the_kernel, 1u, __ATOMIC_RELAXED);
+    note_returning_to_user(tf);
     if (lock_exit != NULL) {
         lock_exit(took);
     }
@@ -335,6 +397,10 @@ void trap_handle(struct trapframe *tf) {
 
 void trap_enable_interrupts(void) {
     __asm__ volatile("csrsi sstatus, 2" : : : "memory"); /* SIE */
+}
+
+void trap_wait_for_interrupt(void) {
+    __asm__ volatile("wfi\n\tcsrsi sstatus, 2\n\tnop\n\tcsrci sstatus, 2" : : : "memory");
 }
 
 void trap_disable_interrupts(void) {

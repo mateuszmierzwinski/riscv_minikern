@@ -281,3 +281,19 @@ void fat_dos_time(uint64_t now_s, uint16_t *time, uint16_t *date) {
     *date = (uint16_t)(((year - 1980u) << 9) | ((month + 1u) << 5) | (days + 1u));
     *time = (uint16_t)(((secs / 3600u) << 11) | (((secs / 60u) % 60u) << 5) | ((secs % 60u) / 2u));
 }
+
+uint64_t fat_unix_time(uint16_t time, uint16_t date) {
+    static const uint8_t mdays[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    uint32_t year = 1980u + (date >> 9), month = (date >> 5) & 15u, day = date & 31u;
+    uint64_t days;
+    if (date == 0 || month == 0 || month > 12u || day == 0) {
+        return 0; /* never set, or not a date: no time rather than a wrong one */
+    }
+    days = days_before(year);
+    for (uint32_t m = 0; m + 1u < month; m++) {
+        days += mdays[m] + (m == 1u && leap(year) ? 1u : 0u);
+    }
+    days += day - 1u;
+    return days * 86400u + (uint64_t)(time >> 11) * 3600u + ((time >> 5) & 63u) * 60u +
+           (time & 31u) * 2u;
+}

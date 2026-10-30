@@ -200,23 +200,43 @@ static void challenge(uint8_t out[64], const uint8_t *r, const uint8_t *key, con
     sha512_final(&s, out);
 }
 
-bool ed25519_verify(const uint8_t key[ED25519_PUBLIC_KEY], const uint8_t sig[ED25519_SIGNATURE],
-                    const void *msg, uint32_t len) {
-    struct point a, r, base, sb, ka, sum;
-    uint8_t k[64], want[32], got[32];
-    if (!scalar_in_range(sig + 32) || !point_decode(&a, key) || !point_decode(&r, sig)) {
-        return false;
-    }
+/* [S]B, encoded. Its own frame: the verification's six points together
+ * pass the kernel's 1 KiB stack-frame limit on riscv64. */
+static __attribute__((noinline)) void scalar_times_base(const uint8_t s[32], uint8_t out[32]) {
+    struct point base, sb;
     fe_from_bytes(&base.x, ED_BASE_X);
     fe_from_bytes(&base.y, ED_BASE_Y);
     fe_one(&base.z);
     fe_mul(&base.t, &base.x, &base.y);
+    point_mul(&sb, s, 32, &base);
+    point_encode(out, &sb);
+}
+
+/* R + [k]A, encoded; false when either point does not decode. */
+static __attribute__((noinline)) bool r_plus_k_a(const uint8_t key[ED25519_PUBLIC_KEY],
+                                                 const uint8_t sig[ED25519_SIGNATURE],
+                                                 const uint8_t k[64], uint8_t out[32]) {
+    struct point a, r, ka, sum;
+    if (!point_decode(&a, key) || !point_decode(&r, sig)) {
+        return false;
+    }
+    point_mul(&ka, k, 64, &a);
+    point_add(&sum, &r, &ka);
+    point_encode(out, &sum);
+    return true;
+}
+
+bool ed25519_verify(const uint8_t key[ED25519_PUBLIC_KEY], const uint8_t sig[ED25519_SIGNATURE],
+                    const void *msg, uint32_t len) {
+    uint8_t k[64], want[32], got[32];
+    if (!scalar_in_range(sig + 32)) {
+        return false;
+    }
     challenge(k, sig, key, msg, len);
-    point_mul(&sb, sig + 32, 32, &base); /* [S]B */
-    point_mul(&ka, k, 64, &a);           /* [k]A */
-    point_add(&sum, &r, &ka);            /* R + [k]A */
-    point_encode(want, &sum);
-    point_encode(got, &sb);
+    if (!r_plus_k_a(key, sig, k, want)) {
+        return false;
+    }
+    scalar_times_base(sig + 32, got);
     for (uint32_t i = 0; i < 32; i++) {
         if (got[i] != want[i]) {
             return false;

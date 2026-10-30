@@ -13,7 +13,7 @@ git, and the pitfalls are in `CLAUDE.md` §5.
 
 ### Open
 
-- [ ] **The SD card's `/init` is no longer the Go test binary — needs the operator** — `a stock Go binary off the card` fails because `/init` on the card is a 9,760-byte C program that exits 42 (seen 2026-10-29); the kernel ran it correctly. Needed: put the Go test binary (`src/userland/gotest`) back as `/init` on the card's ROOT, or say which `/init` the card should carry and the case will follow it.
+- [ ] **The SD card's `/init` is no longer the Go test binary — needs the operator** — `a stock Go binary off the card` fails because `/init` on the card is a 9,760-byte C program that exits 42 (seen 2026-10-29); the kernel ran it correctly. Needed: put the Go test binary (`src/userland/gotest`) back as `/init` on the card's ROOT, or say which `/init` the card should carry and the case will follow it. **2026-10-30:** `/init` on the card is now QuokkaOS init (2,949,282 bytes; it ran and started qmcd and statsd), and **`/swapfile` is gone** (`swap: cannot use /swapfile (rc -2)`), so `swap and a file-backed mapping` and `part of a transparent huge page sent to swap and back` fail too. Needed as well: a 64 MiB non-sparse `/swapfile` on ROOT (`dd if=/dev/zero of=/mnt/swapfile bs=1M count=64`).
 
 ### Done
 
@@ -67,7 +67,7 @@ git, and the pitfalls are in `CLAUDE.md` §5.
 
 
 - [x] **`pgtable_map` could write through a borrowed kernel table** — since step C a process borrows only the kernel's top half, and its own mappings are all below `USER_TOP`, so no walk for a user address reaches a kernel table. The boot counter stays (`pgtable: no process wrote into the kernel's tables`).
-- [ ] **ELF segments are not in the region record** (S) — text and data are mapped but unrecorded, so placement could see them as free (`uspace_stale_records` counts it). Recording them in `load_segment` broke the board twice under the old layout; retry after step C.
+- [x] **ELF segments are in the region record** — `load_segment` records each segment (`record_segment`); a page two segments share gets the union of their rights in the earlier region, as its mapping does. The `wait4` case that hung at round one under the old layout passes its 200 rounds.
 
 ### Done
 

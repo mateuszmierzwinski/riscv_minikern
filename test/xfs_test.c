@@ -1042,6 +1042,170 @@ static void test_the_realtime_bitmap_allocates(void) {
     KTEST_CHECK(reads_outside == 0);
 }
 
+/* A realtime file's holes are filled from the bitmap, and a truncate gives
+ * the blocks back to it.
+ *
+ * The file holds realtime block 3 (marked used), then is written two
+ * blocks in: the gap between stays a hole that reads as zeroes, and block 2
+ * takes the first free realtime extent. Truncating to one byte keeps block
+ * 0 and returns the other to the bitmap — the count is the evidence, since
+ * a truncate that freed into an allocation group (as one once did) would
+ * leave the bitmap one short. */
+static void test_a_realtime_file_fills_holes_and_truncates(void) {
+    struct xfs_inode ip;
+    uint64_t free_now = 0;
+    char buf[8];
+    uint32_t put = 0, got = 0;
+    mount_fresh();
+    build_a_realtime_file("x", "data device decoy");
+    build_a_realtime_bitmap((uint8_t)(0xffu & ~(1u << RT_FSB)));
+    bcache_invalidate(&cache);
+    KTEST_CHECK(xfs_mount(&fs, &cache) == KERR_OK);
+    KTEST_CHECK(xfs_attach_rt(&fs, &rtcache) == KERR_OK);
+    KTEST_CHECK(xfs_rt_free_extents(&fs, &free_now) == KERR_OK);
+    KTEST_CHECK(free_now == RT_BLOCKS - 1u);
+
+    KTEST_CHECK(xfs_inode_read(&fs, RT_INO, &ip) == KERR_OK);
+    KTEST_CHECK(xfs_file_write(&fs, &ip, 2u * BS, "far", 3u, &put) == KERR_OK);
+    KTEST_CHECK(put == 3u);
+    KTEST_CHECK(xfs_rt_free_extents(&fs, &free_now) == KERR_OK);
+    KTEST_CHECK(free_now == RT_BLOCKS - 2u);
+    KTEST_CHECK(xfs_inode_read(&fs, RT_INO, &ip) == KERR_OK);
+    memset(buf, 0x55, sizeof buf);
+    KTEST_CHECK(xfs_file_read(&fs, &ip, 2u * BS, buf, 3u, &got) == KERR_OK);
+    KTEST_CHECK(got == 3u && memcmp(buf, "far", 3) == 0);
+    memset(buf, 0x55, sizeof buf);
+    KTEST_CHECK(xfs_file_read(&fs, &ip, BS, buf, 4u, &got) == KERR_OK);
+    KTEST_CHECK(got == 4u && buf[0] == 0 && buf[3] == 0); /* the hole between */
+
+    KTEST_CHECK(xfs_truncate(&fs, &ip, 1u, 0) == KERR_OK);
+    KTEST_CHECK(ip.size == 1u);
+    KTEST_CHECK(xfs_rt_free_extents(&fs, &free_now) == KERR_OK);
+    KTEST_CHECK(free_now == RT_BLOCKS - 1u);
+    KTEST_CHECK(memcmp(block(RT_FSB), "data device decoy", 17) == 0);
+}
+
+/* The realtime summary: a file on the data device of `uint32` counters,
+ * one per (size class, bitmap block). Eight extents give `rextslog` 3 —
+ * four size classes — and one bitmap block, so sixteen bytes. Seeded with
+ * junk, which a rebuild must overwrite rather than add to. */
+#define RSUM_INO 107u
+#define RSUM_FSB 18u
+
+static void build_a_realtime_summary(void) {
+    uint8_t *di;
+    struct xfs_extent e = {.startoff = 0, .startblock = RSUM_FSB, .blockcount = 1};
+    memset(block(RSUM_FSB), 0x5a, BS);
+    di = build_inode(RSUM_INO, 0100600u, XFS_DINODE_FMT_EXTENTS, 16u);
+    put32(di + XFS_DI_NEXTENTS, 1u);
+    put64(di + XFS_DI_NBLOCKS, 1u);
+    xfs_extent_pack(di + XFS_DI_V3_SIZE, &e);
+    seal(di, ISIZE, XFS_DI_CRC);
+    put64(block(0) + XFS_SB_RSUMINO, RSUM_INO);
+    put32(block(0) + XFS_SB_RBMBLOCKS, 1u);
+    block(0)[XFS_SB_REXTSLOG] = 3u;
+    seal(block(0), 512u, XFS_SB_CRC);
+}
+
+/* The summary counter for (size class, bitmap block 0), as stored. */
+static uint32_t summary_entry(uint32_t level) {
+    const uint8_t *p = block(RSUM_FSB) + level * 4u;
+    return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+
+static uint64_t sb_frextents(void) {
+    uint64_t v = 0;
+    for (uint32_t i = 0; i < 8u; i++) {
+        v = v << 8 | block(0)[XFS_SB_FREXTENTS + i];
+    }
+    return v;
+}
+
+/* Every realtime allocation and release keeps the summary and
+ * `sb_frextents` true to the bitmap. Neither was maintained, so
+ * `xfs_repair` would have flagged any realtime filesystem written here.
+ * Extent 3 starts used: free runs [0,3) and [4,8) — one of size class 1,
+ * one of class 2. Taking two from the front leaves [2,3) and [4,8); giving
+ * them back merges nothing across the used extent. */
+static void test_the_realtime_summary_follows_the_bitmap(void) {
+    uint64_t start = 0;
+    mount_fresh();
+    build_a_realtime_file("x", "data device decoy");
+    build_a_realtime_bitmap((uint8_t)(0xffu & ~(1u << RT_FSB)));
+    build_a_realtime_summary();
+    bcache_invalidate(&cache);
+    KTEST_CHECK(xfs_mount(&fs, &cache) == KERR_OK);
+    KTEST_CHECK(xfs_attach_rt(&fs, &rtcache) == KERR_OK);
+    KTEST_CHECK(xfs_rt_alloc(&fs, 2u, &start) == KERR_OK && start == 0);
+    KTEST_CHECK(xfs_flush(&fs) == KERR_OK);
+    KTEST_CHECK(summary_entry(0) == 1u && summary_entry(1) == 0u); /* [2,3) */
+    KTEST_CHECK(summary_entry(2) == 1u && summary_entry(3) == 0u); /* [4,8) */
+    KTEST_CHECK(sb_frextents() == 5u);
+    KTEST_CHECK(xfs_rt_release(&fs, 0, 2u) == KERR_OK);
+    KTEST_CHECK(xfs_flush(&fs) == KERR_OK);
+    KTEST_CHECK(summary_entry(0) == 0u && summary_entry(1) == 1u); /* [0,3) */
+    KTEST_CHECK(summary_entry(2) == 1u && summary_entry(3) == 0u); /* [4,8) */
+    KTEST_CHECK(sb_frextents() == 7u);
+}
+
+/* A realtime file on a subvolume whose extents are TWO blocks: the file
+ * holds realtime extent 1 (blocks 2..3) as its blocks 0..1, two blocks
+ * long, and the bitmap marks that extent used — four extents, three free. */
+static void build_a_two_block_extent_file(void) {
+    uint8_t *di;
+    struct xfs_extent e = {.startoff = 0, .startblock = 2u, .blockcount = 2u};
+    build_a_realtime_file("x", "data device decoy");
+    di = build_inode(RT_INO, 0100644u, XFS_DINODE_FMT_EXTENTS, 2u * BS);
+    put32(di + XFS_DI_NEXTENTS, 1u);
+    put64(di + XFS_DI_NBLOCKS, 2u);
+    put16(di + XFS_DI_FLAGS, XFS_DIFLAG_REALTIME);
+    xfs_extent_pack(di + XFS_DI_V3_SIZE, &e);
+    seal(di, ISIZE, XFS_DI_CRC);
+    put64(block(0) + XFS_SB_REXTENTS, RT_BLOCKS / 2u);
+    put32(block(0) + XFS_SB_REXTSIZE, 2u);
+    seal(block(0), 512u, XFS_SB_CRC);
+    build_a_realtime_bitmap((uint8_t)(0x0fu & ~(1u << 1)));
+}
+
+static void mount_two_block_extents(struct xfs_inode *ip) {
+    mount_fresh();
+    build_a_two_block_extent_file();
+    bcache_invalidate(&cache);
+    KTEST_CHECK(xfs_mount(&fs, &cache) == KERR_OK);
+    KTEST_CHECK(xfs_attach_rt(&fs, &rtcache) == KERR_OK);
+    KTEST_CHECK(xfs_inode_read(&fs, RT_INO, ip) == KERR_OK);
+}
+
+/* With `rextsize` 2 a hole takes ONE extent and maps both of its blocks
+ * (the aligned pair the write falls in); a write growing the file takes
+ * one extent for two blocks; a truncate gives them back. Mapping one block
+ * per extent — what the writer did — would leave half of every extent
+ * owned by nobody, and the free count is how that shows. */
+static void test_realtime_extents_of_two_blocks_are_used_whole(void) {
+    struct xfs_inode ip;
+    struct xfs_extent e;
+    uint64_t free_now = 0;
+    char buf[4];
+    uint32_t put = 0, got = 0;
+    mount_two_block_extents(&ip);
+    KTEST_CHECK(xfs_rt_free_extents(&fs, &free_now) == KERR_OK && free_now == 3u);
+    KTEST_CHECK(xfs_file_write(&fs, &ip, 2u * BS, "grow", 4u, &put) == KERR_OK && put == 4u);
+    KTEST_CHECK(xfs_file_write(&fs, &ip, 3u * BS, "more", 4u, &put) == KERR_OK && put == 4u);
+    KTEST_CHECK(xfs_rt_free_extents(&fs, &free_now) == KERR_OK && free_now == 2u); /* one, not two */
+    KTEST_CHECK(xfs_inode_read(&fs, RT_INO, &ip) == KERR_OK && ip.nblocks == 4u);
+    KTEST_CHECK(xfs_truncate(&fs, &ip, 2u * BS, 0) == KERR_OK);
+    KTEST_CHECK(xfs_file_write(&fs, &ip, 5u * BS, "far", 3u, &put) == KERR_OK && put == 3u);
+    KTEST_CHECK(xfs_rt_free_extents(&fs, &free_now) == KERR_OK && free_now == 2u);
+    KTEST_CHECK(xfs_inode_read(&fs, RT_INO, &ip) == KERR_OK);
+    KTEST_CHECK(xfs_bmap(&fs, &ip, 4u, &e) == KERR_OK && e.startblock % 2u == 0);
+    KTEST_CHECK(e.startoff <= 4u && e.startoff + e.blockcount >= 6u); /* both blocks of the pair */
+    KTEST_CHECK(xfs_file_read(&fs, &ip, 5u * BS, buf, 3u, &got) == KERR_OK && memcmp(buf, "far", 3) == 0);
+    KTEST_CHECK(xfs_file_read(&fs, &ip, 4u * BS, buf, 4u, &got) == KERR_OK && buf[0] == 0 && buf[3] == 0);
+    KTEST_CHECK(xfs_truncate(&fs, &ip, 1u, 0) == KERR_OK);
+    KTEST_CHECK(xfs_rt_free_extents(&fs, &free_now) == KERR_OK && free_now == 3u);
+    KTEST_CHECK(memcmp(block(RT_FSB), "data device decoy", 17) == 0);
+}
+
 /* The realtime subvolume: a file's data comes from its own device.
  *
  * Three things, and the middle one is the one that would silently do the
@@ -2009,6 +2173,9 @@ int main(void) {
     KTEST_RUN(test_a_superblock_that_cannot_be_trusted);
     KTEST_RUN(test_a_realtime_file_is_read_from_its_own_device);
     KTEST_RUN(test_the_realtime_bitmap_allocates);
+    KTEST_RUN(test_a_realtime_file_fills_holes_and_truncates);
+    KTEST_RUN(test_realtime_extents_of_two_blocks_are_used_whole);
+    KTEST_RUN(test_the_realtime_summary_follows_the_bitmap);
     KTEST_RUN(test_quotas_are_read);
     KTEST_RUN(test_quotas_are_enforced);
     KTEST_RUN(test_a_soft_limit_starts_a_grace_period);

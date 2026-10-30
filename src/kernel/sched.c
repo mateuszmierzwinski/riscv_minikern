@@ -94,6 +94,7 @@ struct thread {
      * `SMP_MAX_HARTS` means "never run anywhere yet". */
     uint32_t last_hart;
     virt_t futex_addr;
+    uint64_t futex_space;   /* whose address `futex_addr` is: 0 for a kernel key */
     const void *wait_chan;  /* a kernel object being waited on; see sched.h */
     uint64_t futex_deadline;
     bool woken;
@@ -147,6 +148,8 @@ struct hartstate {
     struct uproc *loaded;
     uint32_t current;   /* SCHED_NO_THREAD when it is idle */
     uint64_t switches;
+    uint64_t idle_ns; /* this hart's share of `idle_ns`, for /proc/stat's cpuN */
+    uint64_t joined_ns; /* when it entered the scheduler: before that it was neither busy nor idle */
     bool joined;
     /* In `wfi` with nothing to run. */
     bool idle;
@@ -285,8 +288,16 @@ static struct hartstate *me(void) {
 }
 
 /* The thread this hart is running, or NULL when it is between threads. */
+/* Whether `sched_init` has run. Until then `harts` is all zeroes, and a
+ * zero `current` reads as "running thread 0": the boot path, which has no
+ * thread, would then block in `sched_wait_on` with nothing to resume it. */
+static bool scheduler_initialised;
+
 static struct thread *running_thread(void) {
     struct hartstate *h = me();
+    if (!scheduler_initialised) {
+        return NULL;
+    }
     return h->current == SCHED_NO_THREAD ? NULL : &threads[h->current];
 }
 
@@ -297,6 +308,7 @@ int sched_init(struct uproc *proc, const struct trapframe *frame, uint64_t sp, u
     for (uint32_t i = 0; i < SMP_MAX_HARTS; i++) {
         harts[i] = (struct hartstate){.current = SCHED_NO_THREAD};
     }
+    scheduler_initialised = true;
     next_tid = 1;
     process_over = false;
     idle_ticks = 0;
@@ -378,6 +390,7 @@ static void thread_trampoline(void) {
      * mode for the first time, so it is the one place this belongs. The
      * cost is a single instruction per thread start. */
     __asm__ volatile("fence.i" : : : "memory");
+    trap_note_entering_user();
     klock_exit(true);
     uspace_enter_frame(frame);
 }
@@ -1104,6 +1117,26 @@ bool sched_raise_on_process(uint32_t pid, uint32_t signo) {
     return true;
 }
 
+bool sched_raise_on_thread(uint64_t tid, uint32_t signo) {
+    for (uint32_t i = 0; i < SCHED_MAX_THREADS; i++) {
+        if (threads[i].state == THREAD_FREE || threads[i].tid != tid) {
+            continue;
+        }
+        signal_raise_on(&threads[i].signals, signo, 0, 0);
+        /* **Woken when it is sleeping and will take it**, as a signal ends
+         * an interruptible sleep on Linux. Only pending, a thread parked in
+         * `futex` with no deadline never ran its handler — and Go's
+         * `syscall.Setuid` signals every thread and waits for each, so the
+         * whole program stopped. A signal it blocks leaves it asleep. */
+        if (threads[i].state == THREAD_BLOCKED && signal_unblocked_in(&threads[i].signals, signo)) {
+            place_on_runqueue(i);
+            poke_idle_harts();
+        }
+        return true;
+    }
+    return false;
+}
+
 uint32_t sched_continue_process(uint32_t pid) {
     uint32_t moved = 0;
     for (uint32_t i = 0; i < SCHED_MAX_THREADS; i++) {
@@ -1162,6 +1195,15 @@ bool sched_set_rt(uint32_t priority, bool round_robin) {
 int32_t sched_nice(void) {
     const struct thread *t = running_thread();
     return t != NULL ? t->nice : 0;
+}
+
+int32_t sched_nice_of(const struct uproc *proc) {
+    for (uint32_t i = 0; i < SCHED_MAX_THREADS; i++) {
+        if (threads[i].state != THREAD_FREE && threads[i].proc == proc) {
+            return threads[i].nice;
+        }
+    }
+    return 0;
 }
 
 bool sched_set_nice(int32_t nice) {
@@ -1460,6 +1502,7 @@ void sched_run(void) {
     bool took = klock_enter();
     h = me();
     h->joined = true;
+    h->joined_ns = timer_ns();
     /* Dynamic ticks, on by default; `minikern.periodic` puts the 100 Hz
      * clock back. docs/PREEMPTION_MODEL.md says what is built. */
     if (dynticks_wanted) {
@@ -1492,6 +1535,7 @@ void sched_run(void) {
                 uint64_t entered = timer_ns();
                 klock_idle_wait();
                 idle_ns += timer_ns() - entered;
+                h->idle_ns += timer_ns() - entered;
             }
             h->idle = false;
             continue;
@@ -1559,12 +1603,38 @@ void sched_yield_now(void) {
     yield_to_scheduler();
 }
 
+/* The address space a thread's user addresses belong to: its page-table
+ * root, which a vfork child shares with its parent. */
+static uint64_t space_of(const struct thread *t) {
+    return t != NULL && t->proc != NULL ? (uint64_t)t->proc->pt.root_phys : 0u;
+}
+
+static bool futex_wait_in(uint64_t space, virt_t addr, uint64_t deadline_ns);
+static uint32_t futex_wake_in(uint64_t space, virt_t addr, uint32_t count);
+
 bool sched_futex_wait(virt_t addr, uint64_t deadline_ns) {
+    return futex_wait_in(0, addr, deadline_ns);
+}
+
+bool sched_futex_wait_user(virt_t addr, uint64_t deadline_ns) {
+    return futex_wait_in(space_of(running_thread()), addr, deadline_ns);
+}
+
+uint32_t sched_futex_wake(virt_t addr, uint32_t count) {
+    return futex_wake_in(0, addr, count);
+}
+
+uint32_t sched_futex_wake_user(virt_t addr, uint32_t count) {
+    return futex_wake_in(space_of(running_thread()), addr, count);
+}
+
+static bool futex_wait_in(uint64_t space, virt_t addr, uint64_t deadline_ns) {
     struct thread *t = running_thread();
     if (t == NULL) {
         return false;
     }
     t->futex_addr = addr;
+    t->futex_space = space;
     t->wait_chan = NULL;
     t->futex_deadline = deadline_ns;
     t->woken = false;
@@ -1639,7 +1709,7 @@ void sched_sleep_report(uint64_t *count, uint64_t *average_late_us, uint64_t *wo
     *worst_late_us = worst_late / 1000u;
 }
 
-uint32_t sched_futex_wake(virt_t addr, uint32_t count) {
+static uint32_t futex_wake_in(uint64_t space, virt_t addr, uint32_t count) {
     uint32_t woke = 0;
     bool poked = false;
     /* Logged even when it matches nothing. A wake with no waiter is the
@@ -1652,7 +1722,7 @@ uint32_t sched_futex_wake(virt_t addr, uint32_t count) {
     }
     for (uint32_t i = 0; i < SCHED_MAX_THREADS && woke < count; i++) {
         if (threads[i].state == THREAD_BLOCKED && threads[i].wait_chan == NULL &&
-            threads[i].futex_addr == addr) {
+            threads[i].futex_addr == addr && threads[i].futex_space == space) {
             place_on_runqueue(i);
             threads[i].woken = true;
             threads[i].futex_addr = 0;
@@ -1745,6 +1815,30 @@ struct thread_signals *sched_signals_of(uint64_t tid) {
         }
     }
     return NULL;
+}
+
+uint64_t sched_hart_idle_ns(uint32_t hart_index) {
+    return hart_index < SMP_MAX_HARTS ? harts[hart_index].idle_ns : 0u;
+}
+
+void sched_report_threads(void) {
+    for (uint32_t i = 0; i < SCHED_MAX_THREADS; i++) {
+        const struct thread *t = &threads[i];
+        if (t->state == THREAD_FREE) {
+            continue;
+        }
+        kprintf("sched: thread %u tid %llu pid %u state %u woken %u futex %llx deadline %llu "
+                "chan %llx last hart %u harts %llx\n", i, (unsigned long long)t->tid,
+                t->proc != NULL ? t->proc->pid : 0u, (uint32_t)t->state, t->woken,
+                (unsigned long long)t->futex_addr, (unsigned long long)t->futex_deadline,
+                (unsigned long long)(uintptr_t)t->wait_chan, t->last_hart,
+                (unsigned long long)t->harts);
+    }
+}
+
+uint64_t sched_hart_online_ns(uint32_t hart_index) {
+    const struct hartstate *h = hart_index < SMP_MAX_HARTS ? &harts[hart_index] : NULL;
+    return h != NULL && h->joined ? timer_ns() - h->joined_ns : 0u;
 }
 
 uint32_t sched_hart_switches(uint32_t hart_index) {
@@ -1923,6 +2017,26 @@ uint32_t sched_overdue_wakes(void) {
  * It complements `sched_lost_deadlines`, which asks whether a deadline is
  * *armed* on some hart. This asks whether one that was armed ever
  * **arrived**, which is a different failure and the one that hangs. */
+/* Every hart's timer state, for the first few overdue wakes: which hart
+ * should have taken the deadline, and what it was doing instead. */
+static void report_harts_for_overdue(uint64_t now) {
+    static uint32_t reports;
+    if (reports++ >= 3u) {
+        return;
+    }
+    for (uint32_t k = 0; k < SMP_MAX_HARTS; k++) {
+        const struct hartstate *h = &harts[k];
+        uint64_t armed = timer_armed_ns_of(k);
+        if (!h->joined) {
+            continue;
+        }
+        kprintf("sched:   hart %u: current %u idle %u untimed %u backstop %u armed %lld ms from now, "
+                "%llu timer irqs\n", k, h->current, h->idle, h->untimed, h->backstop,
+                armed == 0 ? -1LL : (long long)((int64_t)(armed - now) / 1000000),
+                (unsigned long long)timer_interrupts_of(k));
+    }
+}
+
 static void watch_for_overdue_wakes(uint64_t now) {
     for (uint32_t i = 0; i < SCHED_MAX_THREADS; i++) {
         uint64_t at = threads[i].futex_deadline;
@@ -1934,6 +2048,7 @@ static void watch_for_overdue_wakes(uint64_t now) {
                 " (waiting on %llx)\n",
                 (unsigned long long)threads[i].tid, (unsigned long long)((now - at) / 1000000u),
                 (unsigned long long)(uintptr_t)threads[i].wait_chan);
+        report_harts_for_overdue(now);
         /* Woken, because the report is worth more than the hang and a
          * spurious wake is something every caller of a timed wait already
          * has to handle. */

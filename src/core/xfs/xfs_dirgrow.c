@@ -166,8 +166,8 @@ int xfs_dir_touch(struct xfs *fs, const struct xfs_inode *dir, uint64_t now_s) {
         return rc;
     }
     di = b->data + boffset;
-    xfs_put_be32(di + XFS_DI_MTIME, (uint32_t)now_s);
-    xfs_put_be32(di + XFS_DI_CTIME, (uint32_t)now_s);
+    xfs_put_time(di, XFS_DI_MTIME, now_s);
+    xfs_put_time(di, XFS_DI_CTIME, now_s);
     xfs_reseal(fs, di, fs->inodesize, XFS_DI_CRC);
     bcache_dirty(b);
     bcache_put(fs->cache, b);
@@ -198,8 +198,8 @@ static int repoint_inode(struct xfs *fs, const struct xfs_inode *dir, uint64_t f
     xfs_dinode_set_data_extents(fs, di, 1u);
     xfs_put_be64(di + XFS_DI_NBLOCKS, 1u);
     xfs_put_be64(di + XFS_DI_SIZE, fs->dirblocksize);
-    xfs_put_be32(di + XFS_DI_MTIME, (uint32_t)now_s);
-    xfs_put_be32(di + XFS_DI_CTIME, (uint32_t)now_s);
+    xfs_put_time(di, XFS_DI_MTIME, now_s);
+    xfs_put_time(di, XFS_DI_CTIME, now_s);
     xfs_reseal(fs, di, fs->inodesize, XFS_DI_CRC);
     bcache_dirty(b);
     bcache_put(fs->cache, b);

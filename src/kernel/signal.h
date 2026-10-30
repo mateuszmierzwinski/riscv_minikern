@@ -165,6 +165,16 @@ void signal_raise_on(struct thread_signals *who, uint32_t signo, virt_t fault_ad
  * and that is not this module's decision to carry out. */
 bool signal_deliver(struct trapframe *tf);
 
+/* Leaves the current (temporary) mask in force and puts `original` back
+ * after the next handler — in its signal frame, so `rt_sigreturn` restores
+ * it — or on the way to user mode if no handler runs. What Linux does for
+ * a `ppoll`/`pselect6` a signal interrupted. */
+void signal_restore_mask_later(uint64_t original);
+
+/* The way-to-user-mode half: a mask still waiting to be put back is put
+ * back now. Called after `signal_deliver` on the return path. */
+void signal_finish_return(void);
+
 /* Whether a signal is pending whose action is to kill the process, and
  * which one. For the caller that has to end it. */
 bool signal_is_fatal(uint32_t *signo);

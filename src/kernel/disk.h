@@ -47,6 +47,12 @@ uint32_t disk_volume_count(void);
  * `ROOT`, or volume 0 when nothing is. `xfsmount` mounts it; automount
  * mounts the others. */
 uint32_t disk_root_volume(void);
+
+/* Whether the attached disk has a root filesystem: a volume labelled
+ * `ROOT`, or an unlabelled XFS first volume. A card that is one FAT
+ * partition has none; its volumes are still mounted, and `/` comes from the
+ * command line. */
+bool disk_has_root(void);
 const struct blockdev *disk_volume(uint32_t i);
 
 struct bcache *disk_cache(void);

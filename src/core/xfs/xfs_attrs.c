@@ -62,7 +62,7 @@ static int change_inode(struct xfs *fs, uint64_t ino, bool want_mode, uint32_t m
     /* **The change time, because something changed.** A tool that compares
      * `ctime` to decide whether to re-read an inode — every backup program —
      * would otherwise miss a permission change entirely. */
-    xfs_put_be32(di + XFS_DI_CTIME, (uint32_t)now_s);
+    xfs_put_time(di, XFS_DI_CTIME, now_s);
     xfs_reseal(fs, di, fs->inodesize, XFS_DI_CRC);
     bcache_dirty(b);
     bcache_put(fs->cache, b);
@@ -114,6 +114,29 @@ int xfs_counters(struct xfs *fs, struct xfs_counters *out) {
     return KERR_OK;
 }
 
+int xfs_times(struct xfs *fs, const struct xfs_inode *ip, uint64_t *atime_s, uint64_t *mtime_s,
+              uint64_t *ctime_s) {
+    uint64_t block;
+    uint32_t boffset;
+    struct bbuf *b;
+    const uint8_t *di;
+    int rc;
+    if (ip == NULL) {
+        return KERR_INVAL;
+    }
+    xfs_inode_place(fs, ip->ino, &block, &boffset);
+    rc = bcache_get(fs->cache, block, &b);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    di = b->data + boffset;
+    *atime_s = xfs_get_time(di, XFS_DI_ATIME);
+    *mtime_s = xfs_get_time(di, XFS_DI_MTIME);
+    *ctime_s = xfs_get_time(di, XFS_DI_CTIME);
+    bcache_put(fs->cache, b);
+    return KERR_OK;
+}
+
 int xfs_utimes(struct xfs *fs, const struct xfs_inode *ip, uint64_t atime_s, uint64_t mtime_s) {
     uint64_t block;
     uint32_t boffset;
@@ -138,10 +161,9 @@ int xfs_utimes(struct xfs *fs, const struct xfs_inode *ip, uint64_t atime_s, uin
      * which is *now*, because this call is a change to it. A `utimensat`
      * that let a caller backdate `ctime` would let a modified file claim it
      * had not been touched. */
-    xfs_put_be32(di + XFS_DI_ATIME, (uint32_t)atime_s);
-    xfs_put_be32(di + XFS_DI_MTIME, (uint32_t)mtime_s);
-    xfs_put_be32(di + XFS_DI_CTIME, (uint32_t)atime_s > (uint32_t)mtime_s ? (uint32_t)atime_s
-                                                                          : (uint32_t)mtime_s);
+    xfs_put_time(di, XFS_DI_ATIME, atime_s);
+    xfs_put_time(di, XFS_DI_MTIME, mtime_s);
+    xfs_put_time(di, XFS_DI_CTIME, atime_s > mtime_s ? atime_s : mtime_s);
     xfs_reseal(fs, di, fs->inodesize, XFS_DI_CRC);
     bcache_dirty(b);
     bcache_put(fs->cache, b);

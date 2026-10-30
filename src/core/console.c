@@ -73,6 +73,18 @@ void console_write(const char *buf, size_t len) {
     }
 }
 
+void console_write_untranslated(const char *buf, size_t len) {
+    if (attached.write_untranslated != NULL) {
+        attached.write_untranslated(attached.self, buf, len);
+    } else {
+        console_write(buf, len);
+    }
+}
+
+bool console_untranslated(void) {
+    return attached.write_untranslated != NULL;
+}
+
 bool console_attached(void) {
     return attached.write != NULL;
 }

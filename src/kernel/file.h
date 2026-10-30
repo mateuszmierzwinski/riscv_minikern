@@ -39,6 +39,7 @@
 #define EPOLLERR 0x008u
 #define EPOLLHUP 0x010u
 #define EPOLLRDHUP 0x2000u
+#define EPOLLET (1u << 31)
 
 /* `open`'s status flags, of which only these matter here. */
 #define O_RDONLY 0u
@@ -51,6 +52,7 @@
 #define O_RDWR 2u
 /* The generic ABI's values, which riscv64 uses. */
 #define O_CREAT 0100u
+#define O_EXCL 0200u
 #define O_TRUNC 01000u
 #define O_APPEND 02000u
 #define O_NONBLOCK 0x800u
@@ -76,6 +78,11 @@ struct file_ops {
      * every pipe claim to be one. `arg` is a user pointer and belongs to the
      * implementation to validate. */
     int32_t (*ioctl)(struct file *f, uint32_t request, virt_t arg);
+    /* `pread64` and `pwrite64`: at `off`, leaving the descriptor's own
+     * offset where it was. `buf` is a user pointer, as for `read`. NULL
+     * means the object has no positions (a pipe, a socket): `ESPIPE`. */
+    int32_t (*pread)(struct file *f, void *buf, uint32_t n, uint64_t off);
+    int32_t (*pwrite)(struct file *f, const void *buf, uint32_t n, uint64_t off);
 };
 
 struct file {
@@ -103,6 +110,9 @@ void fd_close_on_exec(void);
  * the same console and read the same pipe. */
 int fd_copy_table(struct uproc *to, const struct uproc *from);
 
+/* Closes every descriptor `p` holds: what exiting does to its table. */
+void fd_release_table(struct uproc *p);
+
 /* Takes a file and gives it the lowest free descriptor. The file's reference
  * is transferred. Negative on failure (KERR_MFILE when the table is full). */
 int fd_install(struct file *f);
@@ -122,6 +132,11 @@ int fd_dup(int32_t fd);
  * is what puts a pipe on descriptor 1 before an `exec`, and it is the reason
  * `dup2`/`dup3` exist at all. */
 int fd_dup_to(int32_t from, int32_t to);
+
+/* Descriptor fd's close-on-exec flag, which is the descriptor's and not
+ * its file's: a dup'd copy starts without it. */
+bool fd_cloexec(int32_t fd);
+void fd_set_cloexec(int32_t fd, bool on);
 
 /* Allocates a file with `ops` and `priv`. NULL when memory runs out. */
 struct file *file_new(const struct file_ops *ops, void *priv, uint32_t flags);

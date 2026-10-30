@@ -30,6 +30,9 @@
  * frequency is worse than no timer: it looks like it works. */
 int timer_init(const struct fdt *fdt, uint32_t hz);
 
+/* The same with the counter's frequency given (`minikern.timebase=`). */
+int timer_init_at(uint64_t freq, uint32_t hz);
+
 /* Arms the next tick, one interval from the deadline that just passed — not
  * from *now*, so a slow handler does not make the clock drift. */
 void timer_rearm(void);

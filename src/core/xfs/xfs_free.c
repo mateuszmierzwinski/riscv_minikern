@@ -91,8 +91,8 @@ int xfs_dir_sf_remove(struct xfs *fs, const struct xfs_inode *dir, const char *n
     }
     sf[XFS_DIR_SF_COUNT_OFF] = (uint8_t)(count - 1u);
     xfs_put_be64(di + XFS_DI_SIZE, used - gap);
-    xfs_put_be32(di + XFS_DI_MTIME, (uint32_t)now_s);
-    xfs_put_be32(di + XFS_DI_CTIME, (uint32_t)now_s);
+    xfs_put_time(di, XFS_DI_MTIME, now_s);
+    xfs_put_time(di, XFS_DI_CTIME, now_s);
     xfs_reseal(fs, di, fs->inodesize, XFS_DI_CRC);
     bcache_dirty(b);
     bcache_put(fs->cache, b);

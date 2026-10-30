@@ -114,7 +114,10 @@ void timer_wake_at(uint64_t ns) {
 }
 
 int timer_init(const struct fdt *fdt, uint32_t hz) {
-    uint64_t freq = fdt_get_u32(fdt, "/cpus", "timebase-frequency", 0);
+    return timer_init_at(fdt_get_u32(fdt, "/cpus", "timebase-frequency", 0), hz);
+}
+
+int timer_init_at(uint64_t freq, uint32_t hz) {
     if (freq == 0 || hz == 0) {
         return KERR_NOENT;
     }

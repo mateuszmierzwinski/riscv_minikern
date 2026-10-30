@@ -64,13 +64,20 @@ enum tty_action {
  * allocates. */
 struct tty {
     uint8_t line[TTY_LINE_MAX];
-    uint32_t len;      /* how much of `line` is being edited */
-    uint32_t ready;    /* how much of `line` is a completed line, 0 if none */
+    uint32_t ready;    /* line[0, ready): delivered input nobody has read yet */
+    uint32_t len;      /* line[ready, ready + len): the line being edited */
     bool echo;         /* print what is typed back at the terminal */
+    bool canonical;    /* ICANON: lines, edited; off: every byte is data */
+    bool signals;      /* ISIG: ^C and ^Z raise signals */
+    bool cr_to_nl;     /* ICRNL: a typed CR arrives as LF */
 };
 
-/* Starts a terminal in canonical mode with echo on. */
+/* Starts a terminal in canonical mode with echo, signals and CR->LF on. */
 void tty_init(struct tty *t);
+
+/* Changes the mode. Leaving canonical mode hands over the line being
+ * edited as it stands, as Linux does: nothing typed is lost. */
+void tty_set_mode(struct tty *t, bool canonical, bool signals, bool cr_to_nl);
 
 /* Feeds one byte in.
  *

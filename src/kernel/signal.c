@@ -347,7 +347,7 @@ static void save_context(const struct thread_signals *me, struct rt_sigframe *fr
                                         .si_code = me->fault_code,
                                         .si_addr = me->fault_address};
     frame->uc = (struct user_ucontext){0};
-    frame->uc.uc_sigmask[0] = me->blocked;
+    frame->uc.uc_sigmask[0] = me->restore_mask ? me->saved_mask : me->blocked;
     frame->uc.uc_stack.ss_sp = me->altstack_sp;
     frame->uc.uc_stack.ss_size = me->altstack_size;
     /* A cookie in a word no part of the ABI reads, checked on the way back.
@@ -392,6 +392,7 @@ bool signal_deliver(struct trapframe *tf) {
     sp = (handler_stack(me, a, tf) - sizeof(struct rt_sigframe)) & ~15ull;
     frame = (struct rt_sigframe *)(uintptr_t)sp;
     save_context(me, frame, tf, signo);
+    me->restore_mask = false; /* the frame carries it now */
     take(me, signo);
     /* Blocked while the handler runs, plus whatever it asked to block, so a
      * fault inside a SIGSEGV handler does not recurse for ever. */
@@ -412,6 +413,22 @@ bool signal_deliver(struct trapframe *tf) {
      * reported "signal 0" for all forty-four of them. */
     sig.by_signal[signo < SIG_COUNT ? signo : 0u]++;
     return true;
+}
+
+void signal_restore_mask_later(uint64_t original) {
+    struct thread_signals *me = mine();
+    if (me != NULL) {
+        me->saved_mask = original;
+        me->restore_mask = true;
+    }
+}
+
+void signal_finish_return(void) {
+    struct thread_signals *me = mine();
+    if (me != NULL && me->restore_mask) {
+        me->blocked = me->saved_mask;
+        me->restore_mask = false;
+    }
 }
 
 int signal_return(struct trapframe *tf) {

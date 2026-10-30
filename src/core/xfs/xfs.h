@@ -296,6 +296,7 @@ struct xfs {
     uint32_t quota_grace_started;
     uint32_t quota_grace_expired;
     uint64_t rsumino;
+    struct xfs_inode rsum_inode; /* the summary's inode, read when it is rebuilt */
     uint32_t rextsize;
     /* **Which on-disk format this is**, and the sizes that follow from it.
      *
@@ -383,6 +384,10 @@ struct xfs {
      * hand-damaged log proves the parser; a log this kernel wrote and then
      * failed to close proves the path a real machine takes. */
     bool skip_unmount_record;
+    /* Leaves the COMMIT_TRANS off the next logged transaction: the shape of
+     * a record cut off mid-transaction, which replay must not apply. A test
+     * switch like the one above, cleared once used. */
+    bool skip_commit_record;
     bool ftype;           /* directory entries carry a type byte */
     bool mounted;
     /* The filesystem uses read-only-compatible features the writer does not
@@ -769,6 +774,11 @@ int xfs_counters(struct xfs *fs, struct xfs_counters *out);
  * last changed, and letting it be backdated would let a modified file claim
  * it had not been touched. */
 int xfs_utimes(struct xfs *fs, const struct xfs_inode *ip, uint64_t atime_s, uint64_t mtime_s);
+
+/* An inode's access, modification and change times, in seconds since the
+ * Unix epoch, whichever encoding (classic or bigtime) the inode uses. */
+int xfs_times(struct xfs *fs, const struct xfs_inode *ip, uint64_t *atime_s, uint64_t *mtime_s,
+              uint64_t *ctime_s);
 
 /* Makes a regular file `size` bytes long, freeing whatever it no longer
  * needs.

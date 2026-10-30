@@ -352,9 +352,12 @@ int xfs_log_inodes(struct xfs *fs, const struct xfs_log_inode_item *items, uint3
     for (uint32_t i = 0; rc == KERR_OK && i < n; i++) {
         rc = put_inode_item(fs, &items[i]);
     }
-    rc = rc != KERR_OK ? rc : put_op(XFS_LOG_TID, XLOG_COMMIT_TRANS, NULL, 0);
+    if (!fs->skip_commit_record) {
+        rc = rc != KERR_OK ? rc : put_op(XFS_LOG_TID, XLOG_COMMIT_TRANS, NULL, 0);
+    }
     /* Three operations frame the transaction and two carry each item. */
-    rc = rc != KERR_OK ? rc : emit(fs, 3u + 2u * n);
+    rc = rc != KERR_OK ? rc : emit(fs, (fs->skip_commit_record ? 2u : 3u) + 2u * n);
+    fs->skip_commit_record = false;
     /* The unmount record follows it — unless a test has asked for it to be
      * left off, which is the shape a power cut leaves behind: the newest
      * record is then this transaction, and the next mount replays it. */

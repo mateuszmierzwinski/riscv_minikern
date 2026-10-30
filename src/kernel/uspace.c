@@ -20,6 +20,7 @@
 #include "arch/riscv/sigframe.h"
 #include "kernel/signal.h"
 #include "kernel/syscall.h"
+#include "core/reclock.h"
 
 /* Mappings the address-space record could not hold. Any value but zero means
  * placement may hand out an address that is already in use. */
@@ -477,6 +478,7 @@ static void on_user_return(struct trapframe *tf) {
         return;
     }
     (void)signal_deliver(tf);
+    signal_finish_return();
     /* **On the way back to user mode, say when to be interrupted next.**
      * Every trap can change the answer — a syscall that blocked, a signal
      * that woke something, a thread that ended — and this is the one place
@@ -922,20 +924,35 @@ static bool pc_outside_user_space(virt_t pc) {
     return (flags & PTE_U) == 0;
 }
 
+/* Whether this was an `execve` that failed: one that succeeded moved `sepc`
+ * to the new program's entry, one that was refused left it on its `ecall`.
+ *
+ * **Without this a refused exec was retried for ever.** The program's `a0`
+ * now held the error, so the retry read the error as the path, failed with
+ * EFAULT, and retried that — a vfork child spinning on one hart with its
+ * parent waiting, which is how a 20 MB blog binary over the 16 MB limit
+ * looked: no message, no exit, just a process that never started. */
+static bool exec_refused(bool exec, const struct trapframe *tf, uint64_t at) {
+    return exec && tf->sepc == at;
+}
+
 static bool on_user_trap(struct trapframe *tf) {
     if ((tf->scause & SCAUSE_INTERRUPT) != 0) {
         return false; /* an interrupt: the trap layer deals with those */
     }
     if ((tf->scause & ~SCAUSE_INTERRUPT) == EXC_ECALL_FROM_U) {
         bool step = syscall_steps_over_ecall(tf);
+        bool exec = tf->x[17] == SYS_EXECVE;
+        uint64_t at = tf->sepc;
         (void)syscall_dispatch(tf);
         /* Past the `ecall`, or the process makes the same call for ever.
          * `ecall` is always 4 bytes, unlike most of this ISA.
          *
          * Asked **before** the call, because `rt_sigreturn` replaces the
          * whole register set — including the syscall number this would be
-         * read from afterwards. */
-        tf->sepc += step ? 4u : 0u;
+         * read from afterwards. A refused `execve` left `sepc` on its
+         * `ecall`, and is stepped like any other call (see below). */
+        tf->sepc += step || exec_refused(exec, tf, at) ? 4u : 0u;
         return true;
     }
     /* **Before the stale-translation retry**, because a copy-on-write page
@@ -1163,6 +1180,25 @@ static uint64_t prot_bits(uint32_t prot) {
            ((prot & PROT_EXEC) != 0 ? PTE_X : 0u);
 }
 
+/* Records a loaded segment's pages as a region, so placement and `fork`
+ * see the program's own text and data as taken.
+ *
+ * **A page two segments share** (the linker may put the end of one and the
+ * start of the next together) is already in the earlier segment's region;
+ * it gets the union of both rights there, as its mapping did, or a write to
+ * the data half would be refused once `fork` made the page copy-on-write. */
+static int record_segment(struct uproc *p, virt_t start, virt_t end, uint32_t prot) {
+    const struct vma *shared = vma_find(&p->vmas, start);
+    if (shared != NULL) {
+        int rc = vma_protect(&p->vmas, start, start + PAGE_SIZE, shared->prot | prot);
+        if (rc != KERR_OK) {
+            return rc;
+        }
+        start += PAGE_SIZE;
+    }
+    return start < end ? vma_insert(&p->vmas, start, end, prot, 0u) : KERR_OK;
+}
+
 /* Maps and fills one segment, a page at a time.
  *
  * Page at a time because a segment's file bytes and its memory size differ:
@@ -1207,12 +1243,7 @@ static int load_segment(struct uproc *p, const struct elf_load *l, const uint8_t
         }
         (void)want;
     }
-    /* **The segments are deliberately NOT recorded here.** Recording them is
-     * the right fix for a forked child that dies on its own text, and it has
-     * twice taken the board out of green — see docs/ROADMAP.md.
-     * `fork_bystanders` in `src/userland/waitloop` is the reproducer. */
-
-    return KERR_OK;
+    return record_segment(p, start, end, l->prot);
 }
 
 /* The auxiliary vector a Go runtime reads. AT_PAGESZ and AT_RANDOM are the
@@ -1381,6 +1412,28 @@ int uspace_build_elf(struct uproc *p, const uint8_t *image, uint32_t bytes, cons
     return uspace_build_elf_args(p, image, bytes, path, argv, 1u);
 }
 
+/* Copies a process name, terminated, within UPROC_NAME_MAX. */
+static void copy_name(char to[UPROC_NAME_MAX], const char *from) {
+    uint32_t i = 0;
+    while (from[i] != '\0' && i + 1u < UPROC_NAME_MAX) {
+        to[i] = from[i];
+        i++;
+    }
+    to[i] = '\0';
+}
+
+/* The name a program at `path` runs under: its last component. */
+static void name_from_path(char to[UPROC_NAME_MAX], const char *path) {
+    const char *last = path;
+    for (const char *c = path; *c != '\0'; c++) {
+        last = c[0] == '/' && c[1] != '\0' ? c + 1 : last;
+    }
+    copy_name(to, last);
+    for (uint32_t i = 0; to[i] != '\0'; i++) {
+        to[i] = to[i] == '/' ? '\0' : to[i];
+    }
+}
+
 int uspace_build_elf_args(struct uproc *p, const uint8_t *image, uint32_t bytes, const char *path,
                           const char *const *argv, uint32_t argc) {
     struct pt_mem mem = {.alloc = proc_alloc, .free = proc_free, .to_virt = proc_to_virt};
@@ -1460,6 +1513,7 @@ int uspace_build_elf_args(struct uproc *p, const uint8_t *image, uint32_t bytes,
     }
     p->entry = img.entry;
     p->built = true;
+    name_from_path(p->name, path != NULL ? path : "");
     /* The break starts above the last segment, page-aligned, and anonymous
      * mappings start far above it so that neither can grow into the other.
      * A program that uses `brk` and `mmap` both, as a Go runtime does, is
@@ -1524,6 +1578,8 @@ int uspace_fork_shared(struct uproc *child, struct uproc *parent) {
     child->euid = parent->euid;
     child->suid = parent->suid;
     child->egid = parent->egid;
+    child->sgid = parent->sgid;
+    copy_name(child->name, parent->name);
     /* Capabilities and the syscall filter both cross `fork` unchanged: a
      * child that lost its parent's confinement would be an escape, and one
      * that lost its capabilities could not do the work it was forked for. */
@@ -1780,6 +1836,7 @@ int uspace_exec(struct uproc *p, const uint8_t *image, uint32_t bytes, const cha
                             .suid = p->suid,
                             .shared_pending = p->shared_pending,
                             .egid = p->egid,
+                            .sgid = p->sgid,
                             .rlim_nofile_soft = p->rlim_nofile_soft,
                             .rlim_nofile_hard = p->rlim_nofile_hard,
                             .rlim_nproc_soft = p->rlim_nproc_soft,
@@ -1793,6 +1850,7 @@ int uspace_exec(struct uproc *p, const uint8_t *image, uint32_t bytes, const cha
      * handlers go, because they pointed into code that no longer exists;
      * the thread's own signal mask stays, which is what the ABI says. */
     p->pt = fresh->pt;
+    copy_name(p->name, fresh->name);
     p->entry = fresh->entry;
     p->stack_top = fresh->stack_top;
     p->brk = fresh->brk;
@@ -2148,7 +2206,7 @@ static void choose_layout(struct uproc *p) {
 struct uproc *uspace_alloc(void) {
     for (uint32_t i = 0; i < PROC_MAX; i++) {
         if (!procs[i].used) {
-            procs[i] = (struct uproc){.used = true, .pid = next_pid};
+            procs[i] = (struct uproc){.used = true, .pid = next_pid, .started_ns = timer_ns()};
             /* **The sets come from the uid, once, here.** A process whose
              * capabilities were left zero would be a root process that
              * could do nothing, and the first one has to be able to read
@@ -2169,6 +2227,7 @@ struct uproc *uspace_alloc(void) {
 
 void uspace_release(struct uproc *p) {
     if (p != NULL) {
+        fd_release_table(p); /* one that never ran to exit (a failed fork) */
         *p = (struct uproc){0};
     }
 }
@@ -2226,6 +2285,44 @@ struct uproc *uspace_by_pid(uint32_t pid) {
         }
     }
     return NULL;
+}
+
+uint32_t uspace_pid_at(uint32_t index) {
+    if (index >= PROC_MAX) {
+        return UINT32_MAX;
+    }
+    return procs[index].used ? procs[index].pid : 0u;
+}
+
+uint32_t uspace_processes_created(void) {
+    return next_pid - 1u;
+}
+
+/* Walked a region at a time and a leaf at a time: a 2 MiB leaf counts once,
+ * whole, and the walk steps past it. */
+uint64_t uspace_resident_bytes(const struct uproc *p) {
+    uint64_t bytes = 0;
+    for (uint32_t i = 0; p != NULL && p->built && i < p->vmas.n; i++) {
+        for (virt_t va = p->vmas.v[i].start; va < p->vmas.v[i].end;) {
+            phys_t page = 0;
+            uint64_t prot = 0, size = 0;
+            if (pgtable_lookup(&p->pt, va, &page, &prot, &size) && size != 0) {
+                bytes += size;
+                va = (va & ~(size - 1u)) + size;
+            } else {
+                va += PAGE_SIZE;
+            }
+        }
+    }
+    return bytes;
+}
+
+uint32_t uspace_open_fds(const struct uproc *p) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; p != NULL && i < FD_MAX; i++) {
+        n += p->fds[i] != NULL ? 1u : 0u;
+    }
+    return n;
 }
 
 struct uproc *uspace_reapable_child(uint32_t parent_pid) {
@@ -2293,6 +2390,12 @@ void uspace_exit(int64_t status) {
             uspace_destroy(me);
         }
         me->shares_pt = false;
+        /* **Its descriptors close now**, as on Linux, not when the slot is
+         * reused: until then every pipe it held still had a writer, so a
+         * parent reading its child's output through `os/exec` waited for
+         * an end of file that never came. */
+        fd_release_table(me);
+        reclock_release_owner(me->pid); /* and the record locks with them */
         /* Whoever is waiting — a `vfork` parent, or one in `wait4`. */
         (void)sched_wake_on(me, SCHED_MAX_THREADS);
         {
@@ -2777,6 +2880,10 @@ uint64_t uspace_transparent_pages(void) {
     return transparent_pages;
 }
 
+bool uspace_transparent_huge_on(void) {
+    return transparent_on;
+}
+
 /* Turns the 2 MiB leaf covering `va`, if there is one, into 512 4 KiB
  * leaves over **the same frames with the same rights** — so no byte a
  * program can read changes, and every page-by-page operation (discard,
@@ -3238,6 +3345,8 @@ int uspace_fork(struct uproc *child, struct uproc *parent) {
     child->euid = parent->euid;
     child->suid = parent->suid;
     child->egid = parent->egid;
+    child->sgid = parent->sgid;
+    copy_name(child->name, parent->name);
     /* Capabilities and the syscall filter both cross `fork` unchanged: a
      * child that lost its parent's confinement would be an escape, and one
      * that lost its capabilities could not do the work it was forked for. */

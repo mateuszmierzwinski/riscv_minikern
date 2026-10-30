@@ -27,6 +27,11 @@ void kvprintf(const char *fmt, va_list ap);
  * `kprintf` or `klog`. */
 void console_write(const char *buf, size_t len);
 
+/* Writes len bytes with no CR added before an LF — a terminal with `OPOST`
+ * off. Only when `console_untranslated()`: otherwise it is `console_write`. */
+void console_write_untranslated(const char *buf, size_t len);
+bool console_untranslated(void);
+
 /* Whether a port has been attached yet. Output before that is dropped by
  * the console — but it is still *kept* by the log, which is the whole
  * reason the log exists: the earliest lines of a boot are the ones most

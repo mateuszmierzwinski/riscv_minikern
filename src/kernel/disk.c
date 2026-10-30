@@ -208,19 +208,24 @@ uint32_t disk_root_volume(void) {
  * must not decide which filesystem the machine runs on. */
 #define DECIDING_READS 3u
 
-static bool volume_is_root(uint32_t i, uint8_t *page) {
-    char label[XFS_LABEL_BYTES];
+/* Whether volume `i` holds an XFS superblock, and its label into `label`. */
+static bool volume_xfs_label(uint32_t i, uint8_t *page, char *label) {
     const struct blockdev *v = &vol_dev[i];
     int rc = KERR_IO;
     for (uint32_t a = 0; rc != KERR_OK && a < DECIDING_READS && v->block_size <= 4096u; a++) {
         rc = v->read(v->self, 0, 1, page);
     }
-    if (rc != KERR_OK) {
-        return false;
-    }
-    return xfs_superblock_label(page, v->block_size, label) &&
-           label[0] == 'R' && label[1] == 'O' && label[2] == 'O' && label[3] == 'T' &&
-           label[4] == '\0';
+    return rc == KERR_OK && xfs_superblock_label(page, v->block_size, label);
+}
+
+static bool volume_is_root(uint32_t i, uint8_t *page) {
+    char label[XFS_LABEL_BYTES];
+    return volume_xfs_label(i, page, label) && label[0] == 'R' && label[1] == 'O' &&
+           label[2] == 'O' && label[3] == 'T' && label[4] == '\0';
+}
+
+bool disk_has_root(void) {
+    return root_volume < vol_count;
 }
 
 /* Makes candidate `c` the disk, presents its volumes, and says which of
@@ -251,6 +256,24 @@ static uint32_t look_for_root(uint32_t c, uint8_t *page) {
         i++;
     }
     return i;
+}
+
+/* With no `ROOT` label anywhere: the first volume, **if it is XFS** — an
+ * unlabelled card or a test image. A card as bought is one FAT partition
+ * holding the kernel; taking that as the root left it out of the automount
+ * (no `/boot`) and pointed the XFS reader at it. Then there is no root on
+ * the disk, and `/` is the command line's (`minikern.netroot`). */
+static int take_first_if_xfs(uint8_t *page) {
+    char label[XFS_LABEL_BYTES];
+    if (volume_xfs_label(0, page, label)) {
+        root_volume = 0;
+        kprintf("disk: no volume is labelled ROOT; using the first on %s\n", attached_kind);
+        return KERR_OK;
+    }
+    root_volume = vol_count;
+    kprintf("disk: no XFS root on %s (nothing labelled ROOT, and the first volume is not XFS); "
+            "/ is the command line's\n", attached_kind);
+    return KERR_OK;
 }
 
 /* **The root is the XFS labelled `ROOT`, wherever it is.** Devices are
@@ -287,9 +310,7 @@ static int choose_root(const struct fdt *fdt, uint8_t *page) {
         kprintf("disk: the root is volume %u on %s, labelled ROOT\n", root_volume, attached_kind);
         return KERR_OK;
     }
-    root_volume = 0;
-    kprintf("disk: no volume is labelled ROOT; using the first on %s\n", attached_kind);
-    return KERR_OK;
+    return take_first_if_xfs(page);
 }
 
 /* Attaches the disk the root lives on, and points `whole` at the root's
@@ -313,7 +334,7 @@ static int adopt_the_root(const struct fdt *fdt) {
         whole = raw;
         return KERR_OK;
     }
-    whole = vol_over[root_volume];
+    whole = vol_over[root_volume < vol_count ? root_volume : 0];
     return KERR_OK;
 }
 

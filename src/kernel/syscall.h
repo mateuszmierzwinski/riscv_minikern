@@ -114,6 +114,14 @@ void syscall_set_trace(uint32_t budget);
 /* Logs every sleep with the duration it asked for. Separate from the call
  * trace because a sleep happens long after any sensible call budget. */
 void syscall_trace_sleeps(bool on);
+
+/* `minikern.callpid=<pid>`: only that process's calls spend the
+ * `minikern.calls` budget, so a child can be traced past a busy parent. */
+void syscall_set_trace_pid(uint32_t pid);
+
+/* `minikern.exectrace`: each stage of every `execve`, timed — reading the
+ * program, the other threads leaving their harts, the new image built. */
+void sys_proc_trace_exec(bool on);
 bool syscall_tracing_sleeps(void);
 
 /* Logs every call that returns an error, however late it happens. A budget
@@ -163,6 +171,12 @@ bool syscall_steps_over_ecall(const struct trapframe *tf);
 uint64_t syscall_count(void);
 uint64_t syscall_unimplemented(void);
 
+/* Calls of number `nr` since boot (0 for a number past SYSCALL_COUNTED),
+ * and its name ("?" when there is no such call). */
+#define SYSCALL_COUNTED 512u
+uint64_t syscall_calls_of(uint64_t nr);
+const char *syscall_name(uint64_t nr);
+
 /* Argument accessors. The generic convention: the number in `a7`, arguments
  * in `a0`..`a5`, the result in `a0`. Named so a handler reads as the
  * syscall it implements rather than as register arithmetic. */
@@ -175,5 +189,11 @@ static inline uint64_t sysarg(const struct trapframe *tf, uint32_t n) {
  * the kernel and has no syscall layer to go through; the join is the part
  * worth testing, since without it a working directory is a stored string. */
 int syscall_resolve_for_test(const char *given, uint32_t *mode, uint64_t *size, uint32_t *nlink);
+
+/* Installs what `mount` calls for a filesystem type (fstype, source,
+ * target, the option string — "" when none was given); the composition
+ * root's, since the transports live above here. */
+void syscall_set_mount_hook(int (*hook)(const char *fstype, const char *source,
+                                        const char *target, const char *data));
 
 #endif

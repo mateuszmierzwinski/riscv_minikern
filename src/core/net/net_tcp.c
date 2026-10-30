@@ -201,6 +201,16 @@ int32_t tcp_send(struct tcp_conn *c, const void *data, uint32_t n) {
     return (int32_t)take;
 }
 
+/* Whether a read that took the free window from `before` to `after` should
+ * tell the peer (receive-side silly-window avoidance, RFC 1122 4.2.3.3):
+ * when the window was shut, or when it has just grown past half the buffer.
+ * **Not on every read**: an update per read was an ACK per few hundred
+ * bytes, which filled the GMAC's eight transmit slots, and a request that
+ * found them full was lost to a one-second retransmit. */
+static bool window_update_worth_sending(uint32_t before, uint32_t after) {
+    return (before == 0 && after > 0) || (before < TCP_RX_BUF / 2u && after >= TCP_RX_BUF / 2u);
+}
+
 int32_t tcp_recv(struct tcp_conn *c, void *data, uint32_t n, bool peek) {
     uint8_t *p = data;
     uint32_t take = n < c->rx_len ? n : c->rx_len;
@@ -214,11 +224,15 @@ int32_t tcp_recv(struct tcp_conn *c, void *data, uint32_t n, bool peek) {
         p[i] = c->rx[i];
     }
     if (!peek) {
+        uint32_t was_free = tcp_rcv_wnd(c);
         for (uint32_t i = take; i < c->rx_len; i++) {
             c->rx[i - take] = c->rx[i];
         }
         c->rx_len -= take;
-        tcp_send_ack(c);  /* the window just opened */
+        if (window_update_worth_sending(was_free, tcp_rcv_wnd(c))) {
+            c->stack->stats.window_updates++;
+            tcp_send_ack(c);
+        }
     }
     return (int32_t)take;
 }

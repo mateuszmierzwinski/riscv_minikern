@@ -37,6 +37,11 @@ void mmu_set_table_arena(phys_t base, uint64_t bytes);
  * a failure here leaves the machine exactly as it was rather than halfway. */
 int mmu_init(phys_t ram_base, uint64_t ram_bytes);
 
+/* Gives the direct map a randomly chosen place (`seed` not 0), applied by
+ * the next `mmu_init`; and where it ended up. */
+void mmu_randomise_direct_map(uint64_t seed);
+uint64_t mmu_direct_map_base(void);
+
 /* Maps a device's registers into the kernel's address space, identically,
  * read-write and **not** executable.
  *

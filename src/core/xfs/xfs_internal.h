@@ -283,6 +283,14 @@ void xfs_put_be16(uint8_t *p, uint16_t v);
 void xfs_put_be32(uint8_t *p, uint32_t v);
 void xfs_put_be64(uint8_t *p, uint64_t v);
 
+/* A realtime block, zeroed for the reason `xfs_zero_block` gives. */
+int xfs_zero_rt_block(struct xfs *fs, uint64_t block);
+
+/* An inode timestamp at `off` (XFS_DI_ATIME and its neighbours), in whole
+ * seconds since the Unix epoch, in whichever encoding the inode uses. */
+void xfs_put_time(uint8_t *di, uint32_t off, uint64_t secs);
+uint64_t xfs_get_time(const uint8_t *di, uint32_t off);
+
 /* ── the free-space btrees (xfs_alloc.c) ───────────────────────────────── */
 
 /* Takes one block from a group: `want`, if that block is free, and
@@ -716,5 +724,18 @@ int xfs_bmbt_lookup(const struct xfs *fs, const struct xfs_inode *ip, uint64_t o
  * can be a b-tree, and the walk does not care which it is handed. */
 int xfs_bmbt_lookup_in(const struct xfs *fs, const uint8_t *fork, uint32_t fork_len,
                        uint64_t off, struct xfs_extent *out);
+
+/* Rebuilds the realtime summary and `sb_frextents` from the bitmap
+ * (xfs_rtsummary.c); `bmp` is the bitmap's inode. With no summary file the
+ * count is still set. */
+int xfs_rt_summary_rebuild(struct xfs *fs, struct xfs_inode *bmp);
+
+/* How many data extents a write may leave this inode with. Unlimited, but
+ * when its data fork is larger than the `XFS_FORK_MAX` this reader caches
+ * (inodes over 512 bytes), only as many as fit that cache inline: past it
+ * the inode would be refused on the next read, and moving to a b-tree early
+ * is not an answer, because Linux rejects a b-tree fork whose extents would
+ * fit inline. A write that would need more is refused before it allocates. */
+uint32_t xfs_data_extents_cap(const struct xfs *fs, const struct xfs_inode *ip);
 
 #endif

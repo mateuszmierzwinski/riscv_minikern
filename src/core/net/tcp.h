@@ -36,7 +36,7 @@
  * they describe, so nothing is lost by the limit. */
 #define TCP_SACK_BLOCKS 4u
 #define TCP_BACKLOG     8u      /* established connections one listener may hold */
-#define TCP_RX_BUF      8192u
+#define TCP_RX_BUF      49152u  /* a whole netfs reply (32 KiB) and its framing; no window scaling, so < 64 KiB */
 #define TCP_TX_BUF      8192u
 #define TCP_MSS         1460u   /* 1500 MTU - 20 IP - 20 TCP */
 #define TCP_RTO_MIN_MS  200u
@@ -71,7 +71,22 @@ struct tcp_held {
     uint8_t data[TCP_MSS];
 };
 
+/* One segment as it arrived, for `tcp_report_trail`: where it fell against
+ * `rcv_nxt`, how long, its flags, and what became of it. */
+#define TCP_TRAIL 24u
+struct tcp_trail {
+    int32_t off;      /* seq - rcv_nxt when it arrived */
+    uint16_t len;
+    uint8_t flags;
+    char verdict;     /* W out of window, A acked only, T taken, H held, D dropped early, O old */
+    uint32_t wnd;     /* the window it met */
+    uint32_t took;    /* how far rcv_nxt moved because of it */
+};
+
 struct tcp_conn {
+    /* The last TCP_TRAIL segments received, a ring at `trail_at`. */
+    struct tcp_trail trail[TCP_TRAIL];
+    uint32_t trail_at;
     /* Nobody owns this any more, but its shutdown is unfinished: the tick
      * reclaims it when it reaches CLOSED. See `tcp_detach`. */
     bool detached;
@@ -189,6 +204,8 @@ struct tcp_stats {
     uint32_t retransmits;
     uint32_t fast_retransmits; /* losses caught by three duplicate ACKs */
     uint32_t connections;
+    uint32_t window_updates;   /* ACKs sent because a read reopened the window */
+    uint32_t acks_unsent;      /* ACKs the interface would not take */
 };
 
 struct tcp_stack {

@@ -6,6 +6,8 @@
 #include "arch/riscv/mmu.h"
 #include "core/errno.h"
 #include "core/fat/fat.h"
+#include "core/vfs.h"
+#include "kernel/fatmount.h"
 #include "core/xfs/xfs.h"
 #include "kernel/disk.h"
 #include "kernel/mem.h"
@@ -151,6 +153,9 @@ static bool mount_fat(struct volume *v, uint32_t index) {
     }
     v->used = true;
     count++;
+    if (vfs_mount(v->at, &fatmount_vfs_ops, &v->fat) != KERR_OK) {
+        kprintf("volumes: the mount table refused %s\n", v->at);
+    }
     kprintf("volumes: FAT%u \"%s\" mounted at %s%s\n", v->fat.type,
             v->fat.label[0] != '\0' ? v->fat.label : "(no label)", v->at,
             v->fat.writable ? "" : " (read-only)");
@@ -229,15 +234,28 @@ static void settle_boot(void) {
     }
     for (uint32_t i = 0; i < count; i++) {
         if (table[i].is_fat) {
+            (void)vfs_umount(table[i].at);
             copy_str(table[i].at, sizeof table[i].at, VOLUMES_BOOT_DIR);
+            (void)vfs_mount(table[i].at, &fatmount_vfs_ops, &table[i].fat);
             kprintf("volumes: FAT at %s is the boot partition\n", VOLUMES_BOOT_DIR);
             return;
         }
     }
 }
 
+/* Takes the previous automount's FAT volumes out of the mount table, since
+ * the table entries they point at are about to be reused. */
+static void forget_fat_mounts(void) {
+    for (uint32_t i = 0; i < count; i++) {
+        if (table[i].is_fat) {
+            (void)vfs_umount(table[i].at);
+        }
+    }
+}
+
 uint32_t volumes_automount(void) {
     uint32_t candidates = disk_volume_count();
+    forget_fat_mounts();
     count = 0;
     /* **Every candidate but the root.** The root is the one `disk.c`
      * chose and `xfsmount` mounted, and mounting it here as well would be

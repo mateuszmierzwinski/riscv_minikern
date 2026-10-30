@@ -22,6 +22,8 @@
 #include <stddef.h>
 
 #include "core/console.h"
+#include "kernel/mem.h"
+#include "kernel/perm.h"
 #include "arch/riscv/sbi.h"
 #include "arch/riscv/timer.h"
 #include "core/errno.h"
@@ -40,10 +42,11 @@
 #define CLONE_THREAD 0x00010000u
 
 /* The largest program this will load, and the largest argument list. */
-/* Sixteen, matching `/init`'s: a Go binary with its symbol table is several
- * megabytes, and a limit that rejects a program for carrying the symbols
+/* Sixty-four. Sixteen matched `/init`'s, and the first real web service —
+ * the blog, Gin and SQLite with its templates embedded, 20 MB stripped —
+ * walked past it. A limit that rejects a program for carrying the symbols
  * that make its faults diagnosable is a limit arguing for worse debugging. */
-#define EXEC_MAX_BYTES (16u * 1024u * 1024u)
+#define EXEC_MAX_BYTES (64u * 1024u * 1024u)
 #define EXEC_MAX_ARGS 32u
 #define EXEC_MAX_PATH 128u
 
@@ -114,17 +117,48 @@ static int copy_vector_in(virt_t vector, char storage[][EXEC_MAX_PATH], const ch
  * named honestly, since the middle of a replacement is not a state anything
  * else may see (Rule 11, Naming).
  */
-/* The argument list is copied into **static** storage, not a stack frame:
+/* The argument list, copied **per call** into the heap, not a stack frame:
  * thirty-two arguments of up to 128 bytes is four kilobytes, which the
- * frame-size guard refuses. One copy is enough because an `execve` holds the
- * kernel lock from beginning to end and never sleeps. */
-static char exec_strings[EXEC_MAX_ARGS][EXEC_MAX_PATH];
-static const char *exec_argv[EXEC_MAX_ARGS];
+ * frame-size guard refuses. It was one static copy, on the reasoning that an
+ * `execve` never sleeps — but reading the program does (always, over
+ * netfs), so two services started together swapped arguments: QuokkaOS's
+ * statsd came up with qmcd's `-addr :9910`. */
+struct exec_args {
+    char strings[EXEC_MAX_ARGS][EXEC_MAX_PATH];
+    const char *argv[EXEC_MAX_ARGS];
+};
+
+static int64_t do_execve(struct trapframe *tf, struct exec_args *args);
 
 static int64_t sys_execve(struct trapframe *tf) {
+    struct exec_args *args = kzalloc(sizeof *args);
+    int64_t rc;
+    if (args == NULL) {
+        return KERR_NOMEM;
+    }
+    rc = do_execve(tf, args);
+    kfree(args); /* on success the new program's stack already holds its copy */
+    return rc;
+}
+
+static bool exec_tracing;
+
+void sys_proc_trace_exec(bool on) {
+    exec_tracing = on;
+}
+
+/* One stage of an `execve`, timed, under `minikern.exectrace`. */
+static void exec_stage(const struct uproc *me, const char *stage) {
+    if (exec_tracing) {
+        kprintf("exectrace: pid %u %s at %llu us\n", me->pid, stage,
+                (unsigned long long)(timer_ns() / 1000u));
+    }
+}
+
+static int64_t do_execve(struct trapframe *tf, struct exec_args *args) {
     char path[EXEC_MAX_PATH];
-    char (*storage)[EXEC_MAX_PATH] = exec_strings;
-    const char **argv = exec_argv;
+    char (*storage)[EXEC_MAX_PATH] = args->strings;
+    const char **argv = args->argv;
     uint32_t argc = 0;
     struct uproc *me = uspace_current();
     uint8_t *image = NULL;
@@ -156,7 +190,10 @@ static int64_t sys_execve(struct trapframe *tf) {
                     argc > 0 && argv[0] != NULL ? argv[0] : "(none)");
         }
     }
-    rc = xfsmount_read_file(path, EXEC_MAX_BYTES, &image, &size);
+    exec_stage(me, "reading");
+    rc = perm_may_exec(path);
+    rc = rc != KERR_OK ? rc : xfsmount_read_file(path, EXEC_MAX_BYTES, &image, &size);
+    exec_stage(me, "read");
     if (rc != KERR_OK) {
         /* Traced, because a failing `execve` is reported to the caller as one
          * number and the caller usually turns it into "exec failed": without
@@ -174,6 +211,7 @@ static int64_t sys_execve(struct trapframe *tf) {
      * pages next. */
     (void)sched_end_siblings(me);
     left = sched_await_siblings(me);
+    exec_stage(me, "siblings gone");
     if (left != 0) {
         /* Refused rather than risked: an `execve` that fails is something a
          * program can be told about, and memory corruption is not. */
@@ -182,6 +220,7 @@ static int64_t sys_execve(struct trapframe *tf) {
         return KERR_AGAIN;
     }
     rc = uspace_exec(me, image, size, path, argv, argc);
+    exec_stage(me, "built");
     kfree_image(image);
     if (rc != KERR_OK) {
         if (syscall_tracing_sleeps()) {
@@ -402,6 +441,16 @@ static int64_t sys_setresuid(struct trapframe *tf) {
     return 0;
 }
 
+/* Writes three ids to the three user pointers in arguments 0..2. */
+static int64_t copy_out_id_triple(struct trapframe *tf, const uint32_t ids[3]) {
+    for (uint32_t i = 0; i < 3u; i++) {
+        if (uspace_copy_out((virt_t)sysarg(tf, i), &ids[i], sizeof ids[i]) != KERR_OK) {
+            return KERR_FAULT;
+        }
+    }
+    return 0;
+}
+
 /* `getresuid(&real, &effective, &saved)`. */
 static int64_t sys_getresuid(struct trapframe *tf) {
     const struct uproc *me = uspace_current();
@@ -411,12 +460,43 @@ static int64_t sys_getresuid(struct trapframe *tf) {
         ids[1] = me->euid;
         ids[2] = me->suid;
     }
-    for (uint32_t i = 0; i < 3u; i++) {
-        if (uspace_copy_out((virt_t)sysarg(tf, i), &ids[i], sizeof ids[i]) != KERR_OK) {
-            return KERR_FAULT;
-        }
+    return copy_out_id_triple(tf, ids);
+}
+
+/* Whether an unprivileged caller may set a gid to `want`. */
+static bool gid_is_ours(const struct uproc *me, uint32_t want) {
+    return want == UID_KEEP || want == me->gid || want == me->egid || want == me->sgid;
+}
+
+/* `setresgid(real, effective, saved)`, each -1 to keep: setresuid's rule
+ * under CAP_SETGID. It was missing (ENOSYS), so a daemon could drop its
+ * uid but not its group — and kept root's group's access. */
+static int64_t sys_setresgid(struct trapframe *tf) {
+    uint32_t r = (uint32_t)sysarg(tf, 0), e = (uint32_t)sysarg(tf, 1), s = (uint32_t)sysarg(tf, 2);
+    struct uproc *me = uspace_current();
+    if (me == NULL) {
+        return KERR_SRCH;
     }
+    if (!uspace_capable(CAP_SETGID) &&
+        !(gid_is_ours(me, r) && gid_is_ours(me, e) && gid_is_ours(me, s))) {
+        return KERR_PERM;
+    }
+    me->gid = r != UID_KEEP ? r : me->gid;
+    me->egid = e != UID_KEEP ? e : me->egid;
+    me->sgid = s != UID_KEEP ? s : me->sgid;
     return 0;
+}
+
+/* `getresgid(&real, &effective, &saved)`. */
+static int64_t sys_getresgid(struct trapframe *tf) {
+    const struct uproc *me = uspace_current();
+    uint32_t ids[3] = {0, 0, 0};
+    if (me != NULL) {
+        ids[0] = me->gid;
+        ids[1] = me->egid;
+        ids[2] = me->sgid;
+    }
+    return copy_out_id_triple(tf, ids);
 }
 
 static int64_t sys_setgid(struct trapframe *tf) {
@@ -435,6 +515,7 @@ static int64_t sys_setgid(struct trapframe *tf) {
     }
     me->gid = want;
     me->egid = want;
+    me->sgid = want;
     return 0;
 }
 
@@ -951,6 +1032,8 @@ const struct syscall_entry sys_proc_table[] = {
     {146, "setuid", sys_setuid},
     {147, "setresuid", sys_setresuid},
     {148, "getresuid", sys_getresuid},
+    {149, "setresgid", sys_setresgid},
+    {150, "getresgid", sys_getresgid},
     {144, "setgid", sys_setgid},
     {159, "setgroups", sys_setgroups},
     {142, "reboot", sys_reboot},

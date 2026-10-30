@@ -80,6 +80,19 @@ void trap_handle(struct trapframe *tf);
  * enabling any particular source, so the kernel decides when it is ready to
  * be interrupted rather than discovering it was not. */
 void trap_enable_interrupts(void);
+
+/* Sleeps until an interrupt is pending, then takes it, and returns with
+ * interrupts off as they were.
+ *
+ * **`wfi` runs with interrupts OFF.** The old idiom — enable, `wfi`,
+ * disable — loses a wake: an interrupt already pending is taken at the
+ * enable, BEFORE the `wfi`, and the trap returns to the `wfi` with nothing
+ * left to wake it. For the timer that was fatal, because the handler
+ * disarms the comparator: the hart then slept with no timer at all until a
+ * stray device interrupt, and a 1 ms sleeper woke up to five seconds late.
+ * A pending interrupt that is enabled in `sie` ends `wfi` whatever
+ * `sstatus.SIE` says, so this cannot sleep through one. */
+void trap_wait_for_interrupt(void);
 void trap_disable_interrupts(void);
 
 /* Installs a handler for faults the kernel is **expecting** — a self-test
@@ -119,6 +132,23 @@ uint64_t trap_mismatched_entries(void);
  * auditing every structure here — and every argument that ends "but the lock
  * prevents that" rests on it. */
 uint32_t trap_most_harts_inside(void);
+
+/* How long a hart (by enumeration index) has spent in user mode: from each
+ * return to user mode to the trap that next brought it back. */
+uint64_t trap_user_ns(uint32_t index);
+
+/* Traps taken since boot by cause: `interrupt` picks the half of `scause`,
+ * `code` the cause within it (0 for a code past TRAP_CAUSES). */
+#define TRAP_CAUSES 16u
+uint64_t trap_cause_count(bool interrupt, uint32_t code);
+
+/* Who is told how long each stretch in user mode lasted, on the hart that
+ * ran it, as it ends — before the kernel lock is taken. NULL for nobody. */
+void trap_set_user_time_sink(void (*sink)(uint64_t ns));
+
+/* Marks the calling hart as entering user mode now — for the one way into
+ * user mode that is not a return from a trap, a thread's first start. */
+void trap_note_entering_user(void);
 
 /* How many software interrupts (cross-hart pokes) this machine has actually
  * taken as traps, which is not the same as how many were sent. */

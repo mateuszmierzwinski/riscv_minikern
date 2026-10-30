@@ -20,7 +20,8 @@ will actually hand out, and re-staged when they differ. A board result from
 an unknown binary is worse than no board result.
 
 Each case is a name, a kernel command line, and the lines that must appear.
-A case fails if any of them is missing, and the log of every case is kept
+A case fails if any of them is missing (a tuple is one line given several
+ways, and any of them will do), and the log of every case is kept
 under the output directory so a failure can be read rather than re-run.
 """
 import argparse
@@ -115,7 +116,10 @@ CASES = [
      260, RACESTRESS),
     ("§0 control — the corruption must come back without the fix",
      "minikern.disk=sd minikern.env=STRESS_ROUNDS=2500 minikern.keepadvice",
-     ["stress: FAILED"],
+     # The corruption is caught by whichever looks first: the program's own
+     # check, or the Go garbage collector finding a freed object still in
+     # use (2026-10-30, round 1). Either is the control failing.
+     [("stress: FAILED", "fatal error: found pointer to free object")],
      260, RACESTRESS),
     # **§3: a b-tree extent fork and a node directory.** Both were refused
     # outright — `inode 96 has a btree fork` — which meant the root
@@ -561,8 +565,9 @@ CASES = [
       # And the rings, proved in loopback rather than against the network:
       # a quiet switch port and a broken receive ring are indistinguishable
       # from outside, and the first version of this test could not tell
-      # them apart. The frame sent is the frame that must arrive.
-      "dwmac: frame of 64 bytes, 6c:cf:39:00:b6:89 -> ff:ff:ff:ff:ff:ff type 0806",
+      # them apart. The frame sent is the frame that must arrive: 60 bytes,
+      # because the MAC strips the 4-byte CRC on receive (`CST`, `ACS`).
+      "dwmac: frame of 60 bytes, 6c:cf:39:00:b6:89 -> ff:ff:ff:ff:ff:ff type 0806",
       "dwmac: 1 sent, 1 received, 0 dropped"],
      120, None, False),
 
@@ -739,6 +744,12 @@ def built_go(what):
     return out
 
 
+def seen(line, text):
+    """Whether `line` — or, for a tuple, any one of its forms — is in `text`."""
+    forms = line if isinstance(line, tuple) else (line,)
+    return any(form in text for form in forms)
+
+
 def run_case(name, bootargs, wanted, seconds, out_dir, program=None, needs_image=False):
     log_path = os.path.join(out_dir, name.split(" ")[0].replace("/", "_").replace("§", "s")
                             + ".log")
@@ -772,7 +783,7 @@ def run_case(name, bootargs, wanted, seconds, out_dir, program=None, needs_image
         command += ["-i", img]
     subprocess.run(command, check=False)
     text = open(log_path, "rb").read().decode("utf-8", "replace") if os.path.exists(log_path) else ""
-    missing = [line for line in wanted if line not in text]
+    missing = [line for line in wanted if not seen(line, text)]
     return missing, log_path
 
 

@@ -101,6 +101,12 @@ uint32_t xfs_fork_bytes(const struct xfs *fs, const uint8_t *di) {
     return forkoff == 0 ? area : forkoff * 8u;
 }
 
+uint32_t xfs_data_extents_cap(const struct xfs *fs, const struct xfs_inode *ip) {
+    uint32_t area = fs->inodesize - fs->dinode_size;
+    uint32_t avail = ip->forkoff == 0 ? area : (uint32_t)ip->forkoff * 8u;
+    return avail > XFS_FORK_MAX ? XFS_FORK_MAX / XFS_EXTENT_BYTES : UINT32_MAX;
+}
+
 /* Everything that must be true of an inode before its contents are used:
  * it says it is an inode, in the layout we read, it knows its own number,
  * and its checksum and UUID tie it to this filesystem. */

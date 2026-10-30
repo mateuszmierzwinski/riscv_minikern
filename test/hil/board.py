@@ -144,6 +144,23 @@ def power(command):
     time.sleep(1.0)
 
 
+def stop_autoboot(port, log):
+    """Leaves the autoboot countdown at the U-Boot prompt, or returns False.
+
+    **The countdown is a boot menu, and Enter selects its default entry.**
+    Enter used to work only because the default was an EFI entry that fails
+    and drops to the prompt; once the SD card's minikern entry became the
+    default (`bootmenu_0`, docs/quick_run.md), Enter booted it. ESC is the
+    menu's "quit to the console". Sent up to three times, because the first
+    one can land while the menu is still drawing and only stop the timer."""
+    for _ in range(3):
+        port.write(b"\x1b")
+        port.flush()
+        if read_until(port, PROMPT, 4, log):
+            return True
+    return False
+
+
 def send(port, line):
     """Sends one command, terminated with a lone carriage return.
 
@@ -276,9 +293,30 @@ def serve_beside_the_image(path):
     return name, os.path.getsize(target)
 
 
+def parse_sends(specs):
+    """`pattern::bytes` pairs for `--send`, the bytes with Python escapes
+    (`\\r`, `\\x03`) decoded — how a test types at the running kernel."""
+    out = []
+    for spec in specs or []:
+        pattern, sep, text = spec.partition("::")
+        if not sep or not pattern:
+            raise SystemExit(f"hil: --send wants PATTERN::BYTES, got {spec!r}")
+        out.append((pattern.encode(), text.encode().decode("unicode_escape").encode("latin-1")))
+    return out
+
+
+def type_when_seen(port, log, sends, typed):
+    """Types each pending send once its pattern has appeared on the console,
+    in order: a send waits for the ones before it."""
+    while typed[0] < len(sends) and sends[typed[0]][0] in log:
+        port.write(sends[typed[0]][1])
+        typed[0] += 1
+
+
 def boot(bootargs, capture_seconds, out_path, wait_seconds=0.0, program=None, fs_image=None,
-         fifo_path=None):
-    """Power-cycles, loads and boots, and captures the console."""
+         fifo_path=None, sends=None):
+    """Power-cycles, loads and boots, and captures the console; with
+    `sends`, types at the console when their patterns appear."""
     log = bytearray()
     steps_ok = True
     held = take_the_board(wait_seconds)
@@ -291,8 +329,7 @@ def boot(bootargs, capture_seconds, out_path, wait_seconds=0.0, program=None, fs
         if not read_until(port, b"Hit any key to stop autoboot", 40, log):
             print("hil: never saw the autoboot prompt", file=sys.stderr)
             steps_ok = False
-        send(port, "")
-        if not read_until(port, PROMPT, 10, log):
+        if not stop_autoboot(port, log):
             print("hil: never reached a U-Boot prompt", file=sys.stderr)
             steps_ok = False
         steps = [("dhcp", 30), (f"wget {LOAD_AT} {IMAGE_URL}", 30)]
@@ -332,6 +369,7 @@ def boot(bootargs, capture_seconds, out_path, wait_seconds=0.0, program=None, fs
             # file even though the interesting part comes after it.
             live.write(bytes(log))
             live.flush()
+            booted_at, typed = len(log), [0]
             while time.time() < deadline:
                 chunk = port.read(4096)
                 if chunk:
@@ -339,6 +377,8 @@ def boot(bootargs, capture_seconds, out_path, wait_seconds=0.0, program=None, fs
                     live.write(chunk)
                     live.flush()
                     write_tap(tap, chunk)
+                    if sends:
+                        type_when_seen(port, log[booted_at:], sends, typed)
         if tap is not None:
             os.close(tap)
     held.close()
@@ -365,6 +405,9 @@ def main():
                     help="boot whatever is already served, without building")
     ap.add_argument("-w", "--wait", type=float, default=0.0,
                     help="seconds to wait for another run to release the board")
+    ap.add_argument("--send", action="append", default=None, metavar="PATTERN::BYTES",
+                    help="once PATTERN appears on the console after booti, type BYTES "
+                         "(Python escapes); repeatable, typed in order")
     args = ap.parse_args()
     if args.stage:
         digest = image.stage(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -406,7 +449,8 @@ def main():
         ranges_overlap(spans)
         how = "sent whole" if fs[2] is None else f"expands from {fs[2]} bytes"
         print(f"hil: {fs[0]} is {fs[1]} bytes at {IMAGE_AT:#x}, {how}")
-    ok = boot(bootargs, args.seconds, args.out, args.wait, program, fs, args.fifo)
+    ok = boot(bootargs, args.seconds, args.out, args.wait, program, fs, args.fifo,
+              parse_sends(args.send))
     if not args.quiet:
         text = open(args.out, "rb").read().decode("utf-8", "replace")
         start = text.find("Starting kernel")

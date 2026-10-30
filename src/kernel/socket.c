@@ -93,9 +93,20 @@ int socket_create(int domain, int type, int protocol, struct file **out) {
     return rc;
 }
 
+/* Wakes both kinds of waiter: a thread blocked in this socket's own call,
+ * and **every `epoll_pwait`**, which sleeps on the poller key.
+ *
+ * The second was missing. A pipe or an eventfd woke the key; a socket only
+ * bumped the readiness count, which a sleeping poller reads when it wakes —
+ * at its deadline. A Go runtime with no timer pending asks for "for ever",
+ * which this kernel cuts to 10 ms, so a small daemon looked fine; one with
+ * a timer a second away (Gin's, the blog's cleanups) slept the whole second
+ * before seeing a connection. Requests took 0.99, 1.99, 2.99 s — the
+ * deadline, every time — and once 21 s. */
 void socket_wake(struct sock *s) {
     (void)sched_wake_on(s, SCHED_MAX_THREADS);
     file_readiness_changed(s->file);
+    (void)sched_futex_wake(SCHED_POLLER_KEY, 64u);
 }
 
 struct netif *socket_netif(void) {

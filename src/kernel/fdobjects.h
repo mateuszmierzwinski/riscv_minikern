@@ -99,6 +99,25 @@ int fdobjects_seek(int32_t fd, int64_t offset, uint32_t whence, uint64_t *result
  * the limit. */
 const char *fdobjects_path_of(int32_t fd);
 
+/* `fsync` of a descriptor: its file's filesystem, by path. A file opened
+ * for writing and a directory both count — SQLite syncs the database, its
+ * journal and the directory the journal was deleted from — and only a file,
+ * a directory or a read snapshot can be synced: anything else is
+ * KERR_INVAL, as on Linux. */
+int fdobjects_sync(int32_t fd);
+
+/* A descriptor opened for writing: the identity its record locks are kept
+ * under (and its `st_ino`), fixed at open so that a silly-rename after an
+ * unlink does not orphan the locks. KERR_BADF for any other descriptor. */
+int fdobjects_identity_of(int32_t fd, uint64_t *identity);
+
+/* `fstat` for a descriptor opened for writing: the file's real mode, size
+ * and link count, and its identity as the inode. SQLite reads the size to
+ * know whether a database is empty, and compares the inode with `stat`'s to
+ * know whether the file moved. KERR_BADF for any other descriptor. */
+int fdobjects_stat_of(int32_t fd, uint32_t *mode, uint64_t *size, uint32_t *nlink,
+                      uint64_t *ino);
+
 int64_t fdobjects_seek_for_test(int32_t fd, int64_t offset, uint32_t whence);
 int32_t fdobjects_read_for_test(int32_t fd, void *buf, uint32_t n);
 
@@ -145,5 +164,16 @@ int fdobjects_epoll_collect(int32_t epfd, struct user_epoll_event *out, uint32_t
 /* Whether anything registered in this instance is ready, without collecting
  * — for a waiter deciding whether to sleep. */
 bool fdobjects_epoll_has_events(int32_t epfd);
+
+/* The path a directory descriptor was opened at, or NULL when f is not
+ * one: what a *at call resolves a relative path against. */
+const char *fdobjects_dir_path(const struct file *f);
+
+/* `unlink` of a regular file: removed at once, or — when a writer still
+ * has it open — moved to a hidden name and removed at the last close. */
+int fdobjects_unlink(const char *path);
+
+/* Whether a directory entry is such a hidden, removed-while-open file. */
+bool fdobjects_is_orphan_name(const char *name, uint32_t len);
 
 #endif

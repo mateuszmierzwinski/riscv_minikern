@@ -144,9 +144,9 @@ static int mark_run(struct xfs *fs, struct xfs_inode *bmp, uint64_t start, uint6
  * real allocator does not have to do this — it indexes free runs by size
  * per bitmap block — but first fit over the bitmap gives the same answer,
  * and an allocator that is correct and slow is a better starting point than
- * one that is fast and consults an index this does not yet maintain.
- * Maintaining the summary without using it would be the worst of the three:
- * work whose correctness nothing checks. */
+ * one that is fast and consults an index. The summary IS maintained now
+ * (xfs_rtsummary.c), because `xfs_repair` checks it; using it to allocate
+ * is the next step, not a correctness one. */
 static int find_run(struct xfs *fs, struct xfs_inode *bmp, uint64_t count, uint64_t *start) {
     uint64_t run = 0;
     for (uint64_t n = 0; n < fs->rextents; n++) {
@@ -178,7 +178,8 @@ int xfs_rt_alloc(struct xfs *fs, uint64_t count, uint64_t *start) {
         return rc;
     }
     rc = find_run(fs, bmp, count, start);
-    return rc != KERR_OK ? rc : mark_run(fs, bmp, *start, count, false);
+    rc = rc != KERR_OK ? rc : mark_run(fs, bmp, *start, count, false);
+    return rc != KERR_OK ? rc : xfs_rt_summary_rebuild(fs, bmp);
 }
 
 int xfs_rt_release(struct xfs *fs, uint64_t start, uint64_t count) {
@@ -191,5 +192,6 @@ int xfs_rt_release(struct xfs *fs, uint64_t start, uint64_t count) {
         return KERR_ROFS;
     }
     rc = open_bitmap(fs, &bmp);
-    return rc != KERR_OK ? rc : mark_run(fs, bmp, start, count, true);
+    rc = rc != KERR_OK ? rc : mark_run(fs, bmp, start, count, true);
+    return rc != KERR_OK ? rc : xfs_rt_summary_rebuild(fs, bmp);
 }

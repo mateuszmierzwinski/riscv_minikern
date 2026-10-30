@@ -54,6 +54,34 @@ void xfs_put_be64(uint8_t *p, uint64_t v) {
     xfs_put_be32(p + 4, (uint32_t)v);
 }
 
+/* Whether this inode keeps bigtime stamps: a v3 inode with
+ * `XFS_DIFLAG2_BIGTIME`, which `mkfs.xfs` sets by default now. Its eight
+ * bytes are then one count of nanoseconds since 1901, not seconds and
+ * nanoseconds — writing seconds into the top half stored a nonsense time
+ * on every such inode this kernel touched. */
+static bool bigtime(const uint8_t *di) {
+    return di[XFS_DI_VERSION] == XFS_DI_VERSION_3 &&
+           (xfs_be64(di + XFS_DI_FLAGS2) & XFS_DIFLAG2_BIGTIME) != 0;
+}
+
+void xfs_put_time(uint8_t *di, uint32_t off, uint64_t secs) {
+    if (bigtime(di)) {
+        xfs_put_be64(di + off, (secs + XFS_BIGTIME_EPOCH_OFFSET) * 1000000000ull);
+        return;
+    }
+    xfs_put_be32(di + off, (uint32_t)secs);
+    xfs_put_be32(di + off + 4u, 0);
+}
+
+uint64_t xfs_get_time(const uint8_t *di, uint32_t off) {
+    uint64_t v;
+    if (bigtime(di)) {
+        v = xfs_be64(di + off) / 1000000000ull;
+        return v > XFS_BIGTIME_EPOCH_OFFSET ? v - XFS_BIGTIME_EPOCH_OFFSET : 0u;
+    }
+    return xfs_be32(di + off);
+}
+
 static void put_le32(uint8_t *p, uint32_t v) {
     for (uint32_t i = 0; i < 4; i++) {
         p[i] = (uint8_t)(v >> (8u * i));
@@ -239,10 +267,10 @@ static int write_new_inode(struct xfs *fs, uint64_t ino, uint16_t mode, uint64_t
     if (fs->v5) {
         xfs_put_be64(di + XFS_DI_INO, ino);
         copy(di + XFS_DI_UUID, fs->uuid, 16);
-        xfs_put_be32(di + XFS_DI_CRTIME, (uint32_t)now_s);
+        xfs_put_time(di, XFS_DI_CRTIME, now_s);
     }
     for (uint32_t t = 0; t < 3; t++) {
-        xfs_put_be32(di + XFS_DI_ATIME + t * 8u, (uint32_t)now_s);
+        xfs_put_time(di, XFS_DI_ATIME + t * 8u, now_s);
     }
     xfs_reseal(fs, di, fs->inodesize, XFS_DI_CRC);
     bcache_dirty(b);
@@ -321,6 +349,7 @@ int xfs_dir_sf_add(struct xfs *fs, const struct xfs_inode *dir, const char *name
     count = sf[XFS_DIR_SF_COUNT_OFF];
     used = sf_used(sf, count);
     room = di[XFS_DI_FORKOFF] != 0 ? di[XFS_DI_FORKOFF] * 8u : fs->inodesize - fs->dinode_size;
+    room = room > XFS_FORK_MAX ? XFS_FORK_MAX : room; /* past the reader's cache it converts */
     if (sf[XFS_DIR_SF_I8COUNT_OFF] != 0 || ino > 0xffffffffull) {
         rc = KERR_NOTSUP; /* eight-byte inumbers in a directory: a different shape */
     } else if (sf_has_name(sf, count, name, namelen)) {
@@ -340,8 +369,8 @@ int xfs_dir_sf_add(struct xfs *fs, const struct xfs_inode *dir, const char *name
     xfs_put_be32(e + 4 + namelen, (uint32_t)ino);
     sf[XFS_DIR_SF_COUNT_OFF] = (uint8_t)(count + 1u);
     xfs_put_be64(di + XFS_DI_SIZE, used + sf_entry_bytes(namelen));
-    xfs_put_be32(di + XFS_DI_MTIME, (uint32_t)now_s);
-    xfs_put_be32(di + XFS_DI_CTIME, (uint32_t)now_s);
+    xfs_put_time(di, XFS_DI_MTIME, now_s);
+    xfs_put_time(di, XFS_DI_CTIME, now_s);
     xfs_reseal(fs, di, fs->inodesize, XFS_DI_CRC);
     bcache_dirty(b);
     bcache_put(fs->cache, b);
@@ -500,8 +529,8 @@ static int make_it_a_directory(struct xfs *fs, uint64_t ino, uint64_t parent, ui
     /* The size is the header alone: six bytes, and no entries yet. */
     xfs_put_be64(di + XFS_DI_SIZE, XFS_DIR_SF_PARENT + 4u);
     xfs_put_be32(di + XFS_DI_NLINK, 2u);
-    xfs_put_be32(di + XFS_DI_MTIME, (uint32_t)now_s);
-    xfs_put_be32(di + XFS_DI_CTIME, (uint32_t)now_s);
+    xfs_put_time(di, XFS_DI_MTIME, now_s);
+    xfs_put_time(di, XFS_DI_CTIME, now_s);
     xfs_reseal(fs, di, fs->inodesize, XFS_DI_CRC);
     bcache_dirty(b);
     bcache_put(fs->cache, b);

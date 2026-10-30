@@ -50,6 +50,8 @@
 #define MAC_CONFIG_FES   (1u << 14) /* 100 Mbit when PS is set */
 #define MAC_CONFIG_PS    (1u << 15) /* port select: MII/RMII rather than GMII */
 #define MAC_CONFIG_LM    (1u << 12) /* loopback: the MAC feeds itself */
+#define MAC_CONFIG_ACS   (1u << 20) /* strip pad and CRC from length-field frames */
+#define MAC_CONFIG_CST   (1u << 21) /* strip CRC from type-field (Ethernet II) frames */
 
 #define MDIO_BUSY  (1u << 0)
 #define MDIO_READ  (3u << 2)
@@ -87,6 +89,10 @@
 #define DMA_CH0_TXRINGLEN 0x112cu
 #define DMA_CH0_RXRINGLEN 0x1130u
 #define DMA_CH0_STATUS    0x1160u
+#define DMA_DEBUG_STATUS0 0x100cu /* bits 11:8: the receive DMA's state */
+#define DMA_CH0_CUR_RXDESC 0x114cu
+#define MTL_RXQ0_MISSED   0x0d34u /* overflow and missed-packet counts */
+#define MTL_RXQ0_DEBUG    0x0d38u /* bits 29:16 packets in the queue, 5:4 fill level */
 /* DWMAC4 per-channel interrupt enable, and the bits of it this driver wants.
  * `NIE` is the master enable for the "normal" group — without it the
  * individual bits are armed and nothing is ever raised, which is the same
@@ -97,6 +103,7 @@
 /* Write-one-to-clear, like the SD controller's `RINTSTS`: a handler that does
  * not acknowledge at the device leaves the PLIC re-raising for ever. */
 #define DMA_STATUS_RI     (1u << 6)
+#define DMA_STATUS_RBU    (1u << 7)  /* receive buffer unavailable: the DMA suspended */
 #define DMA_STATUS_NIS    (1u << 15)
 
 #define DMA_BUS_MODE_SWR  (1u << 0)
@@ -147,7 +154,7 @@
  * ahead. 2 KiB holds any Ethernet frame this link will carry and is what
  * `RBSZ` is set to — a buffer smaller than a frame makes the controller
  * split it across descriptors, which is a feature nobody here needs. */
-#define RING 8u
+#define RING 64u /* descriptors each way: 8 overflowed under a 12 MB/s netfs burst and the hardware drops silently; a 4 KiB page holds 256 */
 #define BUFFER 2048u
 
 /* The one controller this driver drives, and what it needs to remember.
@@ -193,6 +200,10 @@ static struct {
     uint64_t sent;
     uint64_t received;
     uint64_t dropped;
+    uint64_t rx_resumed; /* receive DMA found suspended (RBU) and restarted */
+    uint32_t polling;    /* callers inside dwmac_poll now */
+    uint64_t overlaps;   /* entries while another caller was already inside */
+    uint64_t tx_full; /* frames given up because the transmit ring stayed full */
 } nic;
 
 static uint32_t rd(uint32_t off) {
@@ -235,6 +246,68 @@ static int phy_write(uint32_t reg, uint16_t value) {
     return mdio(nic.phy, reg, MDIO_WRITE, &value);
 }
 
+/* A Motorcomm PHY's extended register: its address through 0x1e, its value
+ * through 0x1f. */
+static uint16_t phy_read_ext(uint16_t reg);
+
+/* Rewrites the bits `mask` of an extended register to `value`. */
+static int phy_modify_ext(uint16_t reg, uint16_t mask, uint16_t value) {
+    uint16_t now = phy_read_ext(reg);
+    int rc = phy_write(0x1eu, reg);
+    return rc != KERR_OK ? rc : phy_write(0x1fu, (uint16_t)((now & ~mask) | (value & mask)));
+}
+
+static uint16_t phy_read_ext(uint16_t reg) {
+    uint16_t v = 0xffffu;
+    if (phy_write(0x1eu, reg) == KERR_OK) {
+        (void)phy_read(0x1fu, &v);
+    }
+    return v;
+}
+
+static void dump_phy(void) {
+    static const uint16_t ext[] = {0xa000u, 0xa001u, 0xa003u, 0xa010u, 0xa012u};
+    uint16_t v[3] = {0};
+    (void)phy_read(0u, &v[0]);
+    (void)phy_read(1u, &v[1]);
+    (void)phy_read(0x11u, &v[2]);
+    kprintf("gmacdump: phy bmcr %04x bmsr %04x status %04x\n", v[0], v[1], v[2]);
+    for (uint32_t i = 0; i < sizeof ext / sizeof ext[0]; i++) {
+        kprintf("gmacdump: phy ext %04x = %04x\n", ext[i], phy_read_ext(ext[i]));
+    }
+}
+
+/* syscrg's GMAC1 clock registers, by index. */
+static void dump_gmac1_clocks(void) {
+    volatile uint32_t *regs = crg_regs(CRG_SYS);
+    if (regs == NULL) {
+        return;
+    }
+    for (uint32_t i = 95u; i <= 112u; i++) {
+        kprintf("gmacdump: syscrg[%u] = %08x\n", i, regs[crg_clock_offset(i) / 4u]);
+    }
+}
+
+/* sys_syscon around the GMAC1 interface select (0x90). */
+static void dump_syscon(void) {
+    volatile uint32_t *syscon = mmu_map_device(0x13030000u, 0x1000u);
+    if (syscon == NULL) {
+        return;
+    }
+    for (uint32_t off = 0x80u; off <= 0x9cu; off += 4u) {
+        kprintf("gmacdump: sys_syscon+%02x = %08x\n", off, syscon[off / 4u]);
+    }
+}
+
+void dwmac_dump_bringup(void) {
+    if (!nic.present) {
+        return;
+    }
+    dump_phy();
+    dump_gmac1_clocks();
+    dump_syscon();
+}
+
 /* The lowest MDIO address that answers with an identifier.
  *
  * Searched rather than taken from the tree's `phy-handle`, because the
@@ -256,6 +329,97 @@ static int find_phy(void) {
         return KERR_OK;
     }
     return KERR_NODEV;
+}
+
+#define YT_CHIP_CONFIG 0xa001u
+#define YT_RXC_DLY_EN (1u << 8)    /* a fixed ~2 ns receive-clock delay */
+#define YT_RGMII_CONFIG1 0xa003u
+#define YT_RX_DELAY_SHIFT 10u      /* bits 13:10, 150 ps a step */
+#define YT_FE_TX_DELAY_MASK 0x000fu /* bits 3:0, 10/100 transmit, 150 ps a step */
+#define YT_PAD_DRIVE 0xa010u
+#define YT_RX_CLK_DRIVE_SHIFT 13u  /* bits 15:13 */
+#define YT_DELAY_STEP_PS 150u
+#define YT_FIXED_DELAY_PS 1900u
+
+/* A device-tree number from the PHY node, or `fallback`. */
+static uint32_t phy_prop(const struct fdt *fdt, const char *path, const char *name,
+                         uint32_t fallback) {
+    struct fdt_prop p;
+    uint64_t v = 0;
+    if (path == NULL || fdt_get_prop(fdt, path, name, &p) != KERR_OK ||
+        fdt_prop_cells(&p, 0, 1, &v) != KERR_OK) {
+        return fallback;
+    }
+    return (uint32_t)v;
+}
+
+/* The node the controller's `phy-handle` names, into `out`; NULL if none. */
+static const char *phy_node(const struct fdt *fdt, const char *ctrl, char *out, uint32_t cap) {
+    struct fdt_prop p;
+    uint64_t handle = 0;
+    if (fdt_get_prop(fdt, ctrl, "phy-handle", &p) != KERR_OK ||
+        fdt_prop_cells(&p, 0, 1, &handle) != KERR_OK ||
+        fdt_find_phandle(fdt, (uint32_t)handle, out, cap) != KERR_OK) {
+        return NULL;
+    }
+    return out;
+}
+
+/* The YT8531's drive-strength code for a current, from its 1.8 V table:
+ * the largest step not above `microamp`. */
+static uint16_t yt_drive_code(uint32_t microamp) {
+    static const uint16_t table[8] = {1200, 2100, 2700, 2910, 3110, 3600, 3970, 4350};
+    uint16_t code = 0;
+    for (uint16_t i = 0; i < 8u; i++) {
+        code = table[i] <= microamp ? i : code;
+    }
+    return code;
+}
+
+/* The receive-clock delay the tree asks for (`rx-internal-delay-ps`):
+ * under 1.9 ns it is the fine delay alone, otherwise the fixed 2 ns path
+ * plus the rest in fine steps. */
+static int yt_set_rx_delay(uint32_t ps) {
+    bool fixed = ps >= YT_FIXED_DELAY_PS;
+    uint16_t steps = (uint16_t)(((fixed ? ps - YT_FIXED_DELAY_PS : ps) + YT_DELAY_STEP_PS / 2u) /
+                                YT_DELAY_STEP_PS);
+    int rc = phy_modify_ext(YT_CHIP_CONFIG, YT_RXC_DLY_EN, fixed ? YT_RXC_DLY_EN : 0);
+    if (steps > 0xfu) {
+        steps = 0xfu;
+    }
+    return rc != KERR_OK ? rc
+                         : phy_modify_ext(YT_RGMII_CONFIG1, (uint16_t)(0xfu << YT_RX_DELAY_SHIFT),
+                                          (uint16_t)(steps << YT_RX_DELAY_SHIFT));
+}
+
+/* **The PHY's RGMII timing, from the tree — what U-Boot used to do for us.**
+ *
+ * Out of reset the YT8531 adds a fixed ~2 ns to the receive clock; this
+ * board's GMAC1 wiring wants 300 ps (`rx-internal-delay-ps`). A netboot
+ * never noticed, because U-Boot had programmed the PHY before the kernel
+ * ran; booting from the SD card with U-Boot's network untouched, the
+ * controller received **nothing** — 3 DHCP requests sent, 0 frames in,
+ * the receive DMA idle with every buffer free. Measured warm against cold
+ * (`minikern.gmacdump`): 0xa001 8020/8120, 0xa003 08f0/00f1, 0xa010
+ * cbff/6bff. The gigabit transmit delay is left at its reset value, as
+ * U-Boot leaves it. Applied before the PHY's reset, which keeps them. */
+static void phy_apply_tree_timing(const struct fdt *fdt, const char *ctrl) {
+    char path[128];
+    const char *node = phy_node(fdt, ctrl, path, sizeof path);
+    if (node == NULL || phy_prop(fdt, node, "rx-internal-delay-ps", ~0u) == ~0u) {
+        return; /* nothing asked for: the PHY keeps whatever it has */
+    }
+    (void)yt_set_rx_delay(phy_prop(fdt, node, "rx-internal-delay-ps", 0));
+    (void)phy_modify_ext(YT_RGMII_CONFIG1, YT_FE_TX_DELAY_MASK,
+                         (uint16_t)(phy_prop(fdt, node, "tx-internal-delay-ps", 0) /
+                                    YT_DELAY_STEP_PS));
+    (void)phy_modify_ext(YT_PAD_DRIVE, (uint16_t)(0x7u << YT_RX_CLK_DRIVE_SHIFT),
+                         (uint16_t)(yt_drive_code(phy_prop(fdt, node,
+                                                           "motorcomm,rx-clk-drv-microamp", 0))
+                                    << YT_RX_CLK_DRIVE_SHIFT));
+    kprintf("dwmac: PHY timing from the tree: rx delay %u ps, tx delay %u ps\n",
+            phy_prop(fdt, node, "rx-internal-delay-ps", 0),
+            phy_prop(fdt, node, "tx-internal-delay-ps", 0));
 }
 
 /* Resets the PHY and lets it negotiate.
@@ -330,7 +494,12 @@ static int wait_for_link(void) {
  * `PS` and `FES` together name the speed: a gigabit link clears `PS`
  * (GMII), while 10 and 100 set it and are told apart by `FES`. Getting this
  * wrong does not fail loudly — the MAC runs at a rate the PHY is not using
- * and every frame is lost. */
+ * and every frame is lost.
+ *
+ * **The CRC is stripped** (`CST`, `ACS`). Left on, a received length counts
+ * the 4-byte FCS, so a full-size frame reads as 1518 bytes and the stack
+ * drops it as malformed: small replies worked and every bulk TCP transfer
+ * stalled, which is how netfs found it. */
 static void configure_mac(void) {
     uint32_t cfg = rd(MAC_CONFIG);
     cfg &= ~(MAC_CONFIG_PS | MAC_CONFIG_FES | MAC_CONFIG_DM);
@@ -339,6 +508,7 @@ static void configure_mac(void) {
         cfg |= nic.mbit == 100u ? MAC_CONFIG_FES : 0u;
     }
     cfg |= nic.full_duplex ? MAC_CONFIG_DM : 0u;
+    cfg |= MAC_CONFIG_CST | MAC_CONFIG_ACS;
     wr(MAC_CONFIG, cfg);
 }
 
@@ -536,6 +706,23 @@ static int rings_up(void) {
     return KERR_OK;
 }
 
+/* How long a full ring is waited on before a frame is given up: eight
+ * full-size frames leave in under 100 us at a gigabit, so this is several
+ * rings' worth. A frame dropped here costs the sender a retransmit timeout,
+ * which is a second, not microseconds. */
+#define TX_WAIT_SPINS 200000u
+
+/* Whether the descriptor at d is the driver's (the controller has sent it),
+ * waiting a bounded while for it to become so. */
+static bool slot_frees(volatile uint32_t *d) {
+    for (uint32_t i = 0; i < TX_WAIT_SPINS; i++) {
+        if ((d[3] & DESC_OWN) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static int dwmac_send(void *self, const uint8_t *frame, uint32_t len) {
     volatile uint32_t *d;
     uint8_t *buf;
@@ -544,7 +731,8 @@ static int dwmac_send(void *self, const uint8_t *frame, uint32_t len) {
         return KERR_INVAL;
     }
     d = nic.txd + nic.tx_next * 4u;
-    if ((d[3] & DESC_OWN) != 0) {
+    if (!slot_frees(d)) {
+        nic.tx_full++;
         return KERR_AGAIN; /* the controller still has this one */
     }
     buf = nic.txb + nic.tx_next * BUFFER;
@@ -656,11 +844,49 @@ uint32_t dwmac_handle_interrupt(void) {
     return dwmac_poll();
 }
 
+/* Restarts a receive DMA that suspended for want of a descriptor.
+ *
+ * **It suspends with the ring full of free descriptors.** The DMA uses
+ * those before the tail, and the tail is written just past the descriptor
+ * the driver last handed back — so when the driver has caught up entirely,
+ * the tail lands exactly where the DMA is waiting, current equals tail,
+ * and it reads that as none available (measured: status RBU, state 4,
+ * current = tail = slot 22, 63 of 64 owned by the controller, 28 frames
+ * overflowed in the queue). Nothing more arrives, so nothing makes the
+ * driver write the tail again: the board stopped receiving for good, 1 boot
+ * in 8. Linux gets out of it because the RBU interrupt runs its refill;
+ * here the poll checks for it. The tail goes one slot behind the driver,
+ * off the DMA's position, and writing it resumes the DMA. */
+static void resume_if_suspended(void) {
+    if ((rd(DMA_CH0_STATUS) & DMA_STATUS_RBU) == 0) {
+        return;
+    }
+    wr(DMA_CH0_STATUS, DMA_STATUS_RBU); /* write-one-to-clear */
+    wr(DMA_CH0_RXTAIL, (uint32_t)(nic.rxd_phys + ((nic.rx_next + RING - 1u) % RING) * 16u));
+    nic.rx_resumed++;
+}
+
+static uint32_t poll_ring(void);
+
+/* The ring and the stack behind it are one caller's at a time. Counted, so
+ * a second caller — another hart's beat while the boot hart polls without
+ * the kernel lock — shows up as a number rather than as a corrupt stream. */
 uint32_t dwmac_poll(void) {
-    uint32_t delivered = 0;
+    uint32_t delivered;
     if (!nic.present) {
         return 0;
     }
+    if (__atomic_fetch_add(&nic.polling, 1u, __ATOMIC_ACQ_REL) != 0) {
+        nic.overlaps++;
+    }
+    delivered = poll_ring();
+    __atomic_fetch_sub(&nic.polling, 1u, __ATOMIC_ACQ_REL);
+    return delivered;
+}
+
+static uint32_t poll_ring(void) {
+    uint32_t delivered = 0;
+    resume_if_suspended();
     for (uint32_t n = 0; n < RING; n++) {
         volatile uint32_t *d = nic.rxd + nic.rx_next * 4u;
         uint32_t status = d[3];
@@ -692,6 +918,24 @@ uint32_t dwmac_poll(void) {
         wr(DMA_CH0_RXTAIL, (uint32_t)(nic.rxd_phys + nic.rx_next * 16u));
     }
     return delivered;
+}
+
+void dwmac_report(void) {
+    uint32_t owned = 0;
+    if (!nic.present) {
+        return;
+    }
+    for (uint32_t i = 0; i < RING; i++) {
+        owned += (nic.rxd[i * 4u + 3u] & DESC_OWN) != 0 ? 1u : 0u;
+    }
+    kprintf("dwmac: rx dma status %08x (RBU bit 7, RPS bit 8, FBE bit 12), rx state %x, "
+            "current %08x tail %08x, driver at %u, %u of %u owned by the controller; "
+            "%llu suspensions resumed, %llu overlapping polls\n",
+            rd(DMA_CH0_STATUS), (rd(DMA_DEBUG_STATUS0) >> 8) & 0xfu, rd(DMA_CH0_CUR_RXDESC),
+            rd(DMA_CH0_RXTAIL), nic.rx_next, owned, RING, (unsigned long long)nic.rx_resumed,
+            (unsigned long long)nic.overlaps);
+    kprintf("dwmac: rx queue missed/overflow %08x, debug %08x\n", rd(MTL_RXQ0_MISSED),
+            rd(MTL_RXQ0_DEBUG));
 }
 
 /* Loops the MAC back on itself, so a frame sent is a frame received.
@@ -735,7 +979,7 @@ uint32_t dwmac_last_tx_status(void) {
 void dwmac_counters(uint64_t *sent, uint64_t *received, uint64_t *dropped) {
     *sent = nic.sent;
     *received = nic.received;
-    *dropped = nic.dropped;
+    *dropped = nic.dropped + nic.tx_full;
 }
 
 /* ── bringing one up ─────────────────────────────────────────────────── */
@@ -863,6 +1107,7 @@ int dwmac_init(const struct fdt *fdt, const struct netdev_port **port) {
             kprintf("dwmac: no PHY answered\n");
             continue;
         }
+        phy_apply_tree_timing(fdt, CONTROLLERS[i]);
         if (phy_reset() != KERR_OK) {
             kprintf("dwmac: the PHY would not come out of reset\n");
             continue;

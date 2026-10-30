@@ -236,6 +236,8 @@
 #define XFS_DIFLAG_REALTIME 0x0001u
 
 #define XFS_DIFLAG2_REFLINK 0x02u /* this inode's blocks may be shared with another's */
+#define XFS_DIFLAG2_BIGTIME 0x08u /* timestamps are nanoseconds since 1901 */
+#define XFS_BIGTIME_EPOCH_OFFSET 2147483648ull /* 2^31 s: bigtime's zero is 1901 */
 #define XFS_DIFLAG2_NREXT64 0x10u /* this inode uses the 64-bit extent layout */
 
 /* di_format */
@@ -547,6 +549,9 @@
 #define XFS_SB_RBMINO   64u  /* u64: the realtime bitmap's inode */
 #define XFS_SB_RSUMINO  72u  /* u64: the realtime summary's inode */
 #define XFS_SB_REXTSIZE 80u  /* u32: blocks per realtime extent */
+#define XFS_SB_RBMBLOCKS 92u /* u32: blocks the realtime bitmap occupies */
+#define XFS_SB_REXTSLOG 125u /* u8: log2 of the realtime extent count, rounded down */
+#define XFS_SB_FREXTENTS 152u /* u64: free realtime extents */
 #define XFS_SB_UQUOTINO 160u /* u64: the user quota file's inode, 0 if none */
 #define XFS_SB_GQUOTINO 168u /* u64: the group quota file's */
 #define XFS_SB_QFLAGS   176u /* u16: which quotas are accounted and enforced */

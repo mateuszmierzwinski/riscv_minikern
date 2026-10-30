@@ -572,6 +572,32 @@ static void test_poll_bits(void) {
     KTEST_CHECK((tcp_poll(s) & TCP_POLL_ERR) != 0);
 }
 
+static uint32_t notified;
+
+static void count_notify(void *self, struct tcp_conn *c) {
+    (void)self;
+    (void)c;
+    notified++;
+}
+
+/* **An acknowledgement that frees send space tells the owner.** A writer
+ * that filled the buffer waits for "writable"; nothing else announces it.
+ * Without this, a Go server writing a 42 KB stylesheet waited out its
+ * poller's timer between every window — 1 to 26 seconds a page. */
+static void test_an_ack_that_frees_room_notifies(void) {
+    struct tcp_conn *c, *s, *l;
+    static uint8_t out[TCP_TX_BUF];
+    fresh();
+    connect_pair(&c, &s, &l);
+    KTEST_CHECK(tcp_send(c, out, sizeof out) == (int32_t)sizeof out);
+    KTEST_CHECK((tcp_poll(c) & TCP_POLL_OUT) == 0); /* full: the writer waits */
+    c->notify = count_notify;
+    notified = 0;
+    run_ms(50);
+    KTEST_CHECK((tcp_poll(c) & TCP_POLL_OUT) != 0);
+    KTEST_CHECK(notified > 0);
+}
+
 int main(void) {
     KTEST_RUN(test_handshake);
     KTEST_RUN(test_refused_when_nobody_listens);
@@ -594,5 +620,6 @@ int main(void) {
     KTEST_RUN(test_bind_conflicts);
     KTEST_RUN(test_table_exhaustion);
     KTEST_RUN(test_poll_bits);
+    KTEST_RUN(test_an_ack_that_frees_room_notifies);
     return ktest_failures();
 }

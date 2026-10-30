@@ -27,11 +27,13 @@ cc_library(
 cc_library(
     name = "core_boot",
     srcs = [
+        "src/core/boardspec.c",
         "src/core/bootinfo.c",
         "src/core/cmdline.c",
         "src/core/fdt.c",
     ],
     hdrs = [
+        "src/core/boardspec.h",
         "src/core/bootinfo.h",
         "src/core/cmdline.h",
         "src/core/errno.h",
@@ -84,6 +86,26 @@ cc_test(
     deps = [
         ":access",
         ":ktest",
+    ],
+)
+
+# POSIX record locks: the table `fcntl(F_SETLK)` keeps, which SQLite needs
+# before it will run a single statement.
+cc_library(
+    name = "reclock",
+    srcs = ["src/core/reclock.c"],
+    hdrs = ["src/core/reclock.h"],
+    strip_include_prefix = "src",
+    deps = [":core_boot"],
+)
+
+cc_test(
+    name = "reclock_test",
+    size = "small",
+    srcs = ["test/reclock_test.c"],
+    deps = [
+        ":ktest",
+        ":reclock",
     ],
 )
 
@@ -198,6 +220,98 @@ cc_test(
 )
 
 cc_test(
+    name = "ed25519_test",
+    size = "small",
+    srcs = [
+        "test/ed25519_test.c",
+        "test/ed_vectors.h",
+    ],
+    deps = [
+        ":crypto_sign",
+        ":ktest",
+    ],
+)
+
+cc_test(
+    name = "fe25519_test",
+    size = "small",
+    srcs = [
+        "test/fe25519_test.c",
+        "test/fe_vectors.h",
+    ],
+    deps = [
+        ":crypto_sign",
+        ":ktest",
+    ],
+)
+
+cc_test(
+    name = "sha512_test",
+    size = "small",
+    srcs = ["test/sha512_test.c"],
+    deps = [
+        ":crypto_sign",
+        ":ktest",
+    ],
+)
+
+cc_test(
+    name = "netboot_test",
+    size = "small",
+    srcs = [
+        "test/net_frames.h",
+        "test/netboot_test.c",
+        "test/offer_vector.h",
+    ],
+    deps = [
+        ":crypto_hash",
+        ":ktest",
+        ":net",
+        ":netboot",
+    ],
+)
+
+cc_test(
+    name = "boardspec_test",
+    size = "small",
+    srcs = ["test/boardspec_test.c"],
+    deps = [
+        ":core_boot",
+        ":ktest",
+    ],
+)
+
+cc_test(
+    name = "pathres_test",
+    size = "small",
+    srcs = ["test/pathres_test.c"],
+    deps = [
+        ":ktest",
+        ":pathres",
+    ],
+)
+
+cc_test(
+    name = "crc32c_test",
+    size = "small",
+    srcs = ["test/crc32c_test.c"],
+    deps = [
+        ":crypto",
+        ":ktest",
+    ],
+)
+
+cc_test(
+    name = "overlay_test",
+    size = "small",
+    srcs = ["test/overlay_test.c"],
+    deps = [
+        ":ktest",
+        ":overlay",
+    ],
+)
+
+cc_test(
     name = "partition_test",
     size = "small",
     srcs = ["test/partition_test.c"],
@@ -289,6 +403,16 @@ cc_library(
         ":console",
         ":core_boot",
         ":storage",
+    ],
+)
+
+cc_test(
+    name = "fat_time_test",
+    size = "small",
+    srcs = ["test/fat_time_test.c"],
+    deps = [
+        ":fat",
+        ":ktest",
     ],
 )
 
@@ -387,6 +511,7 @@ cc_library(
         ":arch_riscv",
         ":console",
         ":kernel_random",
+        ":klock",
         ":net",
         ":virtio_net",
     ],
@@ -932,6 +1057,8 @@ cc_library(
         "src/arch/riscv/uspace_entry.S",
         "src/kernel/sched.c",
         "src/kernel/fdobjects.c",
+        "src/kernel/flock.c",
+        "src/kernel/perm.c",
         "src/kernel/tty.c",
         "src/kernel/sock_tcp.c",
         "src/kernel/sys_priv.c",
@@ -950,6 +1077,8 @@ cc_library(
     hdrs = [
         "src/arch/riscv/sigframe.h",
         "src/kernel/fdobjects.h",
+        "src/kernel/flock.h",
+        "src/kernel/perm.h",
         "src/kernel/tty.h",
         "src/kernel/netlink.h",
         "src/kernel/socket.h",
@@ -963,6 +1092,9 @@ cc_library(
     strip_include_prefix = "src",
     target_compatible_with = ["//platforms:riscv64"],
     deps = [
+        ":pathres",
+        ":reclock",
+        ":vfs",
         ":vma",
         ":access",
         ":bpf",
@@ -1035,6 +1167,55 @@ cc_library(
     deps = [":crypto_hash"],
 )
 
+# Ed25519 signature verification (and the field and SHA-512 under it), for
+# netboot offers signed by the server. Pure, host-tested against RFC 8032.
+cc_library(
+    name = "crypto_sign",
+    srcs = [
+        "src/lib/ed25519.c",
+        "src/lib/fe25519.c",
+        "src/lib/sha512.c",
+    ],
+    hdrs = [
+        "src/lib/ed25519.h",
+        "src/lib/fe25519.h",
+        "src/lib/sha512.h",
+    ],
+    strip_include_prefix = "src",
+)
+
+# The MKNB netboot client (core/net/netboot.h): pure, host-tested against
+# a fake server and hostile datagrams.
+cc_library(
+    name = "netboot",
+    srcs = ["src/core/net/netboot.c"],
+    hdrs = ["src/core/net/netboot.h"],
+    strip_include_prefix = "src",
+    deps = [
+        ":crypto_hash",
+        ":crypto_sign",
+        ":net",
+    ],
+)
+
+# The netboot client on the live interface, and the image as the root disk.
+cc_library(
+    name = "kernel_netboot",
+    srcs = ["src/kernel/netboot.c"],
+    hdrs = ["src/kernel/netboot.h"],
+    strip_include_prefix = "src",
+    target_compatible_with = ["//platforms:riscv64"],
+    deps = [
+        ":arch_riscv",
+        ":console",
+        ":crypto_hash",
+        ":kernel_mem",
+        ":kernel_net",
+        ":kernel_random",
+        ":netboot",
+    ],
+)
+
 # SHA-256, which the entropy pool reads itself through.
 cc_library(
     name = "crypto_hash",
@@ -1077,11 +1258,46 @@ cc_library(
 
 cc_library(
     name = "kernel_procfs",
-    srcs = ["src/kernel/procfs.c"],
-    hdrs = ["src/kernel/procfs.h"],
+    srcs = [
+        "src/kernel/procfs.c",
+        "src/kernel/synthfs.c",
+    ],
+    hdrs = [
+        "src/kernel/procfs.h",
+        "src/kernel/synthfs.h",
+    ],
     strip_include_prefix = "src",
     target_compatible_with = ["//platforms:riscv64"],
-    deps = [":core_boot"],
+    deps = [
+        ":core_boot",
+        ":kernel_mem",
+        ":vfs",
+    ],
+)
+
+# The generated files that describe the running process and the machine.
+cc_library(
+    name = "kernel_procfiles",
+    srcs = [
+        "src/kernel/cpuwhy.c",
+        "src/kernel/procfiles.c",
+    ],
+    hdrs = [
+        "src/kernel/cpuwhy.h",
+        "src/kernel/procfiles.h",
+    ],
+    strip_include_prefix = "src",
+    target_compatible_with = ["//platforms:riscv64"],
+    deps = [
+        ":klock",
+        ":arch_riscv",
+        ":kernel_procfs",
+        ":kernel_uspace",
+        ":kernel_wallclock",
+        ":kfmt",
+        ":vfs",
+        ":vma",
+    ],
 )
 
 cc_library(
@@ -1142,8 +1358,14 @@ cc_library(
 # else a volume under /volumes.
 cc_library(
     name = "kernel_volumes",
-    srcs = ["src/kernel/volumes.c"],
-    hdrs = ["src/kernel/volumes.h"],
+    srcs = [
+        "src/kernel/fatmount.c",
+        "src/kernel/volumes.c",
+    ],
+    hdrs = [
+        "src/kernel/fatmount.h",
+        "src/kernel/volumes.h",
+    ],
     strip_include_prefix = "src",
     target_compatible_with = ["//platforms:riscv64"],
     deps = [
@@ -1151,7 +1373,74 @@ cc_library(
         ":fat",
         ":kernel_disk",
         ":kernel_mem",
+        ":kernel_wallclock",
+        ":vfs",
         ":xfs",
+    ],
+)
+
+# The filesystem port and the mount table: FAT volumes and netfs exports are
+# mounted here; the root XFS stays the kernel's own. Pure, host-tested.
+# Resolving `.`, `..` and links a component at a time. Pure, host-tested.
+cc_library(
+    name = "pathres",
+    srcs = ["src/core/pathres.c"],
+    hdrs = ["src/core/pathres.h"],
+    strip_include_prefix = "src",
+    deps = [":core_boot"],
+)
+
+cc_library(
+    name = "overlay",
+    srcs = ["src/core/overlay.c"],
+    hdrs = ["src/core/overlay.h"],
+    strip_include_prefix = "src",
+    deps = [":core_boot"],
+)
+
+cc_library(
+    name = "vfs",
+    srcs = ["src/core/vfs.c"],
+    hdrs = ["src/core/vfs.h"],
+    strip_include_prefix = "src",
+    deps = [
+        ":core_boot",
+        ":xfs",
+    ],
+)
+
+# netfs: a directory on the workstation (src/go/tools/netfs), read and
+# written as a filesystem. The protobuf codec and the client are pure and
+# host-tested; the kernel supplies the TCP transport.
+cc_library(
+    name = "netfs",
+    srcs = [
+        "src/core/netfs.c",
+        "src/core/pb.c",
+    ],
+    hdrs = [
+        "src/core/netfs.h",
+        "src/core/pb.h",
+    ],
+    strip_include_prefix = "src",
+    deps = [":core_boot"],
+)
+
+# The netfs transport over the kernel's TCP, and the boot-time mount.
+cc_library(
+    name = "kernel_netfs_tcp",
+    srcs = ["src/kernel/netfs_tcp.c"],
+    hdrs = ["src/kernel/netfs_tcp.h"],
+    strip_include_prefix = "src",
+    target_compatible_with = ["//platforms:riscv64"],
+    deps = [
+        ":arch_riscv",
+        ":console",
+        ":kernel_net",
+        ":kernel_uspace",
+        ":kernel_xfs",
+        ":net",
+        ":netfs",
     ],
 )
 
@@ -1159,11 +1448,13 @@ cc_library(
 cc_library(
     name = "kernel_xfs",
     srcs = [
-        "src/kernel/fatmount.c",
+        "src/kernel/netfsmount.c",
+        "src/kernel/overlayfs.c",
         "src/kernel/xfsmount.c",
     ],
     hdrs = [
-        "src/kernel/fatmount.h",
+        "src/kernel/netfsmount.h",
+        "src/kernel/overlayfs.h",
         "src/kernel/xfsmount.h",
     ],
     strip_include_prefix = "src",
@@ -1173,9 +1464,12 @@ cc_library(
         ":crypto_hash",
         ":kernel_disk",
         ":kernel_mem",
+        ":netfs",
+        ":vfs",
         ":kernel_wallclock",
         ":kernel_volumes",
         ":fat",
+        ":overlay",
         ":xfs",
     ],
 )
@@ -1289,6 +1583,9 @@ cc_library(
         ":drivers_virtio",
         ":kernel_disk",
         ":kernel_mem",
+        ":kernel_procfiles",
+        ":kernel_netboot",
+        ":kernel_netfs_tcp",
         ":kernel_net",
         ":kernel_swap",
         ":kernel_uspace",

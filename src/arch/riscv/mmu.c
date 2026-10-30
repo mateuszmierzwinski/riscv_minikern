@@ -31,6 +31,11 @@ static bool enabled;
  * is not the same as QEMU's. */
 static phys_t ram_origin;
 static uint64_t ram_span;
+
+/* Where the direct map is: a fixed slot until `mmu_randomise_direct_map`
+ * gives a seed, then one chosen by it (see `choose_direct_base`). */
+static uint64_t direct_base = DIRECT_MAP_BASE;
+static uint64_t direct_seed;
 /* Where the next device mapping goes in the MMIO window. Bump-allocated:
  * device registers are mapped once at probe and never unmapped, so there is
  * nothing to reclaim and a bump pointer is the whole allocator. */
@@ -86,6 +91,7 @@ static uint64_t page_up(uint64_t v) {
 
 /* Where `start.S` found the image, before translation was on. */
 extern uint64_t kernel_load_phys;
+
 
 /* Where the kernel's bytes physically are.
  *
@@ -168,7 +174,39 @@ static void enable_translation(uint64_t satp) {
  * second place from which to run it — which is the kind of thing a
  * write-what-where bug turns into an exploit. */
 static int map_direct_window(struct pgtable *pt, phys_t base, uint64_t bytes) {
-    return pgtable_map_range(pt, DIRECT_MAP_BASE, base, bytes, PT_PROT_RW);
+    return pgtable_map_range(pt, direct_base, base, bytes, PT_PROT_RW);
+}
+
+/* The 1 GiB slots the direct map may start in: above the device window
+ * (which grows from slot 320, and is given sixteen), leaving room for all
+ * of RAM and the top slot free. */
+#define DIRECT_SLOT_LOW 336u
+#define GIB (1ull << 30)
+
+/* **Kernel address randomisation for the direct map**, the window through
+ * which the kernel reaches every physical page — so the address an
+ * attacker most wants, a pointer to any page they can name, moves every
+ * boot. The kernel image itself stays at its linked address: moving it
+ * needs a position-independent build, which is the next step. */
+static uint64_t choose_direct_base(uint64_t seed, uint64_t ram_bytes) {
+    uint64_t gib = (ram_bytes + GIB - 1u) / GIB;
+    uint64_t high = 511u - gib; /* the last slot the window may start in */
+    uint64_t span = high >= DIRECT_SLOT_LOW ? high - DIRECT_SLOT_LOW + 1u : 0u;
+    if (span == 0) {
+        return DIRECT_MAP_BASE; /* no room to move: the fixed slot */
+    }
+    seed ^= seed >> 33;
+    seed *= 0xff51afd7ed558ccdull; /* a finaliser, so neighbouring seeds land apart */
+    seed ^= seed >> 33;
+    return KERNEL_VIRT_BASE + (DIRECT_SLOT_LOW - 256u + seed % span) * GIB;
+}
+
+void mmu_randomise_direct_map(uint64_t seed) {
+    direct_seed = seed;
+}
+
+uint64_t mmu_direct_map_base(void) {
+    return direct_base;
 }
 
 int mmu_init(phys_t ram_base, uint64_t ram_bytes) {
@@ -179,6 +217,7 @@ int mmu_init(phys_t ram_base, uint64_t ram_bytes) {
     }
     ram_origin = ram_base;
     ram_span = ram_bytes;
+    direct_base = direct_seed != 0 ? choose_direct_base(direct_seed, ram_bytes) : DIRECT_MAP_BASE;
     rc = map_kernel_image(&kernel_table);
     rc = rc != KERR_OK ? rc : map_remaining_ram(&kernel_table, ram_base, ram_bytes);
     rc = rc != KERR_OK ? rc : map_direct_window(&kernel_table, ram_base, ram_bytes);
@@ -204,18 +243,18 @@ void *mmu_phys_to_virt(phys_t phys) {
     if (!enabled) {
         return (void *)(uintptr_t)phys;
     }
-    return (void *)(uintptr_t)(DIRECT_MAP_BASE + (phys - ram_origin));
+    return (void *)(uintptr_t)(direct_base + (phys - ram_origin));
 }
 
 phys_t mmu_virt_to_phys(const void *virt) {
     uint64_t v = (uint64_t)(uintptr_t)virt;
-    if (v >= DIRECT_MAP_BASE && v < DIRECT_MAP_BASE + ram_span) {
-        return (phys_t)(ram_origin + (v - DIRECT_MAP_BASE));
+    if (v >= direct_base && v < direct_base + ram_span) {
+        return (phys_t)(ram_origin + (v - direct_base));
     }
     /* **A kernel-image address, which is also RAM.** A DMA buffer that is a
      * static array lives in `.bss`, so this is not a corner case: it is how
      * every driver's descriptor ring is addressed. */
-    if (v >= KERNEL_VIRT_BASE + KERNEL_VIRT_OFFSET && v < DIRECT_MAP_BASE) {
+    if (v >= KERNEL_VIRT_BASE + KERNEL_VIRT_OFFSET && v < KERNEL_VIRT_BASE + GIB) {
         return (phys_t)(ram_origin + KERNEL_VIRT_OFFSET + (v - KERNEL_VIRT_BASE -
                                                            KERNEL_VIRT_OFFSET));
     }

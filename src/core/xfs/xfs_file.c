@@ -206,8 +206,7 @@ static uint64_t allocated_bytes(const struct xfs *fs, const struct xfs_inode *ip
  * at block `n * rextsize`. With the common `rextsize` of 1 those are the
  * same number, which is exactly the coincidence that would hide a missing
  * multiplication — so it is written out rather than assumed away. */
-/* A realtime block, zeroed for the reason `xfs_zero_block` gives. */
-static int zero_realtime(struct xfs *fs, uint64_t block) {
+int xfs_zero_rt_block(struct xfs *fs, uint64_t block) {
     struct bbuf *b;
     int rc = bcache_get_zeroed(fs->rt_cache, block, &b);
     if (rc == KERR_OK) {
@@ -216,8 +215,28 @@ static int zero_realtime(struct xfs *fs, uint64_t block) {
     return rc;
 }
 
-static int grow_realtime(struct xfs *fs, struct xfs_fork_map *m, uint64_t logical) {
-    uint64_t extent = 0;
+static uint64_t map_end(const struct xfs_fork_map *m) {
+    const struct xfs_extent *last = m->count > 0 ? &m->e[m->count - 1u] : NULL;
+    return last == NULL ? 0 : last->startoff + last->blockcount;
+}
+
+/* Zeroes `count` realtime blocks from `first`. */
+static int zero_rt_blocks(struct xfs *fs, uint64_t first, uint32_t count) {
+    int rc = KERR_OK;
+    for (uint32_t i = 0; rc == KERR_OK && i < count; i++) {
+        rc = xfs_zero_rt_block(fs, first + i);
+    }
+    return rc;
+}
+
+/* One more realtime extent for the file, mapped WHOLE: `rextsize` blocks
+ * from the extent-aligned block at or below `logical`. Mapping one block of
+ * it left the rest allocated in the bitmap and owned by nobody, and the
+ * next block took a whole extent of its own. A start the map already
+ * passes is not an aligned file, and is refused. */
+static int grow_realtime(struct xfs *fs, struct xfs_fork_map *m, uint64_t logical,
+                         uint32_t *added) {
+    uint64_t extent = 0, start;
     struct xfs_extent e;
     int rc;
     if (fs->rt_cache == NULL) {
@@ -226,21 +245,26 @@ static int grow_realtime(struct xfs *fs, struct xfs_fork_map *m, uint64_t logica
     if (fs->rextsize == 0) {
         return KERR_INVAL;
     }
+    start = logical - logical % fs->rextsize;
+    if (start < map_end(m)) {
+        return KERR_NOTSUP;
+    }
     rc = xfs_rt_alloc(fs, 1u, &extent);
     if (rc != KERR_OK) {
         return rc;
     }
-    e = (struct xfs_extent){.startoff = logical, .startblock = extent * fs->rextsize,
-                            .blockcount = 1};
-    rc = zero_realtime(fs, e.startblock);
+    e = (struct xfs_extent){.startoff = start, .startblock = extent * fs->rextsize,
+                            .blockcount = fs->rextsize};
+    rc = zero_rt_blocks(fs, e.startblock, fs->rextsize);
     rc = rc != KERR_OK ? rc : xfs_fork_map_add(m, &e);
     if (rc != KERR_OK) {
-        /* The extent was taken but the map would not hold it: give it back,
-         * or the bitmap says used and no inode refers to it — a leak only a
-         * repair tool could find. */
+        /* Taken but not held: given back, or the bitmap says used and no
+         * inode refers to it — a leak only a repair tool could find. */
         (void)xfs_rt_release(fs, extent, 1u);
+        return rc;
     }
-    return rc;
+    *added = fs->rextsize;
+    return KERR_OK;
 }
 
 /* One block from an allocation group, next to the file's last one when that
@@ -278,10 +302,6 @@ static int grow_from_group(struct xfs *fs, const struct xfs_inode *ip, struct xf
 }
 
 /* The logical block just past the map's last extent. */
-static uint64_t map_end(const struct xfs_fork_map *m) {
-    const struct xfs_extent *last = m->count > 0 ? &m->e[m->count - 1u] : NULL;
-    return last == NULL ? 0 : last->startoff + last->blockcount;
-}
 
 /* One more block, at `logical`, charged to the owner's quota first.
  *
@@ -290,14 +310,16 @@ static uint64_t map_end(const struct xfs_fork_map *m) {
  * giving it back needs the allocator's free path — which is more work than
  * not allocating. A filesystem with no quotas pays one comparison for this. */
 static int add_block(struct xfs *fs, const struct xfs_inode *ip, struct xfs_fork_map *m,
-                     uint64_t logical) {
-    int rc = xfs_quota_charge_all(fs, ip, 1, 0);
+                     uint64_t logical, uint32_t *added) {
+    int32_t charge = ip->realtime ? (int32_t)fs->rextsize : 1;
+    int rc = xfs_quota_charge_all(fs, ip, charge, 0);
     if (rc != KERR_OK) {
         return rc;
     }
-    rc = ip->realtime ? grow_realtime(fs, m, logical) : grow_from_group(fs, ip, m, logical);
+    *added = 1u;
+    rc = ip->realtime ? grow_realtime(fs, m, logical, added) : grow_from_group(fs, ip, m, logical);
     if (rc != KERR_OK) {
-        (void)xfs_quota_charge_all(fs, ip, -1, 0);
+        (void)xfs_quota_charge_all(fs, ip, -charge, 0);
     }
     return rc;
 }
@@ -306,11 +328,17 @@ static int add_block(struct xfs *fs, const struct xfs_inode *ip, struct xfs_fork
  * hole — until the file reaches `upto`; *added says how many. */
 static int add_blocks(struct xfs *fs, const struct xfs_inode *ip, struct xfs_fork_map *m,
                       uint64_t from, uint64_t upto, uint64_t *added) {
+    uint32_t cap = xfs_data_extents_cap(fs, ip);
     int rc = KERR_OK;
     *added = 0;
     for (uint64_t next = map_end(m); rc == KERR_OK && next < upto; next = map_end(m)) {
-        rc = add_block(fs, ip, m, next > from ? next : from);
-        *added += rc == KERR_OK ? 1u : 0u;
+        uint32_t count = 0;
+        if (m->count + 1u > cap) {
+            rc = KERR_NOTSUP; /* before allocating: a block not mapped would leak */
+            break;
+        }
+        rc = add_block(fs, ip, m, next > from ? next : from, &count);
+        *added += rc == KERR_OK ? count : 0u;
     }
     return rc;
 }

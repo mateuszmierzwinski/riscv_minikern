@@ -330,6 +330,12 @@ static void apply_ack(struct tcp_conn *c, const struct tcp_seg *seg) {
     if (tcp_in_flight(c) > 0) {
         tcp_arm_timer(c);
     }
+    if (acked > 0) {
+        /* Room to write again, and **only this says so**: a writer that
+         * filled the buffer is waiting for "writable", and without the
+         * notification it waited for its poller's own timer instead. */
+        tcp_changed(c);
+    }
 }
 
 /* Copies bytes that follow rcv_nxt into the receive queue and advances it.
@@ -489,9 +495,20 @@ static bool finish_passive_open(struct tcp_conn *c, const struct tcp_seg *seg) {
     return true;
 }
 
+/* Notes a segment in the trail; returns its slot so the verdict can follow. */
+static struct tcp_trail *note_arrival(struct tcp_conn *c, const struct tcp_seg *seg) {
+    struct tcp_trail *t = &c->trail[c->trail_at++ % TCP_TRAIL];
+    *t = (struct tcp_trail){.off = (int32_t)(seg->seq - c->rcv_nxt), .len = (uint16_t)seg->len,
+                            .flags = seg->flags, .verdict = 'A', .wnd = tcp_rcv_wnd(c)};
+    return t;
+}
+
+
 /* Every state from SYN_RECEIVED onwards, which share the sequence checks. */
 static void in_synchronised(struct tcp_conn *c, const struct tcp_seg *seg) {
+    struct tcp_trail *trail = note_arrival(c, seg);
     if (!acceptable(c, seg)) {
+        trail->verdict = 'W';
         c->stack->stats.drop_out_of_window++;
         if (!(seg->flags & TCP_RST)) {
             tcp_send_ack(c);
@@ -505,7 +522,15 @@ static void in_synchronised(struct tcp_conn *c, const struct tcp_seg *seg) {
         return;
     }
     apply_ack(c, seg);
-    take_data(c, seg);
+    if (seg->len != 0) {
+        uint32_t before = c->rcv_nxt, held = c->stack->stats.held_out_of_order,
+                 dropped = c->stack->stats.drop_out_of_order;
+        take_data(c, seg);
+        trail->took = c->rcv_nxt - before;
+        trail->verdict = c->rcv_nxt != before ? 'T'
+                         : c->stack->stats.held_out_of_order != held ? 'H'
+                         : c->stack->stats.drop_out_of_order != dropped ? 'D' : 'O';
+    }
     take_fin(c, seg);
     check_our_fin(c);
     tcp_flush(c);

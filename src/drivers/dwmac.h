@@ -33,6 +33,17 @@ void dwmac_set_sink(const struct frame_sink *sink);
  * what is ready and returns how many frames it passed on. */
 uint32_t dwmac_poll(void);
 
+/* The receive side's own state — DMA status and state, the descriptor it is
+ * on against the tail, ring ownership, the queue's missed and overflow
+ * counts — for a transfer that stopped receiving. */
+void dwmac_report(void);
+
+/* A diagnostic, writing nothing but the PHY's extended-register address:
+ * the PHY's control, status and RGMII delay registers, syscrg's GMAC1
+ * clocks and the system syscon's interface select — the state U-Boot leaves
+ * behind, printed so a warm and a cold bring-up can be compared. */
+void dwmac_dump_bringup(void);
+
 /* Arms the controller's receive interrupt. Without it this device is only
  * looked at when something else happens, which cannot complete a blocking
  * read: the waiting thread has no deadline, so nothing is scheduled to poll

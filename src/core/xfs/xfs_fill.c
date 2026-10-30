@@ -59,8 +59,9 @@ static int fill_block(struct xfs *fs, uint64_t to, uint64_t from) {
 
 /* Maps logical block `logical` of the file to `fsb`, written, in place of
  * whatever it was mapped to (`had` says whether it was mapped at all). */
-static int remap(struct xfs *fs, struct xfs_inode *ip, uint64_t logical, uint64_t fsb, bool had) {
-    struct xfs_extent e = {.startoff = logical, .startblock = fsb, .blockcount = 1};
+static int remap_range(struct xfs *fs, struct xfs_inode *ip, uint64_t logical, uint64_t fsb,
+                       uint32_t count, bool had) {
+    struct xfs_extent e = {.startoff = logical, .startblock = fsb, .blockcount = count};
     struct xfs_fork_map m;
     uint64_t block, old = 0;
     uint32_t boffset;
@@ -72,17 +73,22 @@ static int remap(struct xfs *fs, struct xfs_inode *ip, uint64_t logical, uint64_
         return rc;
     }
     rc = xfs_fork_load(fs, b->data + boffset, &m);
-    rc = rc != KERR_OK || !had ? rc : xfs_fork_map_cut(&m, logical, 1u, &old);
+    rc = rc != KERR_OK || !had ? rc : xfs_fork_map_cut(&m, logical, count, &old);
     rc = rc != KERR_OK ? rc : xfs_fork_map_add(&m, &e);
     if (rc == KERR_OK) {
         uint8_t *di = b->data + boffset;
-        xfs_put_be64(di + XFS_DI_NBLOCKS, xfs_be64(di + XFS_DI_NBLOCKS) + (had ? 0u : 1u));
+        xfs_put_be64(di + XFS_DI_NBLOCKS, xfs_be64(di + XFS_DI_NBLOCKS) + (had ? 0u : count));
         rc = xfs_fork_store(fs, ip->ino, di, &m);
         xfs_reseal(fs, di, fs->inodesize, XFS_DI_CRC);
         bcache_dirty(b);
     }
     bcache_put(fs->cache, b);
     return rc != KERR_OK ? rc : xfs_inode_read(fs, ip->ino, ip);
+}
+
+/* One block, mapped where `logical` is. */
+static int remap(struct xfs *fs, struct xfs_inode *ip, uint64_t logical, uint64_t fsb, bool had) {
+    return remap_range(fs, ip, logical, fsb, 1u, had);
 }
 
 /* A fresh block for logical block `logical`, near the file's inode. */
@@ -135,6 +141,61 @@ static int copy_shared(struct xfs *fs, struct xfs_inode *ip, uint64_t logical, u
     return rc != KERR_OK ? rc : remap(fs, ip, logical, fsb, true);
 }
 
+/* Whether every block of [start, start + count) is a hole in the file. */
+static bool all_holes(struct xfs *fs, struct xfs_inode *ip, uint64_t start, uint32_t count) {
+    struct xfs_extent e;
+    for (uint32_t i = 0; i < count; i++) {
+        if (xfs_bmap(fs, ip, start + i, &e) != KERR_NOENT) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* A hole in a realtime file filled with one whole realtime extent: the
+ * `rextsize` blocks from the aligned block at or below `logical`, zeroed and
+ * mapped together — a realtime extent is allocated whole, so mapping one
+ * block of it would leave the rest owned by nobody. Refused when part of
+ * that aligned range is already mapped, which no aligned file has. No
+ * reverse map: the realtime subvolume has none here. */
+static int fill_realtime_hole(struct xfs *fs, struct xfs_inode *ip, uint64_t logical) {
+    uint32_t r = fs->rextsize;
+    uint64_t start = logical - logical % r, extent = 0;
+    int rc;
+    if (!all_holes(fs, ip, start, r)) {
+        return KERR_NOTSUP;
+    }
+    rc = xfs_rt_alloc(fs, 1u, &extent);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    for (uint32_t i = 0; rc == KERR_OK && i < r; i++) {
+        rc = xfs_zero_rt_block(fs, extent * r + i);
+    }
+    rc = rc != KERR_OK ? rc : remap_range(fs, ip, start, extent * r, r, false);
+    if (rc != KERR_OK) {
+        (void)xfs_rt_release(fs, extent, 1u); /* not referenced: not leaked */
+    }
+    return rc;
+}
+
+/* A hole or an unwritten block of a realtime file, made a written block: a
+ * fresh realtime extent for a hole, the same block zeroed and converted for
+ * an unwritten one — which is per block whatever `rextsize` is, since the
+ * written/unwritten state is the mapping's and not the extent's. */
+static int prepare_realtime(struct xfs *fs, struct xfs_inode *ip, uint64_t logical, bool hole,
+                            uint64_t fsb) {
+    int rc;
+    if (fs->rextsize == 0 || fs->rt_cache == NULL) {
+        return fs->rt_cache == NULL ? KERR_NODEV : KERR_INVAL;
+    }
+    if (hole) {
+        return fill_realtime_hole(fs, ip, logical);
+    }
+    rc = xfs_zero_rt_block(fs, fsb);
+    return rc != KERR_OK ? rc : remap(fs, ip, logical, fsb, true);
+}
+
 int xfs_file_prepare_block(struct xfs *fs, struct xfs_inode *ip, uint64_t logical) {
     struct xfs_extent e;
     bool shared = false;
@@ -143,8 +204,14 @@ int xfs_file_prepare_block(struct xfs *fs, struct xfs_inode *ip, uint64_t logica
     if (rc != KERR_OK && rc != KERR_NOENT) {
         return rc;
     }
+    /* A fill, a conversion or a copy can split one extent into three. */
+    if ((rc == KERR_NOENT || e.unwritten || ip->shares_blocks) &&
+        ip->nextents + 2u > xfs_data_extents_cap(fs, ip)) {
+        return KERR_NOTSUP;
+    }
     if (ip->realtime && (rc == KERR_NOENT || e.unwritten)) {
-        return KERR_NOTSUP; /* the realtime bitmap's business, not a group's */
+        return prepare_realtime(fs, ip, logical, rc == KERR_NOENT,
+                                rc == KERR_NOENT ? 0u : e.startblock + (logical - e.startoff));
     }
     if (rc == KERR_NOENT) {
         return fill_hole(fs, ip, logical);

@@ -64,6 +64,11 @@ struct thread_signals {
      * blocked away: the faulting instruction would be retried for ever. 0
      * when none is pending. */
     uint32_t forced;
+    /* A mask to put back once a handler has run, or on the way to user
+     * mode if none does: `ppoll`/`pselect6` keep their temporary mask until
+     * then, so the signal that interrupted them is the one delivered. */
+    uint64_t saved_mask;
+    bool restore_mask;
 };
 
 /* Go starts one thread per CPU it believes in, plus a few: a handful is
@@ -159,10 +164,24 @@ struct thread_signals *sched_current_signals(void);
  * NULL when no live thread has that id. */
 struct thread_signals *sched_signals_of(uint64_t tid);
 
+/* Raises signo on one thread (`tgkill`), waking it if it is blocked and
+ * does not block the signal. False when there is no such thread. */
+bool sched_raise_on_thread(uint64_t tid, uint32_t signo);
+
 /* How many thread switches a hart has made, by enumeration index. The
  * measurement that distinguishes "four harts available" from "four harts
  * used" — a hart that never switched never ran a thread. */
 uint32_t sched_hart_switches(uint32_t hart_index);
+
+/* How long a hart has spent with nothing to run, by enumeration index. */
+uint64_t sched_hart_idle_ns(uint32_t hart_index);
+
+/* How long a hart has been in the scheduler, by enumeration index: its
+ * busy time is this less its idle time, not the time since boot. */
+uint64_t sched_hart_online_ns(uint32_t hart_index);
+
+/* Every live thread's state, one line each — for a run that hung. */
+void sched_report_threads(void);
 
 /* The process the running thread belongs to, or NULL between threads.
  *
@@ -231,6 +250,14 @@ void sched_yield_now(void);
  * interrupts still off through the syscall that window does not exist. */
 bool sched_futex_wait(virt_t addr, uint64_t deadline_ns);
 
+/* The same for a USER futex: keyed by the caller's address space as well as
+ * the address. Two processes running one non-PIE binary have their runtime
+ * futexes at the same addresses; keyed by address alone, a wake in one
+ * process woke a thread in the other, and the thread it was meant for slept
+ * for ever. A vfork child shares its parent's address space and so its
+ * futexes, as on Linux. */
+bool sched_futex_wait_user(virt_t addr, uint64_t deadline_ns);
+
 /* The key a thread waiting for descriptor readiness is blocked on.
  *
  * It must be wakeable, because a runtime **interrupts its own poller**: it
@@ -279,6 +306,10 @@ void sched_sleep_report(uint64_t *count, uint64_t *average_late_us, uint64_t *wo
 
 /* Wakes up to `count` threads waiting on `addr`. Reports how many. */
 uint32_t sched_futex_wake(virt_t addr, uint32_t count);
+
+/* Wakes up to `count` threads waiting on the user futex `addr` in the
+ * caller's own address space. */
+uint32_t sched_futex_wake_user(virt_t addr, uint32_t count);
 
 /* Ends the calling thread. Does not return. When it was the last one, the
  * process is over and this leaves through `uspace_exit`. */
@@ -421,6 +452,8 @@ void sched_pin_threads(bool on);
  * scheduling decision rather than at the next slice boundary. False only if
  * there is no running thread to set it on. */
 int32_t sched_nice(void);
+/* A process's nice value: its first live thread's (all start equal). */
+int32_t sched_nice_of(const struct uproc *proc);
 bool sched_set_nice(int32_t nice);
 
 /* **Affinity**: which harts may run the calling thread, as a bitmask of

@@ -218,11 +218,48 @@ static int apply_buffer(struct xfs *fs, const uint8_t *blf, const uint8_t *data,
 /* What a pass over the records is accumulating. `applied` is reported, not
  * for interest, but because a replay that applied nothing and a replay that
  * never ran look identical from outside. */
+#define COMMITTED_MAX 512u
+
+/* **Two passes over the log**: the first only learns which transactions
+ * committed, the second applies the items of those. One pass applied each
+ * item as it was read, so the unfinished transaction a crash leaves at the
+ * end of the log had its items applied — the half-made change the commit
+ * record exists to rule out. */
 struct pass {
     struct txn txn;
     uint32_t applied;
     uint32_t items_seen;
+    bool applying;
+    uint32_t committed[COMMITTED_MAX];
+    uint32_t ncommitted;
 };
+
+static bool committed(const struct pass *p, uint32_t tid) {
+    for (uint32_t i = 0; i < p->ncommitted; i++) {
+        if (p->committed[i] == tid) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* A commit, recorded on the first pass and counted on the second. */
+static int note_commit(struct pass *p, uint32_t tid) {
+    bool ours = p->txn.open && p->txn.tid == tid;
+    p->txn.open = false;
+    if (!ours) {
+        return KERR_OK;
+    }
+    if (p->applying) {
+        p->applied++;
+        return KERR_OK;
+    }
+    if (p->ncommitted == COMMITTED_MAX) {
+        return KERR_NOTSUP; /* more transactions than this tracks: refused, not guessed */
+    }
+    p->committed[p->ncommitted++] = tid;
+    return KERR_OK;
+}
 
 /* Applies one item, which is two operations: the format structure and the
  * data it describes. Returns how many operations it consumed. */
@@ -242,15 +279,33 @@ static int apply_item(struct xfs *fs, const uint8_t *fmt, uint32_t fmt_len,
     return KERR_NOTSUP;
 }
 
+/* An item: the format operation at `at` (`len` bytes) and the data
+ * operation after it, applied when its transaction committed (second pass
+ * only). The bytes both take, header included, in *used. */
+static int take_item(struct xfs *fs, struct pass *p, uint32_t at, uint32_t len, uint32_t end,
+                     uint32_t tid, uint32_t *used) {
+    uint32_t dlen = xfs_be32(record + at + len + XLOG_OP_LEN);
+    int rc = KERR_OK;
+    if (at + len + XLOG_OP_HDR_SIZE + dlen > end) {
+        return KERR_IO;
+    }
+    if (p->applying && committed(p, tid)) {
+        rc = apply_item(fs, record + at, len, record + at + len + XLOG_OP_HDR_SIZE, dlen);
+        p->items_seen += rc == KERR_OK ? 1u : 0u;
+    }
+    *used = len + XLOG_OP_HDR_SIZE + dlen;
+    return rc;
+}
+
 /* One record's operations, in order.
  *
  * The transaction framing is what this is really reading: `START_TRANS`
  * opens one, a header names how many items it has, pairs of operations
  * carry them, and `COMMIT_TRANS` is the point at which any of it may be
  * believed. An unfinished transaction at the end of the log — which is what
- * a crash leaves — reaches the end of the walk still open, and is dropped.
+ * a crash leaves — never commits, so the second pass applies none of it.
  *
- * Runs to 30 lines: it is one cursor over a byte range whose every step
+ * Runs to 29 lines: it is one cursor over a byte range whose every step
  * depends on the operation header it just read, and splitting it would need
  * the buffer, the cursor, the remaining count and the transaction state
  * passed across the boundary (Rule 11, Parameters/Control flow). */
@@ -258,8 +313,9 @@ static int walk_ops(struct xfs *fs, uint32_t bytes, uint32_t nops, struct pass *
     uint32_t at = XLOG_REC_HDR_SIZE;
     uint32_t end = XLOG_REC_HDR_SIZE + bytes;
     for (uint32_t i = 0; i < nops; i++) {
-        uint32_t len, tid;
+        uint32_t len, tid, used = 0;
         uint8_t flags;
+        int rc = KERR_OK;
         if (at + XLOG_OP_HDR_SIZE > end) {
             return KERR_IO;
         }
@@ -273,27 +329,18 @@ static int walk_ops(struct xfs *fs, uint32_t bytes, uint32_t nops, struct pass *
         if ((flags & XLOG_START_TRANS) != 0) {
             p->txn = (struct txn){tid, 0, true};
         } else if ((flags & XLOG_COMMIT_TRANS) != 0) {
-            p->applied += p->txn.open && p->txn.tid == tid ? 1u : 0u;
-            p->txn.open = false;
+            rc = note_commit(p, tid);
         } else if (p->txn.open && len == TRANS_HDR_SIZE &&
                    le32(record + at + TRANS_HDR_MAGIC) == XFS_TRANS_HEADER_MAGIC) {
             p->txn.items = le32(record + at + TRANS_HDR_NUM_ITEMS);
         } else if (p->txn.open && len >= ILF_TYPE + 2u && i + 1u < nops) {
-            uint32_t dlen = xfs_be32(record + at + len + XLOG_OP_LEN);
-            int rc;
-            if (at + len + XLOG_OP_HDR_SIZE + dlen > end) {
-                return KERR_IO;
-            }
-            rc = apply_item(fs, record + at, len, record + at + len + XLOG_OP_HDR_SIZE, dlen);
-            if (rc != KERR_OK) {
-                return rc;
-            }
-            p->items_seen++;
-            at += len + XLOG_OP_HDR_SIZE + dlen;
+            rc = take_item(fs, p, at, len, end, tid, &used);
             i++;
-            continue;
         }
-        at += len;
+        if (rc != KERR_OK) {
+            return rc;
+        }
+        at += used != 0 ? used : len;
     }
     return KERR_OK;
 }
@@ -323,8 +370,9 @@ static int replay_ring(struct xfs *fs, struct pass *p) {
 }
 
 int xfs_log_replay(struct xfs *fs) {
-    struct pass p = {{0, 0, false}, 0, 0};
+    static struct pass p; /* 2 KiB of transaction ids: not for a kernel stack */
     int rc;
+    p = (struct pass){0};
     /* **Applied as the walk goes, and committed only at the end.** The
      * writes land in the block cache and the cache is flushed once, after
      * the whole log has been read without complaint — so a replay that
@@ -332,6 +380,9 @@ int xfs_log_replay(struct xfs *fs) {
      * all-or-nothing rule this file opens with, and it is the cache that
      * makes it cheap enough to keep. */
     rc = replay_ring(fs, &p);
+    p.applying = true;
+    p.txn.open = false;
+    rc = rc != KERR_OK ? rc : replay_ring(fs, &p);
     if (rc != KERR_OK) {
         kprintf("xfs: replay abandoned after %u transaction(s): rc %d; nothing written\n",
                 p.applied, rc);

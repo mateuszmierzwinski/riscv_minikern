@@ -3,6 +3,7 @@
 
 #include "core/errno.h"
 #include "kernel/mem.h"
+#include "kernel/wallclock.h"
 
 #define FAT_DIR_MODE  0040755u
 #define FAT_FILE_MODE 0100644u
@@ -178,3 +179,85 @@ int fatmount_counters(struct fat *fs, struct xfs_counters *out) {
                                  .inodes = 0, .free_inodes = 0, .blocksize = fs->cluster};
     return KERR_OK;
 }
+
+/* ── as a vfs filesystem ───────────────────────────────────────────────── */
+
+static int fat_stat_op(void *self, const char *in, uint32_t *mode, uint64_t *size,
+                       uint32_t *nlink) {
+    return fatmount_stat_full(self, in, mode, size, nlink);
+}
+
+/* Every file on FAT is root's: it has no owners to report. */
+static int fat_owner_op(void *self, const char *in, uint32_t *uid, uint32_t *gid) {
+    uint32_t mode = 0, nlink = 0;
+    uint64_t size = 0;
+    int rc = fatmount_stat_full(self, in, &mode, &size, &nlink);
+    if (rc == KERR_OK) {
+        *uid = 0;
+        *gid = 0;
+    }
+    return rc;
+}
+
+static int fat_list_op(void *self, const char *in, xfs_dirent_fn fn, void *ctx) {
+    return fatmount_list(self, in, fn, ctx);
+}
+
+static int fat_read_op(void *self, const char *in, uint32_t limit, uint8_t **out,
+                       uint32_t *size) {
+    return fatmount_read_file(self, in, limit, out, size);
+}
+
+static int fat_write_op(void *self, const char *dir, const char *leaf, uint64_t off,
+                        const void *bytes, uint32_t len) {
+    return fatmount_write_at(self, dir, leaf, off, bytes, len, wallclock_seconds());
+}
+
+static int fat_mkdir_op(void *self, const char *in) {
+    return fatmount_mkdir_p(self, in, wallclock_seconds());
+}
+
+static int fat_unlink_op(void *self, const char *in) {
+    return fatmount_unlink_path(self, in);
+}
+
+static int fat_truncate_op(void *self, const char *in, uint64_t size) {
+    return fatmount_truncate_path(self, in, size, wallclock_seconds());
+}
+
+static int fat_rename_op(void *self, const char *from, const char *to) {
+    return fatmount_rename_path(self, from, to, wallclock_seconds());
+}
+
+static int fat_counters_op(void *self, struct xfs_counters *out) {
+    return fatmount_counters(self, out);
+}
+
+/* FAT keeps the last write's DOS date and time; it stands for all three
+ * (the access date has no time of day, and there is no change time). */
+static int fat_times_op(void *self, const char *in, uint64_t *atime, uint64_t *mtime,
+                        uint64_t *ctime) {
+    struct fat_node n;
+    int rc = lookup(self, in, &n);
+    if (rc == KERR_OK) {
+        *mtime = fat_unix_time(n.mtime, n.mdate);
+        *atime = *mtime;
+        *ctime = *mtime;
+    }
+    return rc;
+}
+
+const struct vfs_ops fatmount_vfs_ops = {
+    .name = "vfat",
+    .stat_full = fat_stat_op,
+    .owner = fat_owner_op,
+    .list = fat_list_op,
+    .read_file = fat_read_op,
+    .write_at = fat_write_op,
+    .mkdir_p = fat_mkdir_op,
+    .unlink = fat_unlink_op,
+    .truncate = fat_truncate_op,
+    .rename = fat_rename_op,
+    .counters = fat_counters_op,
+    .times = fat_times_op,
+};

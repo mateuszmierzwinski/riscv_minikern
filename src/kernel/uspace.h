@@ -126,6 +126,8 @@
  * EINVAL, which `setgroups(2)` already defines for exactly this. */
 #define PROC_MAX_GROUPS 16u
 
+#define UPROC_NAME_MAX 16u
+
 struct uproc {
     /* ── identity ──────────────────────────────────────────────────────── */
     uint32_t pid;
@@ -150,6 +152,10 @@ struct uproc {
     uint32_t euid;
     uint32_t egid;
     uint32_t suid; /* saved: what an unprivileged setresuid may return to */
+    uint32_t sgid; /* saved gid, the same for setresgid */
+    /* What it was started as: the program file's last component, cut to 15
+     * bytes, as Linux keeps `comm`. Set at every load, kept across fork. */
+    char name[UPROC_NAME_MAX];
     /* **The supplementary groups, so that dropping privilege actually
      * drops it.** `setuid` and `setgid` move the primary identity and leave
      * these behind, which is the classic incomplete privilege drop: a
@@ -196,6 +202,11 @@ struct uproc {
      * process's**, which is what made them singletons until there were two
      * processes. A thread's own signal state stays in the thread. */
     struct file *fds[FD_MAX];
+    /* Close-on-exec, **per descriptor** (bit n for fd n): a `dup`'d copy of
+     * a close-on-exec pipe is not close-on-exec, which is how a child's
+     * stdout survives its exec. It was a flag on the shared file. */
+    uint64_t fd_cloexec;
+    uint64_t started_ns; /* when uspace_alloc made it, for /proc/ps time_alive */
     struct user_sigaction actions[SIG_COUNT];
     /* Signals sent to the process (`kill`) rather than to a thread: any
      * thread with one unblocked takes it. Kept across `execve`, cleared for
@@ -264,6 +275,19 @@ void uspace_release(struct uproc *p);
 
 /* The process with this pid, or NULL. */
 struct uproc *uspace_by_pid(uint32_t pid);
+
+/* The pid in process slot `index`: 0 for a free slot, UINT32_MAX past the
+ * last. For listing `/proc`. */
+uint32_t uspace_pid_at(uint32_t index);
+
+/* How many processes have been made since boot (`/proc/stat`'s
+ * `processes`). */
+uint32_t uspace_processes_created(void);
+
+/* The bytes of p's regions that are backed by a frame now (resident), and
+ * how many descriptors it has open: for `/proc/ps`. */
+uint64_t uspace_resident_bytes(const struct uproc *p);
+uint32_t uspace_open_fds(const struct uproc *p);
 
 /* Prints the pids the process table holds, capped at a few calls. For a
  * lookup that answered absent for a process the caller had just been
@@ -749,6 +773,7 @@ uint64_t uspace_freed_frames(void);
 /* Transparent huge pages (on unless `minikern.nothp`): 2 MiB pages for
  * ordinary anonymous memory, and how many were made and later split. */
 void uspace_set_transparent_huge(bool on);
+bool uspace_transparent_huge_on(void);
 
 /* Shares the kernel's low half (its identity map of RAM) into every process's
  * table as well as the top half: `minikern.lowmap`, the control for step C. */

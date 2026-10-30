@@ -66,6 +66,11 @@ struct fat_dirent {
 
 typedef int (*fat_dirent_fn)(void *self, const struct fat_dirent *e);
 
+/* A node's stored DOS time and date (`mtime`, `mdate`) as Unix seconds,
+ * read as UTC (FAT keeps no zone; this kernel writes UTC). 0 for a date
+ * never set. Two-second resolution, as stored. */
+uint64_t fat_unix_time(uint16_t time, uint16_t date);
+
 /* Whether a volume's first sector is a FAT boot sector, and its label — the
  * volume label in the boot sector, as `mkfs.vfat -n` writes it, trailing
  * spaces dropped. Reads nothing beyond the sector it is given. */

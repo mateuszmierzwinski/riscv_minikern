@@ -1,5 +1,9 @@
 #include "kernel/fdobjects.h"
 
+#include "core/reclock.h"
+#include "kernel/random.h"
+#include "kernel/perm.h"
+
 #include "core/klog.h"
 #include "kernel/net.h"
 #include "kernel/procfs.h"
@@ -41,6 +45,69 @@ static uint32_t console_file_poll(struct file *f) {
     return EPOLLOUT | (ktty_ready() ? EPOLLIN : 0u);
 }
 
+/* Linux's `struct termios` as `TCGETS` returns it (asm-generic: four flag
+ * words, the line discipline, nineteen control characters). */
+struct user_termios {
+    uint32_t iflag;
+    uint32_t oflag;
+    uint32_t cflag;
+    uint32_t lflag;
+    uint8_t line;
+    uint8_t cc[19];
+};
+
+#define TCGETS 0x5401u
+#define TCSETS 0x5402u
+#define TCSETSW 0x5403u
+#define TCSETSF 0x5404u
+#define FIONREAD_REQ 0x541bu
+
+/* `TCGETS`: the terminal's mode as `kernel/tty.c` keeps it. */
+static void describe_terminal(struct user_termios *t) {
+    struct ktty_mode m;
+    ktty_get_mode(&m);
+    *t = (struct user_termios){.iflag = m.iflag, .oflag = m.oflag, .cflag = m.cflag,
+                               .lflag = m.lflag};
+    for (uint32_t i = 0; i < KTTY_NCC; i++) {
+        t->cc[i] = m.cc[i];
+    }
+}
+
+/* `TCSETS*`: the whole mode, adopted or refused (`EINVAL`) as one — a flag
+ * the terminal would ignore is never reported as set. */
+static int32_t set_terminal(virt_t arg) {
+    struct user_termios t;
+    struct ktty_mode m;
+    if (uspace_copy_in(&t, arg, sizeof t) != KERR_OK) {
+        return KERR_FAULT;
+    }
+    m = (struct ktty_mode){.iflag = t.iflag, .oflag = t.oflag, .cflag = t.cflag, .lflag = t.lflag};
+    for (uint32_t i = 0; i < KTTY_NCC; i++) {
+        m.cc[i] = t.cc[i];
+    }
+    return ktty_set_mode(&m);
+}
+
+/* The terminal's attribute requests, and how much is waiting to be read. */
+static int32_t console_attr_ioctl(uint32_t request, virt_t arg) {
+    struct user_termios t;
+    uint32_t pending;
+    switch (request) {
+    case TCGETS:
+        describe_terminal(&t);
+        return uspace_copy_out(arg, &t, sizeof t) == KERR_OK ? 0 : KERR_FAULT;
+    case TCSETS:
+    case TCSETSW:
+    case TCSETSF:
+        return set_terminal(arg);
+    case FIONREAD_REQ:
+        pending = ktty_pending();
+        return uspace_copy_out(arg, &pending, sizeof pending) == KERR_OK ? 0 : KERR_FAULT;
+    default:
+        return KERR_NOTTY;
+    }
+}
+
 /* `ioctl`, for the two things a program asks a terminal.
  *
  * A program that cannot get a window size lays itself out for 0x0, and one
@@ -73,7 +140,7 @@ static int32_t console_file_ioctl(struct file *f, uint32_t request, virt_t arg) 
         ktty_set_foreground(pgid);
         return 0;
     default:
-        return KERR_NOTTY;
+        return console_attr_ioctl(request, arg);
     }
 }
 
@@ -82,7 +149,7 @@ static int32_t console_file_ioctl(struct file *f, uint32_t request, virt_t arg) 
  * adapter onto it. */
 static int32_t console_file_write(struct file *f, const void *buf, uint32_t n) {
     (void)f;
-    console_write(buf, (size_t)n);
+    ktty_write(buf, n);
     return (int32_t)n;
 }
 
@@ -186,28 +253,37 @@ int fdobjects_open_eventfd(uint64_t initial, uint32_t flags) {
  *
  * Read-only: a write would be a program claiming the kernel said something.
  */
-struct klog_file {
-    char text[KLOG_TAIL_LINES * (KLOG_LINE_MAX + 1u)];
+#define KLOG_SNAPSHOT_BYTES (KLOG_TAIL_LINES * (KLOG_LINE_MAX + 1u))
+
+/* **One snapshot per descriptor**, taken at open and freed at close. They
+ * were one global each (the log, /proc, resolv.conf) on the reasoning that
+ * only one open happens at a time — but descriptors outlive the open, so a
+ * process holding a /proc descriptor read whatever the next opener's file
+ * said, root's included, and two readers moved each other's offset. */
+struct snapshot {
     uint32_t len;
     uint32_t offset;
+    char text[];
 };
 
-static struct klog_file klog_open_snapshot;
-
-static int32_t klog_read(struct file *f, void *buf, uint32_t n) {
-    uint32_t left;
-    uint32_t take;
-    (void)f;
-    if (klog_open_snapshot.offset >= klog_open_snapshot.len) {
+static int32_t snapshot_read(struct file *f, void *buf, uint32_t n) {
+    struct snapshot *s = f->priv;
+    uint32_t left, take;
+    if (s == NULL || s->offset >= s->len) {
         return 0; /* the end of the snapshot, as a file ends */
     }
-    left = klog_open_snapshot.len - klog_open_snapshot.offset;
+    left = s->len - s->offset;
     take = n < left ? n : left;
     for (uint32_t i = 0; i < take; i++) {
-        ((uint8_t *)buf)[i] = (uint8_t)klog_open_snapshot.text[klog_open_snapshot.offset + i];
+        ((uint8_t *)buf)[i] = (uint8_t)s->text[s->offset + i];
     }
-    klog_open_snapshot.offset += take;
+    s->offset += take;
     return (int32_t)take;
+}
+
+static void snapshot_release(struct file *f) {
+    kfree(f->priv);
+    f->priv = NULL;
 }
 
 static int32_t klog_write_refused(struct file *f, const void *buf, uint32_t n) {
@@ -220,7 +296,8 @@ static int32_t klog_write_refused(struct file *f, const void *buf, uint32_t n) {
 }
 
 static const struct file_ops klog_ops = {
-    .read = klog_read,
+    .read = snapshot_read,
+    .release = snapshot_release,
     .write = klog_write_refused,
 };
 
@@ -241,90 +318,40 @@ static const struct file_ops klog_ops = {
  * it, and a kernel that shadowed it would be overriding a decision it cannot
  * see. Synthesising only when the file is absent is also what makes this
  * safe on a read-only root. */
-struct resolv_file {
-    char text[64];
-    uint32_t len;
-    uint32_t offset;
-};
-
-static struct resolv_file resolv_snapshot;
+#define RESOLV_SNAPSHOT_BYTES 64u
 
 /* "nameserver a.b.c.d\n", built without a formatter: this runs under the
  * kernel lock on the open path and `ip4_format` is already here. */
-static void fill_resolv_snapshot(void) {
+static void fill_resolv_snapshot(struct snapshot *snap) {
     char ip[16];
     const char *prefix = "nameserver ";
     struct netif *nif = knet_interface();
     uint32_t at = 0;
-    resolv_snapshot.offset = 0;
-    resolv_snapshot.len = 0;
-    if (nif == NULL || nif->dns == 0) {
+            if (nif == NULL || nif->dns == 0) {
         return; /* nothing learned: an empty file, which is a true answer */
     }
     while (prefix[at] != '\0') {
-        resolv_snapshot.text[at] = prefix[at];
+        snap->text[at] = prefix[at];
         at++;
     }
     (void)ip4_format(nif->dns, ip);
-    for (uint32_t i = 0; ip[i] != '\0' && at < sizeof resolv_snapshot.text - 2u; i++) {
-        resolv_snapshot.text[at++] = ip[i];
+    for (uint32_t i = 0; ip[i] != '\0' && at < RESOLV_SNAPSHOT_BYTES - 2u; i++) {
+        snap->text[at++] = ip[i];
     }
-    resolv_snapshot.text[at++] = '\n';
-    resolv_snapshot.len = at;
+    snap->text[at++] = '\n';
+    snap->len = at;
 }
 
-static int32_t resolv_read(struct file *f, void *buf, uint32_t n) {
-    uint32_t left;
-    uint32_t take;
-    (void)f;
-    if (resolv_snapshot.offset >= resolv_snapshot.len) {
-        return 0;
-    }
-    left = resolv_snapshot.len - resolv_snapshot.offset;
-    take = n < left ? n : left;
-    for (uint32_t i = 0; i < take; i++) {
-        ((char *)buf)[i] = resolv_snapshot.text[resolv_snapshot.offset + i];
-    }
-    resolv_snapshot.offset += take;
-    return (int32_t)take;
-}
-
-/* A `/proc` file, generated whole at open.
- *
- * **A snapshot, not a stream**, for the same reason the kernel log's is: a
- * file read in two `read` calls must not change between them, or a program
- * parsing it sees one line from before and the next from after. Shared by
- * every `/proc` path because only one can be being opened at a time — the
- * kernel lock is held across an open — and the alternative is a buffer per
- * descriptor for files that are a few hundred bytes. */
-static struct {
-    char text[PROCFS_MAX_BYTES];
-    uint32_t len;
-    uint32_t offset;
-} proc_open_snapshot;
-
-static int32_t procfile_read(struct file *f, void *buf, uint32_t n) {
-    uint32_t left, take;
-    (void)f;
-    if (proc_open_snapshot.offset >= proc_open_snapshot.len) {
-        return 0;
-    }
-    left = proc_open_snapshot.len - proc_open_snapshot.offset;
-    take = n < left ? n : left;
-    for (uint32_t i = 0; i < take; i++) {
-        ((char *)buf)[i] = proc_open_snapshot.text[proc_open_snapshot.offset + i];
-    }
-    proc_open_snapshot.offset += take;
-    return (int32_t)take;
-}
 
 static const struct file_ops procfile_ops = {
-    .read = procfile_read,
+    .read = snapshot_read,
+    .release = snapshot_release,
     .write = klog_write_refused,
 };
 
 static const struct file_ops resolv_ops = {
-    .read = resolv_read,
+    .read = snapshot_read,
+    .release = snapshot_release,
     .write = klog_write_refused,
 };
 
@@ -352,8 +379,18 @@ static int32_t zero_read(struct file *f, void *buf, uint32_t n) {
     return (int32_t)n;
 }
 
+/* `/dev/urandom` and `/dev/random`: the kernel's generator, which never
+ * blocks once seeded (as `getrandom` already behaves). A write is accepted
+ * and ignored, as Linux accepts one without crediting entropy. */
+static int32_t random_read(struct file *f, void *buf, uint32_t n) {
+    (void)f;
+    random_fill(buf, n);
+    return (int32_t)n;
+}
+
 static const struct file_ops null_ops = {.read = null_read, .write = null_write};
 static const struct file_ops zero_ops = {.read = zero_read, .write = null_write};
+static const struct file_ops random_ops = {.read = random_read, .write = null_write};
 
 /* ── a regular file ─────────────────────────────────────────────────────── */
 
@@ -376,13 +413,19 @@ struct diskfile {
     uint8_t *bytes;
     uint32_t size;
     uint32_t offset; /* how much of it this descriptor has handed over */
+    bool used;       /* claimed before the read, which can sleep */
 };
 
 static struct diskfile diskfiles[FD_MAX];
 
+/* A free slot, **claimed at once**: it was recognised by `bytes == NULL`,
+ * which stays true across the read that fills it — and that read sleeps
+ * (NVMe, netfs), so two opens took one slot and closing either freed the
+ * other's bytes. */
 static struct diskfile *diskfile_alloc(void) {
     for (uint32_t i = 0; i < FD_MAX; i++) {
-        if (diskfiles[i].bytes == NULL) {
+        if (!diskfiles[i].used) {
+            diskfiles[i] = (struct diskfile){.used = true};
             return &diskfiles[i];
         }
     }
@@ -400,6 +443,19 @@ static int32_t diskfile_read(struct file *f, void *buf, uint32_t n) {
     return (int32_t)take;
 }
 
+/* A range of the snapshot, copied out rather than stored through: the
+ * caller's buffer is only a number until the copy checks it. */
+static int32_t diskfile_pread(struct file *f, void *buf, uint32_t n, uint64_t off) {
+    const struct diskfile *d = f->priv;
+    uint32_t take = off >= d->size ? 0u : (d->size - off < n ? (uint32_t)(d->size - off) : n);
+    if (take == 0) {
+        return 0;
+    }
+    return uspace_copy_out((virt_t)(uintptr_t)buf, d->bytes + off, take) == KERR_OK
+               ? (int32_t)take
+               : KERR_FAULT;
+}
+
 static void diskfile_release_buffer(struct diskfile *d) {
     kfree_image(d->bytes);
     *d = (struct diskfile){0};
@@ -409,7 +465,20 @@ static void diskfile_release(struct file *f) {
     diskfile_release_buffer(f->priv);
 }
 
-static const struct file_ops diskfile_ops = {.read = diskfile_read, .release = diskfile_release};
+/* `FIONREAD` on a file: what is left after this descriptor's offset. */
+static int32_t diskfile_ioctl(struct file *f, uint32_t request, virt_t arg) {
+    const struct diskfile *d = f->priv;
+    uint32_t left;
+    if (request != FIONREAD_REQ || d == NULL) {
+        return KERR_NOTTY;
+    }
+    left = d->size - d->offset;
+    return uspace_copy_out(arg, &left, sizeof left) == KERR_OK ? 0 : KERR_FAULT;
+}
+
+static const struct file_ops diskfile_ops = {.read = diskfile_read, .ioctl = diskfile_ioctl,
+                                             .release = diskfile_release,
+                                             .pread = diskfile_pread};
 
 /* The bytes behind a descriptor, for a mapping to be backed from — and
  * `KERR_NODEV` for a descriptor that is not a file, which is `mmap`'s
@@ -457,7 +526,7 @@ int fdobjects_file_of_object(void *object, const uint8_t **bytes, uint32_t *size
  * is exactly where the owner/group/other bits mean something, and the mode
  * comes from the filesystem's own inode rather than from a guess. */
 static int open_directory(const char *path);
-static int open_for_writing(const char *path);
+static int open_for_writing(const char *path, uint32_t flags);
 
 static int open_regular(const char *path, uint32_t flags) {
     uint32_t uid = 0, gid = 0, mode = 0;
@@ -485,7 +554,7 @@ static int open_regular(const char *path, uint32_t flags) {
          * **Decided before the file is looked for**, because the stat below
          * would otherwise fail with `ENOENT` on a file that does not exist
          * yet — the one case `O_CREAT` is for. */
-        return open_for_writing(path);
+        return open_for_writing(path, flags);
     }
     {
         /* **A directory is a different kind of descriptor.** It used to fall
@@ -515,6 +584,9 @@ static int open_regular(const char *path, uint32_t flags) {
     d = diskfile_alloc();
     rc = d == NULL ? KERR_NOMEM : xfsmount_read_file(path, DISKFILE_MAX_BYTES, &bytes, &size);
     if (rc != KERR_OK) {
+        if (d != NULL) {
+            d->used = false;
+        }
         return rc;
     }
     d->bytes = bytes;
@@ -560,7 +632,12 @@ static int open_regular(const char *path, uint32_t flags) {
 struct writefile {
     char dir[WRITEFILE_PATH_MAX];
     char leaf[WRITEFILE_PATH_MAX];
+    char path[WRITEFILE_PATH_MAX * 2u]; /* dir and leaf together, for stat */
     uint64_t offset;
+    bool append; /* O_APPEND: every write goes to the end as it is now */
+    bool readable; /* O_RDWR: reads go to the file at the offset too */
+    uint64_t identity; /* reclock_identity of the path it was opened as */
+    bool orphan; /* unlinked while open: removed at the last close */
     bool used;
 };
 
@@ -598,13 +675,58 @@ static int split_path(const char *path, char *dir, char *leaf) {
     return KERR_OK;
 }
 
+static void copy_path(const char *from, char *to, uint32_t room) {
+    uint32_t i = 0;
+    while (from[i] != '\0' && i + 1u < room) {
+        to[i] = from[i];
+        i++;
+    }
+    to[i] = '\0';
+}
+
+/* How much of a write is staged in the kernel at once. */
+#define WRITE_BOUNCE 16384u
+
+/* Writes n bytes of the caller's buffer at w's offset **through a kernel
+ * copy**, a chunk at a time: a write over netfs sleeps while the reply
+ * comes back, and the caller's buffer must not be read after that (a
+ * sibling thread may have unmapped it). */
+static int write_bounced(struct writefile *w, const void *buf, uint32_t n, uint64_t at) {
+    uint8_t *bounce = kzalloc(n < WRITE_BOUNCE ? (n == 0 ? 1u : n) : WRITE_BOUNCE);
+    uint32_t done = 0;
+    int rc = bounce == NULL ? KERR_NOMEM : KERR_OK;
+    if (rc == KERR_OK && n == 0) {
+        rc = xfsmount_write_at(w->dir, w->leaf, at, NULL, 0);
+    }
+    while (rc == KERR_OK && done < n) {
+        uint32_t chunk = n - done < WRITE_BOUNCE ? n - done : WRITE_BOUNCE;
+        rc = uspace_copy_in(bounce, (virt_t)(uintptr_t)buf + done, chunk) == KERR_OK
+                 ? xfsmount_write_at(w->dir, w->leaf, at + done, bounce, chunk)
+                 : KERR_FAULT;
+        done += chunk;
+    }
+    kfree(bounce);
+    return rc;
+}
+
 static int32_t writefile_write(struct file *f, const void *buf, uint32_t n) {
     struct writefile *w = f->priv;
     int rc;
     if (w == NULL) {
         return KERR_BADF;
     }
-    rc = xfsmount_write_at(w->dir, w->leaf, w->offset, buf, n);
+    if (w->append) {
+        /* **The end as it is now**, not as it was at open: another writer
+         * may have grown the file since, and appending means after it. */
+        uint32_t mode = 0, nlink = 0;
+        uint64_t size = 0;
+        rc = xfsmount_stat_full(w->path, &mode, &size, &nlink);
+        if (rc != KERR_OK) {
+            return rc;
+        }
+        w->offset = size;
+    }
+    rc = write_bounced(w, buf, n, w->offset);
     if (rc != KERR_OK) {
         return rc;
     }
@@ -612,59 +734,227 @@ static int32_t writefile_write(struct file *f, const void *buf, uint32_t n) {
     return (int32_t)n;
 }
 
+/* Reads n bytes at `at` into the caller's buffer **through a kernel copy**,
+ * for the reason `write_bounced` writes through one: the read can sleep on
+ * the network, and the caller's mapping may be gone when it returns. */
+static int32_t read_bounced(const struct writefile *w, void *buf, uint32_t n, uint64_t at) {
+    uint8_t *bounce = kzalloc(n < WRITE_BOUNCE ? (n == 0 ? 1u : n) : WRITE_BOUNCE);
+    uint32_t done = 0;
+    int rc = bounce == NULL ? KERR_NOMEM : KERR_OK;
+    while (rc == KERR_OK && done < n) {
+        uint32_t chunk = n - done < WRITE_BOUNCE ? n - done : WRITE_BOUNCE, got = 0;
+        rc = xfsmount_read_path_at(w->path, at + done, bounce, chunk, &got);
+        if (rc == KERR_OK && got > 0 &&
+            uspace_copy_out((virt_t)(uintptr_t)buf + done, bounce, got) != KERR_OK) {
+            rc = KERR_FAULT;
+        }
+        done += rc == KERR_OK ? got : 0u;
+        if (got < chunk) {
+            break; /* the end of the file */
+        }
+    }
+    kfree(bounce);
+    return rc != KERR_OK ? rc : (int32_t)done;
+}
+
+/* A read-write descriptor reads the file at its offset; one opened for
+ * writing only refuses, as Linux does. It used to refuse both, so SQLite —
+ * which opens its database `O_RDWR` and reads it a page at a time — could
+ * not read a byte of a database it had just written. */
 static int32_t writefile_read(struct file *f, void *buf, uint32_t n) {
-    (void)f;
-    (void)buf;
-    (void)n;
-    return KERR_BADF; /* opened for writing */
+    struct writefile *w = f->priv;
+    int32_t got;
+    if (w == NULL || !w->readable) {
+        return KERR_BADF;
+    }
+    got = read_bounced(w, buf, n, w->offset);
+    w->offset += got > 0 ? (uint64_t)got : 0u;
+    return got;
+}
+
+static int32_t writefile_pread(struct file *f, void *buf, uint32_t n, uint64_t off) {
+    const struct writefile *w = f->priv;
+    return w == NULL || !w->readable ? KERR_BADF : read_bounced(w, buf, n, off);
+}
+
+/* `pwrite64`: at `off` and nowhere else — Linux ignores O_APPEND here only
+ * through a long-standing bug, and nothing on this board appends this way. */
+static int32_t writefile_pwrite(struct file *f, const void *buf, uint32_t n, uint64_t off) {
+    struct writefile *w = f->priv;
+    int rc = w == NULL ? KERR_BADF : write_bounced(w, buf, n, off);
+    return rc != KERR_OK ? rc : (int32_t)n;
+}
+
+/* ── unlinked while open ───────────────────────────────────────────────
+ *
+ * A descriptor here holds a path, not an inode, so a file removed while a
+ * writer has it open would be CREATED AGAIN by the next write or
+ * `ftruncate` — the name a program just removed coming back. The answer is
+ * NFS's "silly rename": the file moves to a hidden name beside it, every
+ * descriptor follows, and the last close removes it. */
+#define ORPHAN_PREFIX ".deleted-"
+
+static bool same_path(const char *a, const char *b);
+
+static uint32_t orphans_made;
+
+/* How many write descriptors hold `path`. */
+static uint32_t writers_of(const char *path) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < FD_MAX; i++) {
+        n += writefiles[i].used && same_path(writefiles[i].path, path) ? 1u : 0u;
+    }
+    return n;
+}
+
+/* Appends text at out[*at], within room. */
+static void append_text(char *out, uint32_t *at, uint32_t room, const char *text) {
+    for (uint32_t i = 0; text[i] != '\0' && *at + 1u < room; i++) {
+        out[(*at)++] = text[i];
+    }
+    out[*at] = '\0';
+}
+
+/* The hidden name `path` moves to: its directory, ".deleted-<n>". */
+static int orphan_name(const char *path, char out[WRITEFILE_PATH_MAX * 2u]) {
+    char dir[WRITEFILE_PATH_MAX], leaf[WRITEFILE_PATH_MAX], number[12];
+    uint32_t n = ++orphans_made, at = 0, d = sizeof number - 1u;
+    if (split_path(path, dir, leaf) != KERR_OK) {
+        return KERR_INVAL;
+    }
+    number[d] = '\0';
+    do {
+        number[--d] = (char)('0' + n % 10u);
+        n /= 10u;
+    } while (n != 0 && d > 0);
+    append_text(out, &at, WRITEFILE_PATH_MAX * 2u, dir);
+    append_text(out, &at, WRITEFILE_PATH_MAX * 2u, at == 1u && out[0] == '/' ? "" : "/");
+    append_text(out, &at, WRITEFILE_PATH_MAX * 2u, ORPHAN_PREFIX);
+    append_text(out, &at, WRITEFILE_PATH_MAX * 2u, number + d);
+    return KERR_OK;
+}
+
+/* Points every writer of `from` at `to`, marking them orphans. */
+static void follow_orphan(const char *from, const char *to) {
+    char was[WRITEFILE_PATH_MAX * 2u];
+    copy_path(from, was, sizeof was);
+    for (uint32_t i = 0; i < FD_MAX; i++) {
+        struct writefile *w = &writefiles[i];
+        if (w->used && same_path(w->path, was) && split_path(to, w->dir, w->leaf) == KERR_OK) {
+            copy_path(to, w->path, sizeof w->path);
+            w->orphan = true;
+        }
+    }
+}
+
+int fdobjects_unlink(const char *path) {
+    char hidden[WRITEFILE_PATH_MAX * 2u];
+    int rc;
+    if (writers_of(path) == 0) {
+        return xfsmount_unlink_path(path);
+    }
+    rc = orphan_name(path, hidden);
+    rc = rc != KERR_OK ? rc : xfsmount_rename_path(path, hidden);
+    if (rc == KERR_OK) {
+        follow_orphan(path, hidden);
+    }
+    return rc;
+}
+
+bool fdobjects_is_orphan_name(const char *name, uint32_t len) {
+    uint32_t p = sizeof ORPHAN_PREFIX - 1u;
+    for (uint32_t i = 0; i < p; i++) {
+        if (i >= len || name[i] != ORPHAN_PREFIX[i]) {
+            return false;
+        }
+    }
+    return len > p;
 }
 
 static void writefile_release(struct file *f) {
     struct writefile *w = f->priv;
-    if (w != NULL) {
-        w->used = false;
+    if (w == NULL) {
+        return;
     }
+    w->used = false;
+    if (w->orphan && writers_of(w->path) == 0) {
+        (void)xfsmount_unlink_path(w->path); /* the last close of a removed file */
+    }
+    w->orphan = false;
 }
 
 static const struct file_ops writefile_ops = {
     .read = writefile_read,
     .write = writefile_write,
     .release = writefile_release,
+    .pread = writefile_pread,
+    .pwrite = writefile_pwrite,
 };
 
 /* Opens a path for writing, creating the file at once.
  *
  * **Created on open rather than on the first write**, so that a program
  * which opens a file and writes nothing still leaves an empty file — which
- * is what `O_CREAT` means and what every caller assumes. */
-static int open_for_writing(const char *path) {
-    struct writefile *w = NULL;
-    struct file *f;
+ * is what `O_CREAT` means and what every caller assumes. `O_TRUNC` empties
+ * an existing file and `O_APPEND` writes at its end; both were ignored, so
+ * every open wrote from byte 0 over what was there — QuokkaOS's service
+ * logs, opened for appending, kept only their last write. */
+/* Whether `path` may be opened for writing with these flags: write
+ * permission (perm.h), O_CREAT needed to create, O_EXCL refusing an
+ * existing file, and no directories. */
+static int writable_open(const char *path, uint32_t flags) {
+    uint32_t mode = 0, nlink = 0;
+    uint64_t size = 0;
+    bool exists = false;
+    int rc = perm_may_write(path, &exists);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    if (!exists) {
+        return (flags & O_CREAT) != 0 ? KERR_OK : KERR_NOENT;
+    }
+    if ((flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL)) {
+        return KERR_EXIST;
+    }
+    rc = xfsmount_stat_full(path, &mode, &size, &nlink);
+    return rc == KERR_OK && (mode & 0170000u) == 0040000u ? KERR_ISDIR : rc;
+}
+
+/* A free writefile slot, claimed at once (the create below can sleep). */
+static struct writefile *writefile_claim(void) {
     for (uint32_t i = 0; i < FD_MAX; i++) {
         if (!writefiles[i].used) {
-            w = &writefiles[i];
-            break;
+            writefiles[i].used = true;
+            return &writefiles[i];
         }
     }
+    return NULL;
+}
+
+static int open_for_writing(const char *path, uint32_t flags) {
+    struct writefile *w;
+    struct file *f;
+    int rc = writable_open(path, flags);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    w = writefile_claim();
     if (w == NULL) {
         return KERR_NOMEM;
     }
-    if (split_path(path, w->dir, w->leaf) != KERR_OK) {
-        return KERR_INVAL;
-    }
-    {
-        int rc = xfsmount_write_at(w->dir, w->leaf, 0, NULL, 0);
-        if (rc != KERR_OK) {
-            return rc;
-        }
-    }
-    w->offset = 0;
-    w->used = true;
-    f = file_new(&writefile_ops, w, O_WRONLY);
+    rc = split_path(path, w->dir, w->leaf) != KERR_OK ? KERR_INVAL : KERR_OK;
+    rc = rc != KERR_OK ? rc : xfsmount_write_at(w->dir, w->leaf, 0, NULL, 0);
+    rc = rc != KERR_OK || (flags & O_TRUNC) == 0 ? rc : xfsmount_truncate_path(path, 0);
+    f = rc == KERR_OK ? file_new(&writefile_ops, w, O_WRONLY) : NULL;
     if (f == NULL) {
         w->used = false;
-        return KERR_NOMEM;
+        return rc != KERR_OK ? rc : KERR_NOMEM;
     }
+    copy_path(path, w->path, sizeof w->path);
+    w->offset = 0;
+    w->append = (flags & O_APPEND) != 0;
+    w->readable = (flags & O_ACCMODE) == O_RDWR;
+    w->identity = reclock_identity(path);
     return fd_install(f);
 }
 
@@ -730,6 +1020,8 @@ static struct dirfile *dirfile_alloc(const char *path) {
 #define DT_DIR 4u
 #define DT_REG 8u
 #define DT_UNKNOWN 0u
+#define DT_LNK 10u
+#define DT_CHR 2u
 
 /* What one `getdents64` call is filling. */
 struct dirent_fill {
@@ -752,6 +1044,19 @@ static void put_le64(uint8_t *at, uint64_t v) {
     }
 }
 
+/* The filesystem's type byte as getdents's `d_type`. A symbolic link left
+ * UNKNOWN made a caller stat it — and stat follows it, so a link was
+ * reported as the file it names and copied as one. */
+static uint8_t dirent_type(uint8_t ft) {
+    switch (ft) {
+    case XFS_DIR3_FT_DIR: return (uint8_t)DT_DIR;
+    case XFS_DIR3_FT_REG: return (uint8_t)DT_REG;
+    case XFS_DIR3_FT_SYMLINK: return (uint8_t)DT_LNK;
+    case XFS_DIR3_FT_CHRDEV: return (uint8_t)DT_CHR;
+    default: return (uint8_t)DT_UNKNOWN;
+    }
+}
+
 /* Appends one entry, or marks the buffer full.
  *
  * **A record that does not fit is not written at all**, and the entry is not
@@ -762,6 +1067,9 @@ static int add_dirent(void *self, const struct xfs_dirent *entry) {
     struct dirent_fill *f = self;
     uint32_t reclen;
     uint32_t namelen = entry->name_len;
+    if (fdobjects_is_orphan_name(entry->name, namelen)) {
+        return 0; /* a removed file still open somewhere: not a name any more */
+    }
     f->seen++;
     if (f->seen <= f->skip) {
         return 0; /* already handed to an earlier call */
@@ -792,10 +1100,7 @@ static int add_dirent(void *self, const struct xfs_dirent *entry) {
          * is right: a caller then stats what it cares about, which is what
          * `os.ReadDir` does anyway. Inventing `DT_REG` would make every
          * directory on such a filesystem look like a file. */
-        rec[DIRENT_TYPE] = entry->type == XFS_DIR3_FT_DIR
-                               ? (uint8_t)DT_DIR
-                               : (entry->type == XFS_DIR3_FT_REG ? (uint8_t)DT_REG
-                                                                      : (uint8_t)DT_UNKNOWN);
+        rec[DIRENT_TYPE] = dirent_type(entry->type);
         for (uint32_t i = 0; i < namelen; i++) {
             rec[DIRENT_NAME + i] = (uint8_t)entry->name[i];
         }
@@ -870,6 +1175,11 @@ static const struct file_ops dirfile_ops = {
     .release = dirfile_release,
 };
 
+const char *fdobjects_dir_path(const struct file *f) {
+    const struct dirfile *d = f == NULL ? NULL : f->priv;
+    return f != NULL && f->ops == &dirfile_ops && d != NULL ? d->path : NULL;
+}
+
 int32_t fdobjects_getdents(struct file *f, void *buf, uint32_t room) {
     struct dirfile *d = f == NULL ? NULL : f->priv;
     struct dirent_fill fill = {0};
@@ -915,55 +1225,79 @@ static bool same_path(const char *a, const char *b) {
     return a[i] == b[i];
 }
 
-int fdobjects_open_path(const char *path, uint32_t flags) {
-    const struct file_ops *ops = NULL;
-    if (same_path(path, "/dev/virtual/kernel_logger")) {
-        /* Taken before the descriptor exists, so the snapshot and the
-         * descriptor cannot disagree about which lines are in it. */
-        klog_open_snapshot.len = klog_tail(klog_open_snapshot.text,
-                                          (uint32_t)sizeof klog_open_snapshot.text);
-        klog_open_snapshot.offset = 0;
-    }
+/* A snapshot file: `room` bytes filled by `fill`, its own per descriptor. */
+static int open_snapshot(const struct file_ops *ops, uint32_t room, const char *path,
+                         int (*fill)(const char *path, struct snapshot *snap, uint32_t room),
+                         uint32_t flags) {
+    struct snapshot *snap = kzalloc((uint32_t)sizeof *snap + room);
     struct file *f;
+    int rc;
+    if (snap == NULL) {
+        return KERR_NOMEM;
+    }
+    rc = fill(path, snap, room);
+    f = rc == KERR_OK ? file_new(ops, snap, flags) : NULL;
+    if (f == NULL) {
+        kfree(snap);
+        return rc != KERR_OK ? rc : KERR_NOMEM;
+    }
+    return fd_install(f);
+}
+
+static int fill_klog(const char *path, struct snapshot *snap, uint32_t room) {
+    (void)path;
+    snap->len = klog_tail(snap->text, room);
+    return KERR_OK;
+}
+
+static int fill_proc(const char *path, struct snapshot *snap, uint32_t room) {
+    return procfs_generate(path, snap->text, room, &snap->len) == KERR_OK ? KERR_OK : KERR_NOENT;
+}
+
+static int fill_resolv(const char *path, struct snapshot *snap, uint32_t room) {
+    (void)path;
+    (void)room;
+    fill_resolv_snapshot(snap);
+    return KERR_OK;
+}
+
+/* The kernel's own device objects by path, or NULL. */
+static const struct file_ops *device_ops(const char *path) {
     if (same_path(path, "/dev/null")) {
-        ops = &null_ops;
-    } else if (same_path(path, "/dev/zero")) {
-        ops = &zero_ops;
-    } else if (same_path(path, "/dev/console") || same_path(path, "/dev/tty")) {
-        ops = &console_ops;
-    } else if (same_path(path, "/dev/virtual/kernel_logger")) {
-        ops = &klog_ops;
+        return &null_ops;
     }
-    if (ops == NULL && procfs_has(path)) {
-        /* Generated before the descriptor exists, so the snapshot and the
-         * descriptor cannot disagree about what the file said. */
-        uint32_t wrote = 0;
-        if (procfs_generate(path, proc_open_snapshot.text, PROCFS_MAX_BYTES, &wrote) != KERR_OK) {
-            return KERR_NOENT;
-        }
-        proc_open_snapshot.len = wrote;
-        proc_open_snapshot.offset = 0;
-        ops = &procfile_ops;
+    if (same_path(path, "/dev/zero")) {
+        return &zero_ops;
     }
-    if (ops == NULL && same_path(path, "/etc/resolv.conf")) {
+    if (same_path(path, "/dev/urandom") || same_path(path, "/dev/random")) {
+        return &random_ops;
+    }
+    return same_path(path, "/dev/console") || same_path(path, "/dev/tty") ? &console_ops : NULL;
+}
+
+int fdobjects_open_path(const char *path, uint32_t flags) {
+    const struct file_ops *ops = device_ops(path);
+    struct file *f;
+    if (ops != NULL) {
+        f = file_new(ops, NULL, flags);
+        return f == NULL ? KERR_NOMEM : fd_install(f);
+    }
+    if (same_path(path, "/dev/virtual/kernel_logger")) {
+        return open_snapshot(&klog_ops, KLOG_SNAPSHOT_BYTES, path, fill_klog, flags);
+    }
+    if (procfs_has(path)) {
+        return open_snapshot(&procfile_ops, PROCFS_MAX_BYTES, path, fill_proc, flags);
+    }
+    if (same_path(path, "/etc/resolv.conf")) {
         /* **The filesystem first.** An operator's own file is a decision
          * this kernel cannot see and must not override; the synthesised one
-         * exists for the case where there is none, which on a DHCP-
-         * configured machine with a read-only root is every boot. */
+         * is for when there is none, which on a DHCP-configured machine
+         * with a read-only root is every boot. */
         int real = open_regular(path, flags);
-        if (real >= 0) {
-            return real;
-        }
-        fill_resolv_snapshot();
-        ops = &resolv_ops;
+        return real >= 0 ? real
+                         : open_snapshot(&resolv_ops, RESOLV_SNAPSHOT_BYTES, path, fill_resolv, flags);
     }
-    if (ops == NULL) {
-        /* Not one of the kernel's own objects, so it is a name on the
-         * filesystem — or nothing at all, which the filesystem says. */
-        return open_regular(path, flags);
-    }
-    f = file_new(ops, NULL, flags);
-    return f == NULL ? KERR_NOMEM : fd_install(f);
+    return open_regular(path, flags);
 }
 
 /* ── a pipe ─────────────────────────────────────────────────────────────── */
@@ -983,7 +1317,22 @@ struct pipe {
     uint32_t count;
     bool reader_open;
     bool writer_open;
+    /* Both ends, so a change at one is announced at the **other**: a
+     * reader waits edge-triggered on the read end (Go's poller does), so a
+     * write that only marked the write end changed never woke it, and nor
+     * did the writer closing — a child's output, and its end of file,
+     * never reached the parent. NULL once that end is released. */
+    struct file *reader;
+    struct file *writer;
 };
+
+/* Tells whoever waits on the other end that this end did something. */
+static void announce(struct file *other) {
+    if (other != NULL) {
+        file_readiness_changed(other);
+    }
+    (void)sched_futex_wake(SCHED_POLLER_KEY, 64u);
+}
 
 static uint32_t pipe_used(const struct pipe *pp) {
     return pp->count;
@@ -1005,7 +1354,7 @@ static int32_t pipe_read(struct file *f, void *buf, uint32_t n) {
         pp->count--;
     }
     file_readiness_changed(f);
-    (void)sched_futex_wake(SCHED_POLLER_KEY, 64u);
+    announce(pp->writer); /* room to write again */
     return (int32_t)took;
 }
 
@@ -1026,7 +1375,7 @@ static int32_t pipe_write(struct file *f, const void *buf, uint32_t n) {
         return KERR_AGAIN; /* full: a short write of zero is a would-block */
     }
     file_readiness_changed(f);
-    (void)sched_futex_wake(SCHED_POLLER_KEY, 64u);
+    announce(pp->reader); /* something to read */
     return (int32_t)put;
 }
 
@@ -1050,6 +1399,8 @@ static uint32_t pipe_write_poll(struct file *f) {
 static void pipe_release_read(struct file *f) {
     struct pipe *pp = f->priv;
     pp->reader_open = false;
+    pp->reader = NULL;
+    announce(pp->writer); /* a writer now gets EPIPE */
     if (!pp->writer_open) {
         kfree(pp);
     }
@@ -1058,6 +1409,8 @@ static void pipe_release_read(struct file *f) {
 static void pipe_release_write(struct file *f) {
     struct pipe *pp = f->priv;
     pp->writer_open = false;
+    pp->writer = NULL;
+    announce(pp->reader); /* the reader now sees end of file */
     if (!pp->reader_open) {
         kfree(pp);
     }
@@ -1092,6 +1445,8 @@ int fdobjects_open_pipe(int32_t out[2], uint32_t flags) {
         kfree(pp);
         return KERR_NOMEM;
     }
+    pp->reader = r;
+    pp->writer = w;
     out[0] = (int32_t)fd_install(r);
     out[1] = (int32_t)fd_install(w);
     if (out[0] < 0 || out[1] < 0) {
@@ -1111,6 +1466,11 @@ struct epoll_watch {
     bool used;
     uint32_t events; /* what the caller is interested in */
     uint64_t data;   /* the caller's token, returned unchanged */
+    /* Edge-triggered (`EPOLLET`) only: the file's readiness generation when
+     * this watch was last reported, and the readiness last seen. */
+    uint32_t reported_gen;
+    uint32_t seen;
+    bool reported;
 };
 
 struct epoll {
@@ -1223,6 +1583,30 @@ int fdobjects_epoll_ctl(int32_t epfd, int32_t op, int32_t fd,
     return KERR_OK;
 }
 
+/* Whether a watch is reported now. Level-triggered: whenever it is ready.
+ * Edge-triggered (`EPOLLET`, which Go's runtime asks for on every
+ * descriptor): only once per change — the file's readiness generation has
+ * moved since this watch was last reported, or a bit is set that was clear
+ * the last time anybody looked (for the console, which has no generation).
+ * Without this a descriptor that simply stays writable was reported on every
+ * call, and an idle Go program's poller spun at 23,000 `epoll_pwait`s a
+ * second. The readiness is noted even when nothing is ready, so that a rise
+ * after a fall is an edge. */
+static bool is_reported(struct epoll_watch *w, const struct file *f, uint32_t ready) {
+    bool edge;
+    if ((w->events & EPOLLET) == 0) {
+        return ready != 0;
+    }
+    edge = ready != 0 &&
+           (!w->reported || f->poll_gen != w->reported_gen || (ready & ~w->seen) != 0);
+    w->seen = ready;
+    if (edge) {
+        w->reported = true;
+        w->reported_gen = f->poll_gen;
+    }
+    return edge;
+}
+
 int fdobjects_epoll_collect(int32_t epfd, struct user_epoll_event *out, uint32_t max) {
     struct epoll *ep = epoll_of(epfd);
     uint32_t found = 0;
@@ -1244,7 +1628,7 @@ int fdobjects_epoll_collect(int32_t epfd, struct user_epoll_event *out, uint32_t
             continue;
         }
         ready = file_poll(watched) & ep->watch[i].events;
-        if (ready != 0) {
+        if (is_reported(&ep->watch[i], watched, ready)) {
             out[found].events = ready;
             out[found].padding = 0;
             out[found].data = ep->watch[i].data;
@@ -1364,6 +1748,44 @@ int32_t fdobjects_read_for_test(int32_t fd, void *buf, uint32_t n) {
  * enough: the caller uses it immediately and the kernel lock is held across
  * the syscall, so a second call cannot be in flight.
  */
+static struct writefile *writefile_of(int32_t fd) {
+    struct file *f = fd_get(fd);
+    return f != NULL && f->ops == &writefile_ops ? f->priv : NULL;
+}
+
+int fdobjects_identity_of(int32_t fd, uint64_t *identity) {
+    const struct writefile *w = writefile_of(fd);
+    if (w == NULL) {
+        return KERR_BADF;
+    }
+    *identity = w->identity;
+    return KERR_OK;
+}
+
+int fdobjects_stat_of(int32_t fd, uint32_t *mode, uint64_t *size, uint32_t *nlink,
+                      uint64_t *ino) {
+    const struct writefile *w = writefile_of(fd);
+    if (w == NULL) {
+        return KERR_BADF;
+    }
+    *ino = w->identity;
+    return xfsmount_stat_full(w->path, mode, size, nlink);
+}
+
+int fdobjects_sync(int32_t fd) {
+    struct file *f = fd_get(fd);
+    if (f == NULL) {
+        return KERR_BADF;
+    }
+    if (f->ops == &writefile_ops) {
+        return xfsmount_sync_path(((const struct writefile *)f->priv)->path);
+    }
+    if (f->ops == &dirfile_ops) {
+        return xfsmount_sync_path(((const struct dirfile *)f->priv)->path);
+    }
+    return f->ops == &diskfile_ops ? xfsmount_flush() : KERR_INVAL;
+}
+
 const char *fdobjects_path_of(int32_t fd) {
     static char joined[WRITEFILE_PATH_MAX * 2u];
     struct file *f = fd_get(fd); /* a write descriptor: `fdobjects_file_of` never returns one */

@@ -16,6 +16,7 @@
 #include <stdint.h>
 
 #include "core/fat/fat.h"
+#include "core/vfs.h"
 #include "core/xfs/xfs.h"
 
 int fatmount_stat_full(struct fat *fs, const char *within, uint32_t *mode, uint64_t *size,
@@ -30,5 +31,8 @@ int fatmount_unlink_path(struct fat *fs, const char *within);
 int fatmount_rename_path(struct fat *fs, const char *from, const char *to, uint64_t now_s);
 int fatmount_truncate_path(struct fat *fs, const char *within, uint64_t size, uint64_t now_s);
 int fatmount_counters(struct fat *fs, struct xfs_counters *out);
+
+/* A mounted FAT volume as a vfs filesystem; `self` is its `struct fat`. */
+extern const struct vfs_ops fatmount_vfs_ops;
 
 #endif

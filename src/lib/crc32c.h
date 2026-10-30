@@ -6,9 +6,7 @@
  * little-endian, in a field that was zero while the sum was taken
  * (core/xfs/xfs.h's checksum helper does that part).
  *
- * Four bits at a time, from a 16-entry table: 64 bytes of kernel data
- * rather than the usual kilobyte, and still eight times quicker than doing
- * it a bit at a time. */
+ * Eight bytes at a time, from an 8 KiB table (crc32c.c says why). */
 #ifndef MINIKERN_LIB_CRC32C_H
 #define MINIKERN_LIB_CRC32C_H
 

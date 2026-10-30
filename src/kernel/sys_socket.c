@@ -33,9 +33,8 @@ struct user_timeval {
 #define IOV_LIMIT       64u
 
 /* Installing a descriptor, with the close-on-exec flag the caller asked
- * for. The ARM kernel had this in its file-descriptor syscalls; here it is a
- * two-line adapter onto `fd_install`, because this kernel's flag lives on
- * the file rather than beside the descriptor. */
+ * for: carried on the new file into `fd_install`, which moves it onto the
+ * descriptor (where it lives, so a dup'd copy does not inherit it). */
 static int32_t install_descriptor(struct file *f, bool cloexec) {
     f->flags |= cloexec ? O_CLOEXEC : 0u;
     return (int32_t)fd_install(f);

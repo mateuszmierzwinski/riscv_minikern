@@ -1,4 +1,5 @@
 #include "core/bootinfo.h"
+#include "core/boardspec.h"
 
 #include "core/errno.h"
 #include "core/fdt.h"
@@ -46,14 +47,31 @@ static void fdt_read_initrd(const struct fdt *fdt, struct bootinfo *out) {
     }
 }
 
+/* Memory from the command line (`minikern.mem=`, core/boardspec.h) when it
+ * says, else from the tree's memory node — which a tree that lacks one can
+ * then do without. */
+static int read_memory(const struct fdt *fdt, struct bootinfo *info) {
+    struct board_spec spec;
+    board_spec_parse(info->cmdline, &spec);
+    if (spec.has_mem) {
+        info->mem_base = spec.mem_base;
+        info->mem_size = spec.mem_size;
+        return KERR_OK;
+    }
+    return fdt_read_memory(fdt, info);
+}
+
 int bootinfo_from_fdt(const void *blob, size_t max_size, struct bootinfo *out) {
     struct fdt fdt;
     struct bootinfo info = {.source = BOOTINFO_FDT, .cmdline = ""};
-    if (fdt_open(&fdt, blob, max_size) != KERR_OK || fdt_read_memory(&fdt, &info) != KERR_OK) {
+    if (fdt_open(&fdt, blob, max_size) != KERR_OK) {
+        return KERR_INVAL;
+    }
+    fdt_read_bootargs(&fdt, &info);
+    if (read_memory(&fdt, &info) != KERR_OK) {
         return KERR_INVAL;
     }
     info.block_size = fdt.total_size;
-    fdt_read_bootargs(&fdt, &info);
     fdt_read_initrd(&fdt, &info);
     *out = info;
     return KERR_OK;

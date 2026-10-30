@@ -1,9 +1,11 @@
+#include "arch/riscv/trap.h"
 #include "kernel/net.h"
 
 #include "core/console.h"
 #include "core/net/tcp.h"
 #include "core/errno.h"
 #include "drivers/virtio_net.h"
+#include "kernel/klock.h"
 #include "kernel/random.h"
 #include "arch/riscv/timer.h"
 
@@ -100,13 +102,25 @@ void knet_tick(void) {
     on_tick(&knet, timer_ns());
 }
 
+/* **A random first ephemeral port.** Counting from 49152 every boot gave
+ * each boot's first connection the previous boot's four-tuple: a server
+ * still holding that half-open connection answered the SYN with a reset,
+ * and a predictable port is half of what an off-path attacker needs. */
+static void seed_ephemeral_ports(void) {
+    uint16_t r = 0;
+    random_fill(&r, sizeof r);
+    knet.nif.next_ephemeral = (uint16_t)(r % (65536u - NET_EPHEMERAL_LO));
+}
+
 void knet_start(uint32_t xid) {
+    seed_ephemeral_ports();
     knet.nif.now_ms = timer_ns() / 1000000u;
     dhcp_start(&knet.nif, xid);
     (void)timer_add_housekeeping_hook(knet_tick);
 }
 
 void knet_start_static(ip4_t addr, uint32_t prefix, ip4_t gateway, ip4_t dns) {
+    seed_ephemeral_ports();
     knet.nif.now_ms = timer_ns() / 1000000u;
     knet.nif.ip = addr;
     knet.nif.mask = prefix >= 32u ? 0xffffffffu : ~((1u << (32u - prefix)) - 1u);
@@ -122,7 +136,16 @@ void knet_start_static(ip4_t addr, uint32_t prefix, ip4_t gateway, ip4_t dns) {
     (void)timer_add_housekeeping_hook(knet_tick);
 }
 
+static void (*device_report)(void);
+
+void knet_set_device_report(void (*report)(void)) {
+    device_report = report;
+}
+
 void knet_report(void) {
+    if (device_report != NULL) {
+        device_report();
+    }
     const struct net_stats *n = &knet.nif.stats;
     kprintf("net: %u housekeeping beats, %u net ticks, now_ms %llu, next ping %llu\n",
             timer_housekeeping_beats(), knet.net_ticks,
@@ -142,13 +165,26 @@ void knet_report(void) {
      * not, so the two directions are printed: blocks sent means this stack
      * told a peer what it was holding, blocks received means it understood a
      * peer that told it. */
-    kprintf("tcp: sack blocks %u sent, %u received\n", t->sack_blocks_sent,
-            t->sack_blocks_received);
+    kprintf("tcp: sack blocks %u sent, %u received; window updates %u, acks unsent %u\n",
+            t->sack_blocks_sent, t->sack_blocks_received, t->window_updates, t->acks_unsent);
 }
 
 void knet_set_dns(ip4_t dns) {
     dns_override = dns;
     knet.nif.dns = dns;
+}
+
+void knet_poll_locked(void (*poll)(void)) {
+    bool took = !klock_held() && klock_enter();
+    if (poll != NULL) {
+        poll();
+    } else {
+        virtio_net_poll(&knet.nif);
+    }
+    knet_tick();
+    if (took) {
+        klock_exit(true);
+    }
 }
 
 int knet_wait_address(uint32_t timeout_ms) {
@@ -161,9 +197,8 @@ int knet_wait_address(uint32_t timeout_ms) {
          * can actually arrive. The ARM project had an `irq_wait` for this;
          * here it is the one instruction, because nothing else is needed:
          * the device's interrupt and the tick both wake it. */
-        __asm__ volatile("csrsi sstatus, 2\n\twfi\n\tcsrci sstatus, 2" : : : "memory");
-        virtio_net_poll(&knet.nif);
-        knet_tick();
+        trap_wait_for_interrupt();
+        knet_poll_locked(NULL);
     }
     return KERR_OK;
 }

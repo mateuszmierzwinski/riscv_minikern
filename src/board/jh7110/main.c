@@ -51,6 +51,13 @@
 #include "drivers/virtio_net.h"
 #include "kernel/klock.h"
 #include "kernel/net.h"
+#include "kernel/netboot.h"
+#include "kernel/netfs_tcp.h"
+#include "kernel/overlayfs.h"
+#include "drivers/cpufreq_jh7110.h"
+#include "kernel/cpuwhy.h"
+#include "kernel/procfiles.h"
+#include "core/boardspec.h"
 #include "kernel/random.h"
 #include "kernel/sched.h"
 #include "kernel/swap.h"
@@ -155,20 +162,74 @@ static uint64_t arena_after_the_image(void) {
  * wrong in a way that faults rather than one that stops fetching, a handler
  * exists to say so. And deliberately before the self-tests, so those faults
  * are taken with paging on. */
-static void bring_up_translation(const struct bootinfo *info) {
+/* Folds bytes into a 64-bit value (splitmix64 per byte): every input bit
+ * reaches every output bit, so a seed's entropy is not lost to a sum. */
+static uint64_t fold_seed(uint64_t h, const uint8_t *bytes, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++) {
+        h += 0x9e3779b97f4a7c15ull + bytes[i];
+        h = (h ^ (h >> 30)) * 0xbf58476d1ce4e5b9ull;
+        h = (h ^ (h >> 27)) * 0x94d049bb133111ebull;
+        h ^= h >> 31;
+    }
+    return h;
+}
+
+/* Mixes in /chosen's `prop` when the firmware gave one, and **wipes it**,
+ * as Linux does: the blob stays in memory, and a seed that outlives its use
+ * is a seed something else can read back. */
+static bool take_chosen_seed(const struct fdt *fdt, const char *prop, uint64_t *h) {
+    struct fdt_prop p;
+    bool any = false;
+    if (fdt_get_prop(fdt, "/chosen", prop, &p) != KERR_OK || p.len == 0) {
+        return false;
+    }
+    *h = fold_seed(*h, p.value, p.len);
+    for (uint32_t i = 0; i < p.len; i++) {
+        any = any || p.value[i] != 0;
+        ((uint8_t *)(uintptr_t)p.value)[i] = 0;
+    }
+    return any; /* a placeholder of zeroes is no seed */
+}
+
+/* The seed for the direct map's place, needed before translation and so
+ * before the entropy pool: the firmware's `/chosen` `kaslr-seed` and
+ * `rng-seed` when it gives them (U-Boot does with an RNG driver), always
+ * mixed with the time counter, which alone is a few bits. *strong says
+ * whether a firmware seed was there. */
+static uint64_t kaslr_seed(uint64_t dtb, bool *strong) {
+    struct fdt fdt;
+    uint64_t t, h;
+    __asm__ volatile("rdtime %0" : "=r"(t));
+    h = fold_seed(0, (const uint8_t *)&t, sizeof t);
+    *strong = false;
+    if (fdt_open(&fdt, (const void *)(uintptr_t)dtb, FDT_MAX_BYTES) == KERR_OK) {
+        bool k = take_chosen_seed(&fdt, "kaslr-seed", &h);
+        bool r = take_chosen_seed(&fdt, "rng-seed", &h);
+        *strong = k || r;
+    }
+    return h | 1u; /* never 0, which means "fixed" */
+}
+
+static void bring_up_translation(const struct bootinfo *info, uint64_t dtb) {
     uint64_t arena = arena_after_the_image();
+    bool fixed = cmdline_has(boot_cmdline, "minikern.nokaslr"), strong = false;
     int rc;
     if (info->source != BOOTINFO_FDT || info->mem_size == 0) {
         kprintf("mmu: no memory map, so translation stays off\n");
         return;
     }
     mmu_set_table_arena(arena, TABLE_ARENA_BYTES);
+    mmu_randomise_direct_map(fixed ? 0u : kaslr_seed(dtb, &strong));
     rc = mmu_init(info->mem_base, info->mem_size);
     if (rc != KERR_OK) {
         kprintf("mmu: could not build the kernel map (rc %d); translation stays off\n", rc);
         return;
     }
     kprintf("mmu: sv39 on, %u table pages, kernel text read-execute\n", mmu_table_pages_used());
+    kprintf("mmu: direct map at %016llx%s\n", (unsigned long long)mmu_direct_map_base(),
+            fixed ? " (fixed: minikern.nokaslr)"
+                  : (strong ? " (randomised: firmware seed and timer)"
+                            : " (randomised, timer-seeded only: weak; no /chosen seed)"));
 }
 
 /* The frame allocator and the heap, over the memory that is left.
@@ -398,6 +459,7 @@ static void put_the_boot_log_on_disk(void) {
  * situation worse. */
 static void adopt_the_real_uart(uint64_t dtb) {
     struct console_port port;
+    struct board_spec spec;
     struct fdt fdt;
     /* `minikern.uart=sbi` keeps the firmware's console and never touches the
      * hardware. It exists because on a real board the two are not equally
@@ -410,10 +472,14 @@ static void adopt_the_real_uart(uint64_t dtb) {
         kprintf("uart: keeping the firmware's console (minikern.uart=sbi)\n");
         return;
     }
-    if (fdt_open(&fdt, (const void *)(uintptr_t)dtb, FDT_MAX_BYTES) != KERR_OK) {
-        return;
-    }
-    if (jh7110_uart_init(&fdt, &port) != KERR_OK) {
+    board_spec_parse(boot_cmdline, &spec);
+    if (spec.has_uart) {
+        if (jh7110_uart_init_at(spec.uart_base, spec.uart_shift, spec.uart_width, &port) != KERR_OK) {
+            kprintf("uart: earlycon= could not be mapped; keeping the firmware's console\n");
+            return;
+        }
+    } else if (fdt_open(&fdt, (const void *)(uintptr_t)dtb, FDT_MAX_BYTES) != KERR_OK ||
+               jh7110_uart_init(&fdt, &port) != KERR_OK) {
         kprintf("uart: no 16550 in the device tree; keeping the firmware's console\n");
         return;
     }
@@ -434,6 +500,7 @@ static void adopt_the_real_uart(uint64_t dtb) {
  * before it has a handler for what comes through it crashes in the one place
  * where it cannot explain itself. */
 static void bring_up_interrupts(uint64_t dtb, uint64_t hart) {
+    struct board_spec spec;
     struct fdt fdt;
     if (fdt_open(&fdt, (const void *)(uintptr_t)dtb, FDT_MAX_BYTES) != KERR_OK) {
         return;
@@ -444,7 +511,9 @@ static void bring_up_interrupts(uint64_t dtb, uint64_t hart) {
         kprintf("plic: at %016llx, hart %llu uses context %u\n",
                 (unsigned long long)plic_base(), (unsigned long long)hart, plic_context());
     }
-    if (timer_init(&fdt, TICK_HZ) != KERR_OK) {
+    board_spec_parse(boot_cmdline, &spec);
+    if ((spec.timebase != 0 ? timer_init_at(spec.timebase, TICK_HZ) : timer_init(&fdt, TICK_HZ)) !=
+        KERR_OK) {
         kprintf("timer: the tree does not say the counter's frequency; no tick\n");
         return;
     }
@@ -510,10 +579,63 @@ static void wait_for_ticks(void) {
  * pattern to the **last** sector, reads it back and restores the original —
  * the last, because a filesystem lives at the beginning and a test that
  * scribbles on sector 0 destroys what the next test wants to read. */
+static void bring_up_network(uint64_t dtb);
+static void poll_net_from_tick(void);
+
+/* The pins a netboot is held to, read before the session starts. **False
+ * when one was given and does not parse**: carrying on would boot unpinned
+ * — any server on the LAN choosing the root — while the operator believes
+ * the pin is in force. */
+static bool pin_netboot(void) {
+    size_t len = 0;
+    const char *v = cmdline_value(boot_cmdline, "minikern.rootfs.sha256", &len);
+    if (v != NULL && knetboot_expect(v, len) != KERR_OK) {
+        kprintf("netboot: minikern.rootfs.sha256 is not 64 hex characters; not netbooting\n");
+        return false;
+    }
+    v = cmdline_value(boot_cmdline, "minikern.netboot.key", &len);
+    if (v != NULL && knetboot_require_key(v, len) != KERR_OK) {
+        kprintf("netboot: minikern.netboot.key is not 64 hex characters; not netbooting\n");
+        return false;
+    }
+    return true;
+}
+
+/* `minikern.netboot[=<server ip>]`: the root filesystem from an MKNB server
+ * (src/go/tools/mknbserver), as the RAM disk the disk layer then prefers.
+ * The network comes up early for it; its normal bring-up later is a no-op. */
+static bool netboot_root(uint64_t dtb) {
+    size_t len = 0;
+    const char *v = cmdline_value(boot_cmdline, "minikern.netboot", &len);
+    ip4_t pinned = 0;
+    phys_t at = 0;
+    uint32_t bytes = 0;
+    if (v == NULL) {
+        return false;
+    }
+    if (len > 0 && ip4_parse(v, (uint32_t)len, &pinned) != KERR_OK) {
+        kprintf("netboot: \"minikern.netboot=\" wants an IPv4 address; sweeping instead\n");
+        pinned = 0;
+    }
+    if (!pin_netboot()) {
+        return false;
+    }
+    bring_up_network(dtb);
+    if (knetboot_fetch(pinned, poll_net_from_tick, &at, &bytes) != KERR_OK) {
+        return false;
+    }
+    disk_use_ram(at, bytes);
+    return true;
+}
+
 static void bring_up_storage(uint64_t dtb) {
     size_t kindlen = 0;
     const char *kind = cmdline_value(boot_cmdline, "minikern.disk", &kindlen);
     dwmmc_set_trace(cmdline_has(boot_cmdline, "minikern.mmctrace"));
+    if (netboot_root(dtb)) {
+        kind = "ram";
+        kindlen = 3;
+    }
     disk_prefer(kind, (uint32_t)kindlen);
     struct fdt fdt;
     const struct blockdev *dev;
@@ -799,6 +921,10 @@ static void bring_up_filesystem(void) {
     int rc;
     int32_t entries;
     automount_the_disk();
+    if (disk_device() != NULL && !disk_has_root()) {
+        list_the_volumes(); /* no root to attach: already said so */
+        return;
+    }
     rc = xfsmount_attach();
     if (rc == KERR_NODEV) {
         return; /* no disk: already said so */
@@ -946,7 +1072,7 @@ static void secondary_hart_loop(void) {
     for (;;) {
         struct uproc *p;
         while (!sched_wants_harts()) {
-            __asm__ volatile("csrsi sstatus, 2\n\twfi\n\tcsrci sstatus, 2" : : : "memory");
+            trap_wait_for_interrupt();
         }
         /* Checked again, and for NULL: the process may have ended between
          * the wait and here. Joining a process that is gone would adopt a
@@ -1243,6 +1369,20 @@ static bool net_over_gmac;
 static void on_gmac_interrupt(void *self) {
     (void)self;
     (void)dwmac_handle_interrupt();
+}
+
+/* What the controller saw while DHCP went unanswered: frames out and in say
+ * whether the request left and whether anything at all came back. */
+static void report_no_address(void) {
+    uint64_t sent = 0, got = 0, dropped = 0;
+    if (!net_over_gmac) {
+        return;
+    }
+    dwmac_counters(&sent, &got, &dropped);
+    kprintf("net: the GMAC sent %llu frames, received %llu, dropped %llu\n",
+            (unsigned long long)sent, (unsigned long long)got, (unsigned long long)dropped);
+    dwmac_report();
+    dwmac_dump_bringup();
 }
 
 static void poll_net_from_tick(void) {
@@ -1727,6 +1867,11 @@ static void bring_up_thermal(uint64_t dtb) {
     (void)procfs_add("/proc/thermal", thermal_file);
     (void)procfs_add("/proc/meminfo", meminfo_file);
     (void)procfs_add("/proc/stat", stat_file);
+    procfiles_install();
+    /* `minikern.cpuwhy`: where the processors' time goes, every 10 s. */
+    if (cmdline_has(boot_cmdline, "minikern.cpuwhy")) {
+        cpuwhy_install(cpufreq_jh7110_current_khz);
+    }
     /* **Sampling starts with the sensor**, not with the terminal it was
      * first attached to: the range is only the boot's range if it begins
      * where the readings begin. */
@@ -1775,6 +1920,11 @@ static void bring_up_the_buses(uint64_t dtb) {
 }
 
 static void bring_up_network(uint64_t dtb) {
+    static bool up;
+    if (up) {
+        return; /* a netboot brought it up before storage */
+    }
+    up = true;
     struct fdt fdt;
     const struct netdev_port *port = NULL;
     uint8_t mac[ETH_ALEN];
@@ -1804,6 +1954,10 @@ static void bring_up_network(uint64_t dtb) {
         }
         dwmac_address(mac);
         net_over_gmac = true;
+        if (cmdline_has(boot_cmdline, "minikern.gmacdump")) {
+            dwmac_dump_bringup();
+        }
+        knet_set_device_report(dwmac_report);
     }
     {
         /* **The sink is what the driver hands received frames to**, and it
@@ -1861,6 +2015,7 @@ static void bring_up_network(uint64_t dtb) {
     knet_start(xid);
     if (knet_wait_address(5000u) != KERR_OK) {
         kprintf("net: no address after 5 s — carrying on without one\n");
+        report_no_address();
         return;
     }
     knet_report();
@@ -2318,6 +2473,14 @@ static bool swap_has_slots(void) {
     uint64_t written = 0, read_back = 0;
     swap_report(&slots, &used, &written, &read_back);
     return slots > 0;
+}
+
+/* `minikern.threads`: what was left running when the first program ended
+ * — the state of a child that hung. */
+static void report_threads_if_asked(void) {
+    if (cmdline_has(boot_cmdline, "minikern.threads")) {
+        sched_report_threads();
+    }
 }
 
 static void report_mapping_counters(void) {
@@ -3588,6 +3751,7 @@ static void run_program_from_memory(const uint8_t *image, uint32_t size, const c
     kprintf("init: %s exited with %lld after %llu syscalls (%llu stale-translation faults)\n",
             name, (long long)status, (unsigned long long)uspace_syscalls(),
             (unsigned long long)uspace_stale_faults());
+    report_threads_if_asked();
     report_mapping_counters();
     report_hart_usage();
     uspace_destroy(proc);
@@ -3653,6 +3817,7 @@ static void run_init_from_disk(const char *path) {
     if (cmdline_has(boot_cmdline, "minikern.netstat")) {
         knet_report();
     }
+    report_threads_if_asked();
     uspace_destroy(proc);
 }
 
@@ -3764,7 +3929,9 @@ static void run_user_programs(void) {
      * useless for anything that happens late — the budget was gone long
      * before a child process made its first call. */
     syscall_set_trace(cmdline_number(boot_cmdline, "minikern.calls", 0u));
+    syscall_set_trace_pid(cmdline_number(boot_cmdline, "minikern.callpid", 0u));
     syscall_trace_sleeps(cmdline_has(boot_cmdline, "minikern.sleeps"));
+    sys_proc_trace_exec(cmdline_has(boot_cmdline, "minikern.exectrace"));
     syscall_trace_errors(cmdline_has(boot_cmdline, "minikern.errors"));
     signal_set_delivery(!cmdline_has(boot_cmdline, "minikern.nosignals"));
     uspace_broadcast_additions(cmdline_has(boot_cmdline, "minikern.tlbsafe"));
@@ -4167,6 +4334,35 @@ static void kmain_after_devices(uint64_t hart, uint64_t dtb);
  * why the jump can be verified before that map is dropped — but a missed
  * one is a fault the moment it goes. Re-registering is cheaper than keeping
  * a list of pointers to relocate, and cannot go stale. */
+/* What `mount(2)` mounts, by type: an overlay of two directories, or a
+ * netfs export (whose transport the netfs hook owns). */
+static int mount_by_type(const char *fstype, const char *source, const char *target,
+                         const char *data) {
+    const char *overlay = "overlay";
+    uint32_t i = 0;
+    while (fstype[i] != '\0' && fstype[i] == overlay[i]) {
+        i++;
+    }
+    if (fstype[i] == '\0' && overlay[i] == '\0') {
+        return overlayfs_mount(data, target);
+    }
+    return netfs_tcp_mount_hook(fstype, source, target);
+}
+
+/* `minikern.netfs=<ip>:<port>` mounts that netfs server's export at `/net`,
+ * or at `/` with `minikern.netroot` — programs, init systems and test data
+ * then come straight off the workstation (src/go/tools/netfs). */
+static void mount_netfs_if_asked(void) {
+    size_t len = 0;
+    syscall_set_mount_hook(mount_by_type);
+    const char *spec = cmdline_value(boot_cmdline, "minikern.netfs", &len);
+    if (spec != NULL && len > 0u) {
+        (void)netfs_tcp_mount(spec, len,
+                              cmdline_has(boot_cmdline, "minikern.netroot") ? "/" : "/net",
+                              poll_net_from_tick);
+    }
+}
+
 static void kmain_high(uint64_t hart, uint64_t dtb) {
     struct console_port con = jh7110_sbi_console();
     struct bootinfo info = {0};
@@ -4301,7 +4497,7 @@ void kmain(uint64_t hart, uint64_t dtb) {
      * they happened before the kernel could tell how long it had been
      * alive. */
     klog_time_source(timer_ns);
-    bring_up_translation(&info);
+    bring_up_translation(&info, dtb);
     /* The rest of the boot. There is no jump here any more: `start.S` put
      * the kernel at its linked address before `kmain` was called. The
      * device tree goes on **through the direct map**: it is read for the
@@ -4354,6 +4550,7 @@ static void kmain_after_devices(uint64_t hart, uint64_t dtb) {
         }
     }
     bring_up_network(dtb);
+    mount_netfs_if_asked();
     wait_for_ticks();
     run_user_programs();
     (void)selftest_run(boot_cmdline);

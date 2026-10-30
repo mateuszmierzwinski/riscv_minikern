@@ -49,8 +49,8 @@ int xfs_dir_fork_remove(struct xfs *fs, const struct xfs_inode *dir, uint64_t lo
         xfs_put_be64(di + XFS_DI_NBLOCKS, xfs_be64(di + XFS_DI_NBLOCKS) - fs->dirblocks);
         xfs_put_be64(di + XFS_DI_SIZE, data_end(fs, &m));
         rc = xfs_fork_store(fs, dir->ino, di, &m);
-        xfs_put_be32(di + XFS_DI_MTIME, (uint32_t)now_s);
-        xfs_put_be32(di + XFS_DI_CTIME, (uint32_t)now_s);
+        xfs_put_time(di, XFS_DI_MTIME, now_s);
+        xfs_put_time(di, XFS_DI_CTIME, now_s);
         xfs_reseal(fs, di, fs->inodesize, XFS_DI_CRC);
         bcache_dirty(b);
     }
