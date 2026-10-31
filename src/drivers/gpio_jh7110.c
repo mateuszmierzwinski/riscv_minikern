@@ -164,6 +164,36 @@ int gpio_jh7110_set_input(uint32_t controller, uint32_t pin) {
     return KERR_OK;
 }
 
+int gpio_jh7110_set_function(uint32_t controller, uint32_t pin, uint8_t dout_signal,
+                             uint8_t doen_signal) {
+    int rc = pin_ok(controller, pin);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    if (controller != 0) {
+        return KERR_NOTSUP;
+    }
+    /* The signal before its enable, for the reason `set_output` gives. */
+    write_pin_field(controller, gpio_jh7110_dout_offset(pin), dout_signal);
+    write_pin_field(controller, gpio_jh7110_doen_offset(pin), doen_signal);
+    return KERR_OK;
+}
+
+int gpio_jh7110_route_input(uint32_t controller, uint32_t signal, uint32_t pin) {
+    int rc = pin_ok(controller, pin);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    if (controller != 0) {
+        return KERR_NOTSUP;
+    }
+    if (signal >= JH7110_SYS_GPI_SIGNALS) {
+        return KERR_INVAL;
+    }
+    write_pin_field(controller, gpio_jh7110_gpi_offset(signal), (uint8_t)(pin + 2u));
+    return KERR_OK;
+}
+
 int gpio_jh7110_peek(uint32_t controller, uint32_t byte_offset, uint32_t *word) {
     if (controller >= CONTROLLERS || !controllers[controller].up || (byte_offset & 3u) != 0) {
         return KERR_INVAL;

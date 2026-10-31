@@ -82,6 +82,27 @@ uint32_t gpio_jh7110_init(const struct fdt *fdt);
  * available. */
 int gpio_jh7110_set_output(uint32_t controller, uint32_t pin, bool high);
 int gpio_jh7110_set_input(uint32_t controller, uint32_t pin);
+
+/* **A pad given to a peripheral** (sys controller only). `DOUT` and `DOEN`
+ * do not only hold a level: each byte selects which internal signal drives
+ * the pad and which enables its driver, 0/1 being the constants the plain
+ * GPIO calls above write. `dout_signal` and `doen_signal` are a
+ * peripheral's numbers from the pin-function table (docs/DISPLAY.md §1.7,
+ * e.g. HDMI DDC clock = 11 and 3). KERR_NOTSUP for the aon controller,
+ * whose table is laid out differently. */
+int gpio_jh7110_set_function(uint32_t controller, uint32_t pin, uint8_t dout_signal,
+                             uint8_t doen_signal);
+
+/* **A peripheral input fed from a pad** (sys controller only): the input
+ * routing table has a byte per peripheral input signal, holding the pad
+ * that drives it plus 2 — 0 and 1 are the constant low and high. */
+static inline uint32_t gpio_jh7110_gpi_offset(uint32_t signal) {
+    return 0x080u + signal;
+}
+
+#define JH7110_SYS_GPI_SIGNALS 0x98u /* the table ends where the input levels start, 0x118 */
+
+int gpio_jh7110_route_input(uint32_t controller, uint32_t signal, uint32_t pin);
 int gpio_jh7110_read(uint32_t controller, uint32_t pin, bool *high);
 
 /* Where a controller was found, for the boot log. */

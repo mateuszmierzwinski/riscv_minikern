@@ -95,6 +95,27 @@ def user_binary(name, srcs, **kwargs):
         **kwargs
     )
 
+def musl_binary(name, srcs, deps = [], **kwargs):
+    """A user-mode program written against a C library: musl, linked static.
+
+    Unlike `user_binary` it has no link script of its own — `lld`'s default
+    layout starts at 0x10000 and keeps the program headers in the first
+    segment, which is what `AT_PHDR` needs — and `_start` is musl's
+    (`crt1`), so `main` is an ordinary `main`. Nothing in it knows it runs
+    on minikern: that is the test of the syscall interface it exercises.
+    """
+    cc_binary(
+        name = name,
+        srcs = srcs,
+        deps = deps + [
+            "//third_party/c/musl:crt1",
+            "//third_party/c/musl:c",
+            "//third_party/c/musl:headers",
+        ],
+        target_compatible_with = ["//platforms:riscv64"],
+        **kwargs
+    )
+
 def user_image(name, program):
     """Builds a user program for the board platform and names its ELF."""
     kernel_image(name = name, kernel = program)

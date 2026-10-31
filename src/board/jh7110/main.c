@@ -38,6 +38,8 @@
 #include "core/klog.h"
 #include "kernel/irqwait.h"
 #include "kernel/file.h"
+#include "drivers/display_jh7110.h"
+#include "kernel/fbdev.h"
 #include "kernel/fdobjects.h"
 #include "lib/kfmt.h"
 #include "core/errno.h"
@@ -1842,6 +1844,82 @@ static uint32_t stat_file(char *out, uint32_t room) {
     return at;
 }
 
+/* The framebuffer's mode: `minikern.vfb=<width>x<height>`, or the HDMI
+ * mode when only `minikern.hdmi=` is given. KERR_NOENT when neither asks
+ * for one; a malformed value is said and refused — it would otherwise size
+ * an allocation. */
+static int framebuffer_mode(struct fb_mode *mode) {
+    size_t len = 0;
+    const char *spec = cmdline_value(boot_cmdline, "minikern.vfb", &len);
+    const char *option = "minikern.vfb";
+    int rc;
+    if (spec == NULL) {
+        spec = cmdline_value(boot_cmdline, "minikern.hdmi", &len);
+        option = "minikern.hdmi";
+    }
+    if (spec == NULL) {
+        return KERR_NOENT;
+    }
+    rc = fbinfo_parse_mode(spec, len, mode);
+    if (rc != KERR_OK) {
+        kprintf("fb: %s=%.*s refused (rc %d)\n", option, (int)len, spec, rc);
+    }
+    return rc;
+}
+
+/* Writes the framebuffer back from the L2 ten times a second while HDMI
+ * shows it, so what programs draw reaches the display controller. */
+#define DISPLAY_REFRESH_NS 100000000ull
+
+static void refresh_display_from_beat(void) {
+    static uint64_t last;
+    uint64_t now = timer_ns();
+    if (now - last >= DISPLAY_REFRESH_NS) {
+        last = now;
+        display_jh7110_refresh();
+    }
+}
+
+/* `minikern.hdmi=<width>x<height>`: `/dev/fb0` on the board's HDMI output
+ * (ROADMAP §10). The framebuffer must have the same size — given by
+ * `minikern.vfb`, or made for the HDMI mode when that is absent. */
+static void start_hdmi(const struct fdt *fdt) {
+    phys_t base = 0;
+    struct fb_mode fb, want;
+    size_t len = 0;
+    const char *spec = cmdline_value(boot_cmdline, "minikern.hdmi", &len);
+    if (spec == NULL || fbinfo_parse_mode(spec, len, &want) != KERR_OK ||
+        fbdev_memory(&base, &fb) != KERR_OK) {
+        return;
+    }
+    if (fb.width != want.width || fb.height != want.height) {
+        kprintf("display: minikern.hdmi=%.*s refused: /dev/fb0 is %ux%u\n", (int)len, spec,
+                fb.width, fb.height);
+        return;
+    }
+    if (display_jh7110_start(fdt, base, fb.width, fb.height, fb.stride) == KERR_OK) {
+        (void)timer_add_housekeeping_hook(refresh_display_from_beat);
+    }
+}
+
+/* The display stack: the framebuffer, then — when asked — HDMI. */
+static void bring_up_display(uint64_t dtb) {
+    struct fdt fdt;
+    struct fb_mode mode;
+    int rc;
+    if (framebuffer_mode(&mode) != KERR_OK) {
+        return;
+    }
+    rc = fbdev_install(&mode);
+    if (rc != KERR_OK) {
+        kprintf("fb: /dev/fb0 %ux%u could not be installed (rc %d)\n", mode.width, mode.height, rc);
+        return;
+    }
+    if (fdt_open(&fdt, (const void *)(uintptr_t)dtb, FDT_MAX_BYTES) == KERR_OK) {
+        start_hdmi(&fdt);
+    }
+}
+
 /* Keeps the extremes current when nobody is reading.
  *
  * **The peak is the number the operator wants**, and it happens while the
@@ -2506,6 +2584,16 @@ static void report_mapping_counters(void) {
      * in every report rather than inferred from its absence. */
     kprintf("mem: %llu pages given up on advice\n",
             (unsigned long long)uspace_discarded_pages());
+    kprintf("mem: %llu shared device pages mapped, %u made copy-on-write by mprotect\n",
+            (unsigned long long)uspace_shared_pages(), uspace_protect_kept_cow());
+    {
+        uint64_t refreshes = 0, last_us = 0;
+        display_jh7110_refresh_stats(&refreshes, &last_us);
+        if (refreshes != 0) {
+            kprintf("display: %llu framebuffer flushes, the last took %llu us\n",
+                    (unsigned long long)refreshes, (unsigned long long)last_us);
+        }
+    }
 }
 
 /* Whether the kernel had to catch a thread mid-flight on another hart, and
@@ -3944,6 +4032,9 @@ static void run_user_programs(void) {
     /* `minikern.keepadvice` keeps pages a program said it did not need —
      * the defect §0 came down to, kept so the test for it can fail. */
     syscall_keep_discarded_pages(cmdline_has(boot_cmdline, "minikern.keepadvice"));
+    /* `minikern.protectshares`: `mprotect` makes a page still shared after
+     * `fork` plainly writable again, as it did — the control for the fix. */
+    uspace_set_protect_keeps_cow(!cmdline_has(boot_cmdline, "minikern.protectshares"));
     /* Puts `gettid`'s old wrong answer back, for measuring what it cost. */
     syscall_one_tid(cmdline_has(boot_cmdline, "minikern.onetid"));
     /* Keeps the kernel heap's pages out of the frame pool — a diagnostic for
@@ -4542,6 +4633,7 @@ static void kmain_after_devices(uint64_t hart, uint64_t dtb) {
         }
     }
     bring_up_thermal(dtb);
+    bring_up_display(dtb);
     if (cmdline_has(boot_cmdline, "minikern.probe")) {
         struct fdt probe_tree;
         if (fdt_open(&probe_tree, (const void *)(uintptr_t)dtb, FDT_MAX_BYTES) == KERR_OK) {

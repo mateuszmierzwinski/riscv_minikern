@@ -83,6 +83,13 @@ struct file_ops {
      * means the object has no positions (a pipe, a socket): `ESPIPE`. */
     int32_t (*pread)(struct file *f, void *buf, uint32_t n, uint64_t off);
     int32_t (*pwrite)(struct file *f, const void *buf, uint32_t n, uint64_t off);
+    /* The frame behind the page at `offset` of a device that is mapped by
+     * sharing its own memory (`MAP_SHARED` of a framebuffer). KERR_INVAL past
+     * the device's end. The frame stays the device's: a mapping takes a
+     * share of it (`mem_share_page`) and gives the share back, never the
+     * frame. NULL means the object cannot be mapped shared, and `mmap`
+     * refuses `MAP_SHARED` of it. */
+    int32_t (*map_page)(struct file *f, uint64_t offset, phys_t *phys);
 };
 
 struct file {

@@ -34,11 +34,14 @@
 #include "core/fdt.h"
 #include "core/types.h"
 
-/* Which generator. The two this kernel needs: the system one, which owns
- * most peripherals, and the always-on one. */
+/* Which generator: the system one, which owns most peripherals, the
+ * always-on one, and the display's. */
 enum crg_domain {
     CRG_SYS = 0,
     CRG_AON = 1,
+    /* The display's own generator, inside the VOUT power domain: it reads 0
+     * and ignores writes until that domain is on (`pmu_jh7110`). */
+    CRG_VOUT = 2,
     CRG_DOMAINS,
 };
 
@@ -133,6 +136,20 @@ int crg_enable_device(const struct fdt *fdt, const char *path);
 
 /* Where a generator was found. */
 phys_t crg_base(enum crg_domain domain);
+
+/* Maps a generator the tree does not describe, at its documented address.
+ * For the VOUT generator, which this board's firmware tree may omit.
+ * KERR_OK when it was already mapped from the tree. */
+int crg_jh7110_attach(enum crg_domain domain, phys_t base, uint64_t size);
+
+/* Sets a clock's divider (the low 24 bits), leaving its gate and mux. A
+ * divider of 0 is refused: the hardware reads it as "off" on some clocks
+ * and as 1 on others, and neither is something a caller should get by
+ * accident. */
+int crg_set_divider(enum crg_domain domain, uint32_t index, uint32_t divider);
+
+/* Selects a clock's parent (the mux field, bits 27:24). */
+int crg_select_parent(enum crg_domain domain, uint32_t index, uint32_t mux);
 
 /* **Where this kernel reaches that domain's registers.** `crg_base` is the
  * address the hardware decodes, which stopped being usable as a pointer

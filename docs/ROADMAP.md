@@ -251,3 +251,53 @@ git, and the pitfalls are in `CLAUDE.md` §5.
 - [x] **QEMU suite repaired** — the timestamped log and the kernel's move broke all ten `*_qemu_test` targets; fixed, kept `manual` and sidelined.
 - [x] **Fault reports blamed user code for kernel faults** — the origin is decided from the kernel's own table (`PTE_U` absent = kernel); board-verified both ways.
 - [x] **Stale symbol twin** — `scripts/whereis.sh` rebuilds `minikern_board_elf` before symbolising.
+
+## 10. Display and graphics
+
+Built bottom to top (operator, 2026-10-31): a framebuffer the kernel owns, then 2D output on the board's
+HDMI, then GL in user space. Research: the HDMI bring-up register sequence and the acceleration options are
+summarised in `docs/DISPLAY.md`.
+
+### Open
+
+- [~] **HDMI: a picture confirmed by eye — needs the operator** (S) — the scanout runs on silicon (below), but
+  no monitor is attached to the board (hot-plug low, so no EDID either). With a monitor on the HDMI port:
+  boot `minikern.hdmi=1920x1080` with `fbdemo.elf` and check the colour-bar order (white, yellow, cyan, green,
+  magenta, red, blue, black), a smooth grey ramp and a moving white square; then the EDID line in the log.
+- [ ] **AVI infoframe / HDMI mode** (S) — the transmitter runs in DVI mode (register 0x52 = 0). Some TVs want
+  HDMI mode with a valid AVI infoframe (`display_avi_infoframe` builds it; nothing sends it yet).
+- [ ] **Mode from the EDID** (S) — the mode is the command line's; the monitor's preferred timing is read and
+  only reported. Only 1080p60 and 720p60 have PLL settings.
+- [ ] **Cache maintenance, smarter** (M) — the whole frame is flushed from the L2 ten times a second (~2 ms each,
+  ~2% of a hart at 1080p). Better: flush only what changed (a dirty-rectangle `ioctl`, as DRM's `DIRTYFB`), or
+  the TRM's uncached DRAM view at `0x4_4000_0000` once its semantics and PMP access are measured. Whether the
+  DC snoops the L2 at all is unmeasured — it needs eyes on a monitor with flushing off.
+- [ ] **Permissions on `/dev/fb0`** (S) — any process may open and map it today; Linux gives it to root and the
+  `video` group.
+- [ ] **`read`/`write`/`lseek` on `/dev/fb0`** (S) — only `pread`/`pwrite` and `mmap` now (`cat /dev/fb0` fails).
+- [ ] **A way to see the VFB from the PC** (M) — a QuokkaOS service that maps `/dev/fb0` and serves it over VNC.
+- [ ] **GL in user space** (L) — own small software GL, or Mesa's software renderers (Alpine's riscv64 musl
+  packages run unchanged on this ABI). Mesa needs a minimal KMS (`/dev/dri/card0`: dumb buffers, page flip).
+- [ ] **Acceleration** — the DC8200's planes are the real 2D acceleration (overlays, scaler, hardware cursor);
+  there is no blitter. The PowerVR BXE-4-32 is an XL project of its own (closed MIPS firmware, ~35k-line
+  reference driver, unsupported in Mesa). Measure memset/memcpy and a full-frame flush first.
+
+### Done
+
+- [x] **HDMI scanout of `/dev/fb0`** — `minikern.hdmi=1920x1080` or `1280x720` (`drivers/display_jh7110.c`): HPD
+  and the PMIC rails read, DDC/HPD pins given to the transmitter (`gpio_jh7110_set_function`/`route_input`),
+  VOUT powered (`pmu_jh7110.c`), syscrg and voutcrg clocks and resets (`CRG_VOUT`), the transmitter's PLLs
+  locked in DVI mode (`inno_hdmi.c`), the DC8200 primary plane on display 0 (`dc8200.c`), the frame flushed
+  from the L2 (`ccache_jh7110.c`). Board: DC revision 0x5720, PLLs locked, 31 vsyncs in 0.5 s at both modes,
+  no underflow; fbtest 255 at 1080p while scanned out. Timings, register words, infoframe and EDID are pure
+  and host-tested (`display_mode_test`), the EDID reader is in the CVE suite (`edid_cve_test`, guard pages).
+- [x] **Virtual framebuffer `/dev/fb0`** — `minikern.vfb=<w>x<h>`, XRGB8888, one contiguous run of frames.
+  `FBIOGET_VSCREENINFO`/`FSCREENINFO`, `FBIOPUT_VSCREENINFO` (the current mode only), `FBIOPAN_DISPLAY` (origin),
+  `FBIOBLANK`; `pread`/`pwrite`; `mmap(MAP_SHARED)` maps the device's own frames, shared on `fork`. Board: a
+  musl fbdev client passes all eight checks (`§10:` cases, 255).
+- [x] **`MAP_SHARED` for devices** — `file_ops.map_page`, `VMA_SHARED`; refused (and said once) for anonymous
+  memory and regular files, `EACCES` past the descriptor's mode, `EINVAL` past the device's end.
+- [x] **musl user space** — `third_party/c/musl` (1.2.5) + compiler-rt binary128 routines; `musl_binary`. Board:
+  stdio, malloc and `strtold` (`§10: a program built against musl runs`).
+- [x] **`mprotect` after `fork` broke copy-on-write** — found while building the above: a still-shared page was
+  re-mapped writable. Fixed (`protected_bits`); board control `minikern.protectshares` fails the check (191).

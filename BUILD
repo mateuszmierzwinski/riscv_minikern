@@ -1,7 +1,7 @@
 load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
 load("//:version.bzl", "MINIKERN_VERSION")
-load(":riscv_minikern.bzl", "kernel_binary", "kernel_image", "user_binary", "user_image")
+load(":riscv_minikern.bzl", "kernel_binary", "kernel_image", "musl_binary", "user_binary", "user_image")
 
 # minikern for RISC-V — a from-scratch kernel for the StarFive JH7110
 # (SiFive U74), implementing Linux's syscall interface so that Go binaries
@@ -216,6 +216,26 @@ cc_test(
     deps = [
         ":ktest",
         ":vma",
+    ],
+)
+
+cc_test(
+    name = "display_mode_test",
+    size = "small",
+    srcs = ["test/display_mode_test.c"],
+    deps = [
+        ":display_mode",
+        ":ktest",
+    ],
+)
+
+cc_test(
+    name = "fbinfo_test",
+    size = "small",
+    srcs = ["test/fbinfo_test.c"],
+    deps = [
+        ":fbinfo",
+        ":ktest",
     ],
 )
 
@@ -752,6 +772,38 @@ cc_library(
     ],
 )
 
+# The display path on the board's HDMI (ROADMAP §10, docs/DISPLAY.md): the
+# PMU's VOUT power domain, the L2 flush for scanout, the Innosilicon HDMI
+# transmitter, the DC8200 display controller, and the bring-up that strings
+# them together and proves each step by reading something back.
+cc_library(
+    name = "drivers_display",
+    srcs = [
+        "src/drivers/ccache_jh7110.c",
+        "src/drivers/dc8200.c",
+        "src/drivers/display_jh7110.c",
+        "src/drivers/inno_hdmi.c",
+        "src/drivers/pmu_jh7110.c",
+    ],
+    hdrs = [
+        "src/drivers/ccache_jh7110.h",
+        "src/drivers/dc8200.h",
+        "src/drivers/display_jh7110.h",
+        "src/drivers/inno_hdmi.h",
+        "src/drivers/mmio_poll.h",
+        "src/drivers/pmu_jh7110.h",
+    ],
+    strip_include_prefix = "src",
+    target_compatible_with = ["//platforms:riscv64"],
+    deps = [
+        ":arch_riscv",
+        ":console",
+        ":display_mode",
+        ":drivers_gpio",
+        ":drivers_i2c",
+    ],
+)
+
 # The pure halves, which the host can judge.
 cc_library(
     name = "gpio_offsets",
@@ -794,9 +846,23 @@ cc_test(
     ],
 )
 
+# The EDID reader against a hostile monitor. Each block sits against a
+# PROT_NONE guard page, so a read outside its 128 bytes faults the test
+# rather than passing silently (the host has no sanitizer runtime for gcc).
+cc_test(
+    name = "edid_cve_test",
+    size = "small",
+    srcs = ["test/cve/edid_cve_test.c"],
+    deps = [
+        ":display_mode",
+        ":ktest",
+    ],
+)
+
 test_suite(
     name = "cve",
     tests = [
+        ":edid_cve_test",
         ":elf_cve_test",
         ":fdt_test",
         ":partition_test",
@@ -984,6 +1050,26 @@ cc_library(
     deps = [":core_boot"],
 )
 
+# Video timings, the display hardware's register words for them, the AVI
+# infoframe and the EDID reader (§10). Pure and host-tested.
+cc_library(
+    name = "display_mode",
+    srcs = ["src/core/display_mode.c"],
+    hdrs = ["src/core/display_mode.h"],
+    strip_include_prefix = "src",
+    deps = [":core_boot"],
+)
+
+# A framebuffer's geometry and the fbdev structs that describe it (§10).
+# Pure and host-tested: the mode comes from the command line.
+cc_library(
+    name = "fbinfo",
+    srcs = ["src/core/fbinfo.c"],
+    hdrs = ["src/core/fbinfo.h"],
+    strip_include_prefix = "src",
+    deps = [":core_boot"],
+)
+
 cc_library(
     name = "partition",
     srcs = ["src/core/partition.c"],
@@ -1056,6 +1142,7 @@ cc_library(
         "src/arch/riscv/switch.S",
         "src/arch/riscv/uspace_entry.S",
         "src/kernel/sched.c",
+        "src/kernel/fbdev.c",
         "src/kernel/fdobjects.c",
         "src/kernel/flock.c",
         "src/kernel/perm.c",
@@ -1076,6 +1163,7 @@ cc_library(
     ],
     hdrs = [
         "src/arch/riscv/sigframe.h",
+        "src/kernel/fbdev.h",
         "src/kernel/fdobjects.h",
         "src/kernel/flock.h",
         "src/kernel/perm.h",
@@ -1092,6 +1180,7 @@ cc_library(
     strip_include_prefix = "src",
     target_compatible_with = ["//platforms:riscv64"],
     deps = [
+        ":fbinfo",
         ":pathres",
         ":reclock",
         ":vfs",
@@ -1571,6 +1660,7 @@ cc_library(
         ":arch_riscv",
         ":console",
         ":core_boot",
+        ":drivers_display",
         ":drivers_i2c",
         ":drivers_pwm",
         ":drivers_temp",
@@ -2175,4 +2265,41 @@ test_suite(
         ":user_qemu_test",
         ":xfs_qemu_test",
     ],
+)
+
+# The first program built against a C library (musl, ROADMAP §10): stdio,
+# malloc and the soft-float `long double` path. Exits 0 when all pass.
+musl_binary(
+    name = "musl_hello",
+    srcs = ["src/userland/musl_hello/main.c"],
+)
+
+user_image(
+    name = "musl_hello.elf",
+    program = ":musl_hello",
+)
+
+# The virtual framebuffer from a program's side (ROADMAP §10): /dev/fb0
+# opened, described and mapped shared by an ordinary fbdev client built
+# against musl. Exits with a bitmask of the checks that passed (255 = all).
+musl_binary(
+    name = "fbtest",
+    srcs = ["src/userland/fbtest/main.c"],
+)
+
+user_image(
+    name = "fbtest.elf",
+    program = ":fbtest",
+)
+
+# A test card and a moving square on /dev/fb0, for a person at the monitor:
+# the HDMI check a log cannot make (ROADMAP §10).
+musl_binary(
+    name = "fbdemo",
+    srcs = ["src/userland/fbdemo/main.c"],
+)
+
+user_image(
+    name = "fbdemo.elf",
+    program = ":fbdemo",
 )

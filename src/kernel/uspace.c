@@ -3018,6 +3018,48 @@ static int back_file_megapage(struct uproc *p, const struct vma *r, virt_t base)
     return KERR_OK;
 }
 
+/* Pages of a shared device mapping put into an address space, by a fault,
+ * by `MAP_POPULATE` or by `fork`. */
+static uint64_t shared_pages;
+
+uint64_t uspace_shared_pages(void) {
+    return shared_pages;
+}
+
+/* Maps the device's own frame at `va` of a `MAP_SHARED` region.
+ *
+ * **No frame is allocated and nothing is zeroed or filled**: the frame is
+ * the device's, and what is in it is the device's contents — a framebuffer
+ * another process drew in. The mapping takes a share (`mem_share_page`), so
+ * `munmap`, exit and `MADV_DONTNEED` give back the share and never the
+ * frame, which the device keeps holding. `KERR_EXIST` as `back_one_page`
+ * answers it, for the same race. */
+static int back_shared_page(struct uproc *p, const struct vma *r, virt_t va) {
+    struct file *f = r->file;
+    phys_t phys = 0, already = 0;
+    uint64_t flags = 0, span = 0;
+    int rc;
+    if (r->prot == 0) {
+        return KERR_OK;
+    }
+    if (pgtable_lookup(&p->pt, va, &already, &flags, &span)) {
+        backed_twice++;
+        return KERR_EXIST;
+    }
+    rc = f->ops->map_page(f, r->offset + (va - r->start), &phys);
+    rc = rc != KERR_OK ? rc : mem_share_page(phys);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    rc = pgtable_map(&p->pt, va, phys, PAGE_SIZE, prot_bits(r->prot));
+    if (rc != KERR_OK) {
+        (void)mem_free_pages(phys, 1); /* the share, not the frame */
+        return rc;
+    }
+    shared_pages++;
+    return KERR_OK;
+}
+
 /* Backs whatever the region says belongs at `va`: a 2 MiB block for a
  * region that asked for huge pages and has room for a whole one, a 4 KiB
  * page otherwise.
@@ -3030,6 +3072,10 @@ static int back_for_region(struct uproc *p, const struct vma *r, virt_t va) {
     virt_t base = va & ~(virt_t)(MEGAPAGE_SIZE - 1u);
     virt_t page = va & ~(virt_t)(PAGE_SIZE - 1u);
     int rc;
+    if ((r->flags & VMA_SHARED) != 0) {
+        rc = back_shared_page(p, r, page);
+        return rc == KERR_EXIST ? KERR_OK : rc;
+    }
     if (r->file == NULL && (r->flags & VMA_HUGE) != 0 && base >= r->start &&
         r->end - base >= MEGAPAGE_SIZE && pgtable_megapage_free(&p->pt, base) &&
         back_one_megapage(p, base, r->prot) == KERR_OK) {
@@ -3211,6 +3257,31 @@ static int give_page_cow(struct uproc *child, struct uproc *parent, virt_t va) {
     return rc != KERR_OK ? rc : mem_share_page(phys);
 }
 
+/* One page of a shared device mapping, given to a child as **the same
+ * frame with the same rights** — not copy-on-write, which would give the
+ * child a private copy on its first store and make the "shared" mapping
+ * private after `fork`, the opposite of what `MAP_SHARED` promises. */
+static int give_page_shared(struct uproc *child, struct uproc *parent, virt_t va) {
+    phys_t phys = 0;
+    uint64_t prot = 0, size = 0;
+    int rc;
+    if (!pgtable_lookup(&parent->pt, va, &phys, &prot, &size)) {
+        return KERR_OK; /* never touched: the child faults its own in */
+    }
+    phys &= ~(phys_t)(PAGE_SIZE - 1u);
+    rc = mem_share_page(phys);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    rc = pgtable_map(&child->pt, va, phys, PAGE_SIZE, prot);
+    if (rc != KERR_OK) {
+        (void)mem_free_pages(phys, 1);
+        return rc;
+    }
+    shared_pages++;
+    return KERR_OK;
+}
+
 /* Gives a child every region the parent has, page by page. */
 /* One of a parent's 2 MiB pages, given to a child by **copying it**.
  *
@@ -3247,31 +3318,41 @@ static int give_megapage(struct uproc *child, struct uproc *parent, virt_t at, u
     return KERR_OK;
 }
 
+/* One of the parent's regions, given to the child page by page: a huge
+ * region's blocks copied, a shared device region's frames shared, and
+ * everything else copy-on-write. `r` is the parent's, which this does not
+ * change — the child's record is a copy made before. */
+static int give_region(struct uproc *child, struct uproc *parent, const struct vma *r) {
+    bool huge = (r->flags & VMA_HUGE) != 0;
+    bool shared = (r->flags & VMA_SHARED) != 0;
+    /* **The child's own reference.** Its region set is a copy of the
+     * parent's, pointers and all, so without this the two processes
+     * would share one reference and whichever let go first would take
+     * the file's bytes out from under the other. */
+    if (r->file != NULL) {
+        (void)file_get((struct file *)r->file);
+    }
+    /* Copy-on-write works page by page, so a transparent megapage is
+     * split before it is shared: the child gets each of its pages. */
+    if (!huge && split_huge_in(parent, r->start, r->end) != KERR_OK) {
+        return KERR_NOMEM;
+    }
+    for (virt_t at = r->start; at < r->end; at += huge ? MEGAPAGE_SIZE : PAGE_SIZE) {
+        int rc = huge     ? give_megapage(child, parent, at, r->prot)
+                 : shared ? give_page_shared(child, parent, at)
+                          : give_page_cow(child, parent, at);
+        if (rc != KERR_OK) {
+            return rc;
+        }
+    }
+    return KERR_OK;
+}
+
 static int give_address_space(struct uproc *child, struct uproc *parent) {
     for (uint32_t i = 0; i < parent->vmas.n; i++) {
-        virt_t at = parent->vmas.v[i].start;
-        virt_t end = parent->vmas.v[i].end;
-        bool huge = (parent->vmas.v[i].flags & VMA_HUGE) != 0;
-        uint32_t prot = parent->vmas.v[i].prot;
-        /* **The child's own reference.** Its region set is a copy of the
-         * parent's, pointers and all, so without this the two processes
-         * would share one reference and whichever let go first would take
-         * the file's bytes out from under the other. */
-        if (parent->vmas.v[i].file != NULL) {
-            (void)file_get((struct file *)parent->vmas.v[i].file);
-        }
-        /* Copy-on-write works page by page, so a transparent megapage is
-         * split before it is shared: the child gets each of its pages. */
-        if (!huge && split_huge_in(parent, at, end) != KERR_OK) {
-            return KERR_NOMEM;
-        }
-        for (; at < end;) {
-            int rc = huge ? give_megapage(child, parent, at, prot)
-                          : give_page_cow(child, parent, at);
-            if (rc != KERR_OK) {
-                return rc;
-            }
-            at += huge ? MEGAPAGE_SIZE : PAGE_SIZE;
+        int rc = give_region(child, parent, &parent->vmas.v[i]);
+        if (rc != KERR_OK) {
+            return rc;
         }
     }
     /* The break is not an `mmap` region and is not recorded as one, so it
@@ -3526,11 +3607,17 @@ uint64_t uspace_populated_pages(void) {
  * nothing to populate — `PROT_NONE` means there is deliberately nothing
  * there — so it is left alone rather than quietly given pages. */
 static void populate(struct uproc *p, virt_t base, uint64_t pages, uint32_t prot) {
+    const struct vma *r = vma_find(&p->vmas, base);
+    bool shared = r != NULL && (r->flags & VMA_SHARED) != 0;
     if (prot == 0) {
         return;
     }
     for (uint64_t i = 0; i < pages; i++) {
-        int rc = back_one_page(p, base + i * PAGE_SIZE, prot);
+        /* A shared region's pages are the device's, never fresh zeroes. The
+         * region is looked up again each time: backing does not change the
+         * record, but a pointer into it is only good until the next insert. */
+        int rc = shared ? back_shared_page(p, vma_find(&p->vmas, base), base + i * PAGE_SIZE)
+                        : back_one_page(p, base + i * PAGE_SIZE, prot);
         if (rc != KERR_OK && rc != KERR_EXIST) {
             return;
         }
@@ -3660,7 +3747,9 @@ int uspace_map(struct uproc *p, const struct uspace_mapping *m, virt_t *out) {
         return KERR_NOMEM;
     }
     clear_the_range(p, m->fixed, base, pages);
-    rc = record_the_mapping(p, base, pages, m->prot, m->huge ? VMA_HUGE : 0u, m->file, m->offset);
+    rc = record_the_mapping(p, base, pages, m->prot,
+                            (m->huge ? VMA_HUGE : 0u) | (m->shared ? VMA_SHARED : 0u), m->file,
+                            m->offset);
     if (rc != KERR_OK) {
         return rc;
     }
@@ -4222,6 +4311,47 @@ int uspace_remap(struct uproc *p, virt_t at, uint64_t old_bytes, uint64_t new_by
     return move_mapping(p, at, old_bytes, new_bytes, prot, to, out);
 }
 
+/* Whether `va` lies in a `MAP_SHARED` device region. */
+static bool in_shared_region(struct uproc *p, virt_t va) {
+    const struct vma *r = vma_find(&p->vmas, va);
+    return r != NULL && (r->flags & VMA_SHARED) != 0;
+}
+
+/* Pages `mprotect` made writable that were still another process's too, and
+ * so were given copy-on-write rather than write. */
+static uint32_t protect_kept_cow;
+
+uint32_t uspace_protect_kept_cow(void) {
+    return protect_kept_cow;
+}
+
+/* Whether `mprotect` keeps a still-shared private page copy-on-write. On by
+ * default; `minikern.protectshares` turns it off — the old behaviour, kept
+ * as the control that proves the fix is what makes the test pass. */
+static bool protect_keeps_cow = true;
+
+void uspace_set_protect_keeps_cow(bool on) {
+    protect_keeps_cow = on;
+}
+
+/* The page-table bits for a page whose rights become `prot`.
+ *
+ * **A private page whose frame another process still holds is never made
+ * writable.** `fork` shares every page copy-on-write; re-mapping one with
+ * the plain write bit — what this did — gave both processes one writable
+ * frame, so each saw the other's stores. It is made copy-on-write instead,
+ * and the first store copies it. A shared device region is the exception:
+ * its frames are meant to be written by everyone that maps them. */
+static uint64_t protected_bits(struct uproc *p, virt_t va, phys_t phys, uint32_t prot) {
+    uint64_t bits = prot_bits(prot);
+    if (protect_keeps_cow && (bits & PTE_W) != 0 && !in_shared_region(p, va) &&
+        mem_page_shares(phys & ~(phys_t)(PAGE_SIZE - 1u)) > 1u) {
+        protect_kept_cow++;
+        bits = (bits & ~(uint64_t)PTE_W) | PTE_COW;
+    }
+    return bits;
+}
+
 /* One 4 KiB page's new rights — or, for a megapage the range covered whole
  * (`protect_megapages` left it), nothing: it was done there. */
 static int protect_one(struct uproc *p, virt_t va, uint32_t prot) {
@@ -4229,8 +4359,10 @@ static int protect_one(struct uproc *p, virt_t va, uint32_t prot) {
     uint64_t flags = 0, size = 0;
     if (!pgtable_lookup(&p->pt, va, &phys, &flags, &size)) {
         /* Making a reservation usable: there is nothing there yet, so
-         * this is the moment it gets a page. `PROT_NONE` needs none. */
-        return prot == 0 ? KERR_OK : back_one_page(p, va, prot);
+         * this is the moment it gets a page. `PROT_NONE` needs none, and a
+         * shared device page is the device's, faulted in on first touch —
+         * never an anonymous zero page. */
+        return prot == 0 || in_shared_region(p, va) ? KERR_OK : back_one_page(p, va, prot);
     }
     if (size != PAGE_SIZE) {
         return KERR_OK;
@@ -4239,7 +4371,7 @@ static int protect_one(struct uproc *p, virt_t va, uint32_t prot) {
         return drop_pages(p, va, PAGE_SIZE);
     }
     (void)pgtable_unmap(&p->pt, va);
-    return pgtable_map(&p->pt, va, phys, PAGE_SIZE, prot_bits(prot));
+    return pgtable_map(&p->pt, va, phys, PAGE_SIZE, protected_bits(p, va, phys, prot));
 }
 
 /* The megapages in [at, end), before the page-by-page pass.
@@ -4273,8 +4405,28 @@ static int protect_megapages(struct uproc *p, virt_t at, virt_t end, uint32_t pr
     return rc;
 }
 
+/* Whether `mprotect` would make writable a shared region of a device opened
+ * read-only — Linux's `EACCES`: the descriptor's mode bounds every mapping
+ * made from it, for as long as the mapping lives. */
+static bool write_beyond_the_open(struct uproc *p, virt_t at, virt_t end, uint32_t prot) {
+    if ((prot & PROT_WRITE) == 0) {
+        return false;
+    }
+    for (uint32_t i = 0; i < p->vmas.n; i++) {
+        const struct vma *r = &p->vmas.v[i];
+        if (r->end > at && r->start < end && (r->flags & VMA_SHARED) != 0 &&
+            (((struct file *)r->file)->flags & O_ACCMODE) == O_RDONLY) {
+            return true;
+        }
+    }
+    return false;
+}
+
 int uspace_protect(struct uproc *p, virt_t at, uint64_t bytes, uint32_t prot) {
     uint64_t pages = 0;
+    if (write_beyond_the_open(p, at, at + bytes, prot)) {
+        return KERR_ACCES;
+    }
     /* The record follows the rights, not only the ranges: a region whose
      * permissions changed is still the same region, and a reader of the set
      * that saw stale rights would answer a fault wrongly. */

@@ -1261,6 +1261,45 @@ static int fill_resolv(const char *path, struct snapshot *snap, uint32_t room) {
     return KERR_OK;
 }
 
+/* Devices drivers registered (`fdobjects_add_device`). Few: one per piece
+ * of hardware with a node, so a small fixed table. */
+#define DRIVER_DEVICES_MAX 8u
+
+struct driver_device {
+    const char *path;
+    const struct file_ops *ops;
+    void *priv;
+};
+
+static struct driver_device driver_devices[DRIVER_DEVICES_MAX];
+static uint32_t driver_device_count;
+
+static const struct driver_device *driver_device(const char *path) {
+    for (uint32_t i = 0; i < driver_device_count; i++) {
+        if (same_path(path, driver_devices[i].path)) {
+            return &driver_devices[i];
+        }
+    }
+    return NULL;
+}
+
+int fdobjects_add_device(const char *path, const struct file_ops *ops, void *priv) {
+    if (driver_device(path) != NULL) {
+        return KERR_EXIST;
+    }
+    if (driver_device_count >= DRIVER_DEVICES_MAX) {
+        return KERR_NOMEM;
+    }
+    driver_devices[driver_device_count++] = (struct driver_device){path, ops, priv};
+    return KERR_OK;
+}
+
+/* Opens a driver's device. */
+static int open_driver_device(const struct driver_device *d, uint32_t flags) {
+    struct file *f = file_new(d->ops, d->priv, flags);
+    return f == NULL ? KERR_NOMEM : fd_install(f);
+}
+
 /* The kernel's own device objects by path, or NULL. */
 static const struct file_ops *device_ops(const char *path) {
     if (same_path(path, "/dev/null")) {
@@ -1277,7 +1316,11 @@ static const struct file_ops *device_ops(const char *path) {
 
 int fdobjects_open_path(const char *path, uint32_t flags) {
     const struct file_ops *ops = device_ops(path);
+    const struct driver_device *driver = driver_device(path);
     struct file *f;
+    if (driver != NULL) {
+        return open_driver_device(driver, flags);
+    }
     if (ops != NULL) {
         f = file_new(ops, NULL, flags);
         return f == NULL ? KERR_NOMEM : fd_install(f);

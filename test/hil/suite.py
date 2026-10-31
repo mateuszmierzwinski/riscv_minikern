@@ -635,6 +635,49 @@ CASES = [
      "minikern.nothp",
      ["exited with 127", "mem: 0 transparent huge pages"],
      200, "//:thp.elf"),
+    # **A C library** (§10): the first program built against musl starts,
+    # prints through stdio, allocates and parses a `long double` (the
+    # soft-float path the vendored compiler-rt routines provide).
+    ("§10: a program built against musl runs",
+     "",
+     ["musl_hello: all checks passed", "exited with 0"],
+     200, "//:musl_hello.elf"),
+    # **The virtual framebuffer** (§10): /dev/fb0 described, mapped shared,
+    # drawn through and read back; the same frames after fork and through a
+    # second mapping; the refusals; mprotect after fork keeping a private
+    # page private (the bug found beside this work); pixels outliving munmap.
+    # 255 is all eight.
+    ("§10: a virtual framebuffer, mapped shared by a musl program",
+     "minikern.vfb=640x480",
+     ["fb: /dev/fb0 640x480, stride 2560, 1200 KiB", "fbtest: 640x480, line 2560",
+      "exited with 255"],
+     200, "//:fbtest.elf"),
+    # The control: with the old `mprotect`, the child's store reaches the
+    # parent's page after fork, so check 64 fails (255 - 64 = 191) and no
+    # page is kept copy-on-write.
+    ("§10: the same program with mprotect's copy-on-write fix off",
+     "minikern.vfb=640x480 minikern.protectshares",
+     ["exited with 191", "made copy-on-write by mprotect"],
+     200, "//:fbtest.elf"),
+    # **HDMI** (§10): the VOUT domain powered, the display controller
+    # answering, the transmitter's PLLs locked, and frames counted at the
+    # mode's rate by the controller's own vsync — at both modes. A picture
+    # on a monitor is the operator's check (`fbdemo.elf`).
+    ("§10: HDMI scanout at 1080p60",
+     "minikern.hdmi=1920x1080",
+     ["display: VOUT power domain on", "display: DC8200 revision 5720",
+      "display: HDMI 1920x1080, PLLs locked, TMDS on", "(30 expected), underflow no — scanning out"],
+     120, None),
+    ("§10: HDMI scanout at 720p60",
+     "minikern.hdmi=1280x720",
+     ["display: HDMI 1280x720, PLLs locked, TMDS on", "(30 expected), underflow no — scanning out"],
+     120, None),
+    # The framebuffer client while HDMI shows its pixels: the shared mapping
+    # and the L2 flushes that make a program's drawing reach the controller.
+    ("§10: the framebuffer client while HDMI scans it out",
+     "minikern.hdmi=1920x1080",
+     ["fbtest: 1920x1080, line 7680", "exited with 255", "framebuffer flushes, the last took"],
+     200, "//:fbtest.elf"),
     # **Huge file mappings** (§2): a file mapped privately at an aligned
     # address gets megapages filled from the file. The bytes are the file's,
     # a write stays the mapping's, a partial mprotect splits one and keeps

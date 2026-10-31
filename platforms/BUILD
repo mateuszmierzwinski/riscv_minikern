@@ -10,6 +10,13 @@ constraint_setting(name = "machine")
 constraint_value(
     name = "riscv64",
     constraint_setting = ":machine",
+    # The C library and compiler runtime its user programs link are vendored
+    # under third_party/c and built only for this machine.
+    visibility = [
+        "//:__subpackages__",
+        "//third_party/c/compiler_rt_builtins:__pkg__",
+        "//third_party/c/musl:__pkg__",
+    ],
 )
 
 # The StarFive JH7110: one S7 monitor core plus four U74 application cores —

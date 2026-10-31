@@ -488,6 +488,7 @@ struct uspace_mapping {
     bool noreplace; /* MAP_FIXED_NOREPLACE: this address, and over nothing */
     bool populate;  /* MAP_POPULATE: back the pages now, not on first touch */
     bool huge;      /* MAP_HUGETLB: 2 MiB pages, one table entry each */
+    bool shared;    /* MAP_SHARED of a device: its own frames, in every mapper */
     /* What a file-backed mapping reads from. The mapping takes its own
      * reference, so closing the descriptor afterwards does not take the
      * bytes out from under it — which is what `mmap` of a file promises. */
@@ -787,6 +788,17 @@ uint64_t uspace_split_megapages(void);
 uint64_t uspace_file_megapages(void); /* of those, filled from a file */
 
 uint64_t uspace_huge_pages(void);
+
+/* Pages of shared device mappings put into address spaces, by faults,
+ * `MAP_POPULATE` and `fork`. */
+uint64_t uspace_shared_pages(void);
+
+/* Pages `mprotect` made writable while another process still held their
+ * frame, which were made copy-on-write instead of writable. */
+uint32_t uspace_protect_kept_cow(void);
+
+/* Turns that off (`minikern.protectshares`): the control for the fix. */
+void uspace_set_protect_keeps_cow(bool on);
 
 /* A child with an address space of its own, made of the parent's pages
  * copy-on-write. Unlike `uspace_fork_shared` (which is `vfork`), the two

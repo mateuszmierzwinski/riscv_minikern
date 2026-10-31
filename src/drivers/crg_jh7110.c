@@ -21,6 +21,7 @@ struct domain_layout {
 static const struct domain_layout layouts[CRG_DOMAINS] = {
     {"starfive,jh7110-syscrg", 0x2f8u, 0x308u, 126u},
     {"starfive,jh7110-aoncrg", 0x038u, 0x03cu, 8u},
+    {"starfive,jh7110-voutcrg", 0x048u, 0x04cu, 13u},
 };
 
 static struct {
@@ -117,6 +118,49 @@ int crg_release_reset(enum crg_domain domain, uint32_t id) {
         }
     }
     return KERR_TIMEDOUT;
+}
+
+int crg_jh7110_attach(enum crg_domain domain, phys_t base, uint64_t size) {
+    void *at;
+    if (domain >= CRG_DOMAINS) {
+        return KERR_INVAL;
+    }
+    if (domains[domain].up) {
+        return KERR_OK;
+    }
+    at = mmu_map_device(base, size);
+    if (at == NULL) {
+        return KERR_NOMEM;
+    }
+    domains[domain].regs = (volatile uint32_t *)at;
+    domains[domain].base = base;
+    domains[domain].up = true;
+    return KERR_OK;
+}
+
+/* Replaces the `mask` field of a clock's register with `value`, and reads
+ * it back: a generator that is not powered accepts the write and keeps 0. */
+static int set_field(enum crg_domain domain, uint32_t index, uint32_t mask, uint32_t value) {
+    uint32_t off = crg_clock_offset(index);
+    if (domain >= CRG_DOMAINS || !domains[domain].up) {
+        return KERR_NOENT;
+    }
+    write_reg(domain, off, (read_reg(domain, off) & ~mask) | (value & mask));
+    return (read_reg(domain, off) & mask) == (value & mask) ? KERR_OK : KERR_IO;
+}
+
+int crg_set_divider(enum crg_domain domain, uint32_t index, uint32_t divider) {
+    if (divider == 0 || divider > CRG_CLOCK_DIV_MASK) {
+        return KERR_INVAL;
+    }
+    return set_field(domain, index, CRG_CLOCK_DIV_MASK, divider);
+}
+
+int crg_select_parent(enum crg_domain domain, uint32_t index, uint32_t mux) {
+    if (mux > (CRG_CLOCK_MUX_MASK >> 24)) {
+        return KERR_INVAL;
+    }
+    return set_field(domain, index, CRG_CLOCK_MUX_MASK, mux << 24);
 }
 
 phys_t crg_base(enum crg_domain domain) {

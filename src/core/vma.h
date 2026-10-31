@@ -20,6 +20,9 @@
 /* prot is Linux PROT_* (1 read, 2 write, 4 exec; 0 = reserved, no access). */
 #define VMA_GROWSDOWN 1u  /* the main stack: not merged with neighbours */
 #define VMA_HUGE 2u       /* asked for in 2 MiB pages, and backed in them */
+/* `MAP_SHARED` of a device: the pages are the device's own frames, the same
+ * ones in every process that maps it — never copied, never swapped. */
+#define VMA_SHARED 4u
 
 struct vma {
     virt_t start;

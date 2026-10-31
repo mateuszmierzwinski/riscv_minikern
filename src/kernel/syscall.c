@@ -154,9 +154,11 @@ static uint64_t complained[8];
  *     pages cannot be evicted either. Saying so is not the same as ignoring
  *     it, and writing it down is what stops someone "implementing" it.
  *   - **refused**: it would otherwise be accepted and not delivered.
- *     `MAP_SHARED` without shared frames is a private mapping that two
- *     processes each believe the other can see — writes that silently go
- *     nowhere. `MAP_GROWSDOWN` would promise a mapping that grows
+ *     `MAP_SHARED` is honoured only for a device that maps its own frames
+ *     (a framebuffer, `file_ops.map_page`); of anonymous memory or of a
+ *     regular file it would be a private mapping that two processes each
+ *     believe the other can see — writes that silently go nowhere — so
+ *     there it is refused. `MAP_GROWSDOWN` would promise a mapping that grows
  *     downwards, and nothing here grows one. `MAP_HUGETLB` was in this list
  *     until there were huge pages to give, which is the right place for a
  *     flag to wait.
@@ -185,9 +187,16 @@ struct refused_map_flag {
 };
 
 static const struct refused_map_flag refused_map_flags[] = {
-    {MAP_SHARED, "MAP_SHARED"},
     {MAP_GROWSDOWN, "MAP_GROWSDOWN"},
 };
+
+/* The two `MAP_SHARED` requests there are no shared frames for, named for
+ * the log like the refused flags. Their bits are above every real flag's:
+ * they only mark "already said" in `complained_flags`. */
+static const struct refused_map_flag shared_anonymous = {1ull << 40,
+                                                         "MAP_SHARED of anonymous memory"};
+static const struct refused_map_flag shared_unmappable = {
+    1ull << 41, "MAP_SHARED of a file with no frames to share"};
 
 /* The flags `mremap` is called with. `MREMAP_FIXED` is the only one that
  * reads the fifth argument, which is why the argument is not read without
@@ -278,6 +287,76 @@ static int file_backing(struct uspace_mapping *m, int32_t fd, uint64_t offset) {
     return m->file == NULL ? KERR_NODEV : KERR_OK;
 }
 
+#define MAP_PROT_READ 0x1u
+#define MAP_PROT_WRITE 0x2u
+
+/* Whether the descriptor's mode allows the rights a shared mapping asks for:
+ * Linux's `EACCES` — reading needs a readable descriptor, and a shared
+ * write needs a writable one, because the stores reach the device. */
+static bool open_mode_allows(const struct file *f, uint32_t prot) {
+    uint32_t mode = f->flags & O_ACCMODE;
+    return !((prot & MAP_PROT_READ) != 0 && mode == O_WRONLY) &&
+           !((prot & MAP_PROT_WRITE) != 0 && mode == O_RDONLY);
+}
+
+/* Attaches a device's own frames to a `MAP_SHARED` request.
+ *
+ * The device answers for every page: the last one is asked for here, so a
+ * mapping that would reach past the device is refused at `mmap` rather than
+ * faulting later on a page nobody can back. KERR_NODEV when the object has
+ * no frames to share (`refused` says so in the log). */
+static int shared_backing(struct uspace_mapping *m, int32_t fd, uint64_t offset) {
+    struct file *f = fd_get(fd);
+    uint64_t span = (m->bytes + PAGE_SIZE - 1u) & ~(uint64_t)(PAGE_SIZE - 1u);
+    phys_t last = 0;
+    if (f == NULL) {
+        return KERR_BADF;
+    }
+    if (f->ops->map_page == NULL) {
+        return KERR_NODEV;
+    }
+    if ((offset & (PAGE_SIZE - 1u)) != 0 || span == 0 || offset + span < offset) {
+        return KERR_INVAL;
+    }
+    if (!open_mode_allows(f, m->prot)) {
+        return KERR_ACCES;
+    }
+    if (f->ops->map_page(f, offset + span - PAGE_SIZE, &last) != KERR_OK) {
+        return KERR_INVAL;
+    }
+    m->file = file_get(f);
+    m->offset = offset;
+    m->shared = true;
+    m->huge = false; /* the device's frames, one page at a time */
+    return KERR_OK;
+}
+
+/* Says once why a request was refused — the reason `EINVAL` cannot carry. */
+static void refuse_mapping_once(const struct refused_map_flag *no) {
+    if ((complained_flags & no->bit) == 0) {
+        complained_flags |= no->bit;
+        kprintf("mmap: %s refused — it would be accepted and not delivered\n", no->name);
+    }
+}
+
+/* What backs a mapping request: nothing, a file read privately, or a
+ * device's frames shared. */
+static int backing_for(struct uspace_mapping *m, uint64_t flags, int32_t fd, uint64_t offset) {
+    int rc;
+    if ((flags & MAP_SHARED) == 0) {
+        return (flags & MAP_ANONYMOUS) != 0 ? KERR_OK : file_backing(m, fd, offset);
+    }
+    if ((flags & MAP_ANONYMOUS) != 0) {
+        refuse_mapping_once(&shared_anonymous);
+        return KERR_INVAL;
+    }
+    rc = shared_backing(m, fd, offset);
+    if (rc == KERR_NODEV) {
+        refuse_mapping_once(&shared_unmappable);
+    }
+    return rc;
+}
+
 static int64_t sys_mmap(struct trapframe *tf) {
     uint64_t flags = sysarg(tf, 3);
     const struct refused_map_flag *no = refused_flag(flags);
@@ -289,10 +368,7 @@ static int64_t sys_mmap(struct trapframe *tf) {
     virt_t out = 0;
     int rc;
     if (no != NULL) {
-        if ((complained_flags & no->bit) == 0) {
-            complained_flags |= no->bit;
-            kprintf("mmap: %s refused — it would be accepted and not delivered\n", no->name);
-        }
+        refuse_mapping_once(no);
         return KERR_INVAL;
     }
     m.at = sysarg(tf, 0);
@@ -313,11 +389,9 @@ static int64_t sys_mmap(struct trapframe *tf) {
      * that cannot be had contiguously falls back to 4 KiB pages rather than
      * failing the mapping — `uspace_huge_pages` says how many were real. */
     m.huge = (flags & MAP_HUGETLB) != 0;
-    if ((flags & MAP_ANONYMOUS) == 0) {
-        rc = file_backing(&m, (int32_t)sysarg(tf, 4), sysarg(tf, 5));
-        if (rc != KERR_OK) {
-            return rc;
-        }
+    rc = backing_for(&m, flags, (int32_t)sysarg(tf, 4), sysarg(tf, 5));
+    if (rc != KERR_OK) {
+        return rc;
     }
     rc = uspace_map(uspace_current(), &m, &out);
     if (rc != KERR_OK && m.file != NULL) {
