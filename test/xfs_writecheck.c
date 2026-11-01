@@ -946,6 +946,91 @@ static void step_tallfork(struct xfs *fs) {
     must(xfs_unlink(fs, &root, "tall", 4u, NOW), "unlink tall");
 }
 
+/* A directory past what one node and one free block describe: 200,000
+ * names of 40 bytes, which is ~2,800 data blocks (a second free block past
+ * 2,016) and a hash index whose root fills at ~177,000 names (a level of
+ * nodes under it). Every other name is then removed and both halves are
+ * looked up, and then the rest go, emptying leaves and nodes on the way.
+ * A minute and a 1 GiB image, so it runs only when asked for
+ * (`XFS_WRITECHECK_BIGDIR`); `xfs_repair` judges the result. */
+#define BIGDIR_NAMES 200000u
+
+static void bigdir_name(char *out, size_t room, uint32_t i) {
+    snprintf(out, room, "a-directory-entry-with-a-long-name-%06u", i);
+}
+
+/* Whether name `i` is in /bigdir, as wanted. */
+static void bigdir_expect(struct xfs *fs, uint64_t dirino, uint32_t i, bool present) {
+    struct xfs_inode dir;
+    uint64_t ino = 0;
+    char name[48];
+    bigdir_name(name, sizeof name, i);
+    read_inode(fs, dirino, &dir);
+    if ((xfs_dir_lookup(fs, &dir, name, (uint32_t)strlen(name), &ino) == KERR_OK) != present) {
+        fprintf(stderr, "xfs_writecheck: %s is %s\n", name, present ? "missing" : "still there");
+        exit(1);
+    }
+}
+
+/* Removes names from `first` on, `step` apart. */
+static void bigdir_remove(struct xfs *fs, uint64_t dirino, uint32_t first, uint32_t step) {
+    char name[48];
+    for (uint32_t i = first; i < BIGDIR_NAMES; i += step) {
+        struct xfs_inode dir;
+        read_inode(fs, dirino, &dir);
+        bigdir_name(name, sizeof name, i);
+        must(xfs_unlink(fs, &dir, name, (uint32_t)strlen(name), NOW), "unlink bigdir");
+    }
+}
+
+/* The hash index root's level: 1 when it names leaves, 2 with nodes under. */
+static uint32_t bigdir_index_level(struct xfs *fs, uint64_t dirino) {
+    struct xfs_inode dir;
+    uint64_t fsb = 0;
+    read_inode(fs, dirino, &dir);
+    must(xfs_dir_raw_load(fs, &dir, fs->dir_leaf_block, &fsb), "the index root");
+    return xfs_be16(fs->dirblock + fs->da_level);
+}
+
+/* Whether the free index has its second block (data blocks past 2,016). */
+static bool bigdir_has_second_free_block(struct xfs *fs, uint64_t dirino) {
+    struct xfs_inode dir;
+    uint64_t fsb = 0;
+    read_inode(fs, dirino, &dir);
+    return xfs_dir_raw_load(fs, &dir, fs->dir_free_block + fs->dirblocks, &fsb) == KERR_OK &&
+           xfs_be32(fs->dirblock) == xfs_magic_for(fs, XFS_BLK_DIR_FREE);
+}
+
+static void step_bigdir(struct xfs *fs) {
+    struct xfs_inode root, dir;
+    uint64_t dirino, ino;
+    char name[48];
+    if (getenv("XFS_WRITECHECK_BIGDIR") == NULL) {
+        return;
+    }
+    read_inode(fs, fs->rootino, &root);
+    must(xfs_mkdir(fs, &root, "bigdir", 6u, NOW, &dirino), "mkdir bigdir");
+    for (uint32_t i = 0; i < BIGDIR_NAMES; i++) {
+        read_inode(fs, dirino, &dir);
+        bigdir_name(name, sizeof name, i);
+        must(xfs_create(fs, &dir, name, (uint32_t)strlen(name), 0100644, NOW, &ino), name);
+    }
+    printf("xfs_writecheck: %u names, index root level %u\n", BIGDIR_NAMES,
+           bigdir_index_level(fs, dirino));
+    if (bigdir_index_level(fs, dirino) < 2u || !bigdir_has_second_free_block(fs, dirino)) {
+        fprintf(stderr, "xfs_writecheck: the index never grew a level of nodes, or the free "
+                        "index a second block\n");
+        exit(1);
+    }
+    bigdir_remove(fs, dirino, 0, 2u);
+    for (uint32_t i = 0; i < BIGDIR_NAMES; i += 997u) {
+        bigdir_expect(fs, dirino, i, i % 2u == 1u);
+    }
+    bigdir_remove(fs, dirino, 1u, 2u);
+    bigdir_expect(fs, dirino, BIGDIR_NAMES - 1u, false);
+    printf("xfs_writecheck: every name removed again\n");
+}
+
 /* On a `-i size=1024` image made with /big (a shortform directory whose
  * fork is past XFS_FORK_MAX) and /beside: the big directory is refused —
  * per inode, KERR_NOTSUP — and everything else on the filesystem still
@@ -979,6 +1064,7 @@ static const struct step steps[] = {
     {"reflink", step_reflink},  {"holes", step_holes},     {"boardgrow", step_boardgrow},
     {"trim", step_trim},        {"eofzero", step_eofzero},  {"realtime", step_realtime},
     {"uncommitted", step_uncommitted}, {"bigfork", step_bigfork}, {"tallfork", step_tallfork},
+    {"bigdir", step_bigdir},
 };
 
 /* Runs the named steps, or every one when none is named. */

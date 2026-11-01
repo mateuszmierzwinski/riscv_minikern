@@ -23,7 +23,7 @@ check() {
     shift
     local img="$tmp/$label.img"
     rm -f "$img"
-    truncate -s 300M "$img"
+    truncate -s "${IMG_SIZE:-300M}" "$img"
     mkfs.xfs -q -f "$@" "$img" || fail "mkfs.xfs refused the $label image"
     # shellcheck disable=SC2086 # STEPS is a word list on purpose
     "$writecheck" "$img" ${STEPS:-} || fail "the writes did not all succeed on the $label image"
@@ -55,6 +55,11 @@ check_rt() {
 
 check_rt realtime4k 4k
 check_rt realtime16k 16k
+
+# A directory of 200,000 long names, on an image of its own: its hash index
+# grows a level of nodes and its free index a second block, then every name
+# is removed (the `bigdir` step).
+XFS_WRITECHECK_BIGDIR=1 STEPS=bigdir IMG_SIZE=1G check bigdir
 
 check minimal -m crc=1,finobt=1,reflink=0,rmapbt=0,bigtime=0,inobtcount=0 -i sparse=0,nrext64=0
 check defaults

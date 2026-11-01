@@ -616,6 +616,64 @@ int xfs_dir_take_out(struct xfs *fs, const char *name, uint32_t namelen, uint64_
  * choose between operations that write. */
 uint16_t xfs_dir_index_shape(struct xfs *fs, const struct xfs_inode *dir);
 
+/* ── a node directory's hash index at any height (xfs_danode.c) ────────── */
+
+/* The way from the root to one leaf: at each level, the node, the entry
+ * taken and how many that node has — root first, `depth` levels. */
+struct xfs_da_path {
+    uint32_t depth;
+    uint64_t node[XFS_DA3_MAX_LEVELS];
+    uint32_t index[XFS_DA3_MAX_LEVELS];
+    uint32_t count[XFS_DA3_MAX_LEVELS];
+    uint64_t leaf;
+};
+
+/* A child that split: the path's child now tops out at `lower`, and the
+ * new one at logical block `child`, after it, at `upper`. */
+struct xfs_da_split {
+    uint32_t lower;
+    uint64_t child;
+    uint32_t upper;
+};
+
+/* A node block's header fields, for writing one. */
+struct xfs_da_node_head {
+    uint32_t level;
+    uint32_t count;
+    uint64_t forw;
+    uint64_t back;
+};
+
+/* A `da3` header in `fs->dirblock`, the rest zeroed; a sibling pointer at
+ * `off` of the index block at `logical` set (nothing for 0); and the
+ * logical block for a new index block, past every one the directory has. */
+void xfs_da_header(struct xfs *fs, uint16_t magic, uint64_t ino, uint32_t count, uint64_t forw,
+                   uint64_t back);
+int xfs_da_set_sibling(struct xfs *fs, const struct xfs_inode *dir, uint64_t logical,
+                       uint32_t off, uint32_t value);
+int xfs_da_next_block(struct xfs *fs, const struct xfs_inode *dir, uint64_t *at);
+
+/* The path an insertion of `hash` takes; and the path to the known leaf
+ * `leaf` that holds a hash (a run of equal hashes can span leaves). */
+int xfs_da_descend(struct xfs *fs, const struct xfs_inode *dir, uint32_t hash,
+                   struct xfs_da_path *p);
+int xfs_da_find(struct xfs *fs, const struct xfs_inode *dir, uint32_t hash, uint64_t leaf,
+                struct xfs_da_path *p);
+
+/* Whether the path's leaf is the directory's only one. */
+bool xfs_da_only_leaf(const struct xfs_da_path *p);
+
+/* The path's leaf now tops out at `hash`; it split (`s`); it emptied and
+ * left. Each keeps every key above it equal to its child's highest hash,
+ * splitting full nodes (the root grows a level) and removing empty ones.
+ * `dir` is re-read when its fork changes. */
+int xfs_da_set_top(struct xfs *fs, const struct xfs_inode *dir, const struct xfs_da_path *p,
+                   uint32_t hash);
+int xfs_da_add_child(struct xfs *fs, struct xfs_inode *dir, struct xfs_da_path *p,
+                     const struct xfs_da_split *s, uint64_t now_s);
+int xfs_da_drop_child(struct xfs *fs, struct xfs_inode *dir, struct xfs_da_path *p,
+                      uint64_t now_s);
+
 /* Turns a leaf-format directory into a node-format one, adding `name` as
  * part of the same step, and adds to and removes from one afterwards. */
 int xfs_dir_to_node(struct xfs *fs, const struct xfs_inode *dir, uint64_t now_s);
@@ -719,6 +777,11 @@ uint32_t xfs_dir_hashname(const char *name, uint32_t len);
  * name is not there, KERR_NOTSUP when this directory has no index to use. */
 int xfs_dir_hash_lookup(struct xfs *fs, const struct xfs_inode *dir, const char *name,
                         uint32_t len, uint64_t *ino);
+
+/* The same, also saying where the entry is: its address (a byte offset in
+ * the data space divided by eight), which names its data block. */
+int xfs_dir_hash_find(struct xfs *fs, const struct xfs_inode *dir, const char *name,
+                      uint32_t len, uint64_t *ino, uint32_t *address);
 
 /* The extent covering logical block off, or KERR_NOENT when off is in a
  * hole. Walks the inode's inline extent list. */

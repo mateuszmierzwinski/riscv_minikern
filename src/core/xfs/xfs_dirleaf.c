@@ -479,8 +479,34 @@ static uint32_t first_with_room(const struct xfs *fs, uint32_t at, uint32_t n, u
     return have;
 }
 
+/* The first data block the free index says has `need` bytes of room, or
+ * `have`. The index is a run of free blocks from `dir_free_block`, the k-th
+ * describing data blocks from its `firstdb`; one given back (it named no
+ * data block) is a gap, so every one up to the last data block is asked. */
+static uint32_t room_in_free_index(struct xfs *fs, const struct xfs_inode *dir, uint32_t need,
+                                   uint32_t have) {
+    uint32_t counts = fs->v5 ? XFS_DIR3_FREE_FIRSTDB : XFS_DIR2_FREE_FIRSTDB;
+    uint32_t per = (fs->dirblocksize - fs->dir_free_hdr) / XFS_DIR2_LEAF_BEST_SIZE;
+    for (uint32_t k = 0; per > 0 && (uint64_t)k * per < have; k++) {
+        uint64_t fsb = 0;
+        uint32_t first, n, i;
+        if (xfs_dir_raw_load(fs, dir, fs->dir_free_block + (uint64_t)k * fs->dirblocks, &fsb) !=
+                KERR_OK ||
+            xfs_be32(fs->dirblock) != xfs_magic_for(fs, XFS_BLK_DIR_FREE)) {
+            continue;
+        }
+        first = xfs_be32(fs->dirblock + counts);
+        n = xfs_be32(fs->dirblock + counts + 4u);
+        i = first < have ? first_with_room(fs, fs->dir_free_hdr, n, need, have - first) : 0;
+        if (first < have && i < have - first) {
+            return first + i;
+        }
+    }
+    return have;
+}
+
 /* Which data block probably has room, from the directory's own index: the
- * free block of a node directory, or the leaf's `bests` tail. A hint only —
+ * free blocks of a node directory, or the leaf's `bests` tail. A hint only —
  * the caller still checks the block it names and falls back to the scan,
  * so an index that is stale or absent costs time, never an entry. Without
  * it every insert read every data block: 937,000 loads for 17,000 names. */
@@ -489,9 +515,7 @@ static uint32_t room_hint(struct xfs *fs, const struct xfs_inode *dir, uint32_t 
     uint64_t fsb = 0;
     if (xfs_dir_raw_load(fs, dir, fs->dir_free_block, &fsb) == KERR_OK &&
         xfs_be32(fs->dirblock) == xfs_magic_for(fs, XFS_BLK_DIR_FREE)) {
-        uint32_t n = xfs_be32(fs->dirblock + (fs->v5 ? XFS_DIR3_FREE_FIRSTDB : XFS_DIR2_FREE_FIRSTDB) +
-                              4u);
-        return first_with_room(fs, fs->dir_free_hdr, n, need, have);
+        return room_in_free_index(fs, dir, need, have);
     }
     if (xfs_dir_raw_load(fs, dir, fs->dir_leaf_block, &fsb) == KERR_OK &&
         xfs_be16(fs->dirblock + XFS_DA3_MAGIC_OFF) == xfs_magic_for(fs, XFS_BLK_DIR_LEAF1)) {

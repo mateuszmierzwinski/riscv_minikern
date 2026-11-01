@@ -113,7 +113,7 @@ static uint32_t first_at_or_above(const uint8_t *entries, uint32_t count, uint32
  * the boundary would miss a name whose hash happens to sit there. */
 static int search_leaf(struct xfs *fs, const struct xfs_inode *dir, const uint8_t *leaf,
                        uint32_t hash, const char *name, uint32_t len, uint64_t *ino,
-                       uint64_t *next) {
+                       uint32_t *found, uint64_t *next) {
     uint32_t count = xfs_be16(leaf + fs->da_count);
     const uint8_t *entries = leaf + fs->da_hdr;
     uint32_t at;
@@ -133,6 +133,7 @@ static int search_leaf(struct xfs *fs, const struct xfs_inode *dir, const uint8_
             continue; /* a stale entry: the name it had was removed */
         }
         rc = name_at(fs, dir, address, name, len, ino);
+        *found = address;
         if (rc != KERR_NOENT) {
             return rc;
         }
@@ -178,6 +179,12 @@ static int find_leaf(struct xfs *fs, const struct xfs_inode *dir, uint32_t hash,
 
 int xfs_dir_hash_lookup(struct xfs *fs, const struct xfs_inode *dir, const char *name,
                         uint32_t len, uint64_t *ino) {
+    uint32_t address = 0;
+    return xfs_dir_hash_find(fs, dir, name, len, ino, &address);
+}
+
+int xfs_dir_hash_find(struct xfs *fs, const struct xfs_inode *dir, const char *name,
+                      uint32_t len, uint64_t *ino, uint32_t *address) {
     uint32_t hash = xfs_dir_hashname(name, len);
     struct xfs_extent e;
     uint64_t block;
@@ -197,7 +204,7 @@ int xfs_dir_hash_lookup(struct xfs *fs, const struct xfs_inode *dir, const char 
         if (rc != KERR_OK) {
             return rc;
         }
-        rc = search_leaf(fs, dir, b.at, hash, name, len, ino, &next);
+        rc = search_leaf(fs, dir, b.at, hash, name, len, ino, address, &next);
         xfs_dir_block_put(fs, &b);
         if (rc != KERR_NOENT || next == 0) {
             return rc;
