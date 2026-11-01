@@ -94,3 +94,13 @@ bool fbinfo_var_matches(const struct fb_mode *m, const struct fb_var_screeninfo 
            v->bits_per_pixel == want.bits_per_pixel && same_channel(v->red, want.red) &&
            same_channel(v->green, want.green) && same_channel(v->blue, want.blue);
 }
+
+bool fbinfo_dirty_rows(const struct fb_mode *m, const struct fb_dirty *d, uint32_t *first,
+                       uint32_t *end) {
+    if (d->width == 0 || d->height == 0 || d->x >= m->width || d->y >= m->height) {
+        return false;
+    }
+    *first = d->y;
+    *end = d->height > m->height - d->y ? m->height : d->y + d->height;
+    return true;
+}

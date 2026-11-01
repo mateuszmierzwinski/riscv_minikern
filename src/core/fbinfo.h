@@ -34,6 +34,10 @@
 #define FBIOGET_FSCREENINFO 0x4602u
 #define FBIOPAN_DISPLAY 0x4606u
 #define FBIOBLANK 0x4611u
+/* minikern's own: `_IOW('F', 0x40, struct fb_dirty)` — "these pixels
+ * changed", as DRM's DIRTYFB says it. A program that uses it is flushed
+ * only where it drew; one that does not keeps the whole-frame flush. */
+#define MINIKERN_FBIO_DIRTY 0x40104640u
 
 struct fb_mode {
     uint32_t width;
@@ -107,6 +111,18 @@ _Static_assert(offsetof(struct fb_fix_screeninfo, mmio_start) == 56, "mmio_start
  * [FB_MIN_SIDE, FB_MAX_SIDE] — a value from the command line is untrusted
  * input, and a typo must not size an allocation. */
 int fbinfo_parse_mode(const char *text, size_t len, struct fb_mode *out);
+
+/* A changed rectangle, as `MINIKERN_FBIO_DIRTY` carries it. */
+struct fb_dirty {
+    uint32_t x, y, width, height;
+};
+
+/* The lines of `m` the rectangle touches, clipped to the screen: [*first,
+ * *end). False — and nothing to flush — for a rectangle empty or wholly off
+ * the screen. Only rows matter: the flush is by address range, and a line
+ * is one contiguous run of the frame. */
+bool fbinfo_dirty_rows(const struct fb_mode *m, const struct fb_dirty *d, uint32_t *first,
+                       uint32_t *end);
 
 /* The bytes the whole framebuffer occupies, rounded up to whole pages: what
  * `mmap` may map and what the device allocates. */

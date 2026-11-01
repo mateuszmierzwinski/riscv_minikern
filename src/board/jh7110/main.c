@@ -2016,9 +2016,15 @@ static int framebuffer_mode(const struct fdt *fdt, struct fb_mode *mode) {
 static void refresh_display_from_beat(void) {
     static uint64_t last;
     uint64_t now = timer_ns();
+    uint64_t offset = 0, bytes = 0;
     if (now - last >= DISPLAY_REFRESH_NS) {
         last = now;
-        display_jh7110_refresh();
+        /* Only what programs marked, once one marks anything (fbdev). */
+        if (!fbdev_take_dirty(&offset, &bytes)) {
+            display_jh7110_refresh();
+        } else if (bytes != 0) {
+            display_jh7110_refresh_range(offset, bytes);
+        }
     }
 }
 

@@ -1981,6 +1981,21 @@ user_image(
     program = ":wdog",
 )
 
+# Dirty rectangles on /dev/fb0: a band drawn and marked, an off-screen and
+# a bad-pointer rectangle, a second mark after a flush. 15 for all four.
+user_binary(
+    name = "fbdirty",
+    srcs = [
+        "src/userland/fbdirty/main.c",
+        "src/userland/start.S",
+    ],
+)
+
+user_image(
+    name = "fbdirty.elf",
+    program = ":fbdirty",
+)
+
 # Rule 25's syscall surface, second program: the signal frame placed and
 # read through a hostile stack pointer, descriptor-table exhaustion, and a
 # path argument unmapped by another thread while the call reads it. Each

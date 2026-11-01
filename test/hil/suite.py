@@ -749,6 +749,13 @@ CASES = [
       "display: HDMI 1920x1080, PLLs locked, TMDS on",
       "(30 expected), underflow no — scanning out"],
      120, None),
+    # Dirty rectangles (§10): a program marks the 32 rows it drew and the
+    # beat flushes those — 245,760 bytes — instead of the 8.3 MB frame.
+    ("§10: only the rows a program marked are flushed",
+     "minikern.hdmi=1920x1080",
+     ["exited with 15",
+      "display: dirty rectangles in use; the first flushed 245760 of 8294400 bytes"],
+     150, "//:fbdirty.elf"),
     ("§10: HDMI scanout at 720p60",
      "minikern.hdmi=1280x720",
      ["display: HDMI 1280x720, PLLs locked, TMDS on", "(30 expected), underflow no — scanning out"],

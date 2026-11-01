@@ -44,6 +44,10 @@ int display_jh7110_start(const struct fdt *fdt, phys_t fb, uint32_t width, uint3
  * drawn. Called from the housekeeping beat while HDMI is up. */
 void display_jh7110_refresh(void);
 
+/* The same for `bytes` of the frame from `offset`: what changed, when a
+ * program says so (`MINIKERN_FBIO_DIRTY`). */
+void display_jh7110_refresh_range(uint64_t offset, uint64_t bytes);
+
 /* How many refreshes ran, and the last one's cost in microseconds. */
 void display_jh7110_refresh_stats(uint64_t *count, uint64_t *last_us);
 

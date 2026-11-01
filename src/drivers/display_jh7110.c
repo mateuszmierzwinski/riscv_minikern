@@ -333,15 +333,27 @@ int display_jh7110_start(const struct fdt *fdt, phys_t fb, uint32_t width, uint3
     return rc;
 }
 
-void display_jh7110_refresh(void) {
+void display_jh7110_refresh_range(uint64_t offset, uint64_t bytes) {
+    static bool said;
     uint64_t from;
-    if (!display.up) {
+    if (!display.up || offset >= display.bytes || bytes == 0) {
         return;
     }
+    bytes = bytes > display.bytes - offset ? display.bytes - offset : bytes;
     from = timer_ns();
-    (void)ccache_flush_range(display.fb, display.bytes);
+    (void)ccache_flush_range(display.fb + offset, bytes);
     display.last_refresh_us = (timer_ns() - from) / 1000u;
     display.refreshes++;
+    if (!said && bytes < display.bytes) {
+        said = true;
+        kprintf("display: dirty rectangles in use; the first flushed %llu of %llu bytes in %llu us\n",
+                (unsigned long long)bytes, (unsigned long long)display.bytes,
+                (unsigned long long)display.last_refresh_us);
+    }
+}
+
+void display_jh7110_refresh(void) {
+    display_jh7110_refresh_range(0, display.bytes);
 }
 
 void display_jh7110_refresh_stats(uint64_t *count, uint64_t *last_us) {

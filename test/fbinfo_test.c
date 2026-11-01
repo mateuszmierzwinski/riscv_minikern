@@ -91,7 +91,29 @@ static void test_only_the_current_mode_matches(void) {
     KTEST_CHECK(!fbinfo_var_matches(&m, &v));
 }
 
+static void test_a_dirty_rectangle_becomes_rows_clipped_to_the_screen(void) {
+    struct fb_mode m;
+    uint32_t first = 0, end = 0;
+    KTEST_CHECK(fbinfo_parse_mode("640x480", 7u, &m) == KERR_OK);
+    struct fb_dirty inside = {10u, 100u, 50u, 32u};
+    KTEST_CHECK(fbinfo_dirty_rows(&m, &inside, &first, &end) && first == 100u && end == 132u);
+    struct fb_dirty overlong = {0u, 470u, 640u, 0xffffffffu};
+    KTEST_CHECK(fbinfo_dirty_rows(&m, &overlong, &first, &end) && first == 470u && end == 480u);
+}
+
+static void test_an_empty_or_offscreen_rectangle_flushes_nothing(void) {
+    struct fb_mode m;
+    uint32_t first = 0, end = 0;
+    KTEST_CHECK(fbinfo_parse_mode("640x480", 7u, &m) == KERR_OK);
+    struct fb_dirty empty = {0u, 0u, 0u, 10u}, below = {0u, 480u, 10u, 10u}, right = {640u, 0u, 1u, 1u};
+    KTEST_CHECK(!fbinfo_dirty_rows(&m, &empty, &first, &end));
+    KTEST_CHECK(!fbinfo_dirty_rows(&m, &below, &first, &end));
+    KTEST_CHECK(!fbinfo_dirty_rows(&m, &right, &first, &end));
+}
+
 int main(void) {
+    KTEST_RUN(test_a_dirty_rectangle_becomes_rows_clipped_to_the_screen);
+    KTEST_RUN(test_an_empty_or_offscreen_rectangle_flushes_nothing);
     KTEST_RUN(test_a_mode_is_read_with_its_stride);
     KTEST_RUN(test_an_odd_width_pads_the_line);
     KTEST_RUN(test_malformed_modes_are_refused);

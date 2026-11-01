@@ -135,8 +135,54 @@ static int32_t pan(virt_t arg) {
  * ignored: there is no light to switch off. */
 #define FB_BLANK_POWERDOWN 4u
 
+/* The rows programs have said they changed since the last flush
+ * (`MINIKERN_FBIO_DIRTY`): [first, end), and whether any program has used
+ * the ioctl at all — until one does, the whole frame is flushed as before. */
+static struct {
+    uint32_t users; /* open descriptors that have marked: dirty mode while > 0 */
+    bool pending;
+    uint32_t first, end;
+} dirty;
+
+static int32_t mark_dirty(struct file *f, virt_t arg) {
+    struct fb_dirty d;
+    uint32_t first, end;
+    if (uspace_copy_in(&d, arg, sizeof d) != KERR_OK) {
+        return KERR_FAULT;
+    }
+    if (f->priv != &dirty) {
+        f->priv = &dirty; /* this descriptor marks: counted until it closes */
+        dirty.users++;
+    }
+    if (!fbinfo_dirty_rows(&fb.mode, &d, &first, &end)) {
+        return KERR_OK; /* nothing on screen changed */
+    }
+    dirty.first = dirty.pending && dirty.first < first ? dirty.first : first;
+    dirty.end = dirty.pending && dirty.end > end ? dirty.end : end;
+    dirty.pending = true;
+    return KERR_OK;
+}
+
+bool fbdev_take_dirty(uint64_t *offset, uint64_t *bytes) {
+    if (dirty.users == 0) {
+        return false;
+    }
+    *offset = dirty.pending ? (uint64_t)dirty.first * fb.mode.stride : 0u;
+    *bytes = dirty.pending ? (uint64_t)(dirty.end - dirty.first) * fb.mode.stride : 0u;
+    dirty.pending = false;
+    return true;
+}
+
+/* A descriptor that marked goes: when it was the last, whole frames are
+ * flushed again — a later program that draws without marking must not be
+ * left unflushed because an earlier one marked. */
+static void fb_release(struct file *f) {
+    if (f->priv == &dirty && dirty.users > 0) {
+        dirty.users--;
+    }
+}
+
 static int32_t fb_ioctl(struct file *f, uint32_t request, virt_t arg) {
-    (void)f;
     switch (request) {
     case FBIOGET_VSCREENINFO:
         return get_var(arg);
@@ -148,6 +194,8 @@ static int32_t fb_ioctl(struct file *f, uint32_t request, virt_t arg) {
         return pan(arg);
     case FBIOBLANK:
         return arg <= FB_BLANK_POWERDOWN ? KERR_OK : KERR_INVAL;
+    case MINIKERN_FBIO_DIRTY:
+        return mark_dirty(f, arg);
     default:
         return KERR_NOTTY;
     }
@@ -160,6 +208,7 @@ static const struct file_ops fb_ops = {
     .pread = fb_pread,
     .pwrite = fb_pwrite,
     .ioctl = fb_ioctl,
+    .release = fb_release,
     .map_page = fb_map_page,
 };
 
