@@ -637,6 +637,8 @@ static void bring_up_storage(uint64_t dtb) {
     size_t kindlen = 0;
     const char *kind = cmdline_value(boot_cmdline, "minikern.disk", &kindlen);
     dwmmc_set_trace(cmdline_has(boot_cmdline, "minikern.mmctrace"));
+    /* `minikern.sdhs=0`: default speed, the control for high-speed mode. */
+    dwmmc_allow_high_speed(cmdline_number(boot_cmdline, "minikern.sdhs", 1u) != 0);
     if (netboot_root(dtb)) {
         kind = "ram";
         kindlen = 3;

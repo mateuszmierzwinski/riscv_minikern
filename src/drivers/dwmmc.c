@@ -78,6 +78,8 @@
 #define STATUS_DATA_BUSY 0x00000200u
 #define STATUS_FIFO_EMPTY 0x00000004u
 #define STATUS_FIFO_FULL 0x00000008u
+#define STATUS_FIFO_COUNT_SHIFT 17u /* STATUS[29:17]: words the FIFO holds */
+#define STATUS_FIFO_COUNT_MASK 0x1fffu
 
 #define WAIT_SPINS 40000000u
 
@@ -104,6 +106,10 @@ static struct {
     /* Set once the card has been asked why a write failed, so the answer is
      * printed once per boot rather than once per refused block. */
     bool asked_why;
+    /* The next command carries data although its index is not one of the
+     * four block commands: CMD6, whose index ACMD6 (no data) shares. */
+    bool data_follows;
+    bool high_speed;
 } mmc;
 
 /* How long a transfer may take before the wait gives up. Generous, because
@@ -246,7 +252,7 @@ static int dw_command(void *self, uint8_t index, uint32_t argument, uint32_t kin
      * waited for a FIFO that nothing was filling and timed out. A command
      * that carries data has to say so, and the set is four, not two. */
     if (index == CMD_READ_SINGLE || index == CMD_READ_MULTIPLE || index == CMD_WRITE_SINGLE ||
-        index == CMD_WRITE_MULTIPLE) {
+        index == CMD_WRITE_MULTIPLE || mmc.data_follows) {
         bool writing = index == CMD_WRITE_SINGLE || index == CMD_WRITE_MULTIPLE;
         flags |= CMD_DATA_EXPECTED | (writing ? CMD_WRITE : 0u);
     }
@@ -317,11 +323,21 @@ static int data_error(uint32_t rintsts, uint32_t moved) {
     return KERR_IO;
 }
 
-static int dw_move_block(void *self, bool reading, void *buf) {
-    uint32_t *words = buf;
+/* Takes every word the FIFO holds, up to `room`, after **one** look at its
+ * level — against two register reads per word, which was the ceiling on
+ * reads: 8.2 MB/s at 25 MHz and the same at 50 (ROADMAP §8). */
+static uint32_t drain_fifo(uint32_t *words, uint32_t room) {
+    uint32_t held = (get(DW_STATUS) >> STATUS_FIFO_COUNT_SHIFT) & STATUS_FIFO_COUNT_MASK;
+    uint32_t n = held < room ? held : room;
+    for (uint32_t i = 0; i < n; i++) {
+        words[i] = get(mmc.fifo_offset);
+    }
+    return n;
+}
+
+static int move_words(bool reading, uint32_t *words, uint32_t count) {
     uint32_t moved = 0;
-    (void)self;
-    while (moved < SD_BLOCK_BYTES / 4u) {
+    while (moved < count) {
         uint32_t status;
         bool progressed = false;
         for (uint32_t spin = 0; spin < WAIT_SPINS && !progressed; spin++) {
@@ -329,11 +345,11 @@ static int dw_move_block(void *self, bool reading, void *buf) {
             if ((status & INT_ERRORS) != 0) {
                 return data_error(status, moved);
             }
-            status = get(DW_STATUS);
-            if (reading && (status & STATUS_FIFO_EMPTY) == 0) {
-                words[moved++] = get(mmc.fifo_offset);
-                progressed = true;
-            } else if (!reading && (status & STATUS_FIFO_FULL) == 0) {
+            if (reading) {
+                uint32_t got = drain_fifo(words + moved, count - moved);
+                moved += got;
+                progressed = got != 0;
+            } else if ((get(DW_STATUS) & STATUS_FIFO_FULL) == 0) {
                 put(mmc.fifo_offset, words[moved++]);
                 progressed = true;
             }
@@ -348,6 +364,11 @@ static int dw_move_block(void *self, bool reading, void *buf) {
      * the last one. The block itself is complete when its words have moved,
      * which is what the loop above waited for. */
     return KERR_OK;
+}
+
+static int dw_move_block(void *self, bool reading, void *buf) {
+    (void)self;
+    return move_words(reading, buf, SD_BLOCK_BYTES / 4u);
 }
 
 /* Waits for the controller to finish a transfer.
@@ -460,10 +481,65 @@ int dwmmc_use_interrupts(const struct fdt *fdt) {
     return KERR_OK;
 }
 
-/* Four-bit transfers and a faster clock, once the card has agreed to both. */
+#define CMD_SWITCH_FUNC 6u
+#define SWITCH_TO_HIGH_SPEED 0x80fffff1u /* set function group 1 to 1, leave the rest */
+#define SWITCH_STATUS_BYTES 64u
+#define SWITCH_GROUP1_RESULT 16u /* status bits 379:376, the low nibble of byte 16 */
+#define DIVIDER_BYPASS 0u        /* the 50 MHz input, undivided */
+
+/* CMD6 in mode 1: asks the card to switch to high-speed timing, and reads
+ * the 64-byte status that says whether it did. Status bytes arrive most
+ * significant first, which is why the group-1 result is byte 16. */
+static bool card_switched_to_high_speed(void) {
+    static uint32_t status[SWITCH_STATUS_BYTES / 4u];
+    int rc = reset_fifo();
+    put(DW_BLKSIZ, SWITCH_STATUS_BYTES);
+    put(DW_BYTCNT, SWITCH_STATUS_BYTES);
+    mmc.data_follows = true;
+    rc = rc != KERR_OK ? rc : dw_command(NULL, CMD_SWITCH_FUNC, SWITCH_TO_HIGH_SPEED, SD_RESP_SHORT, NULL);
+    mmc.data_follows = false;
+    rc = rc != KERR_OK ? rc : move_words(true, status, SWITCH_STATUS_BYTES / 4u);
+    rc = rc != KERR_OK ? rc : wait_for_data_over();
+    return rc == KERR_OK && (((const uint8_t *)status)[SWITCH_GROUP1_RESULT] & 0xfu) == 1u;
+}
+
+#define DW_CARDTHRCTL 0x100u
+#define CARD_READ_THRESHOLD_EN 0x1u
+
+/* **A read starts only when the FIFO has room for the whole block.** At
+ * 50 MHz the card fills the FIFO faster than words are taken out of it, and
+ * a FIFO that filled in the middle of a block failed its data CRC (126 of
+ * 128 words held, every time, in the third block of a stream) instead of
+ * pausing the card. The card read threshold is the controller's own answer:
+ * it holds the card clock between blocks until a block fits. */
+static void hold_reads_until_a_block_fits(void) {
+    put(DW_CARDTHRCTL, (SD_BLOCK_BYTES << 16) | CARD_READ_THRESHOLD_EN);
+}
+
+/* Four-bit transfers and a faster clock, once the card has agreed to both.
+ * `minikern.sdhs=0` keeps default speed (`dwmmc_allow_high_speed`). */
+static bool high_speed_allowed = true;
+
+void dwmmc_allow_high_speed(bool on) {
+    high_speed_allowed = on;
+}
+
+bool dwmmc_high_speed(void) {
+    return mmc.high_speed;
+}
+
 static int dw_run_faster(void *self) {
     (void)self;
     put(DW_CTYPE, 1u); /* one card, four-bit bus */
+    /* **50 MHz when the card agrees to high speed** (CMD6): the 50 MHz
+     * input undivided. A card that refuses, or a status that does not say
+     * it switched, stays at the default rate below. */
+    if (high_speed_allowed && card_switched_to_high_speed() &&
+        set_clock_divider(DIVIDER_BYPASS) == KERR_OK) {
+        hold_reads_until_a_block_fits();
+        mmc.high_speed = true;
+        return KERR_OK;
+    }
     /* **25 MHz, which is every SD card's default speed.**
      *
      * The controller divides its input by `2 * CLKDIV`, and the tree says
@@ -766,10 +842,11 @@ static int try_controller(const struct fdt *fdt, const char *path, phys_t base, 
                              .block_size = SD_BLOCK_BYTES,
                              .blocks = mmc.card.blocks,
                              .read_only = false};
-    kprintf("mmc: %s, %llu blocks of %u bytes (%llu MiB)%s\n", path,
+    kprintf("mmc: %s, %llu blocks of %u bytes (%llu MiB)%s, %s\n", path,
             (unsigned long long)mmc.card.blocks, SD_BLOCK_BYTES,
             (unsigned long long)(mmc.card.blocks / 2048u),
-            mmc.card.high_capacity ? ", high capacity" : "");
+            mmc.card.high_capacity ? ", high capacity" : "",
+            mmc.high_speed ? "high speed, 50 MHz" : "default speed, 25 MHz");
     return KERR_OK;
 }
 

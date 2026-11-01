@@ -64,6 +64,13 @@ uint64_t dwmmc_interrupts_missed(void);
 /* How many reads needed a second attempt (see `dw_read`). */
 uint64_t dwmmc_read_retries(void);
 
+/* High-speed mode (CMD6, 50 MHz) is asked for unless this says no — the
+ * control for it (`minikern.sdhs=0`). Call before `dwmmc_init`. */
+void dwmmc_allow_high_speed(bool on);
+
+/* Whether the card agreed to high speed and runs at 50 MHz. */
+bool dwmmc_high_speed(void);
+
 /* Where it was found, and how big the card is, for a report. */
 const char *dwmmc_path(void);
 uint64_t dwmmc_blocks(void);
