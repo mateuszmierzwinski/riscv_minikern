@@ -9,10 +9,10 @@
 #include "core/errno.h"
 #include "kernel/sched.h"
 
-#define DECIDE_EVERY_BEATS 25u /* 25 beats of 10 ms: a decision every 250 ms */
+#define DECIDE_EVERY_NS 250000000ull /* a decision every 250 ms, on its own beat */
 
 static struct governor governor;
-static uint32_t beats, refusals_said;
+static uint32_t refusals_said;
 static uint64_t last_online[SMP_MAX_HARTS], last_idle[SMP_MAX_HARTS];
 static int32_t (*read_temp)(void);
 static uint32_t (*write_khz)(uint32_t khz);
@@ -51,13 +51,9 @@ static uint32_t busiest_hart_pct(void *self) {
     return most;
 }
 
-/* A decision every DECIDE_EVERY_BEATS beats; each move is printed with its
+/* A decision every DECIDE_EVERY_NS; each move is printed with its
  * reason and inputs, and a divider that refuses is said once per refusal. */
 static void govern_from_beat(void) {
-    if (++beats < DECIDE_EVERY_BEATS) {
-        return;
-    }
-    beats = 0;
     struct governor_step s = governor_tick(&governor);
     if (s.moved) {
         kprintf("governor: %u kHz (%s at %d mC, %u%% load)\n", s.khz, cpufreq_reason_name(s.why),
@@ -81,7 +77,7 @@ int govern_start(const struct cpufreq_policy *policy, enum governor_mode mode,
     kprintf("governor: %s, from %u kHz; throttle at %d mC, critical at %d mC\n",
             mode == GOVERNOR_ONDEMAND ? "ondemand" : "thermal", policy->opps[policy->nopps - 1u].khz,
             policy->throttle_mC, policy->critical_mC);
-    return timer_add_housekeeping_hook(govern_from_beat);
+    return timer_add_housekeeping_every(govern_from_beat, DECIDE_EVERY_NS);
 }
 
 uint32_t govern_moves(void) {

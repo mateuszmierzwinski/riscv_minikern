@@ -37,6 +37,7 @@
 #define UART_FCR 2u
 #define UART_USR 31u /* DesignWare: status; read to clear a busy-detect */
 #define UART_CPR 61u /* DesignWare: component parameters (0xF4) */
+#define IER_RX_READY 0x01u
 #define IER_TX_EMPTY 0x02u
 #define IIR_ID_MASK 0x0fu
 #define IIR_BUSY_DETECT 0x07u
@@ -73,6 +74,7 @@ static struct {
     struct txring ring;
     uint32_t fifo;
     bool armed;
+    bool rx_interrupt; /* received bytes raise the interrupt too */
     uint64_t interrupts;
     uint64_t sent_while_full; /* bytes a full ring made wait for the wire */
 } tx;
@@ -150,7 +152,8 @@ static void feed_the_fifo(void) {
             put(UART_THR, (uint8_t)c);
         }
     }
-    put(UART_IER, txring_queued(&tx.ring) != 0u ? IER_TX_EMPTY : 0u);
+    put(UART_IER, (txring_queued(&tx.ring) != 0u ? IER_TX_EMPTY : 0u) |
+                      (tx.rx_interrupt ? IER_RX_READY : 0u));
 }
 
 /* One byte into the ring; a full ring sends what it holds first. */
@@ -190,12 +193,20 @@ static void uart_queue(void *self, const char *data, size_t len, bool translate)
     spin_unlock(&tx.lock);
 }
 
-void jh7110_uart_on_interrupt(void) {
+bool jh7110_uart_on_interrupt(void) {
     if ((get(UART_IIR) & IIR_ID_MASK) == IIR_BUSY_DETECT) {
         (void)get(UART_USR);
     }
     spin_lock(&tx.lock);
     tx.interrupts++;
+    feed_the_fifo();
+    spin_unlock(&tx.lock);
+    return (get(UART_LSR) & LSR_DATA_READY) != 0;
+}
+
+void jh7110_uart_interrupt_on_receive(void) {
+    spin_lock(&tx.lock);
+    tx.rx_interrupt = true;
     feed_the_fifo();
     spin_unlock(&tx.lock);
 }

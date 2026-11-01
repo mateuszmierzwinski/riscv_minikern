@@ -61,6 +61,11 @@ static void refill_icmp(struct netif *nif) {
     }
 }
 
+uint64_t net_next_deadline_ms(const struct netif *nif) {
+    uint64_t icmp = nif->icmp_tokens < NET_ICMP_BURST ? nif->icmp_refill_ms + 1000u : 0u;
+    return net_sooner(dhcp_next_deadline_ms(nif), icmp);
+}
+
 void net_tick(struct netif *nif, uint64_t now_ms) {
     nif->now_ms = now_ms;
     refill_icmp(nif);

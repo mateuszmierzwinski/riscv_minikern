@@ -276,7 +276,17 @@ uint64_t timer_interrupts_of(uint32_t hart_index) {
 #define TICK_HOOKS 12u
 
 static void (*tick_hooks[TICK_HOOKS])(void);
-static void (*housekeeping_hooks[TICK_HOOKS])(void);
+/* **One housekeeping hook and when it next runs.** A periodic hook keeps
+ * its own due time; a "when" hook says it live through `next_ns` (0 = it
+ * has nothing pending), and `due` is then the floor — one beat after its
+ * last run — so a deadline stuck in the past costs a beat, not a storm. */
+struct hk_entry {
+    void (*hook)(void);
+    uint64_t period_ns;
+    uint64_t (*next_ns)(uint64_t now_ns);
+    uint64_t due;
+};
+static struct hk_entry housekeeping[TICK_HOOKS];
 
 /* **The beat has no owner, and is claimed by whichever hart gets to it.**
  *
@@ -302,53 +312,75 @@ static void (*housekeeping_hooks[TICK_HOOKS])(void);
  * harts bother to arm for it is the scheduler's choice, and it prefers one
  * that has stopped anyway — see `sched_arm_timer`. */
 static uint32_t hk_runs;
-static uint64_t housekeeping_due;
 
 uint32_t timer_housekeeping_beats(void) {
     return hk_runs;
 }
 
+/* When one hook is next due; 0 when it has nothing pending. */
+static uint64_t entry_due(const struct hk_entry *e, uint64_t now) {
+    uint64_t next;
+    if (e->hook == NULL || e->next_ns == NULL) {
+        return e->hook == NULL ? 0u : e->due;
+    }
+    next = e->next_ns(now);
+    return next == 0u ? 0u : (next < e->due ? e->due : next);
+}
+
 uint64_t timer_housekeeping_due(void) {
-    return timer_has_housekeeping() ? housekeeping_due : 0u;
-}
-
-/* Runs the hooks if the interval has elapsed, says when the next beat is
- * due, and arms for it — the arming is what makes the beat survive a kernel
- * with nothing else going on. */
-static void housekeeping_if_due(bool may_arm) {
-    uint64_t now;
-    if (!timer_has_housekeeping()) {
-        return;
-    }
-    now = timer_ns();
-    if (now < housekeeping_due) {
-        return;
-    }
-    housekeeping_due = now + TIMER_HOUSEKEEPING_NS;
-    hk_runs++;
-    timer_run_housekeeping();
-    /* Only when this scheduler owns the comparator. Under the periodic
-     * clock the tick is already 10 ms, so the beat rides it and arming here
-     * would overwrite the periodic schedule — the same mistake, in the
-     * other direction, as arming from the scheduler while the clock ran. */
-    /* Arming again here is what keeps the beat alive on a hart that nobody
-     * else will arm — the kernel's own idle loop, which is not the
-     * scheduler and does not call it. */
-    if (may_arm) {
-        timer_arm_at(housekeeping_due);
-    }
-}
-
-int timer_add_housekeeping_hook(void (*hook)(void)) {
+    uint64_t now = timer_ns(), soonest = 0;
     for (uint32_t i = 0; i < TICK_HOOKS; i++) {
-        if (housekeeping_hooks[i] == NULL) {
-            housekeeping_hooks[i] = hook;
-            if (housekeeping_due == 0) {
-                housekeeping_due = timer_ns() + TIMER_HOUSEKEEPING_NS;
-            }
+        uint64_t d = entry_due(&housekeeping[i], now);
+        if (d != 0u && (soonest == 0u || d < soonest)) {
+            soonest = d;
+        }
+    }
+    return soonest;
+}
+
+/* Runs one hook if it is due, and moves its due time on. */
+static bool run_if_due(struct hk_entry *e, uint64_t now) {
+    uint64_t d = entry_due(e, now);
+    if (d == 0u || now < d) {
+        return false;
+    }
+    e->due = now + e->period_ns;
+    e->hook();
+    return true;
+}
+
+/* Runs the hooks that are due and arms for the next one — the arming is
+ * what makes the beat survive a kernel with nothing else going on. */
+static void housekeeping_if_due(bool may_arm) {
+    uint64_t now = timer_ns(), next;
+    bool ran = false;
+    for (uint32_t i = 0; i < TICK_HOOKS; i++) {
+        ran = run_if_due(&housekeeping[i], now) || ran;
+    }
+    if (!ran) {
+        return;
+    }
+    hk_runs++;
+    /* Only when this scheduler owns the comparator: under the periodic
+     * clock the tick is already 10 ms, and arming here would overwrite its
+     * schedule. Arming is what keeps the beat alive on a hart nobody else
+     * arms — the kernel's own idle loop, which is not the scheduler. */
+    next = timer_housekeeping_due();
+    if (may_arm && next != 0u) {
+        timer_arm_at(next);
+    }
+}
+
+static int add_housekeeping(void (*hook)(void), uint64_t period_ns,
+                            uint64_t (*next_ns)(uint64_t now_ns)) {
+    for (uint32_t i = 0; i < TICK_HOOKS; i++) {
+        if (housekeeping[i].hook == hook) {
             return KERR_OK;
         }
-        if (housekeeping_hooks[i] == hook) {
+    }
+    for (uint32_t i = 0; i < TICK_HOOKS; i++) {
+        if (housekeeping[i].hook == NULL) {
+            housekeeping[i] = (struct hk_entry){hook, period_ns, next_ns, timer_ns() + period_ns};
             return KERR_OK;
         }
     }
@@ -356,17 +388,37 @@ int timer_add_housekeeping_hook(void (*hook)(void)) {
     return KERR_NOSPC;
 }
 
+int timer_add_housekeeping_hook(void (*hook)(void)) {
+    return add_housekeeping(hook, TIMER_HOUSEKEEPING_NS, NULL);
+}
+
+int timer_add_housekeeping_every(void (*hook)(void), uint64_t period_ns) {
+    return add_housekeeping(hook, period_ns, NULL);
+}
+
+int timer_add_housekeeping_when(void (*hook)(void), uint64_t (*next_ns)(uint64_t now_ns)) {
+    return add_housekeeping(hook, TIMER_HOUSEKEEPING_NS, next_ns);
+}
+
+void timer_remove_housekeeping_hook(void (*hook)(void)) {
+    for (uint32_t i = 0; i < TICK_HOOKS; i++) {
+        if (housekeeping[i].hook == hook) {
+            housekeeping[i] = (struct hk_entry){0};
+        }
+    }
+}
+
 void timer_run_housekeeping(void) {
     for (uint32_t i = 0; i < TICK_HOOKS; i++) {
-        if (housekeeping_hooks[i] != NULL) {
-            housekeeping_hooks[i]();
+        if (housekeeping[i].hook != NULL) {
+            housekeeping[i].hook();
         }
     }
 }
 
 bool timer_has_housekeeping(void) {
     for (uint32_t i = 0; i < TICK_HOOKS; i++) {
-        if (housekeeping_hooks[i] != NULL) {
+        if (housekeeping[i].hook != NULL) {
             return true;
         }
     }

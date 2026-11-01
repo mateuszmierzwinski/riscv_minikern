@@ -590,7 +590,37 @@ static void test_fuzz_does_not_crash(void) {
     KTEST_CHECK(nif.stats.rx_frames == 200000);
 }
 
+/* The stack's own deadlines: none before DHCP starts; the retransmit
+ * while it waits; renewal at half the lease once bound; and the ICMP bucket
+ * only while it is below full. */
+static void test_the_stack_names_its_next_deadline(void) {
+    uint8_t f[ETH_FRAME_MAX];
+    fresh();
+    KTEST_CHECK(net_next_deadline_ms(&nif) == 0);
+    dhcp_start(&nif, xid);
+    KTEST_CHECK(net_next_deadline_ms(&nif) == nif.dhcp.next_send_ms && nif.dhcp.next_send_ms != 0);
+    bind_with_lease(f, 1000);
+    KTEST_CHECK(net_next_deadline_ms(&nif) == nif.dhcp.renew_at_ms);
+    nif.icmp_tokens = NET_ICMP_BURST - 1u;
+    KTEST_CHECK(nif.icmp_refill_ms + 1000u < nif.dhcp.renew_at_ms); /* renewal is 500 s out */
+    KTEST_CHECK(net_next_deadline_ms(&nif) == nif.icmp_refill_ms + 1000u);
+}
+
+/* A lease that is never renewed by ticking only at the stack's deadlines:
+ * the renewal still goes out at half the lease. */
+static void test_a_renewal_goes_out_at_its_deadline_alone(void) {
+    uint8_t f[ETH_FRAME_MAX];
+    uint64_t due;
+    bind_with_lease(f, 1000);
+    due = net_next_deadline_ms(&nif);
+    KTEST_CHECK(due == nif.dhcp.renew_at_ms && due > nif.now_ms);
+    net_tick(&nif, due);
+    KTEST_CHECK(nif.dhcp.state == DHCP_RENEWING);
+}
+
 int main(void) {
+    KTEST_RUN(test_the_stack_names_its_next_deadline);
+    KTEST_RUN(test_a_renewal_goes_out_at_its_deadline_alone);
     KTEST_RUN(test_ip4_parse);
     KTEST_RUN(test_checksum_rfc1071);
     KTEST_RUN(test_dhcp_conversation);

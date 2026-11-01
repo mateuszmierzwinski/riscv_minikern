@@ -116,6 +116,20 @@ int timer_add_tick_hook(void (*hook)(void));
  * roadmap. */
 int timer_add_housekeeping_hook(void (*hook)(void));
 
+/* The same at an interval of the hook's own, for work that needs a beat but
+ * not every 10 ms (a governor's quarter second, a watchdog's second): the
+ * beat arms only for whichever hook is due first. */
+int timer_add_housekeeping_every(void (*hook)(void), uint64_t period_ns);
+
+/* **Tickless**: the hook says when it next needs to run (`next_ns`, absolute,
+ * 0 = nothing pending), asked afresh whenever the beat is armed — which the
+ * scheduler does on every return to user mode — so work a syscall creates
+ * is seen without anyone having to announce it. At most once per 10 ms. */
+int timer_add_housekeeping_when(void (*hook)(void), uint64_t (*next_ns)(uint64_t now_ns));
+
+/* Takes a hook off the beat (a device whose interrupt replaced its poll). */
+void timer_remove_housekeeping_hook(void (*hook)(void));
+
 /* How often the beat runs: 10 ms, which is what the periodic tick used to
  * give a polled network device. Chosen to keep that behaviour identical
  * rather than to be a new decision. */

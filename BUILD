@@ -2060,6 +2060,21 @@ user_image(
     program = ":pwmdev",
 )
 
+# A line typed at the console, read by a blocked program: woken by the UART's
+# receive interrupt now that nothing polls it. Exits with the line's length.
+user_binary(
+    name = "ttyread",
+    srcs = [
+        "src/userland/ttyread/main.c",
+        "src/userland/start.S",
+    ],
+)
+
+user_image(
+    name = "ttyread.elf",
+    program = ":ttyread",
+)
+
 # Rule 25's syscall surface, second program: the signal frame placed and
 # read through a hostile stack pointer, descriptor-table exhaustion, and a
 # path argument unmapped by another thread while the call reads it. Each

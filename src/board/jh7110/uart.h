@@ -53,7 +53,10 @@ const char *jh7110_uart_path(void);
  * before that, and without it, a queued write is sent at once. Returns the
  * FIFO depth it will feed per interrupt. */
 uint32_t jh7110_uart_start_queueing(uint32_t depth); /* 0: from the part */
-void jh7110_uart_on_interrupt(void);
+/* The handler; true when received bytes are waiting to be read. */
+bool jh7110_uart_on_interrupt(void);
+/* Received bytes raise the interrupt too, so the terminal need not poll. */
+void jh7110_uart_interrupt_on_receive(void);
 void jh7110_uart_queue_stats(uint64_t *interrupts, uint64_t *sent_while_full);
 phys_t jh7110_uart_base(void);
 

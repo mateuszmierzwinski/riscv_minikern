@@ -324,9 +324,16 @@ static void bring_up_memory(const struct bootinfo *info) {
  * A wrapper rather than a direct call, because the disk may be the NVMe
  * drive or a RAM image — and arming an interrupt for a controller nothing
  * is reading would install a handler for a device that will never raise. */
+static void poll_tty_from_beat(void);
+/* Typed bytes arrive by the UART's interrupt, so the terminal is not polled. */
+static bool tty_by_interrupt;
+
+/* Transmit room, and typed bytes for the terminal. */
 static void on_uart_interrupt(void *self) {
     (void)self;
-    jh7110_uart_on_interrupt();
+    if (jh7110_uart_on_interrupt()) {
+        ktty_poll();
+    }
 }
 
 /* **A program's console output is queued, not waited for** (ROADMAP §8,
@@ -350,6 +357,10 @@ static void queue_the_console_output(uint64_t dtb) {
     }
     /* `minikern.uartfifo=<n>` names the FIFO depth, for measuring it: the
      * part's parameter register reads 0, which is "not implemented". */
+    /* Typed bytes by the same interrupt: the terminal's 10 ms poll goes. */
+    jh7110_uart_interrupt_on_receive();
+    tty_by_interrupt = true;
+    timer_remove_housekeeping_hook(poll_tty_from_beat);
     kprintf("uart: program output queued, transmit interrupt %u, %u-byte FIFO\n", source,
             jh7110_uart_start_queueing(
                 (uint32_t)cmdline_number(boot_cmdline, "minikern.uartfifo", 0u)));
@@ -623,6 +634,8 @@ static void wait_for_ticks(void) {
  * scribbles on sector 0 destroys what the next test wants to read. */
 static void bring_up_network(uint64_t dtb);
 static void poll_net_from_tick(void);
+/* The network device's receive interrupt is wired: no 10 ms poll needed. */
+static bool net_irq_armed;
 
 /* The pins a netboot is held to, read before the session starts. **False
  * when one was given and does not parse**: carrying on would boot unpinned
@@ -2245,18 +2258,14 @@ static int framebuffer_mode(const struct fdt *fdt, struct fb_mode *mode) {
  * shows it, so what programs draw reaches the display controller. */
 #define DISPLAY_REFRESH_NS 100000000ull
 
+/* Every DISPLAY_REFRESH_NS, on a beat of its own. */
 static void refresh_display_from_beat(void) {
-    static uint64_t last;
-    uint64_t now = timer_ns();
     uint64_t offset = 0, bytes = 0;
-    if (now - last >= DISPLAY_REFRESH_NS) {
-        last = now;
-        /* Only what programs marked, once one marks anything (fbdev). */
-        if (!fbdev_take_dirty(&offset, &bytes)) {
-            display_jh7110_refresh();
-        } else if (bytes != 0) {
-            display_jh7110_refresh_range(offset, bytes);
-        }
+    /* Only what programs marked, once one marks anything (fbdev). */
+    if (!fbdev_take_dirty(&offset, &bytes)) {
+        display_jh7110_refresh();
+    } else if (bytes != 0) {
+        display_jh7110_refresh_range(offset, bytes);
     }
 }
 
@@ -2301,7 +2310,7 @@ static void start_hdmi(const struct fdt *fdt) {
      * that wants them; DVI otherwise, which every monitor takes. */
     inno_hdmi_use_hdmi_mode(cmdline_equals(boot_cmdline, "minikern.hdmimode", "hdmi"));
     if (display_jh7110_start(fdt, base, fb.width, fb.height, fb.stride) == KERR_OK) {
-        (void)timer_add_housekeeping_hook(refresh_display_from_beat);
+        (void)timer_add_housekeeping_every(refresh_display_from_beat, DISPLAY_REFRESH_NS);
         if (cmdline_has(boot_cmdline, "minikern.hdmicursor")) {
             show_the_cursor(fb.width / 2u, fb.height / 2u);
         }
@@ -2398,8 +2407,10 @@ static void bring_up_thermal(uint64_t dtb) {
     /* **Sampling starts with the sensor**, not with the terminal it was
      * first attached to: the range is only the boot's range if it begins
      * where the readings begin. */
-    (void)timer_add_housekeeping_hook(sample_thermal_from_beat);
-    (void)timer_add_housekeeping_hook(watch_for_borrowed_writes_from_beat);
+    /* Each on its own interval: a beat for one every 10 ms was what kept an
+     * idle machine taking 100 interrupts a second (ROADMAP §5). */
+    (void)timer_add_housekeeping_every(sample_thermal_from_beat, 100000000ull);
+    (void)timer_add_housekeeping_every(watch_for_borrowed_writes_from_beat, 1000000000ull);
     start_the_governor(&fdt);
     {
         int32_t mdeg = temp_jh7110_millidegrees(&soc_temp);
@@ -2496,7 +2507,7 @@ static void bring_up_network(uint64_t dtb) {
     }
     if (!net_over_gmac) {
         static const struct irq_handler handler = {.handle = on_net_interrupt, .self = NULL};
-        (void)irq_register(virtio_net_irq(), &handler);
+        net_irq_armed = irq_register(virtio_net_irq(), &handler) == KERR_OK;
     } else {
         /* **The GMAC's own interrupt, which this device cannot do without.**
          * Polling from the housekeeping beat is enough for DHCP and not
@@ -2513,6 +2524,7 @@ static void bring_up_network(uint64_t dtb) {
             dwmac_trace_destinations(true);
         }
         if (source != 0 && irq_register(source, &gmac) == KERR_OK) {
+            net_irq_armed = true;
             dwmac_enable_rx_interrupt();
             kprintf("net: receive interrupt %u armed\n", source);
         } else {
@@ -2534,7 +2546,17 @@ static void bring_up_network(uint64_t dtb) {
             kprintf("net: over the board's Ethernet, **link down** — DHCP will time out\n");
         }
     }
-    (void)timer_add_housekeeping_hook(poll_net_from_tick);
+    /* **Tickless network** (ROADMAP §5): frames arrive by the device's
+     * interrupt, and the stack is ticked only when one of its own timers is
+     * due. The 10 ms poll stays for a device without its interrupt, and for
+     * `minikern.netbeat`, the control. */
+    {
+        bool beat = cmdline_has(boot_cmdline, "minikern.netbeat");
+        knet_set_tickless(!beat);
+        if (beat || !net_irq_armed) {
+            (void)timer_add_housekeeping_hook(poll_net_from_tick);
+        }
+    }
     random_fill(&xid, sizeof xid);
     knet_start(xid);
     if (knet_wait_address(5000u) != KERR_OK) {
@@ -4723,7 +4745,9 @@ static void run_user_programs(void) {
         static const struct console_input_port port = {.read = console_input_read,
                                                        .ready = console_input_ready};
         ktty_init(&port, 1u);
-        (void)timer_add_housekeeping_hook(poll_tty_from_beat);
+        if (!tty_by_interrupt) {
+            (void)timer_add_housekeeping_hook(poll_tty_from_beat);
+        }
     }
     /* **One thread, one execve**: the comparison that separates "exec is
      * broken" from "exec after Go's multi-threaded fork is broken". It needs

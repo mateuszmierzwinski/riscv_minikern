@@ -147,6 +147,30 @@ static void follow_the_lease(struct netif *nif) {
     }
 }
 
+/* The lease's next step for a stack that holds one: renew, rebind or the
+ * expiry, whichever comes first for the state it is in. */
+static uint64_t lease_deadline_ms(const struct netif *nif) {
+    if (nif->lease_s == 0 || nif->lease_s == DHCP_LEASE_FOREVER) {
+        return 0;
+    }
+    switch (nif->dhcp.state) {
+    case DHCP_BOUND:
+        return net_sooner(nif->dhcp.renew_at_ms, nif->dhcp.expiry_ms);
+    case DHCP_RENEWING:
+        return net_sooner(nif->dhcp.rebind_at_ms, nif->dhcp.expiry_ms);
+    case DHCP_REBINDING:
+        return nif->dhcp.expiry_ms;
+    default:
+        return 0;
+    }
+}
+
+uint64_t dhcp_next_deadline_ms(const struct netif *nif) {
+    bool waiting = nif->dhcp.state == DHCP_SELECTING || nif->dhcp.state == DHCP_REQUESTING ||
+                   holds_address(nif);
+    return net_sooner(waiting ? nif->dhcp.next_send_ms : 0u, lease_deadline_ms(nif));
+}
+
 void dhcp_tick(struct netif *nif) {
     bool waiting = nif->dhcp.state == DHCP_SELECTING || nif->dhcp.state == DHCP_REQUESTING ||
                    holds_address(nif);

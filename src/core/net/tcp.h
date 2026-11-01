@@ -272,6 +272,13 @@ int tcp_close(struct tcp_conn *c);
 /* Timers: retransmission, TIME_WAIT, and sending what the window allows. */
 void tcp_tick(struct tcp_stack *s, uint64_t now_ms);
 
+/* When `tcp_tick` next has something to do, in milliseconds; 0 when nothing
+ * is pending: the earliest retransmit or TIME_WAIT expiry, or now for a
+ * connection with data the window allows, a FIN ready, or a detached one
+ * finished. Every event that changes these (a send, a close, an arriving
+ * segment) also flushes at once, so the tick is the timers' and no more. */
+uint64_t tcp_next_deadline_ms(const struct tcp_stack *s);
+
 /* The TCP_POLL_* bits that describe this connection now. */
 uint32_t tcp_poll(const struct tcp_conn *c);
 

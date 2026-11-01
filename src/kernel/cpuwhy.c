@@ -165,5 +165,5 @@ void cpuwhy_install(uint32_t (*khz)(void)) {
     cycle_khz = khz;
     last.at = timer_ns();
     trap_set_user_time_sink(charge_user_time);
-    (void)timer_add_housekeeping_hook(report_from_beat);
+    (void)timer_add_housekeeping_every(report_from_beat, 1000000000ull); /* checks its 10 s */
 }

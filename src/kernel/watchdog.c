@@ -168,7 +168,9 @@ int watchdog_start(const struct watchdog_port *port, uint32_t seconds, uint32_t 
     wd.kernel_feeds = true;
     feed();
     wd.starve_at_ns = starve_after_s != 0 ? timer_ns() + (uint64_t)starve_after_s * 1000000000ull : 0;
-    return timer_add_housekeeping_hook(feed_from_beat);
+    /* Half the feed interval, so a beat's jitter cannot stretch a feed to
+     * two seconds — the shortest timeout allowed. */
+    return timer_add_housekeeping_every(feed_from_beat, FEED_EVERY_NS / 2u);
 }
 
 void watchdog_stop(void) {

@@ -20,6 +20,10 @@ struct frame_sink knet_init(const uint8_t mac[ETH_ALEN], const struct netdev_por
  * that is waiting for the network to do something. */
 void knet_tick(void);
 
+/* Whether the stack's tick follows its deadlines (the default) or runs every
+ * 10 ms (false: `minikern.netbeat`, the control). Before `knet_start`. */
+void knet_set_tickless(bool on);
+
 /* Starts DHCP and the tick (once the device is up). */
 void knet_start(uint32_t xid);
 

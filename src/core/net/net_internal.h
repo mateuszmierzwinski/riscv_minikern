@@ -76,6 +76,7 @@ void udp_input(struct netif *nif, ip4_t src, ip4_t dst, const uint8_t *p, uint32
 /* DHCP: datagrams for port 68, and retransmission. */
 void dhcp_input(struct netif *nif, const struct udp_datagram *d);
 void dhcp_tick(struct netif *nif);
+uint64_t dhcp_next_deadline_ms(const struct netif *nif);
 
 /* Where payloads start in nif->tx. */
 #define TX_IP(nif)  ((nif)->tx + ETH_HLEN)

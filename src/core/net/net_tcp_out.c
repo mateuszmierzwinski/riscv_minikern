@@ -197,6 +197,27 @@ static bool fin_ready(const struct tcp_conn *c) {
            (c->state == TCP_ESTABLISHED || c->state == TCP_CLOSE_WAIT);
 }
 
+/* One connection's next deadline (tcp.h, `tcp_next_deadline_ms`). */
+static uint64_t conn_deadline_ms(const struct tcp_conn *c, uint64_t now_ms) {
+    if ((c->detached && c->state == TCP_CLOSED) || sendable(c) != 0u || fin_ready(c)) {
+        return now_ms;
+    }
+    if (c->state == TCP_TIME_WAIT) {
+        return net_sooner(c->linger_at_ms, c->rto_at_ms);
+    }
+    return c->rto_at_ms;
+}
+
+uint64_t tcp_next_deadline_ms(const struct tcp_stack *s) {
+    uint64_t due = 0;
+    for (uint32_t i = 0; i < TCP_MAX_CONNS; i++) {
+        if (s->conns[i].used) {
+            due = net_sooner(due, conn_deadline_ms(&s->conns[i], s->now_ms));
+        }
+    }
+    return due;
+}
+
 /* Sends as much of the queue as the window allows, then the FIN. */
 void tcp_flush(struct tcp_conn *c) {
     for (uint32_t n = sendable(c); n > 0; n = sendable(c)) {

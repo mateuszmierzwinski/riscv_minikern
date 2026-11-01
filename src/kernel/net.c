@@ -108,6 +108,34 @@ void knet_tick(void) {
     on_tick(&knet, timer_ns());
 }
 
+static bool tickless = true;
+
+void knet_set_tickless(bool on) {
+    tickless = on;
+}
+
+/* **When the stack next needs its tick**, for the beat (`timer_add_
+ * housekeeping_when`): the stack's own timers, TCP's, and the boot's pings.
+ * 0 when nothing is pending — an idle network then costs no interrupts at
+ * all; frames arrive by the device's interrupt. */
+static uint64_t next_tick_ns(uint64_t now_ns) {
+    uint64_t ms = net_sooner(net_next_deadline_ms(&knet.nif), tcp_next_deadline_ms(&knet.tcp));
+    if (knet.nif.ip != 0 && knet.nif.gateway != 0 && knet.pings_sent < PING_COUNT) {
+        ms = net_sooner(ms, knet.next_ping_ms != 0u ? knet.next_ping_ms : now_ns / 1000000u);
+    }
+    return ms == 0u ? 0u : (ms * 1000000u > now_ns ? ms * 1000000u : now_ns);
+}
+
+/* On the beat: every 10 ms (`minikern.netbeat`, the control) or only when
+ * the stack has something due. */
+static void keep_the_stack_ticking(void) {
+    if (tickless) {
+        (void)timer_add_housekeeping_when(knet_tick, next_tick_ns);
+    } else {
+        (void)timer_add_housekeeping_hook(knet_tick);
+    }
+}
+
 /* **A random first ephemeral port.** Counting from 49152 every boot gave
  * each boot's first connection the previous boot's four-tuple: a server
  * still holding that half-open connection answered the SYN with a reset,
@@ -122,7 +150,7 @@ void knet_start(uint32_t xid) {
     seed_ephemeral_ports();
     knet.nif.now_ms = timer_ns() / 1000000u;
     dhcp_start(&knet.nif, xid);
-    (void)timer_add_housekeeping_hook(knet_tick);
+    keep_the_stack_ticking();
 }
 
 void knet_start_static(ip4_t addr, uint32_t prefix, ip4_t gateway, ip4_t dns) {
@@ -139,7 +167,7 @@ void knet_start_static(ip4_t addr, uint32_t prefix, ip4_t gateway, ip4_t dns) {
          * know that there is an address now, not where it came from. */
         knet.nif.events.dhcp_bound(knet.nif.events.self, &knet.nif);
     }
-    (void)timer_add_housekeeping_hook(knet_tick);
+    keep_the_stack_ticking();
 }
 
 static void (*device_report)(void);

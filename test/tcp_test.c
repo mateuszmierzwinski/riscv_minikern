@@ -598,7 +598,47 @@ static void test_an_ack_that_frees_room_notifies(void) {
     KTEST_CHECK(notified > 0);
 }
 
+/* The deadline names the timer: nothing for idle connections, the
+ * retransmit while data is unacknowledged, nothing again once it is. */
+static void test_the_deadline_names_the_timer(void) {
+    struct tcp_conn *c, *s, *l;
+    fresh();
+    KTEST_CHECK(tcp_next_deadline_ms(&host_a.tcp) == 0);
+    connect_pair(&c, &s, &l);
+    run_ms(50);
+    KTEST_CHECK(tcp_next_deadline_ms(&host_a.tcp) == 0 && tcp_next_deadline_ms(&host_b.tcp) == 0);
+    KTEST_CHECK(tcp_send(c, "deadline", 8) == 8);
+    KTEST_CHECK(c->rto_at_ms != 0 && tcp_next_deadline_ms(&host_a.tcp) == c->rto_at_ms);
+    run_ms(50);
+    KTEST_CHECK(tcp_next_deadline_ms(&host_a.tcp) == 0);
+}
+
+/* **Ticked only at its deadline**, a lost segment is still resent: the
+ * clock jumps straight to what the stack asked for, with no 10 ms tick in
+ * between — which is how the kernel drives it once the beat is gone. A
+ * deadline that forgot the retransmit would leave the bytes lost. */
+static void test_a_lost_segment_is_resent_at_its_deadline_alone(void) {
+    struct tcp_conn *c, *s, *l;
+    uint8_t in[16];
+    uint64_t due;
+    fresh();
+    connect_pair(&c, &s, &l);
+    run_ms(50);
+    wire.drop_once_at = 1;
+    KTEST_CHECK(tcp_send(c, "resent at its due", 17) == 17);
+    wire_pump();
+    KTEST_CHECK(wire.dropped == 1 && tcp_recv(s, in, sizeof in, false) <= 0);
+    due = tcp_next_deadline_ms(&host_a.tcp);
+    KTEST_CHECK(due > clock_ms);
+    clock_ms = due;
+    tcp_tick(&host_a.tcp, clock_ms);
+    wire_pump();
+    KTEST_CHECK(tcp_recv(s, in, sizeof in, false) == 16 && memcmp(in, "resent at its du", 16) == 0);
+}
+
 int main(void) {
+    KTEST_RUN(test_the_deadline_names_the_timer);
+    KTEST_RUN(test_a_lost_segment_is_resent_at_its_deadline_alone);
     KTEST_RUN(test_handshake);
     KTEST_RUN(test_refused_when_nobody_listens);
     KTEST_RUN(test_connect_times_out_when_silent);

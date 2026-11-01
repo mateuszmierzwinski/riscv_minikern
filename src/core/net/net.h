@@ -188,6 +188,17 @@ bool net_is_local(const struct netif *nif, ip4_t ip);
 /* Time passes: DHCP retransmits, the ICMP bucket refills. */
 void net_tick(struct netif *nif, uint64_t now_ms);
 
+/* The earlier of two deadlines, where 0 means "none". */
+static inline uint64_t net_sooner(uint64_t a, uint64_t b) {
+    return a == 0u ? b : (b == 0u || a < b ? a : b);
+}
+
+/* **When `net_tick` next has something to do**, in the stack's
+ * milliseconds; 0 when nothing is pending. What lets the kernel stop ticking
+ * the stack every 10 ms while it is idle: a DHCP retransmit or a lease step
+ * (renew, rebind, expiry), and the ICMP bucket while it is below full. */
+uint64_t net_next_deadline_ms(const struct netif *nif);
+
 /* Starts address configuration. */
 void dhcp_start(struct netif *nif, uint32_t xid);
 

@@ -26,6 +26,7 @@ under the output directory so a failure can be read rather than re-run.
 """
 import argparse
 import os
+import re
 import secrets
 import shutil
 import subprocess
@@ -1075,6 +1076,47 @@ def watchdog_resets(out_dir):
     return missing, log
 
 
+def typed_line_wakes_reader(out_dir):
+    """**Typed bytes wake a blocked reader** (§5, tickless): nothing polls the
+    UART any more, so the line typed at the console must reach `ttyread`,
+    blocked in `read`, by the UART's receive interrupt — or the case times
+    out. "minikern" and Enter: 9 bytes with the LF."""
+    log = os.path.join(out_dir, "ttyread.log")
+    subprocess.run([sys.executable, os.path.join(HERE, "board.py"), "", "-t", "60", "-o", log,
+                    "-q", "-w", "900", "-p", built("//:ttyread.elf"),
+                    "--send", "ttyread: ready::minikern\\r"], check=False)
+    text = open(log, "rb").read().decode("utf-8", "replace") if os.path.exists(log) else ""
+    return [w for w in ["ttyread: got minikern", "exited with 9"] if not seen(w, text)], log
+
+
+def window_interrupts(text):
+    """The spin window's timer interrupts, all harts together (the spinning
+    hart's own are a handful either way)."""
+    m = re.search(r"spin: timer interrupts in the window by hart: ((?:\d+=\d+ ?)+)", text)
+    if m is None:
+        return None
+    return sum(int(pair.split("=")[1]) for pair in m.group(1).split())
+
+
+def network_is_tickless(out_dir):
+    """**An idle network costs no beat** (§5): the spin boot's timer interrupts
+    with the network up, against `minikern.netbeat` (the 10 ms tick) in the next
+    boot. Measured 528 against 2,009 over 15 s; the case wants under half."""
+    missing, counts = [], {}
+    for name, extra in (("tickless", ""), ("netbeat", " minikern.netbeat")):
+        log = os.path.join(out_dir, "spin_" + name + ".log")
+        subprocess.run([sys.executable, os.path.join(HERE, "board.py"), "minikern.spin=1" + extra,
+                        "-t", "120", "-o", log, "-q", "-w", "900"], check=False)
+        text = open(log, "rb").read().decode("utf-8", "replace") if os.path.exists(log) else ""
+        counts[name] = window_interrupts(text)
+        if counts[name] is None:
+            missing.append("spin: timer interrupts in the window (" + name + ")")
+    if not missing and counts["tickless"] * 2 > counts["netbeat"]:
+        missing.append("tickless %d not under half of netbeat %d" %
+                       (counts["tickless"], counts["netbeat"]))
+    return missing, os.path.join(out_dir, "spin_tickless.log")
+
+
 # Where the board finds Go programs over netfs, and where it is on the LAN:
 # netfsd serves ~/vf2/netroot on :8081 and lets only the board's address in.
 NETROOT = os.path.expanduser("~/vf2/netroot")
@@ -1140,7 +1182,11 @@ def main():
     failures = 0
     extra = [("§1: addresses are randomised, compared across two runs", aslr_differs),
              ("§10: the VFB seen from the PC over VNC", vnc_serves),
-             ("§4: the watchdog resets a board nothing feeds", watchdog_resets)]
+             ("§4: the watchdog resets a board nothing feeds", watchdog_resets),
+             ("§5: a typed line wakes a blocked reader by the UART interrupt",
+              typed_line_wakes_reader),
+             ("§5: an idle network costs no beat (against minikern.netbeat)",
+              network_is_tickless)]
     for case in CASES:
         name, bootargs, wanted, seconds = case[:4]
         program = case[4] if len(case) > 4 else None
