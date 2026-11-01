@@ -63,6 +63,7 @@
 #include "drivers/cpufreq_jh7110.h"
 #include "kernel/cpuwhy.h"
 #include "kernel/govern.h"
+#include "kernel/i2cdev.h"
 #include "kernel/watchdog.h"
 #include "kernel/procfiles.h"
 #include "core/boardspec.h"
@@ -1023,6 +1024,9 @@ static void checksum_a_file(void) {
 
 static void drive_a_pin(void);
 static void read_a_pin(void);
+static void report_pin_functions(void);
+static void give_a_pin_away(void);
+static void claim_pins(void);
 static void loopback_pins(void);
 static void dump_pin_registers(void);
 static void set_a_padcfg(void);
@@ -1650,6 +1654,38 @@ static void try_the_watchdog_reset(struct wdt_jh7110 *wdt, uint64_t rate) {
     kprintf("wdt: survived 10 s with control bit %u armed (counter %u)\n", bit,
             wdt_jh7110_counter(wdt));
     (void)wdt_jh7110_stop(wdt);
+}
+
+#define I2C_ALIASES 7u /* i2c0..i2c6 on the JH7110 */
+
+static struct i2c_dw i2c_buses[I2C_ALIASES];
+
+static int transfer_on(void *self, uint8_t addr, const uint8_t *out, uint32_t outlen, uint8_t *in,
+                       uint32_t inlen) {
+    return i2c_dw_transfer(self, addr, out, outlen, in, inlen);
+}
+
+/* `/dev/i2c-N` for each bus the tree's `/aliases` names and that comes up:
+ * the number is the alias's, as Linux numbers them, so `/dev/i2c-5` is the
+ * PMIC's bus here as there. */
+static void offer_the_i2c_buses(uint64_t dtb) {
+    struct fdt fdt;
+    struct fdt_prop p;
+    char alias[8] = "i2c0";
+    uint32_t offered = 0;
+    if (fdt_open(&fdt, (const void *)(uintptr_t)dtb, FDT_MAX_BYTES) != KERR_OK) {
+        return;
+    }
+    for (uint32_t n = 0; n < I2C_ALIASES; n++) {
+        alias[3] = (char)('0' + n);
+        if (fdt_get_prop(&fdt, "/aliases", alias, &p) != KERR_OK ||
+            i2c_dw_init(&i2c_buses[n], &fdt, (const char *)p.value) != KERR_OK) {
+            continue;
+        }
+        struct i2c_port port = {transfer_on, &i2c_buses[n]};
+        offered += i2cdev_install(n, &port) == KERR_OK ? 1u : 0u;
+    }
+    kprintf("i2c: %u bus(es) offered as /dev/i2c-N\n", offered);
 }
 
 /* The watchdog's counter rate on this board (`minikern.wdtprobe`). */
@@ -2474,6 +2510,10 @@ static void bring_up_gpio(uint64_t dtb) {
     read_a_pin();
     dump_pin_registers();
     set_a_padcfg();
+    gpio_jh7110_claim_on_direction(!cmdline_has(boot_cmdline, "minikern.gpio.noclaim"));
+    report_pin_functions();
+    give_a_pin_away();
+    claim_pins();
     loopback_pins();
     drive_a_pin();
 }
@@ -2601,6 +2641,53 @@ static void one_loopback(uint32_t out_ctrl, uint32_t out_pin, uint32_t in_ctrl, 
     }
     kprintf("gpio: %u:%u -> %u:%u  %s (%u of 2 levels)\n", out_ctrl, out_pin, in_ctrl, in_pin,
             matched == 2u ? "WIRE OK" : "MISMATCH", matched);
+}
+
+/* `minikern.gpio.claim=<controller>:<pin>[,...]`: gives each named pad to
+ * GPIO and says what function it had — non-zero is a pad the firmware had
+ * given to something else. Named, like every pin this file touches. */
+/* `minikern.gpio.funcs`: every sys pad's function-select field, read-only —
+ * the pads the firmware gave to a dedicated function, listed. */
+static void report_pin_functions(void) {
+    uint32_t offset = 0, shift = 0, word = 0, given = 0;
+    if (!cmdline_has(boot_cmdline, "minikern.gpio.funcs")) {
+        return;
+    }
+    for (uint32_t pin = 0; pin < JH7110_SYS_GPIOS; pin++) {
+        if (gpio_jh7110_funcsel_of(pin, &offset, &shift) &&
+            gpio_jh7110_peek(0, offset, &word) == KERR_OK && ((word >> shift) & 3u) != 0) {
+            kprintf("gpio: 0:%u has function %u\n", pin, (word >> shift) & 3u);
+            given++;
+        }
+    }
+    kprintf("gpio: %u sys pad(s) given to a dedicated function\n", given);
+}
+
+/* `minikern.gpio.giveaway=<controller>:<pin>`: the claim's control — puts
+ * the pad in function 1, away from GPIO, and reads the field back. A
+ * loopback through that pin afterwards passes only if driving it claims
+ * it back. Name a pin wired to nothing but its jumper. */
+static void give_a_pin_away(void) {
+    uint32_t controller = 0, pin = 0, was = 0, offset = 0, shift = 0, word = 0;
+    if (!pin_from_cmdline("minikern.gpio.giveaway", &controller, &pin)) {
+        return;
+    }
+    int rc = gpio_jh7110_select_function(controller, pin, 1u, &was);
+    if (gpio_jh7110_funcsel_of(pin, &offset, &shift)) {
+        (void)gpio_jh7110_peek(controller, offset, &word);
+    }
+    kprintf("gpio: %u:%u given to function 1 (rc %d): it was %u, it reads %u\n", controller, pin, rc,
+            was, (word >> shift) & 3u);
+}
+
+static void claim_pins(void) {
+    size_t len = 0;
+    const char *spec = cmdline_value(boot_cmdline, "minikern.gpio.claim", &len);
+    uint32_t at = 0, controller = 0, pin = 0, was = 0;
+    while (spec != NULL && parse_pin(spec, len, &at, &controller, &pin)) {
+        int rc = gpio_jh7110_claim(controller, pin, &was);
+        kprintf("gpio: %u:%u had function %u, now GPIO (rc %d)\n", controller, pin, was, rc);
+    }
 }
 
 static void loopback_pins(void) {
@@ -4982,6 +5069,7 @@ void kmain(uint64_t hart, uint64_t dtb) {
 static void kmain_after_devices(uint64_t hart, uint64_t dtb) {
     bring_up_other_harts(dtb, hart);
     start_the_watchdog(dtb);
+    offer_the_i2c_buses(dtb);
     /* **After the harts are up**, because half of what it measures is about
      * them: how many are schedulable, and what an interrupt between two of
      * them costs. */

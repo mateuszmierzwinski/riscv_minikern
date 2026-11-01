@@ -61,7 +61,29 @@ static void test_the_tables_do_not_collide(void) {
     }
 }
 
+/* Every run's first and last pin against Linux's table, and the pins
+ * with no field. */
+static void test_the_function_select_table(void) {
+    static const uint32_t want[][3] = {
+        {6u, 0x2b0u, 0u},   {7u, 0x2b0u, 2u},   {9u, 0x2b0u, 8u},   {10u, 0x29cu, 2u},
+        {19u, 0x29cu, 29u}, {20u, 0x2a0u, 0u},  {29u, 0x2a0u, 27u}, {30u, 0x2a4u, 0u},
+        {35u, 0x2a4u, 15u}, {36u, 0x2a4u, 17u}, {40u, 0x2a4u, 29u}, {41u, 0x2a8u, 0u},
+        {51u, 0x2a8u, 30u}, {52u, 0x2acu, 0u},  {55u, 0x2acu, 6u},  {56u, 0x2acu, 9u},
+        {63u, 0x2acu, 30u},
+    };
+    uint32_t offset = 0, shift = 0;
+    for (uint32_t i = 0; i < sizeof want / sizeof want[0]; i++) {
+        KTEST_CHECK(gpio_jh7110_funcsel_of(want[i][0], &offset, &shift));
+        KTEST_CHECK(offset == want[i][1] && shift == want[i][2]);
+    }
+    for (uint32_t pin = 0; pin < 6u; pin++) {
+        KTEST_CHECK(!gpio_jh7110_funcsel_of(pin, &offset, &shift));
+    }
+    KTEST_CHECK(!gpio_jh7110_funcsel_of(64u, &offset, &shift));
+}
+
 int main(void) {
+    KTEST_RUN(test_the_function_select_table);
     KTEST_RUN(test_a_byte_per_pin);
     KTEST_RUN(test_inputs_are_bits_in_words);
     KTEST_RUN(test_the_tables_do_not_collide);

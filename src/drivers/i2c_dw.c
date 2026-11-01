@@ -39,6 +39,7 @@
 #define CMD_STOP (1u << 9)
 
 /* IC_STATUS */
+#define STATUS_TFNF (1u << 1) /* transmit FIFO not full */
 #define STATUS_TFE (1u << 2)  /* transmit FIFO empty */
 #define STATUS_RFNE (1u << 3) /* receive FIFO not empty */
 #define STATUS_ACTIVITY (1u << 0)
@@ -178,43 +179,56 @@ static int aim_at(const struct i2c_dw *bus, uint8_t addr) {
     return KERR_OK;
 }
 
-int i2c_dw_read_u8(struct i2c_dw *bus, uint8_t addr, uint8_t reg, uint8_t *out) {
+/* The write half: each byte when the FIFO has room, the last with STOP
+ * when nothing is to be read after it. */
+static int send_bytes(const struct i2c_dw *bus, const uint8_t *out, uint32_t n, bool then_read) {
+    for (uint32_t i = 0; i < n; i++) {
+        int rc = wait_status(bus, STATUS_TFNF, true);
+        if (rc != KERR_OK) {
+            return rc;
+        }
+        wr(bus, IC_DATA_CMD, out[i] | (i + 1u == n && !then_read ? CMD_STOP : 0u));
+    }
+    return then_read ? KERR_OK : wait_status(bus, STATUS_TFE, true);
+}
+
+/* The read half, a byte at a time: the controller turns from writing to
+ * reading with a repeated start, and the last read carries STOP. */
+static int receive_bytes(const struct i2c_dw *bus, uint8_t *in, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++) {
+        wr(bus, IC_DATA_CMD, CMD_READ | (i + 1u == n ? CMD_STOP : 0u));
+        int rc = wait_status(bus, STATUS_RFNE, true);
+        if (rc != KERR_OK) {
+            return rc;
+        }
+        in[i] = (uint8_t)(rd(bus, IC_DATA_CMD) & 0xffu);
+    }
+    return KERR_OK;
+}
+
+int i2c_dw_transfer(struct i2c_dw *bus, uint8_t addr, const uint8_t *out, uint32_t outlen,
+                    uint8_t *in, uint32_t inlen) {
     int rc;
-    if (bus == NULL || !bus->up || out == NULL) {
+    if (bus == NULL || !bus->up || outlen + inlen == 0 || outlen > I2C_TRANSFER_MAX ||
+        inlen > I2C_TRANSFER_MAX || (outlen != 0 && out == NULL) || (inlen != 0 && in == NULL)) {
         return KERR_INVAL;
     }
     drain(bus);
     rc = aim_at(bus, addr);
-    if (rc != KERR_OK) {
-        return rc;
-    }
-    wr(bus, IC_DATA_CMD, reg);                 /* the register number */
-    wr(bus, IC_DATA_CMD, CMD_READ | CMD_STOP); /* then read one byte */
-    rc = wait_status(bus, STATUS_RFNE, true);
+    rc = rc != KERR_OK ? rc : send_bytes(bus, out, outlen, inlen != 0);
+    rc = rc != KERR_OK ? rc : receive_bytes(bus, in, inlen);
     if (rc != KERR_OK) {
         (void)abort_reason(bus);
         return rc;
     }
-    *out = (uint8_t)(rd(bus, IC_DATA_CMD) & 0xffu);
     return abort_reason(bus);
 }
 
+int i2c_dw_read_u8(struct i2c_dw *bus, uint8_t addr, uint8_t reg, uint8_t *out) {
+    return i2c_dw_transfer(bus, addr, &reg, 1u, out, 1u);
+}
+
 int i2c_dw_write_u8(struct i2c_dw *bus, uint8_t addr, uint8_t reg, uint8_t value) {
-    int rc;
-    if (bus == NULL || !bus->up) {
-        return KERR_INVAL;
-    }
-    drain(bus);
-    rc = aim_at(bus, addr);
-    if (rc != KERR_OK) {
-        return rc;
-    }
-    wr(bus, IC_DATA_CMD, reg);
-    wr(bus, IC_DATA_CMD, CMD_STOP | value);
-    rc = wait_status(bus, STATUS_TFE, true);
-    if (rc != KERR_OK) {
-        (void)abort_reason(bus);
-        return rc;
-    }
-    return abort_reason(bus);
+    const uint8_t bytes[2] = {reg, value};
+    return i2c_dw_transfer(bus, addr, bytes, 2u, NULL, 0u);
 }

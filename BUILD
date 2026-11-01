@@ -1183,6 +1183,7 @@ cc_library(
         "src/kernel/sched.c",
         "src/kernel/fbdev.c",
         "src/kernel/fdobjects.c",
+        "src/kernel/i2cdev.c",
         "src/kernel/watchdog.c",
         "src/kernel/flock.c",
         "src/kernel/perm.c",
@@ -1204,6 +1205,7 @@ cc_library(
     hdrs = [
         "src/arch/riscv/sigframe.h",
         "src/kernel/fbdev.h",
+        "src/kernel/i2cdev.h",
         "src/kernel/watchdog.h",
         "src/kernel/fdobjects.h",
         "src/kernel/flock.h",
@@ -1994,6 +1996,21 @@ user_binary(
 user_image(
     name = "fbdirty.elf",
     program = ":fbdirty",
+)
+
+# /dev/i2c-5 from a program, read-only: the PMIC's id and core-rail
+# registers through I2C_RDWR, and the shapes it must refuse. 127.
+user_binary(
+    name = "i2cdev",
+    srcs = [
+        "src/userland/i2cdev/main.c",
+        "src/userland/start.S",
+    ],
+)
+
+user_image(
+    name = "i2cdev.elf",
+    program = ":i2cdev",
 )
 
 # Rule 25's syscall surface, second program: the signal frame placed and

@@ -840,6 +840,26 @@ CASES = [
      "minikern.probe",
      ["probe: PMIC DCDC2 (vdd_cpu)", "probe: ---------------------------------"],
      90, None),
+    # **/dev/i2c-N** (§4, beyond the probe): the PMIC read from a program
+    # through I2C_RDWR — its id registers and the core rail — and the
+    # shapes refused. Read-only. 127 is all seven.
+    ("§4: /dev/i2c-5 from a program, the PMIC read",
+     "",
+     ["i2c: ", "bus(es) offered as /dev/i2c-N", "exited with 127"],
+     120, "//:i2cdev.elf"),
+    # **Pinmux** (§4): pad 63 given to function 1, then driven through the
+    # operator's 60-63 jumper — the direction calls claim it back to GPIO,
+    # so the wire works both ways; the control (`minikern.gpio.noclaim`)
+    # leaves it given away, and neither direction can pass.
+    ("§4: a pad given away is claimed back for GPIO",
+     "minikern.gpio.giveaway=0:63 minikern.gpio.loop=0:63,0:60,0:60,0:63",
+     ["0:63 given to function 1 (rc 0): it was 0, it reads 1",
+      "0:63 -> 0:60  WIRE OK", "0:60 -> 0:63  WIRE OK"],
+     60, None),
+    ("§4: the claim's control — a pad left given away cannot be driven",
+     "minikern.gpio.giveaway=0:63 minikern.gpio.noclaim minikern.gpio.loop=0:63,0:60,0:60,0:63",
+     ["0:63 -> 0:60  MISMATCH", "0:60 -> 0:63  MISMATCH"],
+     60, None),
     # **The watchdog** (§4): armed for 3 s and fed by the kernel's beat, the
     # board outlives a 15 s spin and stops it cleanly at power-off — which
     # fails on this board, so an armed watchdog would otherwise reboot a

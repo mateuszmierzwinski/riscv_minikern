@@ -58,6 +58,14 @@ int i2c_dw_init(struct i2c_dw *bus, const struct fdt *fdt, const char *path);
 uint32_t i2c_dw_component_type(const struct i2c_dw *bus);
 uint32_t i2c_dw_component_version(const struct i2c_dw *bus);
 
+/* The general transfer: `outlen` bytes written, then — with a repeated
+ * start — `inlen` bytes read, STOP on the last; either may be 0, not both.
+ * What `I2C_RDWR` carries for a write-then-read message pair. At most
+ * I2C_TRANSFER_MAX bytes each way. */
+#define I2C_TRANSFER_MAX 64u
+int i2c_dw_transfer(struct i2c_dw *bus, uint8_t addr, const uint8_t *out, uint32_t outlen,
+                    uint8_t *in, uint32_t inlen);
+
 /* Reads one 8-bit register from a 7-bit address: writes the register number,
  * then reads one byte, as every PMIC and sensor of this shape expects.
  *

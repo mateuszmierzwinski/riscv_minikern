@@ -81,6 +81,45 @@ uint32_t gpio_jh7110_init(const struct fdt *fdt);
  * range that silently becomes a different pin is the worst outcome
  * available. */
 int gpio_jh7110_set_output(uint32_t controller, uint32_t pin, bool high);
+
+/* Where sys pad `pin`'s 2-bit function-select field is: false for a pin
+ * without one (GPIO0-5). Runs of pins share a register at a fixed step;
+ * the table is Linux's JH7110 sys pinctrl layout, whose spacing is
+ * irregular, so it is tabulated rather than derived. */
+static inline bool gpio_jh7110_funcsel_of(uint32_t pin, uint32_t *offset, uint32_t *shift) {
+    static const struct {
+        uint16_t offset;
+        uint8_t first, count, start, step;
+    } runs[] = {
+        {0x2b0u, 6u, 1u, 0u, 0u},   {0x2b0u, 7u, 3u, 2u, 3u},  {0x29cu, 10u, 10u, 2u, 3u},
+        {0x2a0u, 20u, 10u, 0u, 3u}, {0x2a4u, 30u, 6u, 0u, 3u}, {0x2a4u, 36u, 5u, 17u, 3u},
+        {0x2a8u, 41u, 11u, 0u, 3u}, {0x2acu, 52u, 4u, 0u, 2u}, {0x2acu, 56u, 8u, 9u, 3u},
+    };
+    for (uint32_t r = 0; r < sizeof runs / sizeof runs[0]; r++) {
+        if (pin >= runs[r].first && pin < (uint32_t)runs[r].first + runs[r].count) {
+            *offset = runs[r].offset;
+            *shift = runs[r].start + (pin - runs[r].first) * runs[r].step;
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Claims a sys pad for GPIO: its function-select field set to 0, as the
+ * direction calls above now do first (Linux's order). `*was` is the
+ * function it had — non-zero means the firmware had given it to a
+ * dedicated function. A pin with no field (GPIO0-5, the aon controller) is
+ * left as it is and reports 0. */
+int gpio_jh7110_claim(uint32_t controller, uint32_t pin, uint32_t *was);
+
+/* Whether the direction calls claim the pad (on); off is the control for
+ * the claim (`minikern.gpio.noclaim`). */
+void gpio_jh7110_claim_on_direction(bool on);
+
+/* The general form: `function` (0..3) into the pad's field, `*was` the old
+ * one. Claiming is function 0; anything else gives the pad away from GPIO. */
+int gpio_jh7110_select_function(uint32_t controller, uint32_t pin, uint32_t function,
+                                uint32_t *was);
 int gpio_jh7110_set_input(uint32_t controller, uint32_t pin);
 
 /* **A pad given to a peripheral** (sys controller only). `DOUT` and `DOEN`

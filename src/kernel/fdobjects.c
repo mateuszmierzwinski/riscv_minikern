@@ -1263,7 +1263,7 @@ static int fill_resolv(const char *path, struct snapshot *snap, uint32_t room) {
 
 /* Devices drivers registered (`fdobjects_add_device`). Few: one per piece
  * of hardware with a node, so a small fixed table. */
-#define DRIVER_DEVICES_MAX 8u
+#define DRIVER_DEVICES_MAX 16u /* fb0, the watchdog, up to seven I²C buses, and room */
 
 struct driver_device {
     const char *path;

@@ -141,8 +141,52 @@ static void write_pin_field(uint32_t controller, uint32_t byte_offset, uint8_t v
     *word = (now & ~(0xffu << shift)) | ((uint32_t)value << shift);
 }
 
-int gpio_jh7110_set_output(uint32_t controller, uint32_t pin, bool high) {
+/* **Function select**: a 2-bit field per sys pad choosing between GPIO
+ * (0) and the pad's dedicated functions — the layer under DOUT/DOEN that
+ * this driver never wrote, so a pad the firmware gave to something else
+ * (StarFive's U-Boot puts JTAG on header pins 36, 60, 61 and 63) was not
+ * the GPIO's to drive. Offsets and shifts as Linux's JH7110 sys pinctrl
+ * table lays them out (irregular, so tabulated, not derived); GPIO0-5
+ * have no field. */
+#define FUNCSEL_MASK 0x3u
+
+int gpio_jh7110_select_function(uint32_t controller, uint32_t pin, uint32_t function,
+                                uint32_t *was) {
+    uint32_t offset = 0, shift = 0;
     int rc = pin_ok(controller, pin);
+    *was = 0;
+    if (rc != KERR_OK || controller != 0u || !gpio_jh7110_funcsel_of(pin, &offset, &shift)) {
+        return rc; /* the aon controller and GPIO0-5 have no function to select */
+    }
+    if (function > FUNCSEL_MASK) {
+        return KERR_INVAL;
+    }
+    volatile uint32_t *word = (volatile uint32_t *)(controllers[0].regs + offset);
+    uint32_t now = *word;
+    *was = (now >> shift) & FUNCSEL_MASK;
+    if (*was != function) {
+        *word = (now & ~(FUNCSEL_MASK << shift)) | (function << shift);
+    }
+    return KERR_OK;
+}
+
+static bool claiming = true;
+
+void gpio_jh7110_claim_on_direction(bool on) {
+    claiming = on;
+}
+
+int gpio_jh7110_claim(uint32_t controller, uint32_t pin, uint32_t *was) {
+    if (!claiming) {
+        *was = 0;
+        return pin_ok(controller, pin);
+    }
+    return gpio_jh7110_select_function(controller, pin, 0u, was);
+}
+
+int gpio_jh7110_set_output(uint32_t controller, uint32_t pin, bool high) {
+    uint32_t was;
+    int rc = gpio_jh7110_claim(controller, pin, &was);
     if (rc != KERR_OK) {
         return rc;
     }
@@ -156,7 +200,8 @@ int gpio_jh7110_set_output(uint32_t controller, uint32_t pin, bool high) {
 }
 
 int gpio_jh7110_set_input(uint32_t controller, uint32_t pin) {
-    int rc = pin_ok(controller, pin);
+    uint32_t was;
+    int rc = gpio_jh7110_claim(controller, pin, &was);
     if (rc != KERR_OK) {
         return rc;
     }
