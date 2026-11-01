@@ -11,9 +11,19 @@
 
 #include <stdint.h>
 
+/* Who a device node belongs to and the permission bits it has: what
+ * `stat` reports for it and what `open` checks against. */
+struct device_owner {
+    uint32_t mode; /* the 0777 bits */
+    uint32_t uid;
+    uint32_t gid;
+};
+
 /* Registers a device node's full path ("/dev/null"), so it stats as a
- * character device and lists in its directory. */
-int synthfs_add_device(const char *path);
+ * character device and lists in its directory. `owner` NULL is root's and
+ * open to everyone (0666), which is what the memory devices and the
+ * console are. */
+int synthfs_add_device(const char *path, const struct device_owner *owner);
 
 /* Where the live pids come from (`uspace_pid_at`): 0 for a free slot,
  * UINT32_MAX past the last. Without it /proc lists no processes. */

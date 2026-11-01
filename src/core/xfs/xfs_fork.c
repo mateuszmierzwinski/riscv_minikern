@@ -64,8 +64,8 @@ static struct fork_view view_of(const struct xfs *fs, const uint8_t *di, enum xf
                                   XFS_DI_AFORMAT, XFS_AFORK_MAX,
                                   XFS_RMAP_OFF_BMBT | XFS_RMAP_OFF_ATTR, true};
     }
-    return (struct fork_view){fs->dinode_size, xfs_fork_bytes(fs, di), XFS_DI_FORMAT, XFS_FORK_MAX,
-                              XFS_RMAP_OFF_BMBT, false};
+    return (struct fork_view){fs->dinode_size, xfs_fork_bytes(fs, di), XFS_DI_FORMAT,
+                              XFS_LITERAL_MAX, XFS_RMAP_OFF_BMBT, false};
 }
 
 static uint64_t extents_of(const struct xfs *fs, const uint8_t *di, const struct fork_view *v) {

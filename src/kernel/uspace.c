@@ -453,8 +453,20 @@ static void check_the_frame_is_user(const struct trapframe *tf) {
     }
 }
 
-static void on_user_return(struct trapframe *tf) {
+/* Ends the running process if a signal nothing handles is pending —
+ * through the ordinary exit path, since it may be a child. */
+static bool ended_by_a_signal(void) {
     uint32_t fatal = 0;
+    if (!signal_is_fatal(&fatal)) {
+        return false;
+    }
+    kprintf("\nuspace: pid %u killed by signal %u\n",
+            uspace_current() != NULL ? uspace_current()->pid : 0u, fatal);
+    uspace_exit(-(int64_t)fatal);
+    return true;
+}
+
+static void on_user_return(struct trapframe *tf) {
     check_the_frame_is_user(tf);
     if (sched_take_preempt_request()) {
         sched_yield_now();
@@ -468,16 +480,15 @@ static void on_user_return(struct trapframe *tf) {
      * A fault's signal is the exception and is delivered where it happens,
      * because the handler must start *instead of* the faulting instruction
      * rather than after it. */
-    if (signal_is_fatal(&fatal)) {
-        /* A signal nothing handled. It ends the process it was raised
-         * against, which may be a child — so it goes through the ordinary
-         * exit path rather than stopping the machine. */
-        kprintf("\nuspace: pid %u killed by signal %u\n",
-                uspace_current() != NULL ? uspace_current()->pid : 0u, fatal);
-        uspace_exit(-(int64_t)fatal);
+    if (ended_by_a_signal()) {
         return;
     }
-    (void)signal_deliver(tf);
+    /* A frame delivery could not write ends the process now, not at the
+     * next trap: the thread's stack is unusable, and with dynamic ticks the
+     * next trap may be seconds away. */
+    if (!signal_deliver(tf) && ended_by_a_signal()) {
+        return;
+    }
     signal_finish_return();
     /* **On the way back to user mode, say when to be interrupted next.**
      * Every trap can change the answer — a syscall that blocked, a signal
@@ -1057,7 +1068,7 @@ static bool on_user_trap(struct trapframe *tf) {
     if (syscall_tracing_errors()) {
         trap_dump(tf);
     }
-    uspace_exit(KERR_FAULT);
+    uspace_exit(-(int64_t)SIGSEGV); /* a fault nothing handled: killed by SIGSEGV, as on Linux */
     return true;
 }
 

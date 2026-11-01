@@ -88,6 +88,14 @@ static void take_log_roundoff(struct xfs *fs, const uint8_t *sb) {
     fs->log_roundoff = bytes / XLOG_SECTOR;
 }
 
+/* `1 << log`, or 0 when `log` is past what a 32-bit geometry field can
+ * mean. The superblock's log fields are bytes off a card: shifting by one
+ * of them unchecked is undefined for anything from 32 up (the fuzzer's
+ * first find, `dirblklog` 255), and a 0 here fails `check_geometry`. */
+static uint32_t pow2_or_zero(uint8_t log) {
+    return log < 32u ? 1u << log : 0u;
+}
+
 /* Reads the geometry out of the superblock image at sb. */
 static void take_geometry(struct xfs *fs, const uint8_t *sb) {
     fs->blocksize = xfs_be32(sb + XFS_SB_BLOCKSIZE);
@@ -103,10 +111,10 @@ static void take_geometry(struct xfs *fs, const uint8_t *sb) {
     fs->blocklog = sb[XFS_SB_BLOCKLOG];
     fs->inopblog = sb[XFS_SB_INOPBLOG];
     fs->agblklog = sb[XFS_SB_AGBLKLOG];
-    fs->dirblocks = 1u << sb[XFS_SB_DIRBLKLOG];
+    fs->dirblocks = pow2_or_zero(sb[XFS_SB_DIRBLKLOG]);
     fs->dirblocksize = fs->dirblocks * fs->blocksize;
-    fs->dir_leaf_block = XFS_DIR2_LEAF_SPACE_BYTES >> fs->blocklog;
-    fs->dir_free_block = XFS_DIR2_FREE_SPACE_BYTES >> fs->blocklog;
+    fs->dir_leaf_block = fs->blocklog < 32u ? XFS_DIR2_LEAF_SPACE_BYTES >> fs->blocklog : 0;
+    fs->dir_free_block = fs->blocklog < 32u ? XFS_DIR2_FREE_SPACE_BYTES >> fs->blocklog : 0;
     fs->inoalign = (xfs_be16(sb + XFS_SB_VERSIONNUM) & XFS_SB_V_ALIGNBIT) != 0
                        ? xfs_be32(sb + XFS_SB_INOALIGNMT)
                        : 1u;
@@ -119,10 +127,10 @@ static void take_geometry(struct xfs *fs, const uint8_t *sb) {
  * a wild address. */
 static int check_geometry(const struct xfs *fs) {
     bool sane = fs->blocksize >= 512u && fs->blocksize <= 65536u &&
-                fs->blocksize == (1u << fs->blocklog) && fs->sectsize >= 512u &&
-                fs->inopblock == fs->blocksize / fs->inodesize &&
-                fs->inopblock == (1u << fs->inopblog) && fs->agcount > 0 && fs->agblocks > 0 &&
-                fs->agblocks <= ((uint64_t)1 << fs->agblklog) && fs->dblocks > 0 &&
+                fs->blocksize == pow2_or_zero(fs->blocklog) && fs->sectsize >= 512u &&
+                fs->inodesize != 0 && fs->inopblock == fs->blocksize / fs->inodesize &&
+                fs->inopblock == pow2_or_zero(fs->inopblog) && fs->agcount > 0 && fs->agblocks > 0 &&
+                fs->agblklog < 32u && fs->agblocks <= pow2_or_zero(fs->agblklog) && fs->dblocks > 0 &&
                 fs->dblocks <= (uint64_t)fs->agcount * fs->agblocks;
     if (!sane) {
         kprintf("xfs: the superblock's geometry does not add up\n");
@@ -403,6 +411,30 @@ bool xfs_superblock_label(const uint8_t *sb, uint32_t len, char out[XFS_LABEL_BY
 static uint8_t dir_scratch[XFS_DIRBLK_MAX];
 static uint8_t pair_scratch[XFS_DIRPAIRS_BYTES];
 
+/* Which quotas the filesystem keeps, and in which files. */
+static void take_quota_fields(struct xfs *fs, const uint8_t *sb) {
+    fs->uquotino = xfs_be64(sb + XFS_SB_UQUOTINO);
+    fs->gquotino = xfs_be64(sb + XFS_SB_GQUOTINO);
+    fs->pquotino = xfs_be64(sb + XFS_SB_PQUOTINO);
+    fs->qflags = (uint16_t)xfs_be16(sb + XFS_SB_QFLAGS);
+}
+
+/* The superblock read again after a replay. **Linux turns quotas on by
+ * mounting**: it sets `sb_qflags` and creates the quota files, logs the
+ * superblock, and — if it never unmounts — the disk's superblock still
+ * says no quotas until its log is replayed. Taken from before the replay,
+ * the quota fields left every later write uncharged. */
+static int reread_after_replay(struct xfs *fs) {
+    struct bbuf *b;
+    int rc = bcache_get(fs->cache, 0, &b);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    take_quota_fields(fs, b->data);
+    bcache_put(fs->cache, b);
+    return KERR_OK;
+}
+
 /* Reads block 0 and takes everything the geometry needs from it. The block
  * stays pinned for as long as the superblock is being read out of it. */
 static int mount_from_super(struct xfs *fs, const uint8_t *sb) {
@@ -418,10 +450,7 @@ static int mount_from_super(struct xfs *fs, const uint8_t *sb) {
     fs->rbmino = xfs_be64(sb + XFS_SB_RBMINO);
     fs->rsumino = xfs_be64(sb + XFS_SB_RSUMINO);
     fs->rextsize = xfs_be32(sb + XFS_SB_REXTSIZE);
-    fs->uquotino = xfs_be64(sb + XFS_SB_UQUOTINO);
-    fs->gquotino = xfs_be64(sb + XFS_SB_GQUOTINO);
-    fs->pquotino = xfs_be64(sb + XFS_SB_PQUOTINO);
-    fs->qflags = (uint16_t)xfs_be16(sb + XFS_SB_QFLAGS);
+    take_quota_fields(fs, sb);
     rc = check_geometry(fs);
     if (rc != KERR_OK) {
         return rc;
@@ -473,6 +502,7 @@ int xfs_attach_log(struct xfs *fs, struct bcache *log) {
     if (rc == KERR_DIRTY) {
         rc = xfs_check(fs);
         rc = rc != KERR_OK ? rc : (fs->no_replay ? KERR_NOTSUP : xfs_log_replay(fs));
+        rc = rc != KERR_OK ? rc : reread_after_replay(fs);
         if (rc != KERR_OK) {
             kprintf("xfs: the external log is dirty and could not be replayed\n");
             return rc;
@@ -581,6 +611,7 @@ int xfs_mount(struct xfs *fs, struct bcache *cache) {
          * write, and a kernel that refused the disk outright over an item
          * type it did not recognise would be strictly worse. */
         rc = fs->no_replay || fs->log_cache == NULL ? KERR_NOTSUP : xfs_log_replay(fs);
+        rc = rc != KERR_OK ? rc : reread_after_replay(fs);
         if (rc != KERR_OK) {
             fs->write_refused = true;
             kprintf("xfs: the log could not be replayed; mounting read-only\n");

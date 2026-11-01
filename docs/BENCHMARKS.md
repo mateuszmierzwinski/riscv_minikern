@@ -22,8 +22,24 @@ stale or computed number that looks like a reading is worse than a gap.
 | 2026-10-22 `e093c4d` | `7d2012029` | not measured | not measured | not measured | not measured | n/a | n/a |
 | *unpublished* | `efa74d7ef` | **3.5x** (1.9–3.6x, n=5) | **3 / 467 over 15.0 s, net off** | **332670** | **8043** | **0** | **0** |
 | *unpublished* | `faa4b6253`+ | **3.7x** (2.6–3.7x, n=3) | not re-measured | not re-measured | not re-measured | **0** | **0** |
+| *unpublished* | `9edc86b77`+ | **2.1x** (2.0–3.3x, n=5) | **401** on the spinner's hart over the whole boot (36 s), net off | **332670** | **8308** | **0** | **0** |
 
 Notes per row, because a number without its circumstances is a rumour:
+
+- **`9edc86b77`+** — the first row taken by `test/hil/bench.py`, which runs
+  every measure in this table and appends each reading to `benchmarks.tsv`.
+  Two circumstances differ from the rows above and are why the speedup is
+  lower: the Go program is **loaded by the harness** (`board.py -p`), because
+  the SD card's `/init` is no longer it (§0, needs the operator), and the
+  console is the SBI one. The same measurement on the published images
+  `4a5e3a2` and `b266fce` gave 1.8–3.0x, so nothing in this round moved it.
+  The interrupt column is the spinner's hart — the one with a switch — over
+  the **whole boot**, not the spin's 15 s; the idle harts take ~1,000 each
+  (their backstop). Every published image back to `b266fce` reads the same
+  ~400, so the "3" above is not reproduced by any image the harness can boot
+  now; whether the counter or the behaviour changed is open (ROADMAP §8). The
+  first reading of this column took the largest count (an idle hart, 1,019)
+  and was corrected to the spinner's from the same run's log.
 
 - **`3aa6326`** — the first board publish. The speedup is one run, so it has no
   range; treat it as an existence proof rather than a measurement. Interrupts

@@ -228,8 +228,13 @@ struct user_iovec {
     uint64_t len;
 };
 
+/* The low byte, as Linux keeps it: `exit(-1)` is status 255. A negative
+ * status is how a death by signal is recorded (`uspace_exit(-signo)`), and a
+ * program's own exit must never read as one. */
+#define EXIT_CODE_MASK 0xffu
+
 static int64_t sys_exit(struct trapframe *tf) {
-    uspace_exit((int64_t)(int32_t)sysarg(tf, 0));
+    uspace_exit((int64_t)(sysarg(tf, 0) & EXIT_CODE_MASK));
     return 0; /* not reached */
 }
 
@@ -289,6 +294,24 @@ static int file_backing(struct uspace_mapping *m, int32_t fd, uint64_t offset) {
 
 #define MAP_PROT_READ 0x1u
 #define MAP_PROT_WRITE 0x2u
+#define MAP_PROT_EXEC 0x4u
+
+/* W^X (ROADMAP §6): a user mapping is never writable and executable at
+ * once. A page an attacker can both write and run turns a memory-corruption
+ * bug into code execution in one step, so `mmap` and `mprotect` refuse it
+ * with `EACCES` — what Linux answers under SELinux's `execmem` denial. The
+ * JIT's way, writing a page and then making it read-and-execute, still
+ * works. `minikern.allowwx` turns the refusal off: the control. */
+static bool allow_write_and_execute;
+
+void syscall_allow_write_and_execute(bool on) {
+    allow_write_and_execute = on;
+}
+
+static bool writable_and_executable(uint32_t prot) {
+    uint32_t both = MAP_PROT_WRITE | MAP_PROT_EXEC;
+    return !allow_write_and_execute && (prot & both) == both;
+}
 
 /* Whether the descriptor's mode allows the rights a shared mapping asks for:
  * Linux's `EACCES` — reading needs a readable descriptor, and a shared
@@ -370,6 +393,9 @@ static int64_t sys_mmap(struct trapframe *tf) {
     if (no != NULL) {
         refuse_mapping_once(no);
         return KERR_INVAL;
+    }
+    if (writable_and_executable((uint32_t)sysarg(tf, 2))) {
+        return KERR_ACCES;
     }
     m.at = sysarg(tf, 0);
     m.bytes = sysarg(tf, 1);
@@ -520,6 +546,9 @@ static int64_t sys_mremap(struct trapframe *tf) {
 }
 
 static int64_t sys_mprotect(struct trapframe *tf) {
+    if (writable_and_executable((uint32_t)sysarg(tf, 2))) {
+        return KERR_ACCES;
+    }
     return uspace_protect(uspace_current(), sysarg(tf, 0), sysarg(tf, 1), (uint32_t)sysarg(tf, 2));
 }
 
@@ -2522,7 +2551,7 @@ static int64_t sys_futex(struct trapframe *tf) {
  * threads end with `exit`; `exit_group` is what `main` returning does, and
  * conflating the two kills the program the first time a worker finishes. */
 static int64_t sys_exit_thread(struct trapframe *tf) {
-    sched_exit_thread((int64_t)(int32_t)sysarg(tf, 0));
+    sched_exit_thread((int64_t)(sysarg(tf, 0) & EXIT_CODE_MASK));
     return 0; /* not reached */
 }
 

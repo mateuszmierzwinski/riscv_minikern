@@ -689,6 +689,25 @@ static int64_t sys_swapoff(struct trapframe *tf) {
     return swap_disable();
 }
 
+/* **How a child ended, in the form `wait4` and `waitid` report.** A death by
+ * signal is recorded as minus the signal (`uspace_exit(-signo)`) and an exit
+ * as its low byte. They were reported alike — a child killed by SIGSEGV read
+ * as `WIFEXITED` with code 245 — so a shell, or Go's `os/exec`, could not
+ * tell a crash from an exit. */
+static bool killed_by_signal(const struct uproc *child) {
+    return child->status < 0;
+}
+
+static uint32_t ending_number(const struct uproc *child) {
+    return killed_by_signal(child) ? (uint32_t)(-child->status) & 0x7fu
+                                   : (uint32_t)child->status & 0xffu;
+}
+
+static int32_t wait_status_of(const struct uproc *child) {
+    return killed_by_signal(child) ? (int32_t)ending_number(child)
+                                   : (int32_t)(ending_number(child) << 8);
+}
+
 static int64_t sys_wait4(struct trapframe *tf) {
     int64_t want = (int64_t)sysarg(tf, 0);
     virt_t status_at = sysarg(tf, 1);
@@ -776,9 +795,8 @@ static int64_t sys_wait4(struct trapframe *tf) {
         kprintf("wait4: pid %u reaping child %u after %u rounds\n", me->pid, pid, rounds);
     }
     /* The exit code goes in bits 8..15, which is what `WEXITSTATUS` shifts
-     * back out. A status written in the low byte reads as 0 for every
-     * program that exits with anything under 256. */
-    encoded = (int32_t)((child->status & 0xff) << 8);
+     * back out; a terminating signal in bits 0..6 (`WTERMSIG`). */
+    encoded = wait_status_of(child);
     if (status_at != 0 && uspace_copy_out(status_at, &encoded, 4) != KERR_OK) {
         return KERR_FAULT;
     }
@@ -875,10 +893,10 @@ static int64_t sys_waitid(struct trapframe *tf) {
      * as a C struct here would be this compiler's idea of the layout rather
      * than the ABI's, and the two have differed in this tree before. */
     write_le32(info + SI_SIGNO, 17u); /* SIGCHLD */
-    write_le32(info + SI_CODE, CLD_EXITED);
+    write_le32(info + SI_CODE, killed_by_signal(child) ? CLD_KILLED : CLD_EXITED);
     write_le32(info + SI_PID, child->pid);
     write_le32(info + SI_UID, child->uid);
-    write_le32(info + SI_STATUS, (uint32_t)(child->status & 0xff));
+    write_le32(info + SI_STATUS, ending_number(child));
     if (infop != 0 && uspace_copy_out(infop, info, SI_BYTES) != KERR_OK) {
         return KERR_FAULT;
     }

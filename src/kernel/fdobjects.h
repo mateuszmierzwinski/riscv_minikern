@@ -18,12 +18,16 @@
 #include <stdint.h>
 
 #include "kernel/file.h"
+#include "kernel/synthfs.h"
 
 /* Makes a driver's device openable at `path`: each open is a file with
- * `ops` and `priv`. The driver registers itself, so this layer never names a
- * device it does not own (a framebuffer, later a display). KERR_NOMEM when
- * the table is full, KERR_EXIST when the path is taken. */
-int fdobjects_add_device(const char *path, const struct file_ops *ops, void *priv);
+ * `ops` and `priv`, refused with `EACCES` when `owner`'s bits do not allow
+ * the caller what the open asks for. The driver registers itself, so this
+ * layer never names a device it does not own (a framebuffer, later a
+ * display). KERR_NOMEM when the table is full, KERR_EXIST when the path is
+ * taken. */
+int fdobjects_add_device(const char *path, const struct file_ops *ops, void *priv,
+                         const struct device_owner *owner);
 
 /* Installs the console on 0, 1 and 2. Called once per process, before it
  * runs: a program may assume they exist. */

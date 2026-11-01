@@ -341,41 +341,10 @@ static void step_defragment(struct xfs *fs) {
  * its blocks and its tree's leaves. */
 #define BTREE_FILE_BYTES (4u * 1024u * 1024u)
 
-/* The b-tree step on inodes over 512 bytes, whose data fork is larger than
- * this reader caches: a file may not go past the extents that cache holds
- * (`xfs_data_extents_cap`), so a fragmenting write must stop with
- * KERR_NOTSUP — before allocating, or `xfs_repair` finds the block it took
- * — and what was written must read back. The file is then removed. */
-static void btree_refused(struct xfs *fs) {
-    struct xfs_inode root, ip;
-    uint64_t ino, done = 0;
-    uint32_t put = 0;
-    int rc = KERR_OK;
-    read_inode(fs, fs->rootino, &root);
-    must(xfs_create(fs, &root, "fragmented", 10u, 0100644, NOW, &ino), "create fragmented");
-    for (; rc == KERR_OK && done < BTREE_FILE_BYTES; done += put) {
-        read_inode(fs, ino, &ip);
-        put = 0;
-        rc = xfs_file_write(fs, &ip, done, payload + done % (sizeof payload - 65536u), 65536u, &put);
-    }
-    if (rc != KERR_OK && rc != KERR_NOTSUP) {
-        fprintf(stderr, "xfs_writecheck: a fragmenting write answered %d, want ok or %d\n", rc,
-                KERR_NOTSUP);
-        exit(1);
-    }
-    printf("xfs_writecheck: large inodes: %llu bytes written before %s\n",
-           (unsigned long long)done, rc == KERR_NOTSUP ? "the extent cap" : "the end");
-    read_inode(fs, fs->rootino, &root);
-    must(xfs_unlink(fs, &root, "fragmented", 10u, NOW), "unlink fragmented");
-}
 
 static void step_btreefile(struct xfs *fs) {
     struct xfs_inode root, ip;
     uint64_t ino;
-    if (fs->inodesize - fs->dinode_size > XFS_FORK_MAX) {
-        btree_refused(fs);
-        return;
-    }
     read_inode(fs, fs->rootino, &root);
     ino = make_file(fs, &root, "fragmented", BTREE_FILE_BYTES, 65536u);
     read_inode(fs, ino, &ip);
@@ -906,6 +875,16 @@ static uint32_t tall_root_level(struct xfs *fs, uint64_t ino) {
     return ip.format == XFS_DINODE_FMT_BTREE ? (uint32_t)ip.fork[0] << 8 | ip.fork[1] : 0;
 }
 
+/* The root level the tall file needs: 2 when its extents are more than the
+ * inode's root and one level of leaves name (512-byte inodes), 1 when a
+ * larger inode's root names enough leaves. */
+static uint32_t tall_levels_needed(const struct xfs *fs) {
+    uint32_t root = (fs->inodesize - fs->dinode_size - XFS_BMDR_HDR_BYTES) /
+                    (XFS_BMBT_KEY_BYTES + XFS_BMBT_PTR_BYTES);
+    uint32_t leaf = (fs->blocksize - xfs_bmbt_hdr(fs)) / XFS_EXTENT_BYTES;
+    return TALL_EXTENTS > root * leaf ? 2u : 1u;
+}
+
 /* Truncates the tall file to its first `extents` extents and checks them. */
 static void cut_tall(struct xfs *fs, uint64_t ino, uint32_t extents) {
     struct xfs_inode ip;
@@ -917,15 +896,11 @@ static void cut_tall(struct xfs *fs, uint64_t ino, uint32_t extents) {
 }
 
 /* Grows the tall file to three levels, reads it, cuts it back through two
- * levels to extents in the inode, and removes it. Skipped on inodes whose
- * fork is past what this reader caches (`btreefile` covers those). */
+ * levels to extents in the inode, and removes it. */
 static void step_tallfork(struct xfs *fs) {
     struct xfs_inode root, ip;
     uint64_t ino;
     uint32_t put;
-    if (fs->inodesize - fs->dinode_size > XFS_FORK_MAX) {
-        return;
-    }
     read_inode(fs, fs->rootino, &root);
     must(xfs_create(fs, &root, "tall", 4u, 0100644, NOW, &ino), "create tall");
     for (uint32_t i = 0; i < TALL_EXTENTS; i++) {
@@ -935,8 +910,9 @@ static void step_tallfork(struct xfs *fs) {
     read_inode(fs, ino, &ip);
     printf("xfs_writecheck: tall file has %u extents, root level %u\n", ip.nextents,
            tall_root_level(fs, ino));
-    if (ip.nextents != TALL_EXTENTS || tall_root_level(fs, ino) != 2u) {
-        fprintf(stderr, "xfs_writecheck: the tall file is not a three-level tree\n");
+    if (ip.nextents != TALL_EXTENTS || tall_root_level(fs, ino) != tall_levels_needed(fs)) {
+        fprintf(stderr, "xfs_writecheck: the tall file's root is at level %u, want %u\n",
+                tall_root_level(fs, ino), tall_levels_needed(fs));
         exit(1);
     }
     must_read_tall(fs, ino, TALL_EXTENTS);
@@ -1087,6 +1063,126 @@ static void step_manyattrs(struct xfs *fs) {
     must_read_back(fs, emptied, 4096u);
 }
 
+/* Extent-free intents in a log a crash left dirty. An extent is taken from
+ * free space and an intent to free it logged with no done item — the shape
+ * of a crash between Linux logging a free and finishing it — and the
+ * remount's replay must free it. Then an extent is taken and freed, and an
+ * intent *with* its done item logged: the replay must not free it again.
+ * The items are laid out as Linux lays them out (`xfs_logprint` reads them
+ * as EFI/EFD), and the free-block count is the judge, with `xfs_repair`. */
+static void put_le(uint8_t *p, uint64_t v, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++) {
+        p[i] = (uint8_t)(v >> (8u * i));
+    }
+}
+
+/* An EFI or an EFD for one extent: the two formats are the same shape. */
+static void free_intent(uint8_t out[32], uint16_t type, uint64_t id, uint64_t fsb,
+                        uint32_t len) {
+    memset(out, 0, 32);
+    put_le(out, type, 2);
+    put_le(out + 2, 1, 2);
+    put_le(out + 4, 1, 4);
+    put_le(out + 8, id, 8);
+    put_le(out + 16, fsb, 8);
+    put_le(out + 24, len, 4);
+}
+
+/* Free space as `xfs_repair` counts it: the free-space trees and the free
+ * lists — a block moved onto a free list is still free. */
+static uint64_t free_space(struct xfs *fs) {
+    uint64_t n = free_blocks(fs);
+    for (uint32_t agno = 0; agno < fs->agcount; agno++) {
+        struct bbuf *b;
+        uint8_t *agf;
+        must(xfs_agf_get(fs, agno, &b, &agf), "an AGF");
+        n += xfs_be32(agf + XFS_AGF_FLCOUNT);
+        bcache_put(fs->cache, b);
+    }
+    return n;
+}
+
+static uint64_t take_extent(struct xfs *fs, uint32_t len, uint32_t *agno, uint32_t *agbno) {
+    *agno = 0;
+    must(xfs_alloc_somewhere(fs, agno, len, 0, agbno), "an extent to free later");
+    return ((uint64_t)*agno << fs->agblklog) | *agbno;
+}
+
+/* Logs the items, leaves no unmount record, and mounts again. */
+static void crash_with(struct xfs *fs, const struct xfs_log_region *r, uint32_t n) {
+    static struct xfs again;
+    fs->skip_unmount_record = true;
+    must(xfs_log_regions(fs, r, n, n), "the intents' transaction");
+    must(xfs_flush(fs), "flush before the crash");
+    bcache_invalidate(fs->cache);
+    must(xfs_mount(&again, fs->cache), "mount after the crash");
+    must(xfs_writable(&again) ? KERR_OK : KERR_ROFS, "a writable mount after the replay");
+    *fs = again;
+}
+
+static void step_efi(struct xfs *fs) {
+    uint8_t efi[32], efd[32];
+    uint32_t agno = 0, agbno = 0;
+    uint64_t before = free_space(fs), fsb = take_extent(fs, 8u, &agno, &agbno);
+    free_intent(efi, 0x1236u, 0x4546490000000001ull, fsb, 8u);
+    crash_with(fs, (struct xfs_log_region[]){{efi, sizeof efi}}, 1u);
+    if (free_space(fs) != before) {
+        fprintf(stderr, "xfs_writecheck: an unfinished intent left %llu free, want %llu\n",
+                (unsigned long long)free_space(fs), (unsigned long long)before);
+        exit(1);
+    }
+    fsb = take_extent(fs, 8u, &agno, &agbno);
+    must(xfs_free_extent(fs, agno, agbno, 8u), "an extent freed before the log says so");
+    free_intent(efi, 0x1236u, 0x4546490000000002ull, fsb, 8u);
+    free_intent(efd, 0x1237u, 0x4546490000000002ull, fsb, 8u);
+    crash_with(fs, (struct xfs_log_region[]){{efi, sizeof efi}, {efd, sizeof efd}}, 2u);
+    if (free_space(fs) != before) {
+        fprintf(stderr, "xfs_writecheck: a finished intent was freed again\n");
+        exit(1);
+    }
+    printf("xfs_writecheck: an unfinished free intent was finished, a finished one left\n");
+}
+
+/* On test/testdata/linux_dirty_log.img (scripts/make_linux_log.sh): the
+ * mount replayed a log Linux left dirty — this program refuses a mount
+ * that came up read-only — and the files are what the log says: of
+ * /d/f000..f199 the odd ones remain, owned by 1000 + i % 3 (a chown is
+ * logged); /big was cut to 8 KiB and /frag emptied (a truncate is logged).
+ * Sizes from plain writes are not checked: Linux records a size when the
+ * data is written back, which the guest's shutdown came before — so a crash
+ * leaves those files short, as it would on Linux. Then one more file is
+ * written over the replayed state. Skipped on images without /d. */
+static void step_linuxlog(struct xfs *fs) {
+    struct xfs_inode ip, root;
+    char path[24];
+    if (xfs_path_lookup(fs, "/d", &ip) == KERR_NOENT) {
+        if (getenv("XFS_WRITECHECK_LINUXLOG") != NULL) {
+            fprintf(stderr, "xfs_writecheck: /d is missing: the log was not replayed\n");
+            exit(1);
+        }
+        return;
+    }
+    for (uint32_t i = 0; i < 200u; i++) {
+        int rc;
+        snprintf(path, sizeof path, "/d/f%03u", i);
+        rc = xfs_path_lookup(fs, path, &ip);
+        if (i % 2u == 0 ? rc != KERR_NOENT
+                        : rc != KERR_OK || ip.uid != 1000u + i % 3u) {
+            fprintf(stderr, "xfs_writecheck: %s after replay: rc %d, %llu bytes, uid %u\n", path,
+                    rc, (unsigned long long)ip.size, ip.uid);
+            exit(1);
+        }
+    }
+    must(xfs_path_lookup(fs, "/big", &ip), "/big");
+    must(ip.size == 8192u ? KERR_OK : KERR_IO, "/big's replayed size");
+    must(xfs_path_lookup(fs, "/frag", &ip), "/frag");
+    must(ip.size == 0 ? KERR_OK : KERR_IO, "/frag's replayed size");
+    read_inode(fs, fs->rootino, &root);
+    (void)make_file(fs, &root, "after-replay", 9000u, 4096u);
+    must_read_back(fs, lookup(fs, "/after-replay"), 9000u);
+    printf("xfs_writecheck: a log Linux left dirty was replayed and written over\n");
+}
+
 /* A directory past what one node and one free block describe: 200,000
  * names of 40 bytes, which is ~2,800 data blocks (a second free block past
  * 2,016) and a hash index whose root fills at ~177,000 names (a level of
@@ -1173,24 +1269,34 @@ static void step_bigdir(struct xfs *fs) {
 }
 
 /* On a `-i size=1024` image made with /big (a shortform directory whose
- * fork is past XFS_FORK_MAX) and /beside: the big directory is refused —
- * per inode, KERR_NOTSUP — and everything else on the filesystem still
- * reads and writes. Skipped on images without /big. */
+ * fork, 848 bytes, is past the 412 an inode caches) and /beside: every name
+ * in /big is found — its fork is read from the inode's block — and one more
+ * is added, which turns the directory from shortform into a block through
+ * the same uncached fork. It used to be refused per inode. Skipped on
+ * images without /big. */
 static void step_bigfork(struct xfs *fs) {
-    struct xfs_inode ip, root;
-    int rc = xfs_path_lookup(fs, "/big", &ip);
+    struct xfs_inode ip, root, big;
+    uint64_t ino = 0;
+    char path[48];
+    int rc = xfs_path_lookup(fs, "/big", &big);
     if (rc == KERR_NOENT) {
         return;
     }
-    if (rc != KERR_NOTSUP) {
-        fprintf(stderr, "xfs_writecheck: /big (a fork over %u bytes) answered %d, want %d\n",
-                XFS_FORK_MAX, rc, KERR_NOTSUP);
-        exit(1);
+    must(rc, "/big, a fork over the inode cache");
+    for (uint32_t i = 1; i <= 25u; i++) {
+        snprintf(path, sizeof path, "/big/name-of-entry-%02u", i);
+        must(xfs_path_lookup(fs, path, &ip), path);
     }
+    must(xfs_create(fs, &big, "one-more-after-the-inode-is-full", 32u, 0100644, NOW, &ino),
+         "a name added to /big");
+    must(xfs_path_lookup(fs, "/big/one-more-after-the-inode-is-full", &ip), "the added name");
+    must(xfs_path_lookup(fs, "/big/name-of-entry-25", &ip), "an old name after the conversion");
     must(xfs_path_lookup(fs, "/beside/s1", &ip), "a small directory beside the big one");
     read_inode(fs, fs->rootino, &root);
     (void)make_file(fs, &root, "after-big", 9000u, 4096u);
     must_read_back(fs, lookup(fs, "/after-big"), 9000u);
+    read_inode(fs, lookup(fs, "/big"), &big);
+    printf("xfs_writecheck: /big read through its uncached fork, now format %u\n", big.format);
 }
 
 static const struct step steps[] = {
@@ -1205,6 +1311,7 @@ static const struct step steps[] = {
     {"reflink", step_reflink},  {"holes", step_holes},     {"boardgrow", step_boardgrow},
     {"trim", step_trim},        {"eofzero", step_eofzero},  {"realtime", step_realtime},
     {"uncommitted", step_uncommitted}, {"bigfork", step_bigfork}, {"tallfork", step_tallfork}, {"manyattrs", step_manyattrs},
+    {"linuxlog", step_linuxlog}, {"efi", step_efi},
     {"bigdir", step_bigdir},
 };
 

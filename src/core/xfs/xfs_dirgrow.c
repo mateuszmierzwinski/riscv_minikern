@@ -212,10 +212,11 @@ int xfs_dir_to_block(struct xfs *fs, const struct xfs_inode *dir, const char *na
      * first version sized this for a whole directory block — eight thousand
      * pairs, 64 KiB — and the frame guard refused it, which is the rule
      * about kernel stacks earning its keep. A shortform directory lives in
-     * a few hundred bytes of inode and an entry costs at least nine of
-     * them, so forty is already generous for "every entry it had, plus the
-     * one being added". */
-    struct hashent ents[48];
+     * at most a 2048-byte inode's literal area and an entry costs at least
+     * nine bytes of it, so 256 holds every entry it had plus the one being
+     * added. Static, as every outsized buffer here: one core is inside the
+     * filesystem at a time. */
+    static struct hashent ents[256];
     uint32_t nents = 0;
     uint32_t at = fs->dir_data_hdr;
     uint32_t count = dir->fork[XFS_DIR_SF_COUNT];
@@ -239,7 +240,16 @@ int xfs_dir_to_block(struct xfs *fs, const struct xfs_inode *dir, const char *na
     at += xfs_dir_put_entry(fs, fs->dirblock, at, dir->ino, ".", 1u, XFS_DIR3_FT_DIR);
     insert_sorted(ents, &nents, xfs_dir_hashname("..", 2u), at / XFS_DIR2_DATA_ALIGN);
     at += xfs_dir_put_entry(fs, fs->dirblock, at, parent, "..", 2u, XFS_DIR3_FT_DIR);
-    at = copy_shortform(fs, dir->fork, count, at, ents, &nents);
+    {
+        /* The entries may lie past the inode's cache (inodes over 512 bytes). */
+        struct xfs_fork_ref r;
+        rc = xfs_inode_fork(fs, dir, &r);
+        if (rc != KERR_OK) {
+            return rc;
+        }
+        at = copy_shortform(fs, r.at, count, at, ents, &nents);
+        xfs_inode_fork_put(fs, &r);
+    }
     insert_sorted(ents, &nents, xfs_dir_hashname(name, namelen), at / XFS_DIR2_DATA_ALIGN);
     at += xfs_dir_put_entry(fs, fs->dirblock, at, ino, name, namelen, ftype);
     if (at + nents * XFS_DIR2_LEAF_ENTRY_SIZE + XFS_DIR2_BLOCK_TAIL_SIZE > fs->dirblocksize) {

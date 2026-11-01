@@ -341,7 +341,7 @@ void procfiles_install(void) {
     (void)procfs_add("/sys/devices/system/cpu/online", cpus_file);
     (void)procfs_add("/sys/devices/system/cpu/possible", cpus_file);
     for (uint32_t i = 0; i < sizeof devs / sizeof devs[0]; i++) {
-        (void)synthfs_add_device(devs[i]);
+        (void)synthfs_add_device(devs[i], NULL);
     }
     (void)synthfs_mount();
 }

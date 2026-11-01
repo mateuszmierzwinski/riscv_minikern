@@ -574,13 +574,14 @@
 #define XFS_PQUOTA_ENFD 0x0200u
 #define XFS_PQUOTA_CHKD 0x0400u
 
-/* A disk quota record. The quota files are plain files whose contents are
- * an array of these, and a record's place in the array **is** its id:
- * record `n` is at `n * XFS_DQUOT_BYTES`. There is no index and no search —
- * which is why a quota file is sparse, and why reading one is an ordinary
- * file read at a computed offset. */
+/* A disk quota record. The quota files hold these packed as many to a
+ * block as fit (30 in 4 KiB), the rest of each block unused, and a
+ * record's place **is** its id — so there is no index and no search, and a
+ * quota file is sparse. Linux leaves the files' size at zero: they are
+ * reached through their block map (xfs_quota.c). */
 #define XFS_DQUOT_MAGIC   0x4451u /* "DQ" */
-#define XFS_DQUOT_VERSION 3u      /* on a v5 filesystem */
+#define XFS_DQUOT_VERSION 1u      /* on every filesystem; it was taken to be 3 on v5,
+                                     which refused every record Linux wrote */
 #define XFS_DQUOT_BYTES   136u
 
 #define XFS_DQ_MAGIC         0u   /* be16 */
@@ -634,6 +635,9 @@
 #define XFS_NULL_AGBNO    0xffffffffu /* no sibling */
 #define XFS_BTREE_UUID    32u /* 16 bytes */
 #define XFS_BTREE_CRC     52u /* u32, little-endian */
+#define XFS_REFC_MAGIC    0x52334643u /* "R3FC": the reference-count tree */
+#define XFS_SYMLINK_MAGIC 0x58534c4du /* "XSLM": a remote symlink block */
+#define XFS_SYMLINK_CRC   12u /* u32, little-endian */
 #define XFS_BTREE_RECORDS 56u    /* where the records start on v5 */
 #define XFS_BTREE_V4_RECORDS 16u /* magic, level, numrecs and two siblings */
 
@@ -680,7 +684,8 @@
 #define XLOG_OP_FLAGS    9u /* u8 */
 #define XLOG_OP_HDR_SIZE 12u
 
-#define XLOG_CLIENT_LOG     0xaau /* XFS_LOG: the filesystem itself */
+#define XLOG_CLIENT_LOG     0xaau /* XFS_LOG: the log itself — the unmount record */
+#define XLOG_CLIENT_TRANS   0x69u /* XFS_TRANSACTION: every transaction's operations */
 #define XLOG_UNMOUNT_TRANS  0x20u /* this record is the unmount record */
 #define XLOG_UNMOUNT_MAGIC  0x556eu /* "Un", written in the host's byte order */
 
@@ -729,12 +734,62 @@
 #define ILF_LEN          48u /* u32: its length in 512-byte blocks */
 #define ILF_BOFFSET      52u /* u32: the inode's byte offset within it */
 #define ILF_STRUCT_SIZE  56u
+#define ILF_RDEV         24u /* u32: a device inode's number, when XFS_ILOG_DEV */
 #define XFS_ILOG_CORE    0x0001u /* the item carries the inode's core */
+#define XFS_ILOG_DDATA   0x0002u /* the data fork, held inside the inode */
+#define XFS_ILOG_DEXT    0x0004u /* the data fork's extent list */
+#define XFS_ILOG_DBROOT  0x0008u /* the data fork's b-tree root, in-core layout */
+#define XFS_ILOG_DEV     0x0010u /* a device number in place of a data fork */
+#define XFS_ILOG_ADATA   0x0040u /* the same three for the attribute fork */
+#define XFS_ILOG_AEXT    0x0080u
+#define XFS_ILOG_ABROOT  0x0100u
+#define XFS_ILOG_DOWNER  0x0200u /* a fork's tree blocks changed owner (swapext) */
+#define XFS_ILOG_AOWNER  0x0400u
+
+/* The other item types a log holds. An intent (`*I`) says work is to be
+ * done and its done item (`*D`, carrying the intent's id) that it was;
+ * both put the id at offset 8. */
+#define XFS_LI_EFI       0x1236u /* extents to free */
+#define XFS_LI_EFD       0x1237u
+#define XFS_LI_DQUOT     0x123du
+#define XFS_LI_QUOTAOFF  0x123eu
+#define XFS_LI_ICREATE   0x123fu
+#define XFS_LI_RUI       0x1240u /* reverse-map updates */
+#define XFS_LI_RUD       0x1241u
+#define XFS_LI_CUI       0x1242u /* reference-count updates */
+#define XFS_LI_CUD       0x1243u
+#define XFS_LI_BUI       0x1244u /* block-map updates */
+#define XFS_LI_BUD       0x1245u
+#define XFS_LI_ATTRI     0x1246u /* attribute updates */
+#define XFS_LI_ATTRD     0x1247u
+#define XFS_LI_XMI       0x1248u /* file-range exchanges */
+#define XFS_LI_XMD       0x1249u
+#define INTENT_ID        8u  /* u64: an intent's id, or the id its done item names */
+#define EFI_NEXTENTS     4u  /* u32 */
+#define EFI_EXTENTS      16u /* {start u64, len u32, pad u32}, or packed to 12 bytes */
+
+/* An inode-create item: a chunk of fresh inodes to initialise. */
+#define ICR_AG           4u  /* u32 */
+#define ICR_AGBNO        8u  /* u32 */
+#define ICR_COUNT        12u /* u32 */
+#define ICR_ISIZE        16u /* u32 */
+#define ICR_LENGTH       20u /* u32: blocks */
+#define ICR_GEN          24u /* u32 */
+#define ICR_SIZE         28u
+
+/* A dquot item: where the dquot is, then the dquot itself. */
+#define QLF_BLKNO        8u  /* u64: the dquot block's device block */
+#define QLF_BOFFSET      20u /* u32: the dquot's offset within it */
+#define QLF_SIZE         24u
+#define XFS_DQBLK_SIZE   136u /* a v5 dquot with its checksum, LSN and UUID */
 
 /* A buffer log item: a block, and a bitmap of which 128-byte chunks of it
  * the record carries. This is what Linux logs most metadata as. */
-#define BLF_FLAGS        2u  /* u16 */
-#define BLF_LEN          4u  /* u16: the buffer's length in 512-byte blocks */
+#define BLF_SIZE         2u  /* u16: the operations it takes, format included */
+#define BLF_FLAGS        4u  /* u16 */
+#define BLF_LEN          6u  /* u16: the buffer's length in 512-byte blocks */
+#define XFS_BLF_INODE_BUF 0x0001u /* an inode buffer: only unlinked pointers are logged */
+#define XFS_BLF_CANCEL    0x0002u /* the block was freed: earlier items for it are void */
 #define BLF_BLKNO        8u  /* u64: its device block */
 #define BLF_MAP_SIZE     16u /* u32: words in the dirty-chunk bitmap */
 #define BLF_DATA_MAP     20u /* the bitmap itself */

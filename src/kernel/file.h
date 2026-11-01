@@ -90,6 +90,11 @@ struct file_ops {
      * frame. NULL means the object cannot be mapped shared, and `mmap`
      * refuses `MAP_SHARED` of it. */
     int32_t (*map_page)(struct file *f, uint64_t offset, phys_t *phys);
+    /* A positional device's length, for `lseek(SEEK_END)`. Together with
+     * `pread` it makes the device seekable, its position kept in the
+     * descriptor (`struct file.pos`); NULL leaves `lseek` refusing it with
+     * `ESPIPE`, which is right for a stream. */
+    uint64_t (*size)(struct file *f);
 };
 
 struct file {
@@ -101,6 +106,9 @@ struct file {
      * it can sleep rather than poll: a generation that has not moved means
      * nothing can have become ready. */
     uint32_t poll_gen;
+    /* A positional device's offset: `read` and `write` start here and move
+     * it, `lseek` sets it. Unused by objects that keep their own. */
+    uint64_t pos;
 };
 
 struct uproc;

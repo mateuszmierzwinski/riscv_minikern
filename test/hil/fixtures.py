@@ -304,6 +304,41 @@ def v4_filesystem_big_inodes(at):
     return img
 
 
+def big_inodes(at):
+    """`mkfs.xfs` defaults with **1024-byte inodes**, a seed file, and /big:
+    a shortform directory of 25 long names whose 848-byte fork is past the
+    412 bytes an inode caches, so reading it, and growing it out of
+    shortform, go through the inode's own block. Every step of the write
+    path then runs on inodes this size."""
+    os.makedirs(at, exist_ok=True)
+    data = payload(at)
+    proto = os.path.join(at, "protobig")
+    with open(proto, "w") as f:
+        f.write(f"dummy\n0 0\nd--755 0 0\nseed ---644 0 0 {data}\nbig d--755 0 0\n")
+        for i in range(1, 26):
+            f.write(f"name-of-entry-{i:02d} ---644 0 0 {data}\n")
+        f.write("$\n$\n")
+    img = os.path.join(at, "inodes1k.img")
+    with open(img, "wb") as f:
+        f.truncate(320 * 1024 * 1024)
+    subprocess.run(["mkfs.xfs", "-q", "-f", "-i", "size=1024", "-b", "size=4096", "-p", proto,
+                    img], check=True)
+    return img
+
+
+def linux_dirty_log(at):
+    """The image whose log Linux left dirty (test/testdata/linux_dirty_log.
+    img.xz, made by scripts/make_linux_log.sh), unpacked: the board's replay
+    has to apply Linux's own log items to come up writable."""
+    os.makedirs(at, exist_ok=True)
+    src = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "testdata",
+                       "linux_dirty_log.img.xz")
+    img = os.path.join(at, "linuxlog.img")
+    with open(img, "wb") as out:
+        subprocess.run(["xz", "-dc", src], stdout=out, check=True)
+    return img
+
+
 def external_log_volume(at):
     """A filesystem whose log is on a **separate device**, and that device.
 

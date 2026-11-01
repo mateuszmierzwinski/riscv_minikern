@@ -102,9 +102,9 @@ uint32_t xfs_fork_bytes(const struct xfs *fs, const uint8_t *di) {
 }
 
 uint32_t xfs_data_extents_cap(const struct xfs *fs, const struct xfs_inode *ip) {
-    uint32_t area = fs->inodesize - fs->dinode_size;
-    uint32_t avail = ip->forkoff == 0 ? area : (uint32_t)ip->forkoff * 8u;
-    return avail > XFS_FORK_MAX ? XFS_FORK_MAX / XFS_EXTENT_BYTES : UINT32_MAX;
+    (void)fs;
+    (void)ip;
+    return UINT32_MAX; /* a fork past the cache is read from the inode (`xfs_inode_fork`) */
 }
 
 /* Everything that must be true of an inode before its contents are used:
@@ -183,37 +183,16 @@ static int take(struct xfs *fs, const uint8_t *di, uint64_t ino, struct xfs_inod
         .forkoff = di[XFS_DI_FORKOFF],
         .fork_len = avail < XFS_FORK_MAX ? avail : XFS_FORK_MAX,
     };
-    /* **An inode whose fork is larger than the cache is refused here**, not
-     * at mount: the filesystem is fine and so is every other inode in it.
-     *
-     * The b-tree case is the one that matters most. Its key and pointer
-     * arrays are laid out according to how many records the root *could*
-     * hold, which is computed from the fork's length — so a truncated
-     * `fork_len` does not merely hide the tail, it moves every pointer. A
-     * silently wrong pointer is worse than a refusal by the whole distance
-     * between a wrong answer and no answer. */
-    if (avail > XFS_FORK_MAX) {
-        bool fits = out->format == XFS_DINODE_FMT_LOCAL
-                        ? out->size <= XFS_FORK_MAX
-                        : (out->format == XFS_DINODE_FMT_EXTENTS
-                               ? (uint64_t)out->nextents * XFS_EXTENT_BYTES <= XFS_FORK_MAX
-                               : false);
-        if (!fits) {
-            kprintf("xfs: inode %u has a %u-byte fork; this reader caches %u\n",
-                    (uint32_t)ino, avail, XFS_FORK_MAX);
-            return KERR_NOTSUP;
-        }
-    }
     if (out->format == XFS_DINODE_FMT_BTREE && out->fork_len <= XFS_BMDR_HDR_BYTES) {
         kprintf("xfs: inode %u has a btree fork of only %u bytes\n", (uint32_t)ino, out->fork_len);
         return KERR_IO;
     }
-    if (out->format == XFS_DINODE_FMT_LOCAL && out->size > out->fork_len) {
+    if (out->format == XFS_DINODE_FMT_LOCAL && out->size > avail) {
         kprintf("xfs: inode %u says it holds %u bytes inside itself\n", (uint32_t)ino, (uint32_t)out->size);
         return KERR_IO;
     }
     if (out->format == XFS_DINODE_FMT_EXTENTS &&
-        (uint64_t)out->nextents * XFS_EXTENT_BYTES > out->fork_len) {
+        (uint64_t)out->nextents * XFS_EXTENT_BYTES > avail) {
         kprintf("xfs: inode %u claims %u extents, more than its fork holds\n", (uint32_t)ino, (uint32_t)out->nextents);
         return KERR_IO;
     }
@@ -244,20 +223,42 @@ int xfs_inode_read(struct xfs *fs, uint64_t ino, struct xfs_inode *out) {
     return rc;
 }
 
-int xfs_bmap(const struct xfs *fs, const struct xfs_inode *ip, uint64_t off, struct xfs_extent *out) {
-    /* **The one place the two shapes of extent map meet.** Everything that
-     * asks where a block is — reading a file, listing a directory, following
-     * a symlink — comes through here, so a fork in a b-tree is handled once
-     * rather than at each caller. */
-    if (ip->format == XFS_DINODE_FMT_BTREE) {
-        return xfs_bmbt_lookup(fs, ip, off, out);
+int xfs_inode_fork(const struct xfs *fs, const struct xfs_inode *ip, struct xfs_fork_ref *r) {
+    uint64_t block;
+    uint32_t boffset;
+    int rc;
+    uint32_t area = fs->inodesize - fs->dinode_size;
+    uint32_t full = ip->forkoff == 0 ? area : (uint32_t)ip->forkoff * 8u;
+    *r = (struct xfs_fork_ref){.b = NULL, .at = ip->fork, .len = ip->fork_len,
+                               .format = ip->format, .nextents = ip->nextents};
+    if (full <= ip->fork_len) {
+        return KERR_OK;
     }
-    if (ip->format != XFS_DINODE_FMT_EXTENTS) {
-        return KERR_NOTSUP;
+    xfs_inode_place(fs, ip->ino, &block, &boffset);
+    rc = bcache_get(fs->cache, block, &r->b);
+    if (rc == KERR_OK) {
+        const uint8_t *di = r->b->data + boffset;
+        r->at = di + fs->dinode_size;
+        r->len = xfs_fork_bytes(fs, di);
+        r->format = di[XFS_DI_FORMAT];
+        r->nextents = (uint32_t)xfs_dinode_data_extents(fs, di);
     }
-    for (uint32_t i = 0; i < ip->nextents; i++) {
+    return rc;
+}
+
+void xfs_inode_fork_put(const struct xfs *fs, struct xfs_fork_ref *r) {
+    if (r->b != NULL) {
+        bcache_put(fs->cache, r->b);
+        r->b = NULL;
+    }
+}
+
+/* Where `off` is in an extent list of `n` records at `fork`. */
+static int extents_lookup(const struct xfs *fs, const uint8_t *fork, uint32_t n, uint64_t off,
+                          struct xfs_extent *out) {
+    for (uint32_t i = 0; i < n; i++) {
         struct xfs_extent e;
-        xfs_extent_unpack(ip->fork + i * XFS_EXTENT_BYTES, &e);
+        xfs_extent_unpack(fork + i * XFS_EXTENT_BYTES, &e);
         if (e.blockcount == 0 || !xfs_fsb_valid(fs, e.startblock, e.blockcount)) {
             return KERR_IO;
         }
@@ -267,6 +268,28 @@ int xfs_bmap(const struct xfs *fs, const struct xfs_inode *ip, uint64_t off, str
         }
     }
     return KERR_NOENT; /* a hole, or past the last extent */
+}
+
+int xfs_bmap(const struct xfs *fs, const struct xfs_inode *ip, uint64_t off, struct xfs_extent *out) {
+    /* **The one place the two shapes of extent map meet.** Everything that
+     * asks where a block is — reading a file, listing a directory, following
+     * a symlink — comes through here, so a fork in a b-tree is handled once
+     * rather than at each caller. */
+    struct xfs_fork_ref r;
+    int rc = xfs_inode_fork(fs, ip, &r);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    if (r.format == XFS_DINODE_FMT_BTREE) {
+        rc = xfs_bmbt_lookup_in(fs, r.at, r.len, off, out);
+    } else if (r.format == XFS_DINODE_FMT_EXTENTS) {
+        rc = r.nextents * XFS_EXTENT_BYTES <= r.len ? extents_lookup(fs, r.at, r.nextents, off, out)
+                                                     : KERR_IO;
+    } else {
+        rc = KERR_NOTSUP;
+    }
+    xfs_inode_fork_put(fs, &r);
+    return rc;
 }
 
 bool xfs_is_dir(const struct xfs_inode *ip) {

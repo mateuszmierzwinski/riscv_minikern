@@ -98,37 +98,38 @@ static void zero(uint8_t *dst, uint32_t n) {
     }
 }
 
-/* Every multi-byte field of an inode core, so that each can be turned round
- * on its own. The timestamps are **two 32-bit words each**, not one 64-bit
- * one, and reversing them as a single quantity would swap the seconds with
- * the nanoseconds. The two gaps — the pad at 24 and the on-disk
- * `di_next_unlinked`/`di_crc` at 96 — have no counterpart in the logged form
- * and are left as zeroes. */
-static const struct {
+/* Every multi-byte field of an inode core whose place does not depend on
+ * the inode's flags, so that each can be turned round on its own. The two
+ * gaps — the pad at 24 and the on-disk `di_next_unlinked`/`di_crc` at 96 —
+ * have no counterpart in the logged form and are left alone. */
+static const struct field {
     uint8_t off;
     uint8_t len;
 } CORE_FIELDS[] = {
-    {0, 2},   {2, 2},   {4, 1},   {5, 1},   {6, 2},   {8, 4},   {12, 4},  {16, 4},  {20, 2},  {22, 2},
-    {30, 2},  {32, 4},  {36, 4},  {40, 4},  {44, 4},  {48, 4},  {52, 4},  {56, 8},  {64, 8},  {72, 4},
-    {76, 4},  {80, 2},  {82, 1},  {83, 1},  {84, 4},  {88, 2},  {90, 2},  {92, 4},  {104, 8}, {112, 8},
-    {120, 8}, {128, 4}, {144, 4}, {148, 4}, {152, 8},
+    {0, 2},   {2, 2},   {4, 1},   {5, 1},  {6, 2},   {8, 4},   {12, 4},  {16, 4},
+    {20, 2},  {22, 2},  {56, 8},  {64, 8}, {72, 4},  {76, 4},  {80, 2},  {82, 1},
+    {83, 1},  {84, 4},  {88, 2},  {90, 2}, {92, 4},  {104, 8}, {112, 8}, {120, 8},
+    {128, 4}, {152, 8},
 };
 
-/* Turns an on-disk inode core into the form the log carries: the same
- * fields in the same places, each one reversed, and the UUID copied as the
- * bytes it is. */
-/* **The table runs past a v4 inode's core**, so `core` bounds it.
- *
- * `CORE_FIELDS` describes the v3 core: its last seven entries, from offset
- * 104 to 152, and the UUID at 160, are fields v5 added. On a v2 inode the
- * core ends at 100 and every one of those offsets is inside the *literal
- * area* — the file's own fork. Reading them into the log is merely wrong;
- * writing them back on replay would overwrite the fork of each inode being
- * recovered, which is the same shape as the bug that made the first version
- * of replay corrupt every inode it touched while reporting success. */
-static void copy_core_fields(uint8_t *to, const uint8_t *from, uint32_t core) {
-    for (uint32_t f = 0; f < sizeof CORE_FIELDS / sizeof CORE_FIELDS[0]; f++) {
-        uint32_t off = CORE_FIELDS[f].off, len = CORE_FIELDS[f].len;
+/* **The fields whose shape the inode's flags decide.** A timestamp is two
+ * 32-bit words (seconds, nanoseconds) — reversed as one quantity they would
+ * swap — unless the inode has big timestamps, when it is one 64-bit count
+ * and reversing its halves separately swaps *them*. Offset 24 is a pad and
+ * a 16-bit flush counter, unless the inode uses 64-bit extent counts, when
+ * it is the data fork's count: `mkfs.xfs` makes both the default, and a log
+ * Linux wrote came back with every file's extent count lost. */
+static const struct field SMALL_TIMES[] = {{32, 4},  {36, 4},  {40, 4}, {44, 4},
+                                           {48, 4},  {52, 4},  {144, 4}, {148, 4}};
+static const struct field BIG_TIMES[] = {{32, 8}, {40, 8}, {48, 8}, {144, 8}};
+static const struct field SMALL_COUNTS[] = {{30, 2}};
+static const struct field BIG_COUNTS[] = {{24, 8}};
+
+/* Reverses each field of `table` that lies within `core`. */
+static void swap_fields(uint8_t *to, const uint8_t *from, uint32_t core,
+                        const struct field *table, uint32_t n) {
+    for (uint32_t f = 0; f < n; f++) {
+        uint32_t off = table[f].off, len = table[f].len;
         if (off + len > core) {
             continue; /* a field this inode's core does not have */
         }
@@ -136,33 +137,61 @@ static void copy_core_fields(uint8_t *to, const uint8_t *from, uint32_t core) {
             to[off + i] = from[off + len - 1u - i];
         }
     }
+}
+
+/* **The table runs past a v4 inode's core**, so `core` bounds it: on a v2
+ * inode the core ends at 100 and every v3 offset is inside the file's own
+ * fork, which writing a field there would overwrite. `flags2` is the
+ * inode's (0 on v4, which has neither feature). */
+static void copy_core_fields(uint8_t *to, const uint8_t *from, uint32_t core, uint64_t flags2) {
+    bool big_times = (flags2 & XFS_DIFLAG2_BIGTIME) != 0;
+    bool big_counts = (flags2 & XFS_DIFLAG2_NREXT64) != 0;
+    swap_fields(to, from, core, CORE_FIELDS, sizeof CORE_FIELDS / sizeof CORE_FIELDS[0]);
+    swap_fields(to, from, core, big_times ? BIG_TIMES : SMALL_TIMES,
+                big_times ? 4u : sizeof SMALL_TIMES / sizeof SMALL_TIMES[0]);
+    swap_fields(to, from, core, big_counts ? BIG_COUNTS : SMALL_COUNTS, 1u);
     if (XFS_DI_UUID + 16u <= core) {
         copy(to + XFS_DI_UUID, from + XFS_DI_UUID, 16);
     }
 }
 
+/* The flags that decide the core's shape: big-endian on disk. */
+static uint64_t disk_flags2(const uint8_t *di, uint32_t core) {
+    return XFS_DI_FLAGS2 + 8u <= core ? xfs_be64(di + XFS_DI_FLAGS2) : 0;
+}
+
+/* And in the log, in the host's order (little-endian on everything this
+ * kernel runs on). */
+static uint64_t logged_flags2(const uint8_t *logged, uint32_t core) {
+    uint64_t v = 0;
+    if (XFS_DI_FLAGS2 + 8u > core) {
+        return 0;
+    }
+    for (uint32_t i = 0; i < 8u; i++) {
+        v |= (uint64_t)logged[XFS_DI_FLAGS2 + i] << (8u * i);
+    }
+    return v;
+}
+
+/* Turns an on-disk inode core into the form the log carries: the same
+ * fields in the same places, each one reversed, and the UUID copied. */
 static void log_dinode_from_disk(uint8_t *out, const uint8_t *di, uint32_t core) {
     zero(out, XFS_LOG_DINODE_SIZE);
-    copy_core_fields(out, di, core);
+    copy_core_fields(out, di, core, disk_flags2(di, core));
 }
 
 /* The inverse, for replay: a logged inode core back into an on-disk one.
  *
  * **A logged inode is not an on-disk inode.** Each field keeps its offset
- * but is written in the host's byte order rather than big-endian, because
- * the log is replayed by the machine that wrote it. Copying the logged
- * bytes straight into the inode therefore writes a little-endian core over
- * a big-endian one — which is what the first version of replay did, and it
- * corrupted every inode it touched while reporting success. The board said
- * so by failing to read a file that had been written *before* the crash
- * being recovered from.
+ * but is written in the host's byte order rather than big-endian. Copying
+ * the logged bytes straight into the inode wrote a little-endian core over
+ * a big-endian one — which is what the first version of replay did.
  *
- * Field by field, and **only** the fields in the table: a wholesale
- * 176-byte copy would also zero `di_next_unlinked`, which the log does not
- * carry and the unlinked list needs. Everything outside the table is left
- * as the inode already has it, and the caller reseals. */
+ * Field by field, and **only** the fields in the tables: a wholesale copy
+ * would also zero `di_next_unlinked`, which the log does not carry and the
+ * unlinked list needs. The caller reseals. */
 void xfs_log_dinode_to_disk(uint8_t *di, const uint8_t *logged, uint32_t core) {
-    copy_core_fields(di, logged, core);
+    copy_core_fields(di, logged, core, logged_flags2(logged, core));
 }
 
 /* A record under construction: the header block, then as many data blocks
@@ -174,6 +203,10 @@ static uint8_t record[XLOG_REC_HDR_SIZE + XLOG_DATA_MAX_BB * XLOG_SECTOR];
 static uint32_t record_used; /* bytes of operations, past the header */
 
 /* One operation header plus its payload. */
+/* **A transaction's operations are `TRANS`'s, the unmount record `LOG`'s.**
+ * Every operation said `LOG` here, and Linux recovery skips `LOG`
+ * operations: a log this kernel left dirty would have been ignored by
+ * Linux, and its changes lost. */
 static int put_op(uint32_t tid, uint8_t flags, const uint8_t *data, uint32_t len) {
     uint8_t *op = record + XLOG_REC_HDR_SIZE + record_used;
     if (XLOG_REC_HDR_SIZE + record_used + XLOG_OP_HDR_SIZE + len > sizeof record) {
@@ -181,7 +214,7 @@ static int put_op(uint32_t tid, uint8_t flags, const uint8_t *data, uint32_t len
     }
     put_be32(op + XLOG_OP_TID, tid);
     put_be32(op + XLOG_OP_LEN, len);
-    op[XLOG_OP_CLIENTID] = XLOG_CLIENT_LOG;
+    op[XLOG_OP_CLIENTID] = (flags & XLOG_UNMOUNT_TRANS) != 0 ? XLOG_CLIENT_LOG : XLOG_CLIENT_TRANS;
     op[XLOG_OP_FLAGS] = flags;
     if (len > 0) {
         copy(op + XLOG_OP_HDR_SIZE, data, len);
@@ -335,31 +368,55 @@ static int put_inode_item(const struct xfs *fs, const struct xfs_log_inode_item 
     return rc != KERR_OK ? rc : put_op(XFS_LOG_TID, 0, logged, XFS_LOG_DINODE_SIZE);
 }
 
-int xfs_log_inodes(struct xfs *fs, const struct xfs_log_inode_item *items, uint32_t n) {
+/* A transaction's opening: the start operation and the header naming how
+ * many items follow. */
+static int open_txn(uint32_t items) {
     uint8_t thdr[TRANS_HDR_SIZE];
     int rc;
-    if (n == 0 || n > XFS_LOG_MAX_ITEMS) {
-        return KERR_INVAL;
-    }
     begin_record();
     zero(thdr, sizeof thdr);
     put_le32(thdr + TRANS_HDR_MAGIC, XFS_TRANS_HEADER_MAGIC);
     put_le32(thdr + TRANS_HDR_TYPE, XFS_TRANS_SETATTR_SIZE);
     put_le32(thdr + TRANS_HDR_TID, XFS_LOG_TID);
-    put_le32(thdr + TRANS_HDR_NUM_ITEMS, n);
+    put_le32(thdr + TRANS_HDR_NUM_ITEMS, items);
     rc = put_op(XFS_LOG_TID, XLOG_START_TRANS, NULL, 0);
-    rc = rc != KERR_OK ? rc : put_op(XFS_LOG_TID, 0, thdr, sizeof thdr);
-    for (uint32_t i = 0; rc == KERR_OK && i < n; i++) {
-        rc = put_inode_item(fs, &items[i]);
-    }
+    return rc != KERR_OK ? rc : put_op(XFS_LOG_TID, 0, thdr, sizeof thdr);
+}
+
+/* Its close: the commit (unless a test leaves it off), the record — framed
+ * by three operations, two without the commit — and then the unmount
+ * record, unless a test asks for the shape a power cut leaves: the newest
+ * record is then this transaction, and the next mount replays it. */
+static int close_txn(struct xfs *fs, int rc, uint32_t item_ops) {
     if (!fs->skip_commit_record) {
         rc = rc != KERR_OK ? rc : put_op(XFS_LOG_TID, XLOG_COMMIT_TRANS, NULL, 0);
     }
-    /* Three operations frame the transaction and two carry each item. */
-    rc = rc != KERR_OK ? rc : emit(fs, (fs->skip_commit_record ? 2u : 3u) + 2u * n);
+    rc = rc != KERR_OK ? rc : emit(fs, (fs->skip_commit_record ? 2u : 3u) + item_ops);
     fs->skip_commit_record = false;
-    /* The unmount record follows it — unless a test has asked for it to be
-     * left off, which is the shape a power cut leaves behind: the newest
-     * record is then this transaction, and the next mount replays it. */
     return rc != KERR_OK || fs->skip_unmount_record ? rc : write_unmount(fs);
+}
+
+int xfs_log_inodes(struct xfs *fs, const struct xfs_log_inode_item *items, uint32_t n) {
+    int rc;
+    if (n == 0 || n > XFS_LOG_MAX_ITEMS) {
+        return KERR_INVAL;
+    }
+    rc = open_txn(n);
+    for (uint32_t i = 0; rc == KERR_OK && i < n; i++) {
+        rc = put_inode_item(fs, &items[i]);
+    }
+    return close_txn(fs, rc, 2u * n);
+}
+
+int xfs_log_regions(struct xfs *fs, const struct xfs_log_region *regions, uint32_t nregions,
+                    uint32_t items) {
+    int rc;
+    if (nregions == 0 || items == 0 || items > nregions) {
+        return KERR_INVAL;
+    }
+    rc = open_txn(items);
+    for (uint32_t i = 0; rc == KERR_OK && i < nregions; i++) {
+        rc = put_op(XFS_LOG_TID, 0, regions[i].data, regions[i].len);
+    }
+    return close_txn(fs, rc, nregions);
 }

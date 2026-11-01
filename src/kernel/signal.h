@@ -130,6 +130,10 @@ int signal_altstack_at(virt_t current_sp, const struct user_sigaltstack *in,
  * rewrite the frame the syscall is still using. */
 void signal_raise(uint32_t signo, virt_t fault_address, int32_t code);
 
+/* How many signal frames could not be written or read where a stack
+ * pointer put them, each ending its process with SIGSEGV. */
+uint64_t signal_refused_frames(void);
+
 /* Raises a signal that came from a **synchronous fault**, which cannot be
  * ignored away: if it is blocked, ignored, or arrives while its own handler
  * is running, the process ends. Anything else retries the faulting

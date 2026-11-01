@@ -88,13 +88,10 @@ check fromproto -p "$tmp/proto"
     echo '$'
     echo '$'
 } > "$tmp/bigproto"
-# Inodes over 512 bytes: this writer keeps a file within the extents the
-# reader's 412-byte fork cache holds (xfs_data_extents_cap), so the steps
-# that build b-tree forks or directories of thousands of blocks are refused
-# there by design; these are the ones that fit, and btreefile checks the
-# refusal itself leaves nothing behind.
-large="files dir many truncate unlink attr rename symlink attrfile btreefile holes eofzero uncommitted bigfork"
-STEPS="$large" check bigfork -i size=1024 -p "$tmp/bigproto"
-STEPS="$large" check inodes1k -i size=1024
-STEPS="$large" check inodes2k -i size=2048
+# Inodes over 512 bytes: forks past the inode's 412-byte cache are read
+# from the inode's block, so every step runs on them too; /big is a
+# shortform directory whose 848-byte fork needs exactly that.
+check bigfork -i size=1024 -p "$tmp/bigproto"
+check inodes1k -i size=1024
+check inodes2k -i size=2048
 echo PASS

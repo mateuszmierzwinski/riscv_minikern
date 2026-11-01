@@ -23,6 +23,8 @@
 #define EDID_FIFO_OFFSET 0x4fu
 #define EDID_FIFO_DATA 0x50u
 #define HDCP_CTRL 0x52u
+#define PACKET_INDEX 0x9fu
+#define PACKET_BYTES 0xa0u
 #define INT_MASK1 0xc0u
 #define INT_STATUS1 0xc1u
 #define HDMI_STATUS 0xc8u
@@ -50,6 +52,8 @@
 #define BANDGAP_ON 0x04u
 #define PLL_REFERENCE 0x0fu
 #define VIDEO_EXTERNAL_DE 0x01u /* RGB 4:4:4, DE from the controller */
+#define HDCP_HDMI_MODE 0x02u     /* 0x52 bit 1: HDMI, not DVI */
+#define PACKET_AVI 0x06u         /* the packet buffer that holds the AVI infoframe */
 
 /* The DDC clock divider the vendor driver uses on this SoC: (51.2 MHz >> 2)
  * / 100 kHz. Its source clock is undocumented; 128 is what has worked. */
@@ -60,6 +64,8 @@
 #define TMDS_SETTLE_NS 50000000ull
 
 static volatile uint32_t *regs;
+static bool hdmi_mode;
+static uint8_t avi_sent[AVI_INFOFRAME_BYTES];
 
 static volatile uint32_t *reg(uint32_t n) {
     return regs + n;
@@ -152,13 +158,48 @@ static int lock_the_plls(const struct display_timing *t, const char **why) {
 }
 
 /* The timing registers, 0x08 to 0x15, with the transmitter powered down. */
+void inno_hdmi_use_hdmi_mode(bool on) {
+    hdmi_mode = on;
+}
+
+/* The AVI infoframe for `vic`, into the transmitter's AVI packet buffer
+ * (docs/DISPLAY.md §3.3: index 0x9F = 6, then the bytes from 0xA0) — the
+ * version byte and checksum included, which the vendor's buffer omits. */
+static void send_the_avi_infoframe(uint8_t vic) {
+    display_avi_infoframe(vic, avi_sent);
+    put(PACKET_INDEX, PACKET_AVI);
+    for (uint32_t i = 0; i < AVI_INFOFRAME_BYTES; i++) {
+        put(PACKET_BYTES + i, avi_sent[i]);
+    }
+}
+
+bool inno_hdmi_in_hdmi_mode(void) {
+    return regs != NULL && (*reg(HDCP_CTRL) & HDCP_HDMI_MODE) != 0;
+}
+
+bool inno_hdmi_infoframe_reads_back(void) {
+    if (regs == NULL) {
+        return false;
+    }
+    put(PACKET_INDEX, PACKET_AVI);
+    for (uint32_t i = 0; i < AVI_INFOFRAME_BYTES; i++) {
+        if ((uint8_t)*reg(PACKET_BYTES + i) != avi_sent[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static void frame_the_stream(const struct display_timing *t) {
     uint8_t bytes[HDMI_TIMING_BYTES];
     display_hdmi_timing(t, bytes);
     put(SYS_CTRL, SYS_POWER_OFF);
     put(VIDEO_CONTRL1, VIDEO_EXTERNAL_DE);
     put(VIDEO_CONTRL2, 0x00u); /* 8-bit RGB in and out */
-    put(HDCP_CTRL, 0x00u);     /* DVI: no infoframes needed */
+    put(HDCP_CTRL, hdmi_mode ? HDCP_HDMI_MODE : 0x00u);
+    if (hdmi_mode) {
+        send_the_avi_infoframe(t->vic);
+    }
     for (uint32_t i = 0; i < HDMI_TIMING_BYTES; i++) {
         put(VIDEO_TIMING_CTL + i, bytes[i]);
     }

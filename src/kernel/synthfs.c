@@ -17,13 +17,16 @@
 #define MODE_CHAR 0020666u
 
 static const char *devices[DEVICES_MAX];
+static struct device_owner owners[DEVICES_MAX];
+static const struct device_owner anyone = {MODE_CHAR & 0777u, 0, 0};
 static uint32_t device_count;
 static uint32_t (*pid_at)(uint32_t index);
 
-int synthfs_add_device(const char *path) {
+int synthfs_add_device(const char *path, const struct device_owner *owner) {
     if (device_count == DEVICES_MAX) {
         return KERR_NOSPC;
     }
+    owners[device_count] = owner != NULL ? *owner : anyone;
     devices[device_count++] = path;
     return KERR_OK;
 }
@@ -183,6 +186,16 @@ static bool has_children(const char *dir) {
 }
 
 /* What `path` is: a file (generated or a device) or a directory. */
+/* A registered device's owner, or NULL when `path` is not one. */
+static const struct device_owner *owner_of_device(const char *path) {
+    for (uint32_t d = 0; d < device_count && d < DEVICES_MAX; d++) {
+        if (same(devices[d], path)) {
+            return &owners[d];
+        }
+    }
+    return NULL;
+}
+
 static int classify(const char *path, void *self, uint32_t *mode) {
     char mirror[PATH_MAX_LEN];
     uint32_t uid = 0;
@@ -190,7 +203,7 @@ static int classify(const char *path, void *self, uint32_t *mode) {
     const char *p;
     for (uint32_t i = 0; (p = known_at(i, &device)) != NULL; i++) {
         if (same(p, path)) {
-            *mode = device ? MODE_CHAR : MODE_FILE;
+            *mode = device ? (MODE_CHAR & ~0777u) | owner_of_device(p)->mode : MODE_FILE;
             return KERR_OK;
         }
     }
@@ -218,11 +231,17 @@ static int stat_op(void *self, const char *in, uint32_t *mode, uint64_t *size, u
 }
 
 static int owner_op(void *self, const char *in, uint32_t *uid, uint32_t *gid) {
-    uint32_t mode = 0, nlink = 0;
-    uint64_t size = 0;
+    char path[PATH_MAX_LEN];
+    const struct device_owner *o;
+    int rc = full_path(self, in, path);
     *uid = 0;
     *gid = 0;
-    return stat_op(self, in, &mode, &size, &nlink);
+    o = rc == KERR_OK ? owner_of_device(path) : NULL;
+    if (o != NULL) {
+        *uid = o->uid;
+        *gid = o->gid;
+    }
+    return rc;
 }
 
 /* Hands fn one entry named by a decimal number. */

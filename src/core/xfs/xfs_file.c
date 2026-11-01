@@ -20,14 +20,20 @@ static void zero_fill(uint8_t *at, uint32_t n) {
 
 /* A file held inside its own inode: a symbolic link's target, or a
  * directory's shortform content. */
-static int read_local(const struct xfs_inode *ip, uint64_t off, uint8_t *buf, uint32_t len,
-                      uint32_t *got) {
-    uint32_t have = ip->size < ip->fork_len ? (uint32_t)ip->size : ip->fork_len;
-    if (off >= have) {
-        return KERR_OK;
+static int read_local(const struct xfs *fs, const struct xfs_inode *ip, uint64_t off,
+                      uint8_t *buf, uint32_t len, uint32_t *got) {
+    struct xfs_fork_ref r;
+    uint32_t have;
+    int rc = xfs_inode_fork(fs, ip, &r);
+    if (rc != KERR_OK) {
+        return rc;
     }
-    *got = have - (uint32_t)off < len ? have - (uint32_t)off : len;
-    xfs_copy_bytes(buf, ip->fork + off, *got);
+    have = ip->size < r.len ? (uint32_t)ip->size : r.len;
+    if (off < have) {
+        *got = have - (uint32_t)off < len ? have - (uint32_t)off : len;
+        xfs_copy_bytes(buf, r.at + off, *got);
+    }
+    xfs_inode_fork_put(fs, &r);
     return KERR_OK;
 }
 
@@ -95,7 +101,7 @@ int xfs_file_read(struct xfs *fs, const struct xfs_inode *ip, uint64_t off, void
         return KERR_INVAL;
     }
     if (ip->format == XFS_DINODE_FMT_LOCAL) {
-        return read_local(ip, off, out, len, got);
+        return read_local(fs, ip, off, out, len, got);
     }
     if (ip->format != XFS_DINODE_FMT_EXTENTS && ip->format != XFS_DINODE_FMT_BTREE) {
         return KERR_NOTSUP;

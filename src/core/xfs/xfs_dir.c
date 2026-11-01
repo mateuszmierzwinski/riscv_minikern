@@ -27,8 +27,21 @@ static uint32_t entry_bytes(const struct xfs *fs, uint32_t name_len) {
  * ".." are not stored — the parent is in the header and the directory's own
  * number is the inode's — so both are synthesized here, which is what a
  * reader of this listing expects to see. */
+static int list_shortform_in(struct xfs *fs, const struct xfs_inode *dir, const uint8_t *p,
+                             xfs_dirent_fn fn, void *self);
+
+/* The fork may be past the inode's cache (inodes over 512 bytes): it is
+ * held from the inode's block while it is walked. */
 static int list_shortform(struct xfs *fs, const struct xfs_inode *dir, xfs_dirent_fn fn, void *self) {
-    const uint8_t *p = dir->fork;
+    struct xfs_fork_ref r;
+    int rc = xfs_inode_fork(fs, dir, &r);
+    rc = rc != KERR_OK ? rc : list_shortform_in(fs, dir, r.at, fn, self);
+    xfs_inode_fork_put(fs, &r);
+    return rc;
+}
+
+static int list_shortform_in(struct xfs *fs, const struct xfs_inode *dir, const uint8_t *p,
+                             xfs_dirent_fn fn, void *self) {
     uint32_t count = p[XFS_DIR_SF_COUNT];
     uint32_t inolen = p[XFS_DIR_SF_I8COUNT] != 0 ? 8u : 4u;
     uint32_t at = XFS_DIR_SF_PARENT + inolen;

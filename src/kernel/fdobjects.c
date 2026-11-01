@@ -1269,6 +1269,7 @@ struct driver_device {
     const char *path;
     const struct file_ops *ops;
     void *priv;
+    struct device_owner owner;
 };
 
 static struct driver_device driver_devices[DRIVER_DEVICES_MAX];
@@ -1283,19 +1284,30 @@ static const struct driver_device *driver_device(const char *path) {
     return NULL;
 }
 
-int fdobjects_add_device(const char *path, const struct file_ops *ops, void *priv) {
+int fdobjects_add_device(const char *path, const struct file_ops *ops, void *priv,
+                         const struct device_owner *owner) {
     if (driver_device(path) != NULL) {
         return KERR_EXIST;
     }
     if (driver_device_count >= DRIVER_DEVICES_MAX) {
         return KERR_NOMEM;
     }
-    driver_devices[driver_device_count++] = (struct driver_device){path, ops, priv};
+    driver_devices[driver_device_count++] = (struct driver_device){path, ops, priv, *owner};
     return KERR_OK;
 }
 
-/* Opens a driver's device. */
+/* What an open with `flags` asks of a node's permission bits. */
+static uint32_t access_wanted(uint32_t flags) {
+    uint32_t mode = flags & O_ACCMODE;
+    return (mode != O_WRONLY ? PERM_READ : 0u) | (mode != O_RDONLY ? PERM_WRITE : 0u);
+}
+
+/* Opens a driver's device — when its owner's bits allow it, which is the
+ * check every other node gets from its filesystem. */
 static int open_driver_device(const struct driver_device *d, uint32_t flags) {
+    if (!uspace_may_access(d->owner.uid, d->owner.gid, d->owner.mode, access_wanted(flags))) {
+        return KERR_ACCES;
+    }
     struct file *f = file_new(d->ops, d->priv, flags);
     return f == NULL ? KERR_NOMEM : fd_install(f);
 }
@@ -1706,6 +1718,37 @@ static uint64_t written_size(int32_t fd) {
     return path != NULL && xfsmount_stat_full(path, &mode, &size, &nlink) == KERR_OK ? size : 0;
 }
 
+/* Where a seek on `f` starts from and how long its object is, for the
+ * three kinds of descriptor that have a position: a file being read, one
+ * being written, and a positional device. `ESPIPE` for the rest. */
+static int seek_span(const struct file *f, int32_t fd, uint64_t *at, uint64_t *size) {
+    if (f->ops == &diskfile_ops) {
+        const struct diskfile *d = f->priv;
+        *at = d->offset;
+        *size = d->size;
+    } else if (f->ops == &writefile_ops) {
+        *at = ((const struct writefile *)f->priv)->offset;
+        *size = written_size(fd);
+    } else if (f->ops->pread != NULL && f->ops->size != NULL) {
+        *at = f->pos;
+        *size = f->ops->size((struct file *)f);
+    } else {
+        return KERR_SPIPE;
+    }
+    return KERR_OK;
+}
+
+/* Moves `f`'s position to `at`, wherever that kind keeps it. */
+static void seek_store(struct file *f, uint64_t at) {
+    if (f->ops == &diskfile_ops) {
+        ((struct diskfile *)f->priv)->offset = (uint32_t)at;
+    } else if (f->ops == &writefile_ops) {
+        ((struct writefile *)f->priv)->offset = at;
+    } else {
+        f->pos = at;
+    }
+}
+
 int fdobjects_seek(int32_t fd, int64_t offset, uint32_t whence, uint64_t *result) {
     /* **The descriptor itself, not `fdobjects_file_of`**, which answers for
      * read descriptors only: every `lseek` on a file opened for writing was
@@ -1713,19 +1756,9 @@ int fdobjects_seek(int32_t fd, int64_t offset, uint32_t whence, uint64_t *result
     struct file *f = fd_get(fd);
     uint64_t base = 0;
     uint64_t size = 0;
-    if (f == NULL) {
-        return KERR_BADF;
-    }
-    if (f->ops == &diskfile_ops) {
-        struct diskfile *d = f->priv;
-        base = d->offset;
-        size = d->size;
-    } else if (f->ops == &writefile_ops) {
-        struct writefile *w = f->priv;
-        base = w->offset;
-        size = written_size(fd);
-    } else {
-        return KERR_SPIPE;
+    int rc = f != NULL ? seek_span(f, fd, &base, &size) : KERR_BADF;
+    if (rc != KERR_OK) {
+        return rc;
     }
     switch (whence) {
     case SEEK_SET:
@@ -1746,11 +1779,7 @@ int fdobjects_seek(int32_t fd, int64_t offset, uint32_t whence, uint64_t *result
         return KERR_INVAL;
     }
     base = offset < 0 ? base - (uint64_t)(-offset) : base + (uint64_t)offset;
-    if (f->ops == &diskfile_ops) {
-        ((struct diskfile *)f->priv)->offset = (uint32_t)base;
-    } else {
-        ((struct writefile *)f->priv)->offset = base;
-    }
+    seek_store(f, base);
     *result = base;
     return KERR_OK;
 }

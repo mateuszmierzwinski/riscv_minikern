@@ -98,6 +98,21 @@ uint32_t xfs_magic_for(const struct xfs *fs, enum xfs_blk kind);
  * extent into room for nine, and the inode then read back as corrupt. */
 uint32_t xfs_fork_bytes(const struct xfs *fs, const uint8_t *di);
 
+/* An inode's data fork, whole: the cached copy when it fits the cache, or
+ * the inode's own block held until `xfs_inode_fork_put` when it does not
+ * (inodes over 512 bytes). **Its format and extent count come from the same
+ * place as its bytes** — a caller's copy of an inode can be older than the
+ * block, and an old count over new bytes cuts off the newest extent. */
+struct xfs_fork_ref {
+    struct bbuf *b;
+    const uint8_t *at;
+    uint32_t len;
+    uint8_t format;
+    uint32_t nextents;
+};
+int xfs_inode_fork(const struct xfs *fs, const struct xfs_inode *ip, struct xfs_fork_ref *r);
+void xfs_inode_fork_put(const struct xfs *fs, struct xfs_fork_ref *r);
+
 /* Stamps the **self-describing fields v5 adds** to a metadata block — its
  * own address, the filesystem's UUID and the structure that owns it — and
  * does nothing at all on v4.
@@ -453,6 +468,16 @@ int xfs_free_extents_each(struct xfs *fs, uint32_t agno, xfs_free_visit_fn visit
  * created file is a new inode *and* its parent's directory, and the point
  * of a transaction is that they arrive together or not at all. */
 int xfs_log_inodes(struct xfs *fs, const struct xfs_log_inode_item *items, uint32_t n);
+
+/* One transaction of `items` items whose `nregions` regions the caller has
+ * laid out already, each in the log's own format — for the replay's tests,
+ * which need item types this writer does not otherwise produce. */
+struct xfs_log_region {
+    const uint8_t *data;
+    uint32_t len;
+};
+int xfs_log_regions(struct xfs *fs, const struct xfs_log_region *regions, uint32_t nregions,
+                    uint32_t items);
 
 /* One extent record, unpacked. */
 struct xfs_extent {

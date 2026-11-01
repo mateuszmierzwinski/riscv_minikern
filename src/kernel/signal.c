@@ -368,6 +368,36 @@ static void save_context(const struct thread_signals *me, struct rt_sigframe *fr
     fp_save(&frame->uc.uc_mcontext.sc_fpregs);
 }
 
+#define SEGV_MAPERR_CODE 1 /* si_code: nothing mapped at the address */
+
+static uint64_t refused_frames;
+
+/* A frame that cannot be written where it would go — the stack pointer, or
+ * the alternate stack, is unmapped, read-only or not a user address at all.
+ *
+ * **It used to be written anyway**, wherever `sp` pointed: a thread could
+ * set its stack pointer into the kernel's half and have the next signal
+ * write eight hundred bytes of register values it chose over kernel memory.
+ * Now the process ends with SIGSEGV, as Linux's `force_sigsegv` ends it,
+ * and the handler is reset first, since delivering SIGSEGV to the same
+ * stack would fail the same way. */
+static bool refuse_the_frame(virt_t sp, const char *what) {
+    /* Said every time — each one ends a process, so they cannot flood —
+     * because the refusal is the evidence: a frame aimed at kernel memory
+     * that happened not to be writable would fault and end the process
+     * just the same, and only this line tells the two apart. */
+    kprintf("signal: pid %u's frame at %llx not %s: not its memory\n",
+            uspace_current() != NULL ? uspace_current()->pid : 0u, (unsigned long long)sp, what);
+    actions()[SIGSEGV].sa_handler = SIG_DFL;
+    signal_raise_fault(SIGSEGV, sp, SEGV_MAPERR_CODE);
+    refused_frames++;
+    return false;
+}
+
+uint64_t signal_refused_frames(void) {
+    return refused_frames;
+}
+
 bool signal_deliver(struct trapframe *tf) {
     struct thread_signals *me = delivery_off ? NULL : mine();
     uint32_t signo;
@@ -390,6 +420,10 @@ bool signal_deliver(struct trapframe *tf) {
      * value relative to an unaligned one faults inside the handler, which is
      * the hardest kind of fault to read. */
     sp = (handler_stack(me, a, tf) - sizeof(struct rt_sigframe)) & ~15ull;
+    if (!uspace_can_write(sp, sizeof(struct rt_sigframe))) {
+        take(me, signo);
+        return refuse_the_frame(sp, "written");
+    }
     frame = (struct rt_sigframe *)(uintptr_t)sp;
     save_context(me, frame, tf, signo);
     me->restore_mask = false; /* the frame carries it now */
@@ -434,7 +468,12 @@ void signal_finish_return(void) {
 int signal_return(struct trapframe *tf) {
     const struct rt_sigframe *frame = (const struct rt_sigframe *)(uintptr_t)tf->x[2];
     struct thread_signals *me = mine();
-    if (me == NULL || tf->x[2] == 0 || tf->x[2] >= USER_TOP) {
+    /* **Read only where the process can read**: the frame is wherever its
+     * stack pointer says, and a program that calls `rt_sigreturn` with `sp`
+     * on an unmapped page had the kernel fault on it — a panic. A frame
+     * that cannot be read ends the process, as a bad one does on Linux. */
+    if (me == NULL || !uspace_can_read(tf->x[2], sizeof *frame)) {
+        (void)refuse_the_frame(tf->x[2], "read");
         return KERR_FAULT;
     }
     if (frame->uc.pad != (SIGFRAME_COOKIE ^ (uint64_t)(uintptr_t)frame)) {
@@ -444,6 +483,10 @@ int signal_return(struct trapframe *tf) {
         clobbered_frames++;
         kprintf("\nsignal: the frame at %llx was overwritten while a handler ran\n",
                 (unsigned long long)(uintptr_t)frame);
+        /* And the process ends: `rt_sigreturn` never steps past its own
+         * `ecall`, so a refusal that returned would run it again for ever —
+         * which a forged frame, not only a clobbered one, did. */
+        (void)refuse_the_frame(tf->x[2], "restored");
         return KERR_FAULT;
     }
     me->blocked = frame->uc.uc_sigmask[0];

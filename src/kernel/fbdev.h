@@ -18,13 +18,14 @@
 
 #include "core/fbinfo.h"
 #include "core/types.h"
+#include "kernel/synthfs.h"
 
 #define FBDEV_PATH "/dev/fb0"
 
 /* Allocates the framebuffer for `mode`, clears it and makes `/dev/fb0`
  * openable. KERR_NOMEM when the frames cannot be had in one run, KERR_BUSY
  * when there is already one. */
-int fbdev_install(const struct fb_mode *mode);
+int fbdev_install(const struct fb_mode *mode, const struct device_owner *owner);
 
 /* Where the pixels are and their shape, for a display driver to scan out.
  * KERR_NODEV when no framebuffer was installed. */

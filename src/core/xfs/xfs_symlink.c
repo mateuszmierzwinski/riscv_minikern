@@ -68,7 +68,7 @@ static int store_target(struct xfs *fs, uint64_t ino, const char *target, uint32
  * being a constant anyone can quote. */
 uint32_t xfs_symlink_max(const struct xfs *fs) {
     uint32_t area = fs->inodesize - fs->dinode_size;
-    return area < XFS_FORK_MAX ? area : XFS_FORK_MAX; /* a longer one would not be read back */
+    return area; /* past the inode's cache it is read from the inode (`xfs_inode_fork`) */
 }
 
 int xfs_symlink(struct xfs *fs, const struct xfs_inode *dir, const char *name, uint32_t namelen,

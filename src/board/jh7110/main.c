@@ -39,6 +39,7 @@
 #include "kernel/irqwait.h"
 #include "kernel/file.h"
 #include "drivers/display_jh7110.h"
+#include "drivers/inno_hdmi.h"
 #include "kernel/fbdev.h"
 #include "kernel/fdobjects.h"
 #include "lib/kfmt.h"
@@ -58,6 +59,7 @@
 #include "kernel/overlayfs.h"
 #include "drivers/cpufreq_jh7110.h"
 #include "kernel/cpuwhy.h"
+#include "kernel/govern.h"
 #include "kernel/procfiles.h"
 #include "core/boardspec.h"
 #include "kernel/random.h"
@@ -922,6 +924,13 @@ static void run_volumes_selftest(void) {
 static void bring_up_filesystem(void) {
     int rc;
     int32_t entries;
+    /* `minikern.nomount`: the disk is attached and nothing on it is
+     * mounted, so nothing can be written to it — which is what a benchmark
+     * of the operator's drive needs (`test/hil/bench.py`). */
+    if (cmdline_has(boot_cmdline, "minikern.nomount")) {
+        kprintf("disk: attached, nothing mounted (minikern.nomount)\n");
+        return;
+    }
     automount_the_disk();
     if (disk_device() != NULL && !disk_has_root()) {
         list_the_volumes(); /* no root to attach: already said so */
@@ -1897,20 +1906,30 @@ static void start_hdmi(const struct fdt *fdt) {
                 fb.width, fb.height);
         return;
     }
+    /* `minikern.hdmimode=hdmi`: HDMI mode and an AVI infoframe, for a TV
+     * that wants them; DVI otherwise, which every monitor takes. */
+    inno_hdmi_use_hdmi_mode(cmdline_equals(boot_cmdline, "minikern.hdmimode", "hdmi"));
     if (display_jh7110_start(fdt, base, fb.width, fb.height, fb.stride) == KERR_OK) {
         (void)timer_add_housekeeping_hook(refresh_display_from_beat);
     }
 }
 
-/* The display stack: the framebuffer, then — when asked — HDMI. */
+#define VIDEO_GID 39u /* the `video` group's id on Fedora; `minikern.videogid` overrides */
+
+/* The display stack: the framebuffer, then — when asked — HDMI.
+ *
+ * `/dev/fb0` is root's and the `video` group's, 0660, as on Linux: any
+ * process that can open it can read the screen and draw over it. */
 static void bring_up_display(uint64_t dtb) {
     struct fdt fdt;
     struct fb_mode mode;
+    struct device_owner video = {
+        0660u, 0u, (uint32_t)cmdline_number(boot_cmdline, "minikern.videogid", VIDEO_GID)};
     int rc;
     if (framebuffer_mode(&mode) != KERR_OK) {
         return;
     }
-    rc = fbdev_install(&mode);
+    rc = fbdev_install(&mode, &video);
     if (rc != KERR_OK) {
         kprintf("fb: /dev/fb0 %ux%u could not be installed (rc %d)\n", mode.width, mode.height, rc);
         return;
@@ -1928,6 +1947,37 @@ static void bring_up_display(uint64_t dtb) {
  * so the kernel takes the readings and the reader collects the extremes. */
 static void sample_thermal_from_beat(void) {
     temp_jh7110_sample(&soc_temp);
+}
+
+/* The sensor as the governor reads it: an unreadable sensor is said as
+ * such, and the governor takes that as the critical temperature. */
+static int32_t die_temp_for_the_governor(void) {
+    int32_t mdeg = temp_jh7110_millidegrees(&soc_temp);
+    return mdeg == TEMP_UNREADABLE ? GOVERNOR_NO_READING : mdeg;
+}
+
+/* `minikern.governor=thermal|ondemand|off` (thermal when absent) and
+ * `minikern.governor.throttle=<mC>`, which moves the throttle point — a
+ * board at room temperature proves throttling only with one below it. */
+static void start_the_governor(const struct fdt *fdt) {
+    struct cpufreq_policy policy;
+    enum governor_mode mode = GOVERNOR_THERMAL;
+    if (cmdline_equals(boot_cmdline, "minikern.governor", "off")) {
+        kprintf("governor: off (minikern.governor=off)\n");
+        return;
+    }
+    if (cmdline_equals(boot_cmdline, "minikern.governor", "ondemand")) {
+        mode = GOVERNOR_ONDEMAND;
+    }
+    if (cpufreq_jh7110_init(fdt, &policy) == 0) {
+        kprintf("governor: not started: no operating points to choose from\n");
+        return;
+    }
+    policy.throttle_mC = (int32_t)cmdline_number(boot_cmdline, "minikern.governor.throttle",
+                                                 (uint64_t)policy.throttle_mC);
+    if (govern_start(&policy, mode, die_temp_for_the_governor, cpufreq_jh7110_set_khz) != KERR_OK) {
+        kprintf("governor: not started: the policy or the beat refused it\n");
+    }
 }
 
 static void bring_up_thermal(uint64_t dtb) {
@@ -1955,6 +2005,7 @@ static void bring_up_thermal(uint64_t dtb) {
      * where the readings begin. */
     (void)timer_add_housekeeping_hook(sample_thermal_from_beat);
     (void)timer_add_housekeeping_hook(watch_for_borrowed_writes_from_beat);
+    start_the_governor(&fdt);
     {
         int32_t mdeg = temp_jh7110_millidegrees(&soc_temp);
         if (mdeg == TEMP_UNREADABLE) {
@@ -2845,9 +2896,9 @@ static int rename_moves_a_name(void) {
 /* **A file whose extent map needs a level of nodes.** Every other block of
  * `/w_tall` is written, so each block is an extent of its own wherever the
  * allocator puts it; 7,000 are more than a 512-byte inode's root and one
- * level of leaves can name (20 x 251 on v5, 25 x 254 on v4). The shape is
- * asserted, not assumed: a writer that quietly kept two levels, or refused,
- * fails here. */
+ * level of leaves can name (20 x 251 on v5, 25 x 254 on v4) with 512-byte
+ * inodes. The suite pins the level those cases reach; a writer that
+ * refused, or lost extents, fails here on any inode size. */
 #define TALL_EXTENTS 7000u
 
 /* Block `i` of `/w_tall`: bytes that differ per block and per position. */
@@ -2893,7 +2944,10 @@ static int tall_file_round_trips(void) {
     }
     rc = rc != KERR_OK ? rc : xfsmount_fork_shape("w_tall", &extents, &level);
     kprintf("fswrite:   /w_tall has %u extents, root level %u (rc %d)\n", extents, level, rc);
-    rc = rc != KERR_OK ? rc : (extents == TALL_EXTENTS && level == 2u ? KERR_OK : KERR_IO);
+    /* A b-tree holding all of them; its height depends on the inode size
+     * (level 2 with 512-byte inodes, which the board suite pins; level 1
+     * with larger ones, whose root names more leaves). */
+    rc = rc != KERR_OK ? rc : (extents == TALL_EXTENTS && level >= 1u ? KERR_OK : KERR_IO);
     rc = rc != KERR_OK ? rc : tall_reads_back(0);
     rc = rc != KERR_OK ? rc : tall_reads_back(TALL_EXTENTS / 2u);
     rc = rc != KERR_OK ? rc : tall_reads_back(TALL_EXTENTS - 1u);
@@ -3577,6 +3631,8 @@ static int many_attributes_round_trip(void) {
     return rc != KERR_OK ? rc : xfsmount_unlink("w_attrs");
 }
 
+#define ATTR_FILLERS 80u /* ~2,400 bytes: past a 2048-byte inode's 1,948-byte literal area */
+
 /* Extended attributes: set, read back, list, remove — and then **mount the
  * filesystem again** and read them once more.
  *
@@ -3638,12 +3694,14 @@ static int attributes_round_trip(void) {
         return KERR_IO;
     }
     /* **Past what the inode holds**, so the fork has to become a leaf
-     * block. Half a 512-byte inode's literal area is 168 bytes, and each of
-     * these costs about thirty, so a dozen crosses it comfortably. Without
+     * block. Each filler costs about thirty bytes, and there are enough of
+     * them to overflow the largest literal area XFS makes (1,948 bytes, a
+     * 2048-byte inode): a dozen sufficed for 512-byte inodes, and stopped
+     * sufficing on 1024-byte ones once those kept their whole fork. Without
      * this the leaf writer would never run — and the leaf *reader* would
      * stay unexercised too, which is how its name/value layout came to be
      * wrong in the first place. */
-    for (uint32_t i = 0; rc == KERR_OK && i < 12u; i++) {
+    for (uint32_t i = 0; rc == KERR_OK && i < ATTR_FILLERS; i++) {
         char attr[20] = "user.filler00";
         uint8_t body[16];
         attr[11] = (char)('0' + i / 10u);
@@ -3676,8 +3734,8 @@ static int attributes_round_trip(void) {
     t.seen = 0;
     t.found_colour = false;
     rc = xfsmount_attr_list("a1", tally_attr, &t);
-    if (rc != KERR_OK || t.seen != 14u || !t.found_colour) {
-        kprintf("fswrite: the leaf listed %u attribute(s), wanted 14\n", t.seen);
+    if (rc != KERR_OK || t.seen != ATTR_FILLERS + 2u || !t.found_colour) {
+        kprintf("fswrite: the leaf listed %u attribute(s), wanted %u\n", t.seen, ATTR_FILLERS + 2u);
         return rc != KERR_OK ? rc : KERR_IO;
     }
     /* **A value that cannot live in a block with its name**, so it goes
@@ -4162,6 +4220,8 @@ static void run_user_programs(void) {
     /* `minikern.keepadvice` keeps pages a program said it did not need —
      * the defect §0 came down to, kept so the test for it can fail. */
     syscall_keep_discarded_pages(cmdline_has(boot_cmdline, "minikern.keepadvice"));
+    /* `minikern.allowwx` lets a mapping be writable and executable: W^X's control. */
+    syscall_allow_write_and_execute(cmdline_has(boot_cmdline, "minikern.allowwx"));
     /* `minikern.protectshares`: `mprotect` makes a page still shared after
      * `fork` plainly writable again, as it did — the control for the fix. */
     uspace_set_protect_keeps_cow(!cmdline_has(boot_cmdline, "minikern.protectshares"));

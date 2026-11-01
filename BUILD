@@ -1,6 +1,7 @@
 load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
 load("//:version.bzl", "MINIKERN_VERSION")
+load("//testdata/fuzz:fuzz_corpus.bzl", "fuzz_corpus")
 load(":riscv_minikern.bzl", "kernel_binary", "kernel_image", "musl_binary", "user_binary", "user_image")
 
 # minikern for RISC-V — a from-scratch kernel for the StarFive JH7110
@@ -461,6 +462,21 @@ cc_binary(
     deps = [":xfs"],
 )
 
+# The log replay against a log Linux wrote (scripts/make_linux_log.sh).
+sh_test(
+    name = "xfs_linuxlog_test",
+    size = "medium",
+    srcs = ["test/xfs_linuxlog_test.sh"],
+    args = [
+        "$(rootpath :xfs_writecheck)",
+        "$(rootpath test/testdata/linux_dirty_log.img.xz)",
+    ],
+    data = [
+        "test/testdata/linux_dirty_log.img.xz",
+        ":xfs_writecheck",
+    ],
+)
+
 sh_test(
     name = "xfs_write_test",
     size = "large",
@@ -821,8 +837,14 @@ cc_library(
 # ARM lesson that a fake proves the policy and nothing about the registers.
 cc_library(
     name = "cpufreq",
-    srcs = ["src/core/cpufreq.c"],
-    hdrs = ["src/core/cpufreq.h"],
+    srcs = [
+        "src/core/cpufreq.c",
+        "src/core/governor.c",
+    ],
+    hdrs = [
+        "src/core/cpufreq.h",
+        "src/core/governor.h",
+    ],
     strip_include_prefix = "src",
 )
 
@@ -865,9 +887,26 @@ test_suite(
         ":edid_cve_test",
         ":elf_cve_test",
         ":fdt_test",
+        ":fuzz_edid_replay",
+        ":fuzz_elf_replay",
+        ":fuzz_fdt_replay",
+        ":fuzz_xfs_replay",
         ":partition_test",
         ":tcp_hostile_test",
         ":xfs_test",
+    ],
+)
+
+# The governor with a fake sensor, load and divider: that the reading
+# reaches the policy and the answer reaches the divider. The registers are
+# the board's to prove ("§4: the governor ...").
+cc_test(
+    name = "governor_test",
+    size = "small",
+    srcs = ["test/governor_test.c"],
+    deps = [
+        ":cpufreq",
+        ":ktest",
     ],
 )
 
@@ -1364,6 +1403,23 @@ cc_library(
     ],
 )
 
+# The frequency governor on the housekeeping beat: load from the
+# scheduler's per-hart accounting, sensor and divider from the composition
+# root.
+cc_library(
+    name = "kernel_govern",
+    srcs = ["src/kernel/govern.c"],
+    hdrs = ["src/kernel/govern.h"],
+    strip_include_prefix = "src",
+    target_compatible_with = ["//platforms:riscv64"],
+    deps = [
+        ":arch_riscv",
+        ":console",
+        ":cpufreq",
+        ":kernel_uspace",
+    ],
+)
+
 # The generated files that describe the running process and the machine.
 cc_library(
     name = "kernel_procfiles",
@@ -1673,6 +1729,7 @@ cc_library(
         ":drivers_virtio",
         ":kernel_disk",
         ":kernel_mem",
+        ":kernel_govern",
         ":kernel_procfiles",
         ":kernel_netboot",
         ":kernel_netfs_tcp",
@@ -1888,6 +1945,57 @@ user_binary(
 user_image(
     name = "ids.elf",
     program = ":ids",
+)
+
+# W^X: a mapping that is writable and executable is refused at `mmap` and
+# `mprotect`, and the write-then-flip a JIT does still works. Exits with a
+# bitmask of the checks that passed, 63 for all six.
+user_binary(
+    name = "wx",
+    srcs = [
+        "src/userland/start.S",
+        "src/userland/wx/main.c",
+    ],
+)
+
+user_image(
+    name = "wx.elf",
+    program = ":wx",
+)
+
+# Rule 25's syscall surface, second program: the signal frame placed and
+# read through a hostile stack pointer, descriptor-table exhaustion, and a
+# path argument unmapped by another thread while the call reads it. Each
+# hostile case runs in a child; the parent surviving to report is the
+# kernel surviving. Exits with a bitmask of the checks that passed, 127.
+user_binary(
+    name = "sigframe",
+    srcs = [
+        "src/userland/race/clone.S",
+        "src/userland/sigframe/main.c",
+        "src/userland/start.S",
+    ],
+)
+
+user_image(
+    name = "sigframe.elf",
+    program = ":sigframe",
+)
+
+# `/dev/fb0` as a file: read, write and lseek move one position through the
+# pixels, and only root and the video group may open it. Exits with a
+# bitmask of the checks that passed, 127 for all seven.
+user_binary(
+    name = "fbrw",
+    srcs = [
+        "src/userland/fbrw/main.c",
+        "src/userland/start.S",
+    ],
+)
+
+user_image(
+    name = "fbrw.elf",
+    program = ":fbrw",
 )
 
 # `fstrim` through FITRIM: the system-call contract around a trim, on a
@@ -2303,3 +2411,68 @@ user_image(
     name = "fbdemo.elf",
     program = ":fbdemo",
 )
+
+# ---------------------------------------------------------------------------
+# Fuzzing (ROADMAP §9)
+#
+# Four harnesses, one per parser that reads input from outside the kernel:
+# an ELF a user supplies, the firmware's device tree, a monitor's EDID and
+# the start of an XFS disk. Each is built twice from the same source:
+#
+#   <name>_replay  a cc_test that feeds every committed input under
+#                  //testdata/fuzz/src/c/experiments/riscv_minikern/<Name>/
+#                  through the harness — the regression gate, run by every
+#                  `bazel test`, part of the `cve` suite;
+#   <name>         the libFuzzer binary, `manual` because it is run by
+#                  hand: `gen_fuzz_c.sh <name> [secs]` builds it with the
+#                  whole tree instrumented (coverage, ASan, UBSan) — a flag
+#                  on the command line, since a `copts` here would reach
+#                  only the harness — and moves any crasher into the corpus.
+#
+# The corpus is the monorepo's central one, staged by the same rule the Go
+# fuzz tests use.
+fuzz_corpus(
+    name = "fuzz_corpus",
+    package = "src/c/experiments/riscv_minikern",
+)
+
+cc_library(
+    name = "fuzz_replay",
+    testonly = True,
+    srcs = ["test/fuzz/replay.c"],
+    hdrs = ["test/fuzz/fuzz.h"],
+    strip_include_prefix = "test/fuzz",
+)
+
+FUZZ_HARNESSES = {
+    "fuzz_edid": ("FuzzEdid", [":display_mode"]),
+    "fuzz_elf": ("FuzzElf", [":exec"]),
+    "fuzz_fdt": ("FuzzFdt", [":core_boot"]),
+    "fuzz_xfs": ("FuzzXfs", [
+        ":crypto",
+        ":storage",
+        ":xfs",
+    ]),
+}
+
+[cc_test(
+    name = name + "_replay",
+    size = "small",
+    srcs = ["test/fuzz/%s.c" % name],
+    args = ["$(rootpath :fuzz_corpus)/" + corpus],
+    data = [":fuzz_corpus"],
+    deps = deps + [":fuzz_replay"],
+) for name, (corpus, deps) in FUZZ_HARNESSES.items()]
+
+[cc_binary(
+    name = name,
+    testonly = True,
+    srcs = [
+        "test/fuzz/%s.c" % name,
+        "test/fuzz/fuzz.h",
+    ],
+    copts = ["-Isrc/c/experiments/riscv_minikern/test/fuzz"],
+    linkopts = ["-fsanitize=fuzzer"],
+    tags = ["manual"],
+    deps = deps,
+) for name, (corpus, deps) in FUZZ_HARNESSES.items()]

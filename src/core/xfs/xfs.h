@@ -92,6 +92,12 @@
 #define XFS_INODE_MAX  512u
 #define XFS_FORK_MAX   (XFS_INODE_MAX - 100u)
 
+/* The largest literal area of any inode the format has: 2048 bytes less a
+ * v4 core's 100. A fork larger than `XFS_FORK_MAX` is not cached in the
+ * inode; it is read from the inode's own block when it is needed
+ * (`xfs_inode_fork`). */
+#define XFS_LITERAL_MAX (2048u - 100u)
+
 /* The largest directory block this reader will mount.
  *
  * A directory block is `1 << sb_dirblklog` filesystem blocks, and the format
@@ -113,9 +119,9 @@
  * rather than here. */
 #define XFS_LABEL_BYTES 13u
 
-/* The largest attribute fork this reads: the literal area of the largest
- * inode it accepts (512 bytes, less the 176-byte core). */
-#define XFS_AFORK_MAX 336u
+/* The largest attribute fork this reads: any inode's whole literal area.
+ * Every buffer of this size is static, so its size costs no stack. */
+#define XFS_AFORK_MAX XFS_LITERAL_MAX
 
 /* One inode, parsed, with its inline fork copied out so no cached block
  * stays pinned while a caller walks it. */
@@ -139,6 +145,10 @@ struct xfs_inode {
     bool big_extent_counts;
     uint8_t format;
     uint8_t fork[XFS_FORK_MAX];
+    /* Cached in `fork`; a fork past it (inodes over 512 bytes) is read from
+     * the inode's block on demand (`xfs_inode_fork`). Its real size follows
+     * from the inode size and `forkoff` — not stored, because four more
+     * bytes here push frames holding two inodes past the 1 KiB limit. */
     uint32_t fork_len;
     /* **The attribute fork**, which shares the literal area with the data
      * fork and begins where `di_forkoff` says.

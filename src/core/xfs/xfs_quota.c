@@ -97,12 +97,59 @@ static int record_is(const uint8_t *r, uint8_t type, uint32_t id) {
     return KERR_OK;
 }
 
+/* Where record `id` is in its quota file. **Records are packed per block**:
+ * as many whole ones as a block holds, the rest of the block unused — 30 to
+ * a 4 KiB block — so record n is in block n / 30. It was taken to be at
+ * n × 136, which is right only below the first block's end. */
+static uint64_t record_offset(const struct xfs *fs, uint32_t id) {
+    uint32_t per = fs->blocksize / XFS_DQUOT_BYTES;
+    return (uint64_t)(id / per) * fs->blocksize + (uint64_t)(id % per) * XFS_DQUOT_BYTES;
+}
+
+/* The quota file's block holding the record at byte `at`, through the
+ * file's block map. **Not an ordinary file read**: Linux leaves a quota
+ * file's size at zero, and a read bounded by the size found no record on
+ * any quota file Linux made — so nothing was ever charged there.
+ * `KERR_NOENT` for a hole: an id nobody has a record for. */
+static int record_block(struct xfs *fs, const struct xfs_inode *qip, uint64_t at,
+                        struct bbuf **b) {
+    struct xfs_extent e;
+    uint64_t logical = at / fs->blocksize;
+    int rc = xfs_bmap(fs, qip, logical, &e);
+    if (rc != KERR_OK || e.unwritten) {
+        return rc != KERR_OK ? rc : KERR_NOENT;
+    }
+    return bcache_get(fs->cache, xfs_fsb_to_block(fs, e.startblock + (logical - e.startoff)), b);
+}
+
+static int record_read(struct xfs *fs, const struct xfs_inode *qip, uint64_t at,
+                       uint8_t *record) {
+    struct bbuf *b;
+    int rc = record_block(fs, qip, at, &b);
+    if (rc == KERR_OK) {
+        xfs_copy_bytes(record, b->data + at % fs->blocksize, XFS_DQUOT_BYTES);
+        bcache_put(fs->cache, b);
+    }
+    return rc;
+}
+
+static int record_write(struct xfs *fs, const struct xfs_inode *qip, uint64_t at,
+                        const uint8_t *record) {
+    struct bbuf *b;
+    int rc = record_block(fs, qip, at, &b);
+    if (rc == KERR_OK) {
+        xfs_copy_bytes(b->data + at % fs->blocksize, record, XFS_DQUOT_BYTES);
+        bcache_dirty(b);
+        bcache_put(fs->cache, b);
+    }
+    return rc;
+}
+
 int xfs_quota_get(struct xfs *fs, uint8_t type, uint32_t id, struct xfs_dquot *out) {
     uint8_t record[XFS_DQUOT_BYTES];
     struct xfs_inode *qip = &fs->quota_inode_buf;
     uint64_t ino = quota_inode(fs, type);
-    uint64_t at = (uint64_t)id * XFS_DQUOT_BYTES;
-    uint32_t got = 0;
+    uint64_t at = record_offset(fs, id);
     int rc;
     if (!xfs_quota_accounted(fs, type)) {
         return KERR_NOTSUP; /* this filesystem does not count this kind */
@@ -111,15 +158,9 @@ int xfs_quota_get(struct xfs *fs, uint8_t type, uint32_t id, struct xfs_dquot *o
         return KERR_NODEV; /* counted, but the file has never been made */
     }
     rc = xfs_inode_read(fs, ino, qip);
+    rc = rc != KERR_OK ? rc : record_read(fs, qip, at, record);
     if (rc != KERR_OK) {
         return rc;
-    }
-    if (at + XFS_DQUOT_BYTES > qip->size) {
-        return KERR_NOENT; /* past the end: this id has no record */
-    }
-    rc = xfs_file_read(fs, qip, at, record, XFS_DQUOT_BYTES, &got);
-    if (rc != KERR_OK || got != XFS_DQUOT_BYTES) {
-        return rc != KERR_OK ? rc : KERR_IO;
     }
     rc = record_is(record, type, id);
     if (rc != KERR_OK) {
@@ -153,23 +194,16 @@ int xfs_quota_get(struct xfs *fs, uint8_t type, uint32_t id, struct xfs_dquot *o
  * owner nobody set a limit for has no allowance to exceed. */
 static int dquot_for_update(struct xfs *fs, uint8_t type, uint32_t id, struct xfs_inode *qip,
                             uint8_t *record, uint64_t *at) {
-    uint32_t got = 0;
     uint64_t ino = quota_inode(fs, type);
     int rc;
-    *at = (uint64_t)id * XFS_DQUOT_BYTES;
+    *at = record_offset(fs, id);
     if (!xfs_quota_accounted(fs, type) || ino == 0) {
         return KERR_NOENT;
     }
     rc = xfs_inode_read(fs, ino, qip);
+    rc = rc != KERR_OK ? rc : record_read(fs, qip, *at, record);
     if (rc != KERR_OK) {
         return rc;
-    }
-    if (*at + XFS_DQUOT_BYTES > qip->size) {
-        return KERR_NOENT;
-    }
-    rc = xfs_file_read(fs, qip, *at, record, XFS_DQUOT_BYTES, &got);
-    if (rc != KERR_OK || got != XFS_DQUOT_BYTES) {
-        return rc != KERR_OK ? rc : KERR_IO;
     }
     return record_is(record, type, id) == KERR_OK ? KERR_OK : KERR_NOENT;
 }
@@ -292,7 +326,6 @@ int xfs_quota_charge(struct xfs *fs, uint8_t type, uint32_t id, int64_t blocks, 
     uint8_t record[XFS_DQUOT_BYTES];
     struct xfs_inode *qip = &fs->quota_inode_buf;
     uint64_t at = 0, bcount, icount;
-    uint32_t put = 0;
     int rc;
     /* **The quota file's own writes are not charged.** This rewrites a
      * record in place, so it asks the allocator for nothing and cannot
@@ -358,9 +391,9 @@ int xfs_quota_charge(struct xfs *fs, uint8_t type, uint32_t id, int64_t blocks, 
     xfs_put_be64(record + XFS_DQ_BCOUNT, bcount);
     xfs_put_be64(record + XFS_DQ_ICOUNT, icount);
     xfs_reseal(fs, record, XFS_DQUOT_BYTES, XFS_DQ_CRC_OFF);
-    rc = xfs_file_write(fs, qip, at, record, XFS_DQUOT_BYTES, &put);
+    rc = record_write(fs, qip, at, record);
     fs->charging_quota = false;
-    return rc != KERR_OK ? rc : (put == XFS_DQUOT_BYTES ? KERR_OK : KERR_IO);
+    return rc;
 }
 
 int xfs_quota_charge_ids(struct xfs *fs, uint32_t uid, uint32_t gid, int64_t blocks,

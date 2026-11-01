@@ -268,7 +268,12 @@ uint64_t timer_interrupts_of(uint32_t hart_index) {
     return hart_index < SMP_MAX_HARTS ? per_hart[hart_index].interrupts : 0u;
 }
 
-#define TICK_HOOKS 4u
+/* Twelve: a board boot registers up to eight beat hooks (two thermal, the
+ * governor, two network, the console, the display, cpuwhy), and with room
+ * for four the later ones were refused — every caller ignored the result,
+ * so the console poll or the display refresh could vanish without a word.
+ * A refusal now prints its hook. */
+#define TICK_HOOKS 12u
 
 static void (*tick_hooks[TICK_HOOKS])(void);
 static void (*housekeeping_hooks[TICK_HOOKS])(void);
@@ -347,6 +352,7 @@ int timer_add_housekeeping_hook(void (*hook)(void)) {
             return KERR_OK;
         }
     }
+    kprintf("timer: no room for housekeeping hook %p (%u in use)\n", (void *)hook, TICK_HOOKS);
     return KERR_NOSPC;
 }
 

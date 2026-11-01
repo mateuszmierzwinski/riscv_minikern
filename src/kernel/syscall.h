@@ -84,6 +84,9 @@
 /* Puts back the pre-fix behaviour of keeping pages a program discarded, so
  * that the test of the guarantee can be shown to fail without it. */
 void syscall_keep_discarded_pages(bool on);
+/* Lets a mapping be writable and executable at once — the control for W^X,
+ * which is otherwise refused (`minikern.allowwx`). */
+void syscall_allow_write_and_execute(bool on);
 
 #define SYS_SWAPON 224u
 #define SYS_SWAPOFF 225u

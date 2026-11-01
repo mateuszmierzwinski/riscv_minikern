@@ -187,5 +187,9 @@ int xfs_bmbt_lookup_in(const struct xfs *fs, const uint8_t *fork, uint32_t fork_
 
 int xfs_bmbt_lookup(const struct xfs *fs, const struct xfs_inode *ip, uint64_t off,
                     struct xfs_extent *out) {
-    return xfs_bmbt_lookup_in(fs, ip->fork, ip->fork_len, off, out);
+    struct xfs_fork_ref r;
+    int rc = xfs_inode_fork(fs, ip, &r);
+    rc = rc != KERR_OK ? rc : xfs_bmbt_lookup_in(fs, r.at, r.len, off, out);
+    xfs_inode_fork_put(fs, &r);
+    return rc;
 }

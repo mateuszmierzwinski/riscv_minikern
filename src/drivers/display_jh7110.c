@@ -227,6 +227,11 @@ static int start_the_transmitter(const struct display_timing *t) {
     rc = rc != KERR_OK ? rc : inno_hdmi_set_mode(t, &why);
     kprintf("display: HDMI %ux%u, PLLs %s%s\n", t->hactive, t->vactive,
             rc == KERR_OK ? "locked, TMDS on" : "NOT locked: ", why);
+    if (rc == KERR_OK && inno_hdmi_in_hdmi_mode()) {
+        kprintf("display: HDMI mode, AVI infoframe for VIC %u %s\n", t->vic,
+                inno_hdmi_infoframe_reads_back() ? "reads back as sent"
+                                                 : "does NOT read back as sent");
+    }
     return rc;
 }
 

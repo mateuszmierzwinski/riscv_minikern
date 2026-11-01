@@ -26,6 +26,8 @@ under the output directory so a failure can be read rather than re-run.
 """
 import argparse
 import os
+import secrets
+import shutil
 import subprocess
 import tempfile
 import sys
@@ -295,6 +297,33 @@ CASES = [
       "the log was replayed; the filesystem is clean"],
      700, None, "v4big"),
 
+    # **Inodes over 512 bytes.** An inode caches the first 412 bytes of its
+    # fork; a larger fork is read from the inode's own block. /big is a
+    # shortform directory whose fork is 848 bytes: a file is read through
+    # it, and then the whole write path runs on 1024-byte inodes, growing
+    # /big and every other directory out of the inode.
+    ("§3: the write path on 1024-byte inodes",
+     "minikern.cat=/big/name-of-entry-25 minikern.fswrite",
+     ["1024-byte inodes",
+      f"cat: /big/name-of-entry-25 is {fixtures.PAYLOAD_BYTES} bytes, "
+      f"checksum {fixtures.PAYLOAD_CHECKSUM}",
+      "fswrite: every step passed",
+      "/w_attrs: 600 attributes set, 600 listed, 0 after removal (rc 0)"],
+     700, None, "inodes1k"),
+
+    # **A log Linux left dirty, replayed on the board.** The image is the one
+    # the host test judges with `xfs_repair`: Linux created, chowned, removed
+    # and truncated files with quotas on and shut the filesystem down without
+    # writing its metadata back. The replay applies every item of its three
+    # transactions — inode cores and forks, buffers resealed, inode creates,
+    # dquots — and a file Linux truncated reads at its new size.
+    ("§3: a log Linux left dirty is replayed",
+     "minikern.cat=/big",
+     ["replay applied 3 transaction(s), 247 item(s)",
+      "the log was replayed; the filesystem is clean",
+      "cat: /big is 8192 bytes"],
+     150, None, "linuxlog"),
+
     # **QuokkaOS's init, on the board, from a filesystem.**
     #
     # The whole userland on one XFS image: /init, /bin/rc, /bin/qservice, and
@@ -429,8 +458,29 @@ CASES = [
     ("§6: the die temperature, and /proc/thermal",
      "",
      ["which is a plausible die temperature",
-      "/proc/thermal reports it"],
+      "/proc/thermal reports it",
+      "governor: thermal, from"],
      150, None),
+
+    # **The governor, fed by the sensor** (§4). With the throttle point moved
+    # below any room-temperature die, the thermal governor must step the
+    # clock down a point every 250 ms to the bottom, saying why; a governor
+    # that never read the sensor, or never reached the divider, stays at the
+    # top and prints nothing.
+    ("§4: the governor throttles on the die sensor",
+     "minikern.governor.throttle=20000",
+     ["throttle at 20000 mC",
+      "kHz (throttling at",
+      "375000 kHz (throttling at"],
+     90, None),
+    # Ondemand follows the busiest hart: down while the boot idles, up while
+    # the embedded spinner runs one hart flat out.
+    ("§4: ondemand follows the load",
+     "minikern.governor=ondemand minikern.spin=1",
+     ["governor: ondemand, from",
+      "kHz (idle at",
+      "kHz (load at"],
+     110, None),
 
     # **The four buses the board actually has**, each proved by something
     # that cannot pass if the driver is wrong.
@@ -674,6 +724,15 @@ CASES = [
      ["display: VOUT power domain on", "display: DC8200 revision 5720",
       "display: HDMI 1920x1080, PLLs locked, TMDS on", "(30 expected), underflow no — scanning out"],
      120, None),
+    # HDMI mode with an AVI infoframe (`minikern.hdmimode=hdmi`): the mode
+    # bit set and the infoframe reading back from the packet buffer, with the
+    # scanout unchanged. Whether a TV likes it is the operator's check.
+    ("§10: HDMI mode with an AVI infoframe",
+     "minikern.hdmi=1920x1080 minikern.hdmimode=hdmi",
+     ["display: HDMI 1920x1080, PLLs locked, TMDS on",
+      "display: HDMI mode, AVI infoframe for VIC 16 reads back as sent",
+      "(30 expected), underflow no — scanning out"],
+     120, None),
     ("§10: HDMI scanout at 720p60",
      "minikern.hdmi=1280x720",
      ["display: HDMI 1280x720, PLLs locked, TMDS on", "(30 expected), underflow no — scanning out"],
@@ -723,6 +782,46 @@ CASES = [
      "",
      ["exited with 127"],
      200, "//:ids.elf"),
+    # **`/dev/fb0` as a file** (§10): `read`, `write` and `lseek` move one
+    # position through the pixels, and the node is root's and the video
+    # group's, 0660 — a uid-1000 child outside the group is refused, one in
+    # it is let in. 127 is all seven checks.
+    ("§10: /dev/fb0 reads, writes and seeks, for root and the video group",
+     "minikern.vfb=640x480",
+     ["exited with 127"],
+     200, "//:fbrw.elf"),
+    # **Rule 25, the second syscall-surface program** (§6): a signal frame
+    # aimed by the stack pointer at the kernel or at nothing, and an
+    # `rt_sigreturn` reading through such a pointer, must each end only the
+    # child (SIGSEGV), never the kernel; the descriptor table must fill to
+    # EMFILE and recover; a path unmapped by another thread mid-call must be
+    # answered, not faulted on. 127 is all seven.
+    #
+    # The exit code alone cannot tell a refused frame from a written one: the
+    # control, with delivery's check removed, also exits 127 — the kernel
+    # wrote 1,088 bytes over its own memory at ffffffc0003ffbc0 and the
+    # child died only when `rt_sigreturn` refused to read them back. The
+    # "not written" line is the evidence that nothing was written.
+    ("§6: hostile signal frames, a full descriptor table, a path pulled away",
+     "",
+     ["exited with 127",
+      "s frame at ffffffc0003ffbc0 not written: not its memory",
+      "s frame at 7bc0 not written: not its memory",
+      "s frame at 8000 not read: not its memory",
+      "s frame at ffffffc000400000 not read: not its memory"],
+     240, "//:sigframe.elf"),
+    # **W^X** (§6): no mapping is writable and executable at once — `mmap`
+    # and `mprotect` refuse it with EACCES — and a page written and then
+    # flipped to read-and-execute still runs. 63 is all six checks; the
+    # control, `minikern.allowwx`, must lose exactly the two refusals (58).
+    ("§6: W^X — no page both writable and executable",
+     "",
+     ["exited with 63"],
+     200, "//:wx.elf"),
+    ("§6: W^X's control lets the two refusals through",
+     "minikern.allowwx",
+     ["exited with 58"],
+     200, "//:wx.elf"),
     # **TRIM, judged by the device.** A file written and removed, then the
     # root trimmed: the RAM disk counts what it was told to discard, and the
     # kernel's figure must equal it — a trim that reports more than reached
@@ -826,6 +925,10 @@ def run_case(name, bootargs, wanted, seconds, out_dir, program=None, needs_image
             img = fixtures.v4_filesystem(at)
         elif needs_image == "v4big":
             img = fixtures.v4_filesystem_big_inodes(at)
+        elif needs_image == "inodes1k":
+            img = fixtures.big_inodes(at)
+        elif needs_image == "linuxlog":
+            img = fixtures.linux_dirty_log(at)
         else:
             size = None if needs_image is True else needs_image
             img = fixtures.big_directory(at, FIXTURE_ENTRIES, size)
@@ -872,6 +975,60 @@ def aslr_differs(out_dir):
     return missing, os.path.join(out_dir, "aslr1.log")
 
 
+# Where the board finds Go programs over netfs, and where it is on the LAN:
+# netfsd serves ~/vf2/netroot on :8081 and lets only the board's address in.
+NETROOT = os.path.expanduser("~/vf2/netroot")
+NETFS_AT = "192.168.86.119:8081"
+BOARD_AT = "192.168.86.247"
+
+
+def stage_vnc_password():
+    """A fresh password for this run, in the netfs root at mode 0600 —
+    vncd refuses a file anyone else could read, so the mode is part of
+    the test."""
+    where = os.path.join(NETROOT, "etc", "vncd")
+    os.makedirs(where, exist_ok=True)
+    path = os.path.join(where, "passwd")
+    if os.path.exists(path):
+        os.remove(path)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(secrets.token_hex(4) + "\n")
+    return path
+
+
+def vnc_serves(out_dir):
+    """**The VFB from the PC** (§10): vncd on the board, judged by a client
+    on this machine while the board runs — a case no console line can be.
+
+    vncd runs off netfs with the password file it is pointed at; the probe
+    (QuokkaOS `cmd/vncprobe`) retries until the board answers, checks a
+    wrong password is refused, logs in with the right one and reads the
+    screen's size, name and one full update: 640x480 at four bytes a pixel.
+    """
+    bin_dir = os.path.join(NETROOT, "bin")
+    os.makedirs(bin_dir, exist_ok=True)
+    shutil.copy(built("//src/go/quokkaos/cmd/vncd:vncd_riscv64"), os.path.join(bin_dir, "vncd"))
+    os.chmod(os.path.join(bin_dir, "vncd"), 0o755)
+    passfile = stage_vnc_password()
+    log = os.path.join(out_dir, "vnc.log")
+    args = (f"minikern.vfb=640x480 minikern.netfs={NETFS_AT} minikern.run=/net/bin/vncd "
+            "minikern.env=VNCD_PASSFILE=/net/etc/vncd/passwd")
+    board = subprocess.Popen([sys.executable, os.path.join(HERE, "board.py"), args,
+                              "-t", "150", "-o", log, "-q", "-w", "900"])
+    probe = subprocess.run([built("//src/go/quokkaos/cmd/vncprobe:vncprobe"),
+                            "-addr", f"{BOARD_AT}:5900", "-passfile", passfile, "-wait", "170s"],
+                           capture_output=True, text=True, check=False)
+    board.wait()
+    text = open(log, "rb").read().decode("utf-8", "replace") if os.path.exists(log) else ""
+    want = 'wrong password refused; 640x480 "minikern", full update 1228800 bytes'
+    missing = [] if want in probe.stdout else [
+        f"{want} (the probe said: {(probe.stdout + probe.stderr).strip()})"]
+    if "vncd: serving /dev/fb0" not in text:
+        missing.append("vncd: serving /dev/fb0")
+    return missing, log
+
+
 def main():
     ap = argparse.ArgumentParser(description="Run the board suite on the VisionFive 2.")
     ap.add_argument("-o", "--out", default="/tmp/minikern-hil", help="where logs go")
@@ -881,7 +1038,8 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     print(f"hil: image md5 {image.stage(PROJECT)}")
     failures = 0
-    extra = [("§1: addresses are randomised, compared across two runs", aslr_differs)]
+    extra = [("§1: addresses are randomised, compared across two runs", aslr_differs),
+             ("§10: the VFB seen from the PC over VNC", vnc_serves)]
     for case in CASES:
         name, bootargs, wanted, seconds = case[:4]
         program = case[4] if len(case) > 4 else None

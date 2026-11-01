@@ -1,0 +1,4 @@
+linux_dirty_log.img.xz — an XFS filesystem (mkfs.xfs defaults, 300 MiB)
+whose log Linux 7.1.13-100.fc43.x86_64 left dirty: inode items with inline data,
+buffer items, inode-create (ICR) and quota (DQ) items. Remade by
+scripts/make_linux_log.sh; judged by test/xfs_linuxlog_test.sh.

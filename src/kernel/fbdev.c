@@ -65,6 +65,26 @@ static int32_t fb_pwrite(struct file *f, const void *buf, uint32_t n, uint64_t o
                : KERR_FAULT;
 }
 
+/* `read` and `write`: `pread` and `pwrite` at the descriptor's position,
+ * which they move — what `cat /dev/fb0 > shot` and `dd` use. */
+static int32_t fb_read(struct file *f, void *buf, uint32_t n) {
+    int32_t got = fb_pread(f, buf, n, f->pos);
+    f->pos += got > 0 ? (uint64_t)got : 0u;
+    return got;
+}
+
+static int32_t fb_write(struct file *f, const void *buf, uint32_t n) {
+    int32_t put = fb_pwrite(f, buf, n, f->pos);
+    f->pos += put > 0 ? (uint64_t)put : 0u;
+    return put;
+}
+
+/* The length `lseek(SEEK_END)` measures from: the whole framebuffer. */
+static uint64_t fb_size(struct file *f) {
+    (void)f;
+    return fb.bytes;
+}
+
 /* The frame behind a page of the framebuffer, for `MAP_SHARED`. */
 static int32_t fb_map_page(struct file *f, uint64_t offset, phys_t *phys) {
     (void)f;
@@ -134,6 +154,9 @@ static int32_t fb_ioctl(struct file *f, uint32_t request, virt_t arg) {
 }
 
 static const struct file_ops fb_ops = {
+    .read = fb_read,
+    .write = fb_write,
+    .size = fb_size,
     .pread = fb_pread,
     .pwrite = fb_pwrite,
     .ioctl = fb_ioctl,
@@ -154,7 +177,7 @@ static int allocate_the_frames(uint64_t bytes) {
     return KERR_OK;
 }
 
-int fbdev_install(const struct fb_mode *mode) {
+int fbdev_install(const struct fb_mode *mode, const struct device_owner *owner) {
     int rc;
     if (fb.installed) {
         return KERR_BUSY;
@@ -164,12 +187,12 @@ int fbdev_install(const struct fb_mode *mode) {
         return rc;
     }
     fb.mode = *mode;
-    rc = fdobjects_add_device(FBDEV_PATH, &fb_ops, NULL);
+    rc = fdobjects_add_device(FBDEV_PATH, &fb_ops, NULL, owner);
     if (rc != KERR_OK) {
         (void)mem_free_pages(fb.base, (uint32_t)(fb.bytes / PAGE_SIZE));
         return rc;
     }
-    (void)synthfs_add_device(FBDEV_PATH);
+    (void)synthfs_add_device(FBDEV_PATH, owner);
     fb.installed = true;
     kprintf("fb: %s %ux%u, stride %u, %llu KiB\n", FBDEV_PATH, mode->width, mode->height,
             mode->stride, (unsigned long long)(fb.bytes / 1024u));

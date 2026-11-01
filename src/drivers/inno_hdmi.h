@@ -33,6 +33,16 @@ bool inno_hdmi_hotplug(void);
  * PLL table; KERR_TIMEDOUT naming which PLL did not lock. */
 int inno_hdmi_set_mode(const struct display_timing *t, const char **why);
 
+/* Frames the next mode in **HDMI** mode with an AVI infoframe for its VIC,
+ * rather than in DVI mode. Some TVs want it; every monitor takes DVI, which
+ * is why DVI stays the default (`minikern.hdmimode=hdmi` asks for this). */
+void inno_hdmi_use_hdmi_mode(bool on);
+
+/* After a mode is set: whether it was framed in HDMI mode, and whether the
+ * AVI infoframe in the packet buffer reads back as written. */
+bool inno_hdmi_in_hdmi_mode(void);
+bool inno_hdmi_infoframe_reads_back(void);
+
 /* Reads EDID block `block` (0 = the base block) over the DDC wires. */
 int inno_hdmi_read_edid(uint8_t block, uint8_t out[EDID_BLOCK_BYTES]);
 
