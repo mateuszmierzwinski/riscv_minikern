@@ -1184,6 +1184,8 @@ cc_library(
         "src/kernel/fbdev.c",
         "src/kernel/fdobjects.c",
         "src/kernel/i2cdev.c",
+        "src/kernel/spidev.c",
+        "src/kernel/pwmdev.c",
         "src/kernel/watchdog.c",
         "src/kernel/flock.c",
         "src/kernel/perm.c",
@@ -1206,6 +1208,8 @@ cc_library(
         "src/arch/riscv/sigframe.h",
         "src/kernel/fbdev.h",
         "src/kernel/i2cdev.h",
+        "src/kernel/spidev.h",
+        "src/kernel/pwmdev.h",
         "src/kernel/watchdog.h",
         "src/kernel/fdobjects.h",
         "src/kernel/flock.h",
@@ -2011,6 +2015,36 @@ user_binary(
 user_image(
     name = "i2cdev.elf",
     program = ":i2cdev",
+)
+
+# /dev/spidev0.0 through the operator's jumper (minikern.spi.jumper): bytes
+# sent come back; the settings and the refusals. 63; 39 without the routing.
+user_binary(
+    name = "spidev",
+    srcs = [
+        "src/userland/spidev/main.c",
+        "src/userland/start.S",
+    ],
+)
+
+user_image(
+    name = "spidev.elf",
+    program = ":spidev",
+)
+
+# /dev/pwmchip0 (Linux 6.13's PWM character device): request, round, set,
+# read back, free, and the refusals. 127.
+user_binary(
+    name = "pwmdev",
+    srcs = [
+        "src/userland/pwmdev/main.c",
+        "src/userland/start.S",
+    ],
+)
+
+user_image(
+    name = "pwmdev.elf",
+    program = ":pwmdev",
 )
 
 # Rule 25's syscall surface, second program: the signal frame placed and

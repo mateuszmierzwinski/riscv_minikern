@@ -211,12 +211,18 @@ int gpio_jh7110_set_input(uint32_t controller, uint32_t pin) {
 
 int gpio_jh7110_set_function(uint32_t controller, uint32_t pin, uint8_t dout_signal,
                              uint8_t doen_signal) {
+    uint32_t was;
     int rc = pin_ok(controller, pin);
     if (rc != KERR_OK) {
         return rc;
     }
     if (controller != 0) {
         return KERR_NOTSUP;
+    }
+    /* Routed signals go through the GPIO layer too: function 0 first. */
+    rc = gpio_jh7110_claim(controller, pin, &was);
+    if (rc != KERR_OK) {
+        return rc;
     }
     /* The signal before its enable, for the reason `set_output` gives. */
     write_pin_field(controller, gpio_jh7110_dout_offset(pin), dout_signal);

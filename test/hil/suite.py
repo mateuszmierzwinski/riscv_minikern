@@ -860,6 +860,23 @@ CASES = [
      "minikern.gpio.giveaway=0:63 minikern.gpio.noclaim minikern.gpio.loop=0:63,0:60,0:60,0:63",
      ["0:63 -> 0:60  MISMATCH", "0:60 -> 0:63  MISMATCH"],
      60, None),
+    # **SPI and PWM for programs** (§4). SPI0 routed onto the jumpered pads
+    # (`minikern.spi.jumper`): what a program sends through /dev/spidev0.0
+    # comes back down the wire (63); unrouted, the transfers return the idle
+    # line (39) — the control. PWM: the kernel's own reading of channel 0
+    # through the wire, then /dev/pwmchip0's ABI from a program.
+    ("§4: /dev/spidev0.0 through the jumper",
+     "minikern.spi.jumper",
+     ["spi: transmit on pad 63, receive from pad 60", "exited with 63"],
+     120, "//:spidev.elf"),
+    ("§4: /dev/spidev0.0's control — unrouted, nothing comes back",
+     "",
+     ["exited with 39"],
+     120, "//:spidev.elf"),
+    ("§4: PWM channel 0 read back through the jumper, and /dev/pwmchip0",
+     "minikern.pwm.jumper",
+     ["pwm: channel 0 at 25% reads", "follows its duty (inverted)", "exited with 127"],
+     120, "//:pwmdev.elf"),
     # **The watchdog** (§4): armed for 3 s and fed by the kernel's beat, the
     # board outlives a 15 s spin and stops it cleanly at power-off — which
     # fails on this board, so an armed watchdog would otherwise reboot a

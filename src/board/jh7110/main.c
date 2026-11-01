@@ -64,6 +64,8 @@
 #include "kernel/cpuwhy.h"
 #include "kernel/govern.h"
 #include "kernel/i2cdev.h"
+#include "kernel/pwmdev.h"
+#include "kernel/spidev.h"
 #include "kernel/watchdog.h"
 #include "kernel/procfiles.h"
 #include "core/boardspec.h"
@@ -1686,6 +1688,135 @@ static void offer_the_i2c_buses(uint64_t dtb) {
         offered += i2cdev_install(n, &port) == KERR_OK ? 1u : 0u;
     }
     kprintf("i2c: %u bus(es) offered as /dev/i2c-N\n", offered);
+}
+
+/* ── SPI and PWM for programs (ROADMAP §4) ─────────────────────────────── */
+
+static struct spi_pl022 spi0;
+static struct pwm_jh7110 pwm_block;
+static uint64_t pwm_hz; /* the counter's clock, measured at bring-up */
+
+#define PWM_SYS_CHANNELS 4u  /* 0-3 share the sys node's page; 4-7 are 0x8000 on */
+#define JUMPER_OUT 63u       /* the operator's jumper: pad 63 to pad 60 */
+#define JUMPER_IN 60u
+#define SPI0_TXD 32u         /* GPOUT_SYS_SPI0_TXD */
+#define SPI0_RXD 28u         /* GPI_SYS_SPI0_RXD */
+#define PWM_CH0_OUT 24u      /* GPOUT_SYS_PWM_CHANNEL0 */
+#define PWM_CH0_OE 9u        /* GPOEN_SYS_PWM0_CHANNEL0 */
+
+static int spi_configure(void *self, uint32_t hz) {
+    return spi_pl022_configure(self, hz, false);
+}
+
+static int spi_exchange(void *self, uint8_t out, uint8_t *in) {
+    return spi_pl022_transfer(self, out, in);
+}
+
+/* Nanoseconds to whole counter ticks and back: what the counter can do. */
+static uint64_t ns_to_ticks(uint64_t ns) {
+    return ns * pwm_hz / 1000000000ull;
+}
+
+static void pwm_round(void *self, uint64_t *period_ns, uint64_t *duty_ns) {
+    (void)self;
+    uint64_t period = ns_to_ticks(*period_ns), duty = ns_to_ticks(*duty_ns);
+    period = period > 0xffffffffull ? 0xffffffffull : period;
+    duty = duty > period ? period : duty;
+    *period_ns = period * 1000000000ull / pwm_hz;
+    *duty_ns = duty * 1000000000ull / pwm_hz;
+}
+
+static int pwm_apply(void *self, uint32_t channel, uint64_t period_ns, uint64_t duty_ns) {
+    if (period_ns == 0) {
+        return pwm_jh7110_stop(self, channel);
+    }
+    return pwm_jh7110_start(self, channel, (uint32_t)ns_to_ticks(period_ns),
+                            (uint32_t)ns_to_ticks(duty_ns));
+}
+
+/* The PWM counter's rate: channel 0 run for 10 ms of the timer. */
+static uint64_t measure_pwm_hz(void) {
+    uint32_t first, second;
+    uint64_t t0;
+    (void)pwm_jh7110_start(&pwm_block, 0, 0xffffffffu, 0);
+    first = pwm_jh7110_counter(&pwm_block, 0);
+    t0 = timer_ns();
+    while (timer_ns() - t0 < 10000000ull) {
+    }
+    second = pwm_jh7110_counter(&pwm_block, 0);
+    (void)pwm_jh7110_stop(&pwm_block, 0);
+    return (uint64_t)(second - first) * 100u;
+}
+
+#define DUTY_SAMPLES 20000u
+
+/* Pad 60's share of high readings, in percent, with PWM channel 0 at
+ * `duty` percent of a 100 µs period on pad 63. Sampled at the loop's own
+ * pace, which is not locked to the PWM's — so the share converges on the
+ * duty cycle rather than aliasing. */
+static uint32_t pad_high_percent_at(uint32_t duty) {
+    uint32_t high = 0;
+    bool level = false;
+    (void)pwm_apply(&pwm_block, 0, 100000u, 1000u * duty);
+    for (uint32_t i = 0; i < DUTY_SAMPLES; i++) {
+        high += gpio_jh7110_read(0, JUMPER_IN, &level) == KERR_OK && level ? 1u : 0u;
+        for (volatile uint32_t spin = 0; spin < 37u; spin++) {
+        }
+    }
+    (void)pwm_apply(&pwm_block, 0, 0, 0);
+    return high * 100u / DUTY_SAMPLES;
+}
+
+static bool near(uint32_t got, uint32_t want) {
+    return got + 8u >= want && got <= want + 8u;
+}
+
+/* `minikern.pwm.jumper`: channel 0 onto pad 63, read back on pad 60
+ * through the operator's jumper, at 25 % and 75 %. The JH7110's PWM is
+ * inverted-polarity only (StarFive's driver refuses normal), so a working
+ * channel reads 75 and 25. */
+static void measure_pwm_through_the_jumper(void) {
+    (void)gpio_jh7110_set_input(0, JUMPER_IN);
+    (void)gpio_jh7110_set_function(0, JUMPER_OUT, PWM_CH0_OUT, PWM_CH0_OE);
+    uint32_t at25 = pad_high_percent_at(25u), at75 = pad_high_percent_at(75u);
+    kprintf("pwm: channel 0 at 25%% reads %u%% high, at 75%% reads %u%% high — %s\n", at25, at75,
+            near(at25, 75u) && near(at75, 25u)   ? "follows its duty (inverted)"
+            : near(at25, 25u) && near(at75, 75u) ? "follows its duty"
+                                                 : "does NOT follow its duty");
+}
+
+/* `minikern.spi.jumper`: SPI0's transmit line onto pad 63 and its receive
+ * line from pad 60, so what a program sends comes back through the
+ * operator's jumper; without it the received bytes are the idle line. */
+static void route_signals_through_the_jumper(void) {
+    if (cmdline_has(boot_cmdline, "minikern.pwm.jumper") && pwm_hz != 0) {
+        measure_pwm_through_the_jumper();
+    }
+    if (cmdline_has(boot_cmdline, "minikern.spi.jumper")) {
+        (void)gpio_jh7110_set_input(0, JUMPER_IN);
+        (void)gpio_jh7110_route_input(0, SPI0_RXD, JUMPER_IN);
+        (void)gpio_jh7110_set_function(0, JUMPER_OUT, SPI0_TXD, 0u /* GPOEN_ENABLE */);
+        kprintf("spi: transmit on pad %u, receive from pad %u (the jumper)\n", JUMPER_OUT, JUMPER_IN);
+    }
+}
+
+/* `/dev/spidev0.0` and `/dev/pwmchip0`. */
+static void offer_spi_and_pwm(uint64_t dtb) {
+    struct fdt fdt;
+    if (fdt_open(&fdt, (const void *)(uintptr_t)dtb, FDT_MAX_BYTES) != KERR_OK) {
+        return;
+    }
+    if (spi_pl022_init(&spi0, &fdt, "/soc/spi@10060000") == KERR_OK) {
+        struct spi_port sp = {spi_configure, spi_exchange, &spi0};
+        kprintf("spi: /dev/spidev0.0 %s\n", spidev_install(0, 0, &sp) == KERR_OK ? "offered" : "refused");
+    }
+    if (pwm_jh7110_init(&pwm_block, &fdt, "/soc/pwm@120d0000") == KERR_OK &&
+        (pwm_hz = measure_pwm_hz()) != 0) {
+        struct pwm_port pp = {PWM_SYS_CHANNELS, pwm_round, pwm_apply, &pwm_block};
+        kprintf("pwm: counter at %llu Hz; /dev/pwmchip0 %s\n", (unsigned long long)pwm_hz,
+                pwmdev_install(0, &pp) == KERR_OK ? "offered" : "refused");
+    }
+    route_signals_through_the_jumper();
 }
 
 /* The watchdog's counter rate on this board (`minikern.wdtprobe`). */
@@ -5070,6 +5201,7 @@ static void kmain_after_devices(uint64_t hart, uint64_t dtb) {
     bring_up_other_harts(dtb, hart);
     start_the_watchdog(dtb);
     offer_the_i2c_buses(dtb);
+    offer_spi_and_pwm(dtb);
     /* **After the harts are up**, because half of what it measures is about
      * them: how many are schedulable, and what an interrupt between two of
      * them costs. */
