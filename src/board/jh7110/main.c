@@ -1974,6 +1974,25 @@ static void prove_the_watchdog(const struct fdt *fdt) {
     }
 }
 
+/* A hub on the root port (the VL805's own USB 2.0 hub): what is plugged in
+ * behind it, port by port. */
+static void report_the_hub_ports(void) {
+    uint32_t status[8] = {0};
+    int ports = xhci_hub_ports(status, 8u);
+    if (ports < 0) {
+        kprintf("usb: the hub would not answer (rc %d)\n", ports);
+        return;
+    }
+    kprintf("usb: the hub has %d ports\n", ports);
+    for (int p = 0; p < ports && p < 8; p++) {
+        kprintf("usb:   hub port %d: %s, %s%s, status %08x\n", p + 1,
+                (status[p] & 1u) != 0 ? "connected" : "empty",
+                (status[p] & 0x100u) != 0 ? "powered" : "unpowered",
+                (status[p] & 0x400u) != 0 ? ", high speed" : ((status[p] & 0x200u) != 0 ? ", low speed" : ""),
+                status[p]);
+    }
+}
+
 /* USB: the VL805 the PCIe work has been enumerating and ignoring.
  *
  * Reported in stages because each is provable on its own — the controller's
@@ -2018,6 +2037,9 @@ static void bring_up_usb(void) {
                     dev.port, dev.slot, dev.speed, dev.vendor, dev.product, dev.device_class,
                     dev.max_packet0);
             kprintf("usb: a device descriptor was read over a control transfer\n");
+            if (dev.device_class == 0x09u) {
+                report_the_hub_ports();
+            }
         } else {
             kprintf("usb: no device could be enumerated (rc %d)\n", rc);
         }

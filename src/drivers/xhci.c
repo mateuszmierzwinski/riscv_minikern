@@ -18,6 +18,7 @@
 #define CAP_CAPLENGTH 0x00u /* byte 0: where the operational registers begin */
 #define CAP_HCIVERSION 0x00u /* bits 16-31 of the same word */
 #define CAP_HCSPARAMS1 0x04u
+#define CAP_HCSPARAMS2 0x08u /* scratchpad buffer count, bits 31:27 and 25:21 */
 #define CAP_HCCPARAMS1 0x10u
 #define CAP_DBOFF 0x14u   /* the doorbell array, from the window's start */
 #define CAP_RTSOFF 0x18u  /* the runtime registers, likewise */
@@ -51,6 +52,13 @@
  * a plain read-modify-write of the whole word acknowledges changes the
  * driver never looked at. Every write masks them off. */
 #define PORTSC_CHANGE_BITS 0x00fe0000u
+/* **The bits a write may carry back**: power, the indicator and the wake
+ * enables. PED is write-one-to-*clear* — writing a read value back with it
+ * set disables the port — and the change bits are write-one-to-clear too.
+ * Every write starts from `portsc_neutral`, never from the value read: the
+ * reset's own acknowledgement wrote PED back and switched off the port it had
+ * just enabled, which was "connected, speed 3, Polling, not enabled". */
+#define PORTSC_PRESERVE ((1u << 9) | (3u << 14) | (7u << 25))
 
 /* ── runtime registers ─────────────────────────────────────────────────── */
 #define RT_IMAN 0x20u /* interrupter 0's management */
@@ -150,6 +158,7 @@ static struct {
      * devices exist. */
     uint64_t *dcbaa;
     struct trb *command_ring;
+    phys_t command_ring_phys;
     struct trb *event_ring;
     struct erst_entry *erst;
     uint32_t command_index;
@@ -180,9 +189,14 @@ static void wr32(volatile uint8_t *at, uint32_t off, uint32_t v) {
  * write to their low half — `CRCR` takes the ring pointer then, and `ERDP`
  * acknowledges events — so writing the low half first makes the controller
  * act on a pointer whose top 32 bits are still the previous value. */
+/* **Low dword first, then high**, as the specification orders it. The VL805
+ * commits a 64-bit register when its high half is written: written the other
+ * way round, every ring pointer was committed as {old low = 0, high} —
+ * address 0 — so the controller ran, took commands and posted every event
+ * somewhere else. Control: the old order, same image, no completion. */
 static void wr64(volatile uint8_t *at, uint32_t off, uint64_t v) {
-    wr32(at, off + 4u, (uint32_t)(v >> 32));
     wr32(at, off, (uint32_t)v);
+    wr32(at, off + 4u, (uint32_t)(v >> 32));
 }
 
 /* Defined with the ring machinery below; the port code needs it, because a
@@ -203,6 +217,12 @@ static void *dma_page(phys_t *phys_out) {
         return NULL;
     }
     *phys_out = phys;
+    /* **Zeroed**: the allocator promises nothing about a frame's contents,
+     * and a ring or context with a stale cycle bit or pointer in it is one
+     * the controller acts on. */
+    for (uint32_t i = 0; i < 4096u / 8u; i++) {
+        ((volatile uint64_t *)mmu_phys_to_virt(phys))[i] = 0;
+    }
     return mmu_phys_to_virt(phys);
 }
 
@@ -246,6 +266,34 @@ static int reset_the_controller(void) {
     return wait_until_clear(OP_USBSTS, USBSTS_CNR, READY_TIMEOUT_NS);
 }
 
+/* **Scratchpad pages, when the controller asks for them** (HCSPARAMS2): its
+ * own working memory, handed over through entry 0 of the context array. A
+ * controller that wants them and is given none may run, report ports, and
+ * then never complete a command — the first build gave none. */
+static int give_the_scratchpads(void) {
+    uint32_t p2 = rd32(xhci.cap, CAP_HCSPARAMS2);
+    uint32_t count = (((p2 >> 21) & 0x1fu) << 5) | ((p2 >> 27) & 0x1fu);
+    phys_t array_phys = 0;
+    uint64_t *array;
+    kprintf("xhci: %u scratchpad pages asked for\n", count);
+    if (count == 0u) {
+        return KERR_OK;
+    }
+    array = dma_page(&array_phys);
+    if (array == NULL || count > 4096u / sizeof(uint64_t)) {
+        return KERR_NOMEM;
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        phys_t page = 0;
+        if (dma_page(&page) == NULL) {
+            return KERR_NOMEM;
+        }
+        array[i] = page;
+    }
+    xhci.dcbaa[0] = array_phys;
+    return KERR_OK;
+}
+
 /* The command ring, the event ring and the context array. */
 static int build_the_rings(void) {
     phys_t dcbaa_phys = 0, cmd_phys = 0, event_phys = 0, erst_phys = 0;
@@ -260,12 +308,16 @@ static int build_the_rings(void) {
     /* How many slots the controller may use. It must be told, or it accepts
      * no device at all — the register defaults to zero. */
     wr32(xhci.op, OP_CONFIG, xhci.slots);
+    if (give_the_scratchpads() != KERR_OK) {
+        return KERR_NOMEM;
+    }
     wr64(xhci.op, OP_DCBAAP, dcbaa_phys);
     /* The command ring's pointer, with the cycle bit: the controller and the
      * driver agree on whose turn an entry is by that bit, and starting them
      * disagreeing means the controller sees an empty ring for ever. */
     xhci.command_cycle = true;
     xhci.command_index = 0;
+    xhci.command_ring_phys = cmd_phys;
     wr64(xhci.op, OP_CRCR, cmd_phys | 1u);
     /* One event-ring segment, described by the table the controller reads. */
     xhci.event_ring_phys = event_phys;
@@ -408,6 +460,11 @@ uint32_t xhci_port_status(uint32_t n) {
     return rd32(xhci.op, OP_PORTSC(n));
 }
 
+/* A port's register value with nothing in it a write would act on. */
+static uint32_t portsc_neutral(uint32_t sc) {
+    return sc & PORTSC_PRESERVE;
+}
+
 /* Acknowledges the change bits that are set, and only those.
  *
  * **This is the step the first version left out entirely.** Every write in
@@ -422,7 +479,7 @@ static void acknowledge_changes(uint32_t n) {
     uint32_t sc = rd32(xhci.op, OP_PORTSC(n));
     uint32_t pending = sc & PORTSC_CHANGE_BITS;
     if (pending != 0) {
-        wr32(xhci.op, OP_PORTSC(n), (sc & ~PORTSC_CHANGE_BITS) | pending);
+        wr32(xhci.op, OP_PORTSC(n), portsc_neutral(sc) | pending);
     }
 }
 
@@ -437,7 +494,7 @@ static bool reset_one_port_once(uint32_t n) {
     uint32_t sc = rd32(xhci.op, OP_PORTSC(n));
     uint64_t until;
     if ((sc & PORTSC_PP) == 0) {
-        wr32(xhci.op, OP_PORTSC(n), (sc & ~PORTSC_CHANGE_BITS) | PORTSC_PP);
+        wr32(xhci.op, OP_PORTSC(n), portsc_neutral(sc) | PORTSC_PP);
         for (volatile uint32_t i = 0; i < 200000u; i++) {
         }
     }
@@ -454,7 +511,7 @@ static bool reset_one_port_once(uint32_t n) {
      * whose link is Polling stays there for ever under it — which is exactly
      * what the board showed. */
     wr32(xhci.op, OP_PORTSC(n),
-         (sc & ~PORTSC_CHANGE_BITS) |
+         portsc_neutral(sc) |
              (xhci_port_major(n) >= 3u && ((sc >> 5) & 0xfu) == 7u ? PORTSC_WPR : PORTSC_PR));
     if (xhci.trace_ports) {
         /* **Read straight back.** "The reset was requested" and "the reset
@@ -471,7 +528,7 @@ static bool reset_one_port_once(uint32_t n) {
         }
         if ((sc & PORTSC_PRC) != 0) {
             /* The reset's change bit alone, so the next read is about now. */
-            wr32(xhci.op, OP_PORTSC(n), (sc & ~PORTSC_CHANGE_BITS) | PORTSC_PRC);
+            wr32(xhci.op, OP_PORTSC(n), portsc_neutral(sc) | PORTSC_PRC);
         }
         /* **Waits for `PED` itself, not for the change bit.** The change bit
          * says the reset finished; it does not say the port came up, and a
@@ -610,6 +667,23 @@ static int await_event(uint32_t want, struct trb *out) {
     return KERR_TIMEDOUT;
 }
 
+/* **What the controller says when a command gets no answer**: its status
+ * (halted, host-system error), whether the command ring is running, and
+ * where the rings are — numbers to reason from, where "timed out" is none. */
+static void report_a_silent_command(uint32_t control) {
+    kprintf("xhci: command type %u got no completion: usbsts %08x crcr %08x, "
+            "ring %llx, events %llx, ac64 %u\n",
+            TRB_TYPE(control), rd32(xhci.op, OP_USBSTS), rd32(xhci.op, OP_CRCR),
+            (unsigned long long)xhci.command_ring_phys,
+            (unsigned long long)xhci.event_ring_phys,
+            rd32(xhci.cap, CAP_HCCPARAMS1) & 1u);
+    kprintf("xhci: erstsz %u erstba %08x erdp %08x, reading index %u cycle %u; "
+            "events[0..3] control %08x %08x %08x %08x\n",
+            rd32(xhci.rt, RT_ERSTSZ), rd32(xhci.rt, RT_ERSTBA), rd32(xhci.rt, RT_ERDP),
+            xhci.event_index, xhci.event_cycle ? 1u : 0u, xhci.event_ring[0].control,
+            xhci.event_ring[1].control, xhci.event_ring[2].control, xhci.event_ring[3].control);
+}
+
 /* Puts one command on the ring and waits for its completion event. */
 static int do_command(uint64_t parameter, uint32_t control, struct trb *event) {
     struct trb *slot_trb = &xhci.command_ring[xhci.command_index];
@@ -627,7 +701,7 @@ static int do_command(uint64_t parameter, uint32_t control, struct trb *event) {
          * The controller follows the ring by reading entries, so the end of
          * the ring has to *say* where the ring continues. */
         struct trb *link = &xhci.command_ring[RING_ENTRIES - 1u];
-        link->parameter = 0; /* filled by the caller's own base below */
+        link->parameter = xhci.command_ring_phys; /* back to the start */
         link->status = 0;
         link->control = TRB_SET_TYPE(TRB_LINK) | (1u << 1) |
                         (xhci.command_cycle ? TRB_CYCLE : 0u);
@@ -637,6 +711,7 @@ static int do_command(uint64_t parameter, uint32_t control, struct trb *event) {
     ring_doorbell(0, 0);
     rc = await_event(TRB_EVENT_COMMAND, event);
     if (rc != KERR_OK) {
+        report_a_silent_command(control);
         return rc;
     }
     if (COMPLETION_CODE(event->status) != COMPLETION_SUCCESS) {
@@ -723,48 +798,70 @@ static int address_the_device(uint32_t port, uint32_t speed, struct enumerated *
                       TRB_SET_TYPE(TRB_ADDRESS_DEVICE) | TRB_SLOT(dev->slot), &event);
 }
 
-/* One control transfer that reads `length` bytes in. Three TRBs: the setup
- * packet, the data, and a status stage — which is the protocol, not an
- * optimisation, and a transfer missing its status stage leaves the endpoint
- * halted for everything after it. */
-static int control_in(struct enumerated *dev, uint8_t request, uint16_t value, uint16_t index,
-                      void *buffer, phys_t buffer_phys, uint16_t length) {
-    struct trb event;
+/* One control-transfer request: the setup packet's fields. */
+struct control_request {
+    uint8_t type; /* bmRequestType: direction, kind, recipient */
+    uint8_t request;
+    uint16_t value;
+    uint16_t index;
+    uint16_t length;
+};
+
+/* Puts one TRB on endpoint 0's ring, wrapping through a Link TRB at the end
+ * (the ring would otherwise run off its page after ~85 transfers). */
+static void ep0_put(struct enumerated *dev, uint64_t parameter, uint32_t status,
+                    uint32_t control) {
     struct trb *ring = dev->ep0_ring;
-    uint32_t at = dev->ep0_index;
-    uint64_t setup;
-    (void)buffer;
-    /* The eight setup bytes, little-endian in one 64-bit field: direction
-     * device-to-host, a standard request to the device. */
-    setup = 0x80ull | ((uint64_t)request << 8) | ((uint64_t)value << 16) |
-            ((uint64_t)index << 32) | ((uint64_t)length << 48);
-    ring[at].parameter = setup;
-    ring[at].status = 8u;
-    ring[at].control = TRB_SET_TYPE(TRB_SETUP) | TRB_IDT | (3u << 16) |
-                       (dev->ep0_cycle ? TRB_CYCLE : 0u);
-    ring[at + 1u].parameter = buffer_phys;
-    ring[at + 1u].status = length;
-    ring[at + 1u].control = TRB_SET_TYPE(TRB_DATA) | (1u << 16) |
-                            (dev->ep0_cycle ? TRB_CYCLE : 0u);
-    ring[at + 2u].parameter = 0;
-    ring[at + 2u].status = 0;
-    ring[at + 2u].control = TRB_SET_TYPE(TRB_STATUS) | TRB_IOC |
-                            (dev->ep0_cycle ? TRB_CYCLE : 0u);
-    dev->ep0_index += 3u;
+    if (dev->ep0_index == RING_ENTRIES - 1u) {
+        ring[dev->ep0_index].parameter = dev->ep0_ring_phys;
+        ring[dev->ep0_index].status = 0;
+        ring[dev->ep0_index].control =
+            TRB_SET_TYPE(TRB_LINK) | (1u << 1) | (dev->ep0_cycle ? TRB_CYCLE : 0u);
+        dev->ep0_index = 0;
+        dev->ep0_cycle = !dev->ep0_cycle;
+    }
+    ring[dev->ep0_index].parameter = parameter;
+    ring[dev->ep0_index].status = status;
+    ring[dev->ep0_index].control = control | (dev->ep0_cycle ? TRB_CYCLE : 0u);
+    dev->ep0_index++;
+}
+
+/* One control transfer: setup, an optional data stage, and the status
+ * stage — the protocol, not an optimisation: a transfer missing its status
+ * stage leaves the endpoint halted for everything after it. The data stage's
+ * direction is the request type's top bit; the status stage goes the other
+ * way, or in when there is no data. */
+static int control(struct enumerated *dev, const struct control_request *r, phys_t buffer_phys) {
+    struct trb event;
+    bool in = (r->type & 0x80u) != 0;
+    uint32_t trt = r->length == 0 ? 0u : (in ? 3u : 2u);
+    uint64_t setup = (uint64_t)r->type | ((uint64_t)r->request << 8) |
+                     ((uint64_t)r->value << 16) | ((uint64_t)r->index << 32) |
+                     ((uint64_t)r->length << 48);
+    ep0_put(dev, setup, 8u, TRB_SET_TYPE(TRB_SETUP) | TRB_IDT | (trt << 16));
+    if (r->length != 0) {
+        ep0_put(dev, buffer_phys, r->length, TRB_SET_TYPE(TRB_DATA) | (in ? (1u << 16) : 0u));
+    }
+    ep0_put(dev, 0, 0, TRB_SET_TYPE(TRB_STATUS) | TRB_IOC | (in && r->length != 0 ? 0u : (1u << 16)));
     __asm__ volatile("fence w, w" : : : "memory");
-    /* Endpoint 0's doorbell is 1: the array is indexed by endpoint context,
-     * and 0 belongs to the command ring. */
+    /* Endpoint 0's doorbell is 1: 0 belongs to the command ring. */
     ring_doorbell(dev->slot, 1u);
     if (await_event(TRB_EVENT_TRANSFER, &event) != KERR_OK) {
         return KERR_TIMEDOUT;
     }
     if (COMPLETION_CODE(event.status) != COMPLETION_SUCCESS) {
-        kprintf("xhci: the control transfer failed, completion code %u\n",
-                COMPLETION_CODE(event.status));
+        kprintf("xhci: control request %02x/%02x failed, completion code %u\n", r->type,
+                r->request, COMPLETION_CODE(event.status));
         return KERR_IO;
     }
     return KERR_OK;
 }
+
+/* The device the first enumeration found, kept for what comes after the
+ * descriptor (a hub's ports), with a DMA page for its transfers. */
+static struct enumerated first;
+static uint8_t *first_buffer;
+static phys_t first_buffer_phys;
 
 int xhci_enumerate_first_port(struct xhci_device *out) {
     struct enumerated dev = {0};
@@ -790,7 +887,10 @@ int xhci_enumerate_first_port(struct xhci_device *out) {
             continue;
         }
         /* The device descriptor: request 6, descriptor type 1, 18 bytes. */
-        rc = control_in(&dev, 6u, 0x0100u, 0, buffer, buffer_phys, 18u);
+        {
+            static const struct control_request device_descriptor = {0x80u, 6u, 0x0100u, 0, 18u};
+            rc = control(&dev, &device_descriptor, buffer_phys);
+        }
         if (rc != KERR_OK) {
             continue;
         }
@@ -801,7 +901,69 @@ int xhci_enumerate_first_port(struct xhci_device *out) {
         out->product = (uint16_t)(buffer[10] | (buffer[11] << 8));
         out->device_class = buffer[4];
         out->max_packet0 = buffer[7];
+        first = dev;
+        first_buffer = buffer;
+        first_buffer_phys = buffer_phys;
         return KERR_OK;
     }
     return KERR_NOENT;
+}
+
+/* ── a hub on a root port ──────────────────────────────────────────────── */
+
+#define USB_CLASS_HUB 0x09u
+#define HUB_PORT_POWER 8u /* the port feature selector */
+
+/* Picks the first configuration: what a hub (or anything) needs before its
+ * class requests mean anything. */
+static int configure_first(void) {
+    static const struct control_request config_descriptor = {0x80u, 6u, 0x0200u, 0, 9u};
+    struct control_request set = {0x00u, 9u, 0, 0, 0};
+    int rc = control(&first, &config_descriptor, first_buffer_phys);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    set.value = first_buffer[5]; /* bConfigurationValue */
+    return control(&first, &set, 0);
+}
+
+/* Powers every port, then waits the hub's own power-on time (its descriptor
+ * says it in 2 ms units) and the 100 ms a connection takes to debounce. */
+static int power_the_ports(uint32_t ports, uint32_t power_good_ms) {
+    for (uint32_t p = 1; p <= ports; p++) {
+        struct control_request on = {0x23u, 3u, HUB_PORT_POWER, (uint16_t)p, 0};
+        int rc = control(&first, &on, 0);
+        if (rc != KERR_OK) {
+            return rc;
+        }
+    }
+    {
+        uint64_t until = timer_ns() + ((uint64_t)power_good_ms + 100u) * 1000000u;
+        while (timer_ns() < until) {
+        }
+    }
+    return KERR_OK;
+}
+
+int xhci_hub_ports(uint32_t *status, uint32_t max) {
+    static const struct control_request hub_descriptor = {0xa0u, 6u, 0x2900u, 0, 9u};
+    uint32_t ports;
+    int rc;
+    if (first.slot == 0) {
+        return KERR_NODEV;
+    }
+    rc = configure_first();
+    rc = rc != KERR_OK ? rc : control(&first, &hub_descriptor, first_buffer_phys);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    ports = first_buffer[2];
+    rc = power_the_ports(ports, 2u * first_buffer[5]);
+    for (uint32_t p = 1; rc == KERR_OK && p <= ports && p <= max; p++) {
+        struct control_request get = {0xa3u, 0u, 0, (uint16_t)p, 4u};
+        rc = control(&first, &get, first_buffer_phys);
+        status[p - 1u] = first_buffer[0] | (first_buffer[1] << 8) | (first_buffer[2] << 16) |
+                         ((uint32_t)first_buffer[3] << 24);
+    }
+    return rc != KERR_OK ? rc : (int)ports;
 }

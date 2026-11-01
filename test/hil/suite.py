@@ -422,26 +422,23 @@ CASES = [
       "chunked: the root had 4 entries and now has 5"],
      220, None, "small"),
 
-    # **The USB controller, as far as it is proved.**
-    #
-    # Deliberately asserts the controller and the port map and *not* an
-    # enumerated device: the port never reaches its enabled state and the
-    # cause is not identified (docs/ROADMAP.md §6 has the register traces).
-    # A case that waited for a device would be a known-failing test, and one
-    # that asserted nothing would not notice the controller breaking — so it
-    # pins exactly what works, which is everything up to the port.
-    #
-    # The version, port count and slot count come from registers the
-    # specification fixes, so a wrong window reads as zeroes rather than as
-    # these numbers. "Running" means the controller accepted its rings and
-    # left its halted state, which is the whole of reset, DCBAA, the command
-    # ring, the event ring and the DMA fences working.
-    ("§6: the USB controller runs and maps its ports",
+    # **USB to the hub's ports.** The root port enables, a slot is
+    # addressed, the device descriptor comes back over a control transfer —
+    # the VL805's own USB 2.0 hub, 2109:3431 — and the hub, configured and
+    # powered, reports its four ports. Two bugs stood in the way: PORTSC
+    # written back with its write-one-to-clear enable bit set (the reset's
+    # own acknowledgement disabled the port), and 64-bit registers written
+    # high half first (the VL805 commits on the high half, so every ring
+    # pointer was 0). The ports are asserted to answer, not to be occupied:
+    # what is plugged in is the operator's.
+    ("§6: USB enumerates the VL805's hub and reads its ports",
      "minikern.usb",
      ["usb: xhci 1.0, 5 ports, 32 device slots",
-      "usb: the controller is running",
       "xhci: ports 1..1 speak USB 2",
-      "xhci: ports 2..5 speak USB 3"],
+      "xhci: port 1: connected, enabled, speed 3, link U0",
+      "usb: port 1 slot 1 speed 3: 2109:3431, class 09",
+      "usb: the hub has 4 ports",
+      "usb:   hub port 4: "],
      200, None),
 
     # **The SoC's own temperature, and /proc.**

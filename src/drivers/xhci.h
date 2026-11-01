@@ -67,4 +67,10 @@ struct xhci_device {
  * KERR_NOENT when no port has an enabled device. */
 int xhci_enumerate_first_port(struct xhci_device *out);
 
+/* When the first device is a hub: configures it, powers its ports, and fills
+ * `status` with each port's wPortStatus | wPortChange << 16 (bit 0
+ * connected, 1 enabled, 9 low speed, 10 high speed). Returns the number of
+ * ports, or a negative error. */
+int xhci_hub_ports(uint32_t *status, uint32_t max);
+
 #endif
