@@ -749,7 +749,7 @@ static void checksum_a_file(void);
  * Reads only, and nothing is written: a benchmark that writes to the
  * operator's disk to find out how fast it is has misunderstood the
  * question. */
-static uint8_t bench_buffer[64u * 1024u] __attribute__((aligned(4096)));
+static uint8_t bench_buffer[1024u * 1024u] __attribute__((aligned(4096))); /* up to 1 MiB a read */
 
 static void run_disk_benchmark(void) {
     size_t len = 0;

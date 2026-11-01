@@ -656,6 +656,44 @@ static int find_class_here(uint32_t class_code, uint32_t mask, struct pci_device
     return KERR_NOENT;
 }
 
+#define PCI_STATUS_CAPS (1u << 20) /* in the command/status dword */
+#define PCI_CAP_EXPRESS 0x10u
+
+/* The PCI Express capability's offset, or 0: a walk of the capability list,
+ * bounded so a looping list cannot hang the probe. */
+static uint32_t express_capability(const struct pci_device *d) {
+    uint32_t at;
+    if ((pci_config_read32(d, 0x04u) & PCI_STATUS_CAPS) == 0) {
+        return 0;
+    }
+    at = pci_config_read32(d, 0x34u) & 0xfcu;
+    for (uint32_t hops = 0; at != 0u && hops < 48u; hops++) {
+        uint32_t head = pci_config_read32(d, at);
+        if ((head & 0xffu) == PCI_CAP_EXPRESS) {
+            return at;
+        }
+        at = (head >> 8) & 0xfcu;
+    }
+    return 0;
+}
+
+int pci_link_status(const struct pci_device *d, struct pci_link *out) {
+    uint32_t cap = express_capability(d), devctl, lnkcap, lnksta;
+    if (cap == 0u) {
+        return KERR_NOENT;
+    }
+    devctl = pci_config_read32(d, cap + 0x08u);
+    lnkcap = pci_config_read32(d, cap + 0x0cu);
+    lnksta = pci_config_read32(d, cap + 0x10u) >> 16;
+    *out = (struct pci_link){.speed = lnksta & 0xfu,
+                             .width = (lnksta >> 4) & 0x3fu,
+                             .max_speed = lnkcap & 0xfu,
+                             .max_width = (lnkcap >> 4) & 0x3fu,
+                             .payload = 128u << ((devctl >> 5) & 7u),
+                             .read_request = 128u << ((devctl >> 12) & 7u)};
+    return KERR_OK;
+}
+
 int pci_find_class(uint32_t class_code, uint32_t mask, struct pci_device *out) {
     if (bridge_count == 0) {
         return KERR_NODEV;

@@ -42,6 +42,7 @@
 #define DSM_DEALLOCATE 4u     /* cdw11 bit 2, "AD" */
 #define ONCS_DSM 4u           /* Identify Controller ONCS bit 2: DSM supported */
 #define IDENTIFY_ONCS 520u    /* offset of ONCS, 16 bits */
+#define IDENTIFY_MDTS 77u     /* max transfer: 2^n minimum pages, 0 = no limit */
 #define IDENTIFY_DLFEAT 33u   /* namespace: what a deallocated block reads as */
 #define DLFEAT_READS_ZERO 1u  /* bits 2:0 = 001b */
 
@@ -113,6 +114,9 @@ static uint64_t nvme_interrupts_missed;
 /* The page size the controller is configured for: CC.MPS of 0 means 4 KiB,
  * which is what this kernel sets. A PRP entry addresses within one of these. */
 #define PAGE_BYTES 4096u
+/* The largest transfer this driver will issue in one command, in bytes: what
+ * one list page can describe, less the partial first page. */
+#define MAX_TRANSFER_BYTES ((PAGE_BYTES / sizeof(uint64_t)) * PAGE_BYTES)
 
 /* A 64-byte submission entry, as the specification lays it out. Only the
  * fields this driver sets are named; the rest must be zero, which is why
@@ -163,6 +167,8 @@ static struct {
     uint32_t doorbell_stride;
     uint64_t blocks;
     uint32_t block_size;
+    uint64_t min_page;      /* CAP.MPSMIN: the unit MDTS counts in */
+    uint64_t max_transfer;  /* bytes one command may move: MDTS, or our PRP list */
     char model[41];
     uint16_t next_command_id;
     bool up;
@@ -658,6 +664,20 @@ static void take_model(const uint8_t *identify_page) {
     nvme.model[end] = '\0';
 }
 
+/* **The drive's own limit on one command** (MDTS), which this driver did
+ * not read: it sent up to what its PRP list describes (2 MiB), and a 1 MiB
+ * read failed on the board's drive. MDTS counts minimum pages as a power of
+ * two; 0 means the drive sets no limit, and the list's 2 MiB remains. */
+static void take_transfer_limit(uint8_t mdts) {
+    uint64_t limit = MAX_TRANSFER_BYTES;
+    if (mdts != 0u && mdts < 32u && (nvme.min_page << mdts) < limit) {
+        limit = nvme.min_page << mdts;
+    }
+    nvme.max_transfer = limit;
+    kprintf("nvme: at most %llu KiB a command (MDTS %u)\n", (unsigned long long)(limit / 1024u),
+            mdts);
+}
+
 /* Whether the drive takes deallocate (TRIM) at all: the controller's
  * optional-command bits. A drive that lacks it answers the command with an
  * error, so it is never sent to one. */
@@ -665,6 +685,7 @@ static void take_capabilities(const uint8_t *identify_page) {
     uint16_t oncs = (uint16_t)(identify_page[IDENTIFY_ONCS] |
                                (identify_page[IDENTIFY_ONCS + 1u] << 8));
     nvme.can_deallocate = (oncs & ONCS_DSM) != 0;
+    take_transfer_limit(identify_page[IDENTIFY_MDTS]);
 }
 
 /* Namespace 1's geometry: how many blocks, and how big each is. The size is
@@ -765,16 +786,13 @@ static uint64_t describe_buffer(uint64_t at, uint64_t bytes) {
     return (uint64_t)mmu_virt_to_phys(prp_list);
 }
 
-/* The largest transfer this driver will issue in one command, in bytes: what
- * one list page can describe, less the partial first page. */
-#define MAX_TRANSFER_BYTES ((PAGE_BYTES / sizeof(uint64_t)) * PAGE_BYTES)
 
 static int transfer(uint8_t opcode, uint64_t lba, uint32_t blocks, void *buf) {
     struct nvme_command cmd = {0};
     uint64_t at = (uint64_t)mmu_virt_to_phys(buf);
     uint64_t bytes = (uint64_t)blocks * nvme.block_size;
-    if (bytes > MAX_TRANSFER_BYTES) {
-        return KERR_INVAL; /* the caller splits it: one list page is the limit */
+    if (bytes > nvme.max_transfer) {
+        return KERR_INVAL; /* the caller splits it: MDTS, or one list page */
     }
     cmd.opcode = opcode;
     cmd.namespace_id = 1;
@@ -789,7 +807,7 @@ static int transfer(uint8_t opcode, uint64_t lba, uint32_t blocks, void *buf) {
 /* Splits a request into transfers this driver can describe, so a caller
  * never has to know the limit. */
 static int transfer_all(uint8_t opcode, uint64_t lba, uint32_t blocks, void *buf) {
-    uint32_t per = (uint32_t)(MAX_TRANSFER_BYTES / nvme.block_size);
+    uint32_t per = (uint32_t)(nvme.max_transfer / nvme.block_size);
     uint8_t *to = buf;
     while (blocks > 0) {
         uint32_t n = blocks < per ? blocks : per;
@@ -883,6 +901,7 @@ static int start_controller(void) {
     uint64_t cap = (uint64_t)read_reg(NVME_CAP) | ((uint64_t)read_reg(NVME_CAP + 4u) << 32);
     int rc;
     nvme.doorbell_stride = 4u << ((cap >> 32) & 0xfu);
+    nvme.min_page = 4096ull << ((cap >> 48) & 0xfu);
     /* **Masked before anything can raise.** The queues below ask for
      * completion interrupts, and the handler for them is installed much
      * later — the interrupt controller does not exist during device
@@ -941,6 +960,17 @@ static int identify_drive(uint8_t *page) {
     return rc;
 }
 
+/* The link the drive trained to: the ceiling any throughput is judged by. */
+static void report_the_link(void) {
+    struct pci_link l;
+    if (pci_link_status(&nvme.pci, &l) != KERR_OK) {
+        kprintf("nvme: no PCI Express capability to read the link from\n");
+        return;
+    }
+    kprintf("nvme: PCIe link gen%u x%u (the drive can do gen%u x%u), payload %u B, read request %u B\n",
+            l.speed, l.width, l.max_speed, l.max_width, l.payload, l.read_request);
+}
+
 int nvme_init(struct blockdev *out) {
     uint8_t *page = identify_buffer;
     int rc = pci_find_class(NVME_PCI_CLASS, NVME_PCI_CLASS_MASK, &nvme.pci);
@@ -955,6 +985,7 @@ int nvme_init(struct blockdev *out) {
      * which separates "the bridge does not forward this address" from "the
      * controller refused to start" — two failures that otherwise look the
      * same from outside. */
+    report_the_link();
     kprintf("nvme: bar0 %016llx, cap %08x%08x\n", (unsigned long long)nvme.pci.bar0,
             (unsigned)nvme.regs[1], (unsigned)nvme.regs[0]);
     rc = start_controller();

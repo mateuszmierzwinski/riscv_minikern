@@ -133,4 +133,17 @@ phys_t pci_ecam_base(void);
 uint32_t pci_functions_seen(void);
 bool pci_ready(void);
 
+/* **What the link trained to**, from the PCI Express capability: the
+ * generation (1 = 2.5, 2 = 5, 3 = 8 GT/s) and lane count it runs at and
+ * could run at, and the payload and read-request sizes set for it. What a
+ * throughput ceiling is checked against before anything is tuned. */
+struct pci_link {
+    uint32_t speed, width;         /* as trained */
+    uint32_t max_speed, max_width; /* as capable */
+    uint32_t payload, read_request; /* bytes */
+};
+
+/* KERR_NOENT when the function has no PCI Express capability. */
+int pci_link_status(const struct pci_device *d, struct pci_link *out);
+
 #endif
