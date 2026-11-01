@@ -96,32 +96,33 @@ git, and the pitfalls are in `CLAUDE.md` §5.
 
 ### Open
 
-- [ ] **A file in an 8 KiB-directory-block filesystem cannot be read** (M) — lookup succeeds through the hash index, then the read returns `EIO` (`cat: /p2999 cannot be read (rc -5, 14 hashed, 0 walked)`); the 4 KiB variant reads the same file. Pre-existing (fails identically at `c4856ea1`). Reproducer: suite case `§3: 8 KiB directory blocks`.
-- [~] **A VFS layer** (L) — The mount table holds XFS and FAT volumes, and each path-based `xfsmount_*` call asks it which kind a path is on (`volumes_resolve_fat` → `fatmount.c`). There is still no filesystem port, no `mount`/`umount` and no overlay. Next step: a port struct in `src/core` once a third filesystem needs one.
-- [ ] **`/proc`, `/sys`, `/dev`** (M) — Nothing synthetic exists beyond a few `/dev` names and `/dev/virtual/kernel_logger`; `/proc/self/maps` or `/sys/kernel/mm/...` give `ENOENT`, which Go tolerates and most software does not. Next step: extend the synthetic-path dispatch in `fdobjects_open_path`.
-- [ ] **`/proc` depth** (M) — `/proc/stat` lacks `ctxt`, `processes` and per-hart `cpuN` (needs idle accounting in `struct hart`); all busy time reports as `system` (a split needs trap entry/exit stamping); `/proc/uptime`, `loadavg`, `cpuinfo` and `/proc/<pid>/` are missing.
-- [ ] **`/proc/ps/` — processes as files for the Go coreutils** (M) — Views `by-pid/<pid>/`, `by-name/<name>/<pid>/`, `by-user/<uid>/<pid>/`, one value per file in bytes (`memory_bytes`, `pid`, `time_alive`, `niceness`, `fds_opened`, later `ppid`/`uid`/`state`/...). Known-path reads can ride the `fdobjects_open_path` dispatch first; directory listing needs the VFS.
-- [ ] **Device nodes** (M) — `/dev/null`, `/dev/zero`, `/dev/urandom` exist as descriptor objects but cannot be opened by path (regular files can). Next step: register them in the synthetic-path dispatch.
-- [ ] **`ioctl`** (S for a stub, M to mean anything).
-- [ ] **`poll`/`ppoll` and `select`/`pselect`** (S) — `epoll` exists; much software uses these instead. Next step: implement them over the existing per-object readiness used by `epoll`.
-- [~] **Path resolution of `.` and `..`** — Any path containing a dot component is refused with `ENOENT` (board-tested) because textual `..` collapsing escapes sandboxes through symlinks. Next step: resolve components against the tree, never by string operation.
-- [~] **`utimensat` `UTIME_OMIT` and `ftruncate` limits** — `UTIME_OMIT` is refused because `stat` reports no timestamps; `ftruncate` works only on write descriptors, not on read descriptors or files unlinked while open. Next step: report timestamps in `stat`, and let descriptors hold the inode.
-- [~] **Realtime files: truncate, holes, unwritten extents** — Refused (`ENOTSUP`): their blocks belong to the realtime bitmap, not a group. Unlink frees them to the bitmap.
-- [~] **XFS log replay coverage** — Only inode and buffer log items replay; extent-free intents, inode-create and quota items abandon replay and leave the filesystem read-only. Next step: add item types as Linux-written dirty logs require them.
-- [~] **XFS writer depth limits** — Node directories are written one node level deep; an extent b-tree fork is written two levels deep (up to ~5,000 extents with 512-byte inodes; a third level is `NOSPC`); a single map edit holds at most 4,096 extents; the attribute fork is not converted to a b-tree; the rt summary file is not maintained. The reader walks every depth.
-- [ ] **The writer's speed** (M) — Each change re-reads the trees it touches from the root, and a b-tree fork is rewritten whole per block appended. Correct, measured by `xfs_repair`, and slow: `xfs_write_test` takes ~4½ minutes on the host. Next step: profile it.
-
-### XFS
-
-- [~] **Inodes whose fork exceeds `XFS_FORK_MAX` (412 bytes)** — `struct xfs_inode` caches the fork and the 1 KiB frame limit forbids a larger cache, so such inodes are refused per inode (never the whole filesystem); in practice rare. The refusal path is untested: it needs a fixture with 1024-byte inodes (unreachable at 512). Next step: build that fixture; lifting the limit means reading forks on demand at ~20 write-path call sites.
+- [~] **Realtime files on the board — needs the operator** — truncate, holes and unwritten extents in realtime files are built and host-judged (`xfs_repair -n -r`, extent sizes 4 and 16 KiB). A board run needs a second block device for the realtime subvolume; the board has the operator's NVMe and one SD card.
+- [~] **XFS log replay coverage — needs the operator** — inode and buffer items replay, committed transactions only (two passes). Extent-free intents, inode-create and quota items still abandon replay and mount read-only. Needed: a Linux-written dirty log to build against (mounting needs root, or a Linux VM).
+- [~] **XFS writer depth limits** — node directories are written one node level deep, and the attribute fork is never converted to a b-tree. The reader walks every depth.
+- [~] **Inodes whose fork exceeds `XFS_FORK_MAX` (412 bytes)** — refused per inode (`bigfork` step, 1024-byte inodes). Lifting it means reading forks on demand at ~20 write-path call sites.
 
 ### Done
+
+- [x] **An extent map of any height** — `xfs_fork.c` loads a tree of up to five levels and stores the least-height tree whose root fits the inode, each level filled evenly; the map holds 65,536 extents (was 4,096, and two levels: ~5,000 with 512-byte inodes). Host: `xfs_write_test` `tallfork` (7,000 extents → root level 2, cut to 900 → 1, to 5 → in the inode) on every image, `xfs_repair -n` clean. Board 2026-11-01: `/w_tall` in `fswrite` — 7,000 extents, root level 2, read back, removed — on the v5, `mkfs.xfs`-defaults and v4 RAM-disk cases.
+- [x] **A full free list refused frees** — a truncate of ~900 scattered extents merged reverse-map blocks onto the group's free list until `xfs_agfl_ensure` answered `NOSPC` for the next free; the list is now drained back to free space (`drain`, raw free and raw unmap, as Linux's `xfs_alloc_fix_freelist`). Host: `xfs_write_test` (defaults image, every step then `tallfork`) failed before, passes after, `xfs_repair -n` clean.
+- [x] **A VFS layer, `mount`/`umount2`, overlay** — `core/vfs.c` port and longest-prefix mount table (FAT, netfs, overlay); `mount("netfs")` under `CAP_SYS_ADMIN`; overlay with copy-up and whiteouts. Board 2026-10-29 (`overlaygo`, FAT `/boot` cases).
+- [x] **`/proc`, `/sys`, `/dev` as filesystems** — `kernel/synthfs.c` (stat, listing, read; writes `EPERM`) over `procfiles.c`: `/proc/self/{maps,status,comm}`, `stat`, `uptime`, `loadavg`, `cpuinfo`, `mounts`, `version`, THP and CPU files under `/sys`. Board `procgo` (re-run 2026-11-01).
+- [x] **`/proc` depth** — per-hart `cpuN`, `ctxt`, `btime`, `processes`, `procs_running`; user/system split from trap stamps; `/proc/<pid>/`. Board `procgo`, `cpugo`.
+- [x] **`/proc/ps/`** — `by-pid/`, `by-user/`, `by-name/`, one value per file. Board `procgo`, `namego`.
+- [x] **Device nodes by path** — `/dev/null`, `zero`, `urandom`, `random`, `console`, `tty`; stat as character devices, list in `/dev`. Board `procgo`.
+- [x] **`ioctl` and raw terminal mode** — `FIOCLEX`/`FIONCLEX`/`FIONBIO`/`FIONREAD`, termios with canonical and raw modes (`VMIN`/`VTIME`); an unhonoured bit is refused whole. Board `ioctlgo` (re-run 2026-11-01), `rawgo`.
+- [x] **`ppoll` and `pselect6`** — over each object's readiness, sigmask kept until a handler runs. Board `pollgo` (re-run 2026-11-01).
+- [x] **`.` and `..` resolved against the tree** — `core/pathres.c`, one component at a time, links expanded first, `ELOOP` at 40. Host `pathres_test`; board `dotgo`.
+- [x] **Timestamps, `UTIME_OMIT`, `ftruncate`, unlinked-while-open files** — `stat`/`statx` report times (bigtime honoured at all 30 sites), a removed file a writer holds is renamed aside until the last close. Board `timesgo`, `unlinkgo`.
+- [x] **The writer's speed** — `xfs_write_test` ~4½ min → 48 s (slice-by-8 CRC32C; gprof).
+- [x] **`chmod` over netfs** — `OP_CHMOD` in the protocol, netfsd sets permission bits through `os.Root` and refuses setuid/setgid/sticky (`EPERM`, not dropped); the kernel's `vfs_ops.chmod`. Host: `service_test`, `fsadapter_test` (escape refused); board `netfsgo` 2026-11-01: 0600 and 0644 round-trip through `stat`, setuid refused with `EPERM`.
 
 - [x] **Directory and file syscalls** — `getdents64`, `fstat`, `newfstatat`, `statx` (honest `stx_mask`), `statfs`, `faccessat`, `mkdirat`, `unlinkat`, `renameat2`, `linkat`, `symlinkat`, `readlinkat`, `fchmodat`, `fchownat`, `utimensat`, `lseek`, `fsync`/`fdatasync`, `openat` create/truncate; board-proven.
 - [x] **`truncate`/`ftruncate`, `umask`, `chdir`/`getcwd`** — free-block accounting asserted on the board; `umask` read by create (`0022`→`0644`); relative paths resolve in `copy_in_path`; all inherited across fork/exec.
 - [x] **B-tree format forks** — keyed descent in `xfs_bmbt.c` behind `xfs_bmap`, every disk number checked; board: 3,000- and 40,000-entry directories list completely, payload checksums exact.
 - [x] **Directory hash index** — `xfs_dirhash.c` name hash, leaf binary search and node descent with collision runs; board requires `0 walked` lookups.
 - [x] **B-tree board case** — the expectation was wrong, not the reader; the case asserts `cat: hash index answered`.
+- [x] **8 KiB directory blocks** — passes on the board (2026-10-31: `/p2999`, 12 hashed, 0 walked, checksum exact). Not a reader bug: the reader at `9edc86b7` reads the same `mkfs.xfs -n size=8192` image on the host (3,000 files); the board failures predate the single-address kernel.
 - [x] **Multi-block directories** — leaf/node directories with several data blocks are read and written (dirblocks).
 - [x] **Dirty filesystem checked, mounted read-only** — `xfs_check` validates group headers, b-tree roots, counts and root inode, writing nothing; board-proven with a log this kernel left dirty.
 - [x] **Log replay** — all-or-nothing replay of inode and buffer items in the block cache, host-byte-order inode conversion; board: dirty log replayed, pre-crash file intact, writable, with read-only control.
@@ -210,6 +211,8 @@ git, and the pitfalls are in `CLAUDE.md` §5.
 - [ ] **W^X for user mappings** (S) — `mprotect` is honoured, but nothing refuses a mapping that is both writable and executable.
 
 ### Done
+- [x] **Permission checks on every mutating path** — `kernel/perm.c`: write-open, create (`O_CREAT`/`O_EXCL`), mkdir, unlink, rename, link, symlink, chmod, chown, utimensat, truncate, execve; every `*at` call resolves its `dirfd`. Board `permgo` (re-run 2026-11-01): as uid 1000 every write to a root-owned file is refused.
+- [x] **The kernel's direct map is randomised** — a random 1 GiB slot per boot, seeded from `/chosen` `kaslr-seed`/`rng-seed` and the timer (`minikern.nokaslr` is the control). The kernel image itself stays at its link address: tried as a PIE and reverted, by the operator's decision (2026-10-29).
 - [x] **Capabilities and `seccomp`** — 41 capabilities with full sets, `capget`/`capset` v3, and seccomp strict plus classic-BPF filter mode checked before the syscall table. There are no file capabilities. Board: `minikern.privsep` exits 0.
 - [x] **ASLR** — Stack, trampoline, `mmap` floor and heap gap are each randomised by ~12 bits, with the trap path feeding the entropy pool. Proved on the board across two runs. `minikern.noaslr` turns it off.
 - [x] **CVE regression suite (Rule 25)** — Host parser cases for the device tree, XFS, partitions and ELF (`//:cve`), plus `minikern.hostile=1` on the board (accepted-bitmask 0). It found and fixed three real defects.
@@ -219,10 +222,12 @@ git, and the pitfalls are in `CLAUDE.md` §5.
 ## 7. Boot and delivery
 
 ### Open
-- [~] **Local boot from SD or NVMe** (M) — U-Boot cannot read XFS, so the kernel sits on a FAT partition (or a raw one) beside the `ROOT` XFS; booted end to end from a FAT partition on the board, recipe in `docs/BOOTING.md`. Left: a saved `bootcmd` so it boots unattended, and the raw-partition variant.
-- [ ] **Own netboot** (M) — The ARM project's authenticated MKNB protocol (Ed25519-verified offers) came over as code, but nothing is wired to it.
+
+### Done
+- [x] **Local boot from SD** — the board boots unattended from the card's FAT partition (saved `bootcmd` + boot menu default, `docs/BOOTING.md`); root by `ROOT` label, or netfs. A FAT-only card no longer takes the FAT as its root. Board 2026-10-29: power-on to QuokkaOS serving `statsd` in 55 s; netboot 30/30 clean after the YT8531 RGMII-delay fix. The raw-partition variant is dropped (operator).
+- [x] **Own netboot** — `minikern.netboot[=<ip>]` fetches the root image over MKNB (`kernel/netboot.c`, up to 64 MiB, `minikern.rootfs.sha256=` and `minikern.netboot.key=` pin an Ed25519-signed server) into the RAM-disk root; server `src/go/tools/mknbserver`.
+- [x] **Describe an unknown board** — `minikern.mem=`, Linux `earlycon=uart8250,…`, `minikern.timebase=` replace the tree's values (`core/boardspec.c`). Host `boardspec_test`; board: all three applied.
 - [x] **Kernel in the top half** (M) — The kernel runs only high (linked at `0xffffffc000200000`), and since step C a process's table carries only the kernel's top-half root entries: the identity map of RAM is not reachable from user tables at all. Every physical-address-as-pointer use goes through `mmu_phys_to_virt` (page tables, frames, kernel stacks, the loader, swap, disk buffers); `mmu: N identity addresses converted after the switch` counts any that are missed (0 on every board case). `minikern.lowmap` restores the old sharing as the control. `copy_in`/`copy_out` take user addresses and were rightly left alone — converting them was the likely cause of the old attempt's `fork` hang.
-- [ ] **Describe an unknown board** (S) — A device-tree overlay or a command-line way to describe a board this kernel hasn't met.
 
 ---
 

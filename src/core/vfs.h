@@ -49,6 +49,9 @@ struct vfs_ops {
     /* A symbolic link's target (no terminator, cut to max). NULL: the
      * filesystem has no links, and readlink answers EINVAL. */
     int (*readlink)(void *self, const char *in, char *out, uint32_t max, uint32_t *got);
+    /* Sets permission bits (07777 at most). NULL: the filesystem serves its
+     * own modes, and chmod answers EPERM. */
+    int (*chmod)(void *self, const char *in, uint32_t mode);
 };
 
 struct vfs_mount {

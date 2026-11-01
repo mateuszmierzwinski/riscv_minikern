@@ -77,5 +77,8 @@ int netfs_mkdir(struct netfs *nf, const char *path);
 int netfs_unlink(struct netfs *nf, const char *path);
 int netfs_truncate(struct netfs *nf, const char *path, uint64_t size);
 int netfs_rename(struct netfs *nf, const char *from, const char *to);
+/* Permission bits only: the server refuses setuid, setgid and sticky with
+ * KERR_PERM rather than storing what it was not asked to keep. */
+int netfs_chmod(struct netfs *nf, const char *path, uint32_t mode);
 
 #endif

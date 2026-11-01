@@ -209,6 +209,9 @@ CASES = [
       # split nothing, because the conversion's two leaves hold about a
       # thousand hashes between them.
       "1 to block, 1 to leaf, 1 to node, 8 data block(s), 5 leaf split(s)",
+      # A file's extent map grown past a root and one level of leaves —
+      # the shape asserted, so a writer that kept two levels fails.
+      "/w_tall has 7000 extents, root level 2 (rc 0)",
       # The allocator left a full group — and its control, in this same
       # run, shows the write being refused without that search.
       "crossed a group after",

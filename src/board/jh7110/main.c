@@ -2842,6 +2842,64 @@ static int rename_moves_a_name(void) {
     return KERR_OK;
 }
 
+/* **A file whose extent map needs a level of nodes.** Every other block of
+ * `/w_tall` is written, so each block is an extent of its own wherever the
+ * allocator puts it; 7,000 are more than a 512-byte inode's root and one
+ * level of leaves can name (20 x 251 on v5, 25 x 254 on v4). The shape is
+ * asserted, not assumed: a writer that quietly kept two levels, or refused,
+ * fails here. */
+#define TALL_EXTENTS 7000u
+
+/* Block `i` of `/w_tall`: bytes that differ per block and per position. */
+static void tall_fill(uint8_t *block, uint32_t i) {
+    for (uint32_t j = 0; j < 4096u; j++) {
+        block[j] = (uint8_t)(i * 7u + j);
+    }
+}
+
+/* The 4 KiB of `/w_tall` at `off` hold `want` (zeroes when NULL). */
+static int tall_holds(uint64_t off, const uint8_t *want) {
+    static uint8_t got[4096];
+    int rc = xfsmount_read_at("w_tall", off, got, sizeof got);
+    for (uint32_t j = 0; rc == KERR_OK && j < sizeof got; j++) {
+        rc = got[j] == (want != NULL ? want[j] : 0u) ? KERR_OK : KERR_IO;
+    }
+    return rc;
+}
+
+/* Block `i` reads back as written, and the hole after it — every block but
+ * the last has one — as zeroes. */
+static int tall_reads_back(uint32_t i) {
+    static uint8_t want[4096];
+    int rc;
+    tall_fill(want, i);
+    rc = tall_holds((uint64_t)i * 8192u, want);
+    if (rc == KERR_OK && i + 1u < TALL_EXTENTS) {
+        rc = tall_holds((uint64_t)i * 8192u + 4096u, NULL);
+    }
+    if (rc != KERR_OK) {
+        kprintf("fswrite:   /w_tall block %u read back wrong (rc %d)\n", i, rc);
+    }
+    return rc;
+}
+
+static int tall_file_round_trips(void) {
+    static uint8_t block[4096];
+    uint32_t extents = 0, level = 0;
+    int rc = xfsmount_create("w_tall", 0100644);
+    for (uint32_t i = 0; rc == KERR_OK && i < TALL_EXTENTS; i++) {
+        tall_fill(block, i);
+        rc = xfsmount_write("w_tall", (uint64_t)i * 8192u, block, sizeof block);
+    }
+    rc = rc != KERR_OK ? rc : xfsmount_fork_shape("w_tall", &extents, &level);
+    kprintf("fswrite:   /w_tall has %u extents, root level %u (rc %d)\n", extents, level, rc);
+    rc = rc != KERR_OK ? rc : (extents == TALL_EXTENTS && level == 2u ? KERR_OK : KERR_IO);
+    rc = rc != KERR_OK ? rc : tall_reads_back(0);
+    rc = rc != KERR_OK ? rc : tall_reads_back(TALL_EXTENTS / 2u);
+    rc = rc != KERR_OK ? rc : tall_reads_back(TALL_EXTENTS - 1u);
+    return rc != KERR_OK ? rc : xfsmount_unlink("w_tall");
+}
+
 /* A mode written and read back, which is the whole of chmod working.
  *
  * The permission bits only: the read compares against `0777` of the mode,
@@ -3742,6 +3800,7 @@ static void run_write_selftest(void) {
     ok = ok && wrote_and_checked("chmod cannot change the file type", chmod_keeps_the_type());
     ok = ok && wrote_and_checked("an owner is set and read back", chown_round_trip());
     ok = ok && wrote_and_checked("a rename moves a name", rename_moves_a_name());
+    ok = ok && wrote_and_checked("a map grows a level of nodes", tall_file_round_trips());
     ok = ok && wrote_and_checked("allocate past one group", fill_past_one_group());
     ok = ok && wrote_and_checked("one group alone must refuse", one_group_refuses());
     /* Last, because it leaves the filesystem read-only: anything after it

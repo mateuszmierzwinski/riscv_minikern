@@ -402,6 +402,10 @@ static int give_back(struct xfs *fs, uint32_t agno, uint32_t start, uint32_t cou
     return rc != KERR_OK ? rc : agf_after(fs, agno, (int32_t)count);
 }
 
+int xfs_free_raw(struct xfs *fs, uint32_t agno, uint32_t start, uint32_t count) {
+    return count == 0 ? KERR_INVAL : give_back(fs, agno, start, count);
+}
+
 int xfs_free_owned(struct xfs *fs, uint64_t fsb, uint32_t count, uint64_t owner,
                    uint64_t offset) {
     uint64_t mask = ((uint64_t)1 << fs->agblklog) - 1u;

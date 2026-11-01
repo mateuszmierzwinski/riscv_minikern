@@ -10,29 +10,41 @@
  *
  * It does so by **loading the whole map, editing it as an array, and
  * storing it back in whichever form fits**: in the inode while it fits
- * there, and as a two-level tree when it does not — a root in the inode
- * naming leaves on disk, filled evenly so every leaf is at least half full,
- * as `xfs_repair` requires of a tree's non-root blocks. The leaves a map
- * had are reused for the map it becomes, so a file that grows a block at a
- * time does not allocate and free tree blocks with every block; only a
- * change in how many leaves are needed takes or gives one back, and each
- * goes in and out of the reverse map as the file's tree block.
+ * there, and otherwise as a tree of the least height whose root fits the
+ * inode — leaves of records, then as many levels of nodes as it takes —
+ * each level filled evenly so every non-root block is at least half full,
+ * as `xfs_repair` requires. The blocks a tree had are reused for the tree
+ * it becomes, so a file that grows a block at a time does not allocate and
+ * free tree blocks with every block; only a change in how many are needed
+ * takes or gives one back, and each goes in and out of the reverse map as
+ * the file's tree block.
  *
- * A map larger than `XFS_FORK_MAP_MAX` extents, or one needing more leaves
- * than the inode's root can name, is refused with KERR_NOSPC — a
- * three-level tree is not written. Read, any depth is (xfs_bmbt.c). */
+ * A map larger than `XFS_FORK_MAP_MAX` extents, or a tree of more than
+ * `XFS_FORK_BLOCKS_MAX` blocks or `XFS_FORK_LEVELS_MAX` levels, is refused
+ * with KERR_NOSPC. */
 #include "core/bcache.h"
 #include "core/errno.h"
 #include "core/xfs/xfs_internal.h"
 
 #define NULL_FSB 0xffffffffffffffffull
 
-/* The map being edited, and the leaves it was loaded from. Static: one
- * core is inside the filesystem at a time, nothing here sleeps, and a map
- * of this size is far too large for a kernel stack (CLAUDE.md §10). */
+/* The map being edited, the tree blocks it was loaded from (any level, in
+ * no particular order: they are a pool to reuse), and per level of the tree
+ * being stored, each block's first file offset. Static: one core is inside
+ * the filesystem at a time, nothing here sleeps, and a map of this size is
+ * far too large for a kernel stack (CLAUDE.md §10). */
 static struct xfs_extent map[XFS_FORK_MAP_MAX];
-static uint64_t leaves[XFS_FORK_LEAVES_MAX];
-static uint32_t leaf_count;
+static uint64_t blocks[XFS_FORK_BLOCKS_MAX];
+static uint64_t keys[XFS_FORK_BLOCKS_MAX];
+static uint32_t block_count;
+
+/* How many blocks each level of a tree has, leaves first, and how many
+ * levels below the root. */
+struct tree_shape {
+    uint32_t width[XFS_FORK_LEVELS_MAX];
+    uint32_t levels;
+    uint32_t total;
+};
 
 uint32_t xfs_bmbt_hdr(const struct xfs *fs) {
     return fs->v5 ? XFS_BMBT_BLOCK_BYTES : XFS_BMBT_V4_BLOCK_BYTES;
@@ -40,6 +52,11 @@ uint32_t xfs_bmbt_hdr(const struct xfs *fs) {
 
 static uint32_t leaf_capacity(const struct xfs *fs) {
     return (fs->blocksize - xfs_bmbt_hdr(fs)) / XFS_EXTENT_BYTES;
+}
+
+/* Key/pointer pairs one node block holds; also where its pointers start. */
+static uint32_t node_capacity(const struct xfs *fs) {
+    return (fs->blocksize - xfs_bmbt_hdr(fs)) / (XFS_BMBT_KEY_BYTES + XFS_BMBT_PTR_BYTES);
 }
 
 /* How many key/pointer pairs the inode's root can hold in `bytes`. */
@@ -52,39 +69,63 @@ static uint32_t root_capacity(uint32_t bytes) {
 /* ── loading ──────────────────────────────────────────────────────────── */
 
 /* Appends one leaf's records to the map. */
-static int load_leaf(struct xfs *fs, uint64_t fsb, uint32_t *count) {
+static int load_records(struct xfs *fs, const uint8_t *data, uint32_t n, uint32_t *count) {
+    if (n > leaf_capacity(fs) || *count + n > XFS_FORK_MAP_MAX) {
+        return KERR_NOSPC;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        xfs_extent_unpack(data + xfs_bmbt_hdr(fs) + i * XFS_EXTENT_BYTES, &map[(*count)++]);
+    }
+    return KERR_OK;
+}
+
+static int load_block(struct xfs *fs, uint64_t fsb, uint32_t level, uint32_t *count);
+
+/* Descends into each child a node names, in order. */
+static int load_children(struct xfs *fs, const uint8_t *data, uint32_t n, uint32_t level,
+                         uint32_t *count) {
+    const uint8_t *ptrs = data + xfs_bmbt_hdr(fs) + node_capacity(fs) * XFS_BMBT_KEY_BYTES;
+    int rc = n > 0 && n <= node_capacity(fs) ? KERR_OK : KERR_IO;
+    for (uint32_t i = 0; rc == KERR_OK && i < n; i++) {
+        rc = load_block(fs, xfs_be64(ptrs + i * XFS_BMBT_PTR_BYTES), level - 1u, count);
+    }
+    return rc;
+}
+
+/* Loads the subtree at `fsb`, which must be a block of `level`: its records
+ * when a leaf, its children's when a node. The block is held while its
+ * children load, so the cache holds one block per level at most. */
+static int load_block(struct xfs *fs, uint64_t fsb, uint32_t level, uint32_t *count) {
     struct bbuf *b;
     uint32_t n;
-    int rc = xfs_fsb_valid(fs, fsb, 1) ? bcache_get(fs->cache, xfs_fsb_to_block(fs, fsb), &b)
-                                       : KERR_IO;
+    int rc = xfs_fsb_valid(fs, fsb, 1) && block_count < XFS_FORK_BLOCKS_MAX
+                 ? bcache_get(fs->cache, xfs_fsb_to_block(fs, fsb), &b)
+                 : KERR_NOSPC;
     if (rc != KERR_OK) {
         return rc;
     }
+    blocks[block_count++] = fsb;
     n = xfs_be16(b->data + 6u);
-    rc = xfs_be32(b->data) != xfs_magic_for(fs, XFS_BLK_BMBT) || xfs_be16(b->data + 4u) != 0 ||
-                 n > leaf_capacity(fs) || *count + n > XFS_FORK_MAP_MAX
-             ? KERR_NOSPC
-             : KERR_OK;
-    for (uint32_t i = 0; rc == KERR_OK && i < n; i++) {
-        xfs_extent_unpack(b->data + xfs_bmbt_hdr(fs) + i * XFS_EXTENT_BYTES, &map[(*count)++]);
+    if (xfs_be32(b->data) != xfs_magic_for(fs, XFS_BLK_BMBT) || xfs_be16(b->data + 4u) != level) {
+        rc = KERR_IO;
+    } else if (level == 0) {
+        rc = load_records(fs, b->data, n, count);
+    } else {
+        rc = load_children(fs, b->data, n, level, count);
     }
     bcache_put(fs->cache, b);
     return rc;
 }
 
-/* A two-level tree's leaves, in order, from the root in the inode. Taller
- * trees — written by Linux for maps of thousands of extents — are refused
- * for writing; they are read as any other. */
+/* The tree's records in order, from the root in the inode down. */
 static int load_tree(struct xfs *fs, const uint8_t *fork, uint32_t bytes, uint32_t *count) {
-    uint32_t n = xfs_be16(fork + 2u), mx = root_capacity(bytes);
-    int rc = xfs_be16(fork) == 1u && n > 0 && n <= mx && n <= XFS_FORK_LEAVES_MAX ? KERR_OK
-                                                                                  : KERR_NOSPC;
-    leaf_count = 0;
+    uint32_t level = xfs_be16(fork), n = xfs_be16(fork + 2u), mx = root_capacity(bytes);
+    int rc = level >= 1u && level <= XFS_FORK_LEVELS_MAX && n > 0 && n <= mx ? KERR_OK
+                                                                           : KERR_NOSPC;
     for (uint32_t i = 0; rc == KERR_OK && i < n; i++) {
         uint64_t fsb = xfs_be64(fork + XFS_BMDR_HDR_BYTES + mx * XFS_BMBT_KEY_BYTES +
                                 i * XFS_BMBT_PTR_BYTES);
-        leaves[leaf_count++] = fsb;
-        rc = load_leaf(fs, fsb, count);
+        rc = load_block(fs, fsb, level - 1u, count);
     }
     return rc;
 }
@@ -93,7 +134,7 @@ int xfs_fork_load(struct xfs *fs, const uint8_t *di, struct xfs_fork_map *out) {
     const uint8_t *fork = di + fs->dinode_size;
     uint32_t bytes = xfs_fork_bytes(fs, di), n = 0;
     int rc = KERR_OK;
-    leaf_count = 0;
+    block_count = 0;
     if (di[XFS_DI_FORMAT] == XFS_DINODE_FMT_EXTENTS) {
         n = (uint32_t)xfs_dinode_data_extents(fs, di);
         rc = n * XFS_EXTENT_BYTES <= bytes && n <= XFS_FORK_MAP_MAX ? KERR_OK : KERR_IO;
@@ -213,106 +254,192 @@ static void store_extents(struct xfs *fs, uint8_t *di, const struct xfs_fork_map
     di[XFS_DI_FORMAT] = XFS_DINODE_FMT_EXTENTS;
 }
 
-/* Writes records [first, first+n) into the leaf at `fsb`, between its
- * siblings. */
-static int write_leaf(struct xfs *fs, uint64_t ino, uint64_t fsb, const struct xfs_fork_map *m,
-                      uint32_t first, uint32_t n, uint64_t left, uint64_t right) {
-    struct bbuf *b;
-    int rc = bcache_get(fs->cache, xfs_fsb_to_block(fs, fsb), &b);
-    if (rc != KERR_OK) {
-        return rc;
+/* The tree of least height for `count` records under a root of `root_cap`
+ * pairs: leaves, then levels of nodes until one level fits the root. */
+static int plan_tree(const struct xfs *fs, uint32_t count, uint32_t root_cap,
+                     struct tree_shape *t) {
+    uint32_t w = (count + leaf_capacity(fs) - 1u) / leaf_capacity(fs);
+    *t = (struct tree_shape){.levels = 0};
+    while (t->levels < XFS_FORK_LEVELS_MAX) {
+        t->width[t->levels++] = w;
+        t->total += w;
+        if (w <= root_cap) {
+            return t->total <= XFS_FORK_BLOCKS_MAX ? KERR_OK : KERR_NOSPC;
+        }
+        w = (w + node_capacity(fs) - 1u) / node_capacity(fs);
     }
-    for (uint32_t i = 0; i < fs->blocksize; i++) {
-        b->data[i] = 0;
-    }
-    xfs_put_be32(b->data, xfs_magic_for(fs, XFS_BLK_BMBT));
-    xfs_put_be16(b->data + 6u, (uint16_t)n);
-    xfs_put_be64(b->data + 8u, left);
-    xfs_put_be64(b->data + 16u, right);
-    if (fs->v5) {
-        xfs_put_be64(b->data + 24u, xfs_fsb_to_daddr(fs, fsb));
-        xfs_copy_bytes(b->data + XFS_BMBT_UUID_OFF, fs->uuid, 16u);
-        xfs_put_be64(b->data + 56u, ino);
-    }
-    for (uint32_t i = 0; i < n; i++) {
-        xfs_extent_pack(b->data + xfs_bmbt_hdr(fs) + i * XFS_EXTENT_BYTES, &m->e[first + i]);
-    }
-    xfs_reseal(fs, b->data, fs->blocksize, XFS_BMBT_CRC_OFF);
-    bcache_dirty(b);
-    bcache_put(fs->cache, b);
-    return KERR_OK;
+    return KERR_NOSPC;
 }
 
-/* Makes the tree's leaves number `want`: takes new ones near the inode and
+/* Makes the tree's blocks number `want`: takes new ones near the inode and
  * gives back ones no longer needed, each through the reverse map as this
  * inode's tree block. *delta is how many the inode gained (or lost). */
-static int fit_leaves(struct xfs *fs, uint64_t ino, uint32_t want, int64_t *delta) {
+static int fit_blocks(struct xfs *fs, uint64_t ino, uint32_t want, int64_t *delta) {
     int rc = KERR_OK;
     *delta = 0;
-    while (rc == KERR_OK && leaf_count < want) {
+    while (rc == KERR_OK && block_count < want) {
         uint32_t agno = xfs_fsb_ag(fs, ino >> fs->inopblog), got = 0;
         rc = xfs_alloc_somewhere(fs, &agno, 1u, 0, &got);
         if (rc == KERR_OK) {
-            leaves[leaf_count] = ((uint64_t)agno << fs->agblklog) | got;
-            rc = xfs_rmap_map(fs, leaves[leaf_count], 1u, ino, XFS_RMAP_OFF_BMBT);
-            leaf_count++;
+            blocks[block_count] = ((uint64_t)agno << fs->agblklog) | got;
+            rc = xfs_rmap_map(fs, blocks[block_count], 1u, ino, XFS_RMAP_OFF_BMBT);
+            block_count++;
             (*delta)++;
         }
     }
-    while (rc == KERR_OK && leaf_count > want) {
-        leaf_count--;
-        rc = xfs_free_owned(fs, leaves[leaf_count], 1u, ino, XFS_RMAP_OFF_BMBT);
+    while (rc == KERR_OK && block_count > want) {
+        block_count--;
+        rc = xfs_free_owned(fs, blocks[block_count], 1u, ino, XFS_RMAP_OFF_BMBT);
         (*delta)--;
     }
     return rc;
 }
 
-/* Writes the map as a two-level tree: leaves filled evenly, and the root
- * in the inode naming them by their first record's file offset. */
-static int store_tree(struct xfs *fs, uint64_t ino, uint8_t *di, const struct xfs_fork_map *m,
-                      uint32_t want) {
-    uint8_t *fork = di + fs->dinode_size;
-    uint32_t mx = root_capacity(xfs_fork_bytes(fs, di)), at = 0;
+/* One block of the tree being written: where it is, its level, how many
+ * entries it holds, and its siblings on that level. */
+struct tree_block {
+    uint64_t fsb, left, right;
+    uint32_t level, n;
+};
+
+/* Takes the block, zeroed, with its header written; the caller fills the
+ * entries and hands it to finish_block. */
+static int start_block(struct xfs *fs, uint64_t ino, const struct tree_block *tb,
+                       struct bbuf **out) {
+    int rc = bcache_get(fs->cache, xfs_fsb_to_block(fs, tb->fsb), out);
+    uint8_t *d;
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    d = (*out)->data;
+    for (uint32_t i = 0; i < fs->blocksize; i++) {
+        d[i] = 0;
+    }
+    xfs_put_be32(d, xfs_magic_for(fs, XFS_BLK_BMBT));
+    xfs_put_be16(d + 4u, (uint16_t)tb->level);
+    xfs_put_be16(d + 6u, (uint16_t)tb->n);
+    xfs_put_be64(d + 8u, tb->left);
+    xfs_put_be64(d + 16u, tb->right);
+    if (fs->v5) {
+        xfs_put_be64(d + 24u, xfs_fsb_to_daddr(fs, tb->fsb));
+        xfs_copy_bytes(d + XFS_BMBT_UUID_OFF, fs->uuid, 16u);
+        xfs_put_be64(d + 56u, ino);
+    }
+    return KERR_OK;
+}
+
+static void finish_block(struct xfs *fs, struct bbuf *b) {
+    xfs_reseal(fs, b->data, fs->blocksize, XFS_BMBT_CRC_OFF);
+    bcache_dirty(b);
+    bcache_put(fs->cache, b);
+}
+
+/* A leaf holding records [first, first+n). */
+static int write_leaf(struct xfs *fs, uint64_t ino, const struct tree_block *tb,
+                      const struct xfs_fork_map *m, uint32_t first) {
+    struct bbuf *b;
+    int rc = start_block(fs, ino, tb, &b);
+    for (uint32_t i = 0; rc == KERR_OK && i < tb->n; i++) {
+        xfs_extent_pack(b->data + xfs_bmbt_hdr(fs) + i * XFS_EXTENT_BYTES, &m->e[first + i]);
+    }
+    if (rc == KERR_OK) {
+        finish_block(fs, b);
+    }
+    return rc;
+}
+
+/* A node naming children [first, first+n) of the level below, whose blocks
+ * start at blocks[child_base] and whose first offsets are keys[]. */
+static int write_node(struct xfs *fs, uint64_t ino, const struct tree_block *tb,
+                      uint32_t child_base, uint32_t first) {
+    uint32_t hdr = xfs_bmbt_hdr(fs), ptrs = hdr + node_capacity(fs) * XFS_BMBT_KEY_BYTES;
+    struct bbuf *b;
+    int rc = start_block(fs, ino, tb, &b);
+    for (uint32_t i = 0; rc == KERR_OK && i < tb->n; i++) {
+        xfs_put_be64(b->data + hdr + i * XFS_BMBT_KEY_BYTES, keys[first + i]);
+        xfs_put_be64(b->data + ptrs + i * XFS_BMBT_PTR_BYTES, blocks[child_base + first + i]);
+    }
+    if (rc == KERR_OK) {
+        finish_block(fs, b);
+    }
+    return rc;
+}
+
+/* Writes level `l` of the tree, whose blocks are blocks[base...]: the
+ * entries below spread evenly over them, and keys[j] left as block j's
+ * first file offset for the level above. keys[] is rewritten in place,
+ * which is safe because block j's first child is never before child j. */
+static int store_level(struct xfs *fs, uint64_t ino, const struct xfs_fork_map *m,
+                       const struct tree_shape *t, uint32_t l, uint32_t base) {
+    uint32_t width = t->width[l], below = l == 0 ? m->count : t->width[l - 1u], at = 0;
     int rc = KERR_OK;
+    for (uint32_t j = 0; rc == KERR_OK && j < width; j++) {
+        struct tree_block tb = {.fsb = blocks[base + j], .level = l,
+                                .n = (below - at) / (width - j),
+                                .left = j > 0 ? blocks[base + j - 1u] : NULL_FSB,
+                                .right = j + 1u < width ? blocks[base + j + 1u] : NULL_FSB};
+        uint64_t first = l == 0 ? m->e[at].startoff : keys[at];
+        rc = l == 0 ? write_leaf(fs, ino, &tb, m, at)
+                    : write_node(fs, ino, &tb, base - below, at);
+        keys[j] = first;
+        at += tb.n;
+    }
+    return rc;
+}
+
+/* The root in the inode, naming the top level's blocks (blocks[top...]). */
+static void store_root(struct xfs *fs, uint8_t *di, const struct tree_shape *t, uint32_t top) {
+    uint8_t *fork = di + fs->dinode_size;
+    uint32_t mx = root_capacity(xfs_fork_bytes(fs, di)), n = t->width[t->levels - 1u];
     for (uint32_t i = 0; i < xfs_fork_bytes(fs, di); i++) {
         fork[i] = 0;
     }
-    xfs_put_be16(fork, 1u);
-    xfs_put_be16(fork + 2u, (uint16_t)want);
-    for (uint32_t l = 0; rc == KERR_OK && l < want; l++) {
-        uint32_t n = (m->count - at) / (want - l);
-        uint64_t left = l > 0 ? leaves[l - 1u] : NULL_FSB;
-        uint64_t right = l + 1u < want ? leaves[l + 1u] : NULL_FSB;
-        xfs_put_be64(fork + XFS_BMDR_HDR_BYTES + l * XFS_BMBT_KEY_BYTES, m->e[at].startoff);
-        xfs_put_be64(fork + XFS_BMDR_HDR_BYTES + mx * XFS_BMBT_KEY_BYTES +
-                         l * XFS_BMBT_PTR_BYTES, leaves[l]);
-        rc = write_leaf(fs, ino, leaves[l], m, at, n, left, right);
-        at += n;
+    xfs_put_be16(fork, (uint16_t)t->levels);
+    xfs_put_be16(fork + 2u, (uint16_t)n);
+    for (uint32_t i = 0; i < n; i++) {
+        xfs_put_be64(fork + XFS_BMDR_HDR_BYTES + i * XFS_BMBT_KEY_BYTES, keys[i]);
+        xfs_put_be64(fork + XFS_BMDR_HDR_BYTES + mx * XFS_BMBT_KEY_BYTES + i * XFS_BMBT_PTR_BYTES,
+                     blocks[top + i]);
     }
     di[XFS_DI_FORMAT] = XFS_DINODE_FMT_BTREE;
+}
+
+/* Writes the map as the tree `t`, leaves first, from the pool's blocks in
+ * order: the leaves take the first ones, each node level the next. */
+static int store_tree(struct xfs *fs, uint64_t ino, uint8_t *di, const struct xfs_fork_map *m,
+                      const struct tree_shape *t) {
+    uint32_t base = 0;
+    int rc = KERR_OK;
+    for (uint32_t l = 0; rc == KERR_OK && l < t->levels; l++) {
+        rc = store_level(fs, ino, m, t, l, base);
+        base += t->width[l];
+    }
+    if (rc == KERR_OK) {
+        store_root(fs, di, t, base - t->width[t->levels - 1u]);
+    }
     return rc;
 }
 
 int xfs_fork_store(struct xfs *fs, uint64_t ino, uint8_t *di, const struct xfs_fork_map *m) {
     uint32_t bytes = xfs_fork_bytes(fs, di);
     bool fits = m->count * XFS_EXTENT_BYTES <= bytes;
-    uint32_t want = fits ? 0 : (m->count + leaf_capacity(fs) - 1u) / leaf_capacity(fs);
+    struct tree_shape t = {.levels = 0};
     int64_t delta = 0;
-    int rc;
-    if (want > root_capacity(bytes) || want > XFS_FORK_LEAVES_MAX) {
-        return KERR_NOSPC; /* a third level: not written */
+    int rc = fits ? KERR_OK : plan_tree(fs, m->count, root_capacity(bytes), &t);
+    if (rc != KERR_OK) {
+        return rc;
     }
     if (bytes > XFS_FORK_MAX && (!fits || m->count * XFS_EXTENT_BYTES > XFS_FORK_MAX)) {
         return KERR_NOTSUP; /* the last guard: this reader would refuse the result */
     }
-    rc = fit_leaves(fs, ino, want, &delta);
+    rc = fit_blocks(fs, ino, t.total, &delta);
     if (rc != KERR_OK) {
         return rc;
     }
     if (fits) {
         store_extents(fs, di, m);
     } else {
-        rc = store_tree(fs, ino, di, m, want);
+        rc = store_tree(fs, ino, di, m, &t);
     }
     xfs_dinode_set_data_extents(fs, di, m->count);
     xfs_put_be64(di + XFS_DI_NBLOCKS, xfs_be64(di + XFS_DI_NBLOCKS) + (uint64_t)delta);

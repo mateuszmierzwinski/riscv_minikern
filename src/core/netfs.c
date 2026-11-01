@@ -6,8 +6,19 @@
 #include "core/pb.h"
 
 /* netfs.proto's numbers. */
-enum { OP_STAT = 1, OP_READ, OP_LIST, OP_WRITE, OP_MKDIR, OP_UNLINK, OP_TRUNCATE, OP_RENAME, OP_READLINK };
-enum { REQ_OP = 1, REQ_PATH, REQ_TO, REQ_OFFSET, REQ_LENGTH, REQ_DATA };
+enum {
+    OP_STAT = 1,
+    OP_READ,
+    OP_LIST,
+    OP_WRITE,
+    OP_MKDIR,
+    OP_UNLINK,
+    OP_TRUNCATE,
+    OP_RENAME,
+    OP_READLINK,
+    OP_CHMOD
+};
+enum { REQ_OP = 1, REQ_PATH, REQ_TO, REQ_OFFSET, REQ_LENGTH, REQ_DATA, REQ_MODE };
 enum { RESP_STATUS = 1, RESP_DATA, RESP_STAT, RESP_ENTRIES };
 enum { STAT_MODE = 1, STAT_NLINK, STAT_SIZE, STAT_MTIME, STAT_UID, STAT_GID };
 enum { ENTRY_NAME = 1, ENTRY_MODE };
@@ -22,6 +33,7 @@ struct request {
     uint32_t length;
     const void *data;
     uint32_t data_len;
+    uint32_t mode; /* OP_CHMOD */
 };
 
 /* A decoded response; `data` and `entries` point into the frame buffer. */
@@ -52,6 +64,9 @@ static uint32_t encode(struct netfs *nf, const struct request *req) {
     pb_put_varint(&w, REQ_LENGTH, req->length);
     if (req->data != NULL) {
         pb_put_bytes(&w, REQ_DATA, req->data, req->data_len);
+    }
+    if (req->op == OP_CHMOD) {
+        pb_put_varint(&w, REQ_MODE, req->mode);
     }
     return w.overflow ? 0u : w.len;
 }
@@ -103,7 +118,7 @@ static int exchange(struct netfs *nf, struct response *resp, uint32_t n) {
  * the second time and report a failure for what was done. */
 static bool idempotent(uint32_t op) {
     return op == OP_STAT || op == OP_READ || op == OP_LIST || op == OP_WRITE || op == OP_TRUNCATE ||
-           op == OP_READLINK;
+           op == OP_READLINK || op == OP_CHMOD;
 }
 
 /* A server's status as an errno: success, a Linux errno (-4095..-1), or
@@ -298,14 +313,23 @@ static int list_held(struct netfs *nf, const char *path, netfs_entry_fn fn, void
 }
 
 /* An operation whose answer is only a status. */
-static int simple(struct netfs *nf, uint32_t op, const char *path, const char *to, uint64_t offset) {
-    struct request req = {.op = op, .path = path, .to = to, .offset = offset};
+static int answered(struct netfs *nf, const struct request *req) {
     struct response resp;
     int rc;
     hold(nf);
-    rc = call(nf, &req, &resp);
+    rc = call(nf, req, &resp);
     let_go(nf);
     return rc;
+}
+
+static int simple(struct netfs *nf, uint32_t op, const char *path, const char *to, uint64_t offset) {
+    struct request req = {.op = op, .path = path, .to = to, .offset = offset};
+    return answered(nf, &req);
+}
+
+int netfs_chmod(struct netfs *nf, const char *path, uint32_t mode) {
+    struct request req = {.op = OP_CHMOD, .path = path, .mode = mode};
+    return answered(nf, &req);
 }
 
 int netfs_mkdir(struct netfs *nf, const char *path) {

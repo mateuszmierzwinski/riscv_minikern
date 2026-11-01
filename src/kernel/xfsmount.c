@@ -825,6 +825,20 @@ int xfsmount_inode_of(const char *name, uint64_t *ino, uint32_t *nlink) {
     return rc;
 }
 
+int xfsmount_fork_shape(const char *name, uint32_t *extents, uint32_t *root_level) {
+    struct xfs_inode root, ip;
+    uint64_t ino = 0;
+    int rc = root_inode(&root);
+    rc = rc != KERR_OK ? rc : xfs_dir_lookup(&fs, &root, name, name_length(name), &ino);
+    rc = rc != KERR_OK ? rc : xfs_inode_read(&fs, ino, &ip);
+    if (rc == KERR_OK) {
+        *extents = ip.nextents;
+        *root_level =
+            ip.format == XFS_DINODE_FMT_BTREE ? (uint32_t)ip.fork[0] << 8 | ip.fork[1] : 0;
+    }
+    return rc;
+}
+
 void xfsmount_root_shape(void) {
     struct xfs_inode root;
     int rc = root_inode(&root);
@@ -1333,7 +1347,7 @@ int xfsmount_chmod_path(const char *path, uint32_t mode) {
     const char *in = NULL;
     const struct vfs_mount *m = vfs_resolve(path, &in);
     if (m != NULL) {
-        return KERR_PERM; /* their files are root's, mode as served */
+        return m->ops->chmod != NULL ? m->ops->chmod(m->self, in, mode & 07777u) : KERR_PERM;
     }
     struct xfs *vol = NULL;
     struct xfs_inode ip;

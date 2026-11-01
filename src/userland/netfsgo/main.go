@@ -4,6 +4,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -18,6 +19,27 @@ func step(name string, err error) {
 		os.Exit(1)
 	}
 	fmt.Printf("netfsgo: %s ok\n", name)
+}
+
+// chmodTo sets path's permission bits and checks a fresh stat reports them:
+// the export stores modes, so the round trip is what proves it.
+func chmodTo(path string, mode os.FileMode) error {
+	if err := os.Chmod(path, mode); err != nil {
+		return err
+	}
+	fi, err := os.Stat(path)
+	if err == nil && fi.Mode().Perm() != mode {
+		err = fmt.Errorf("mode %v after chmod %v", fi.Mode().Perm(), mode)
+	}
+	return err
+}
+
+// refused is nil when err is the errno wanted.
+func refused(err error, want syscall.Errno) error {
+	if errors.Is(err, want) {
+		return nil
+	}
+	return fmt.Errorf("got %v, want %v", err, want)
 }
 
 func main() {
@@ -44,6 +66,9 @@ func main() {
 		err = fmt.Errorf("size %d", fi.Size())
 	}
 	step("stat", err)
+	step("chmod 0600", chmodTo(filepath.Join(dir, "moved"), 0o600))
+	step("chmod 0644", chmodTo(filepath.Join(dir, "moved"), 0o644))
+	step("setuid refused", refused(os.Chmod(filepath.Join(dir, "moved"), os.ModeSetuid|0o755), syscall.EPERM))
 	step("remove", os.Remove(filepath.Join(dir, "moved")))
 	_, err = os.Stat(filepath.Join(dir, "moved"))
 	if os.IsNotExist(err) {

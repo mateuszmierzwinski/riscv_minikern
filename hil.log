@@ -47,14 +47,14 @@ ethernet@16030000 Waiting for PHY auto negotiation to complete......... TIMEOUT 
 phy_startup() failed: -110
 FAILED: -110
 ethernet@16040000 Waiting for PHY auto negotiation to complete...... done
-DHCP client bound to address 192.168.86.247 (1131 ms)
+DHCP client bound to address 192.168.86.247 (1115 ms)
 StarFive # wget 0x82000000 http://192.168.86.119:8780/minikern.bin
 #####
-589952 bytes transferred in 5 ms (112.5 MiB/s)
-Bytes transferred = 589952 (90080 hex)
-StarFive # setenv bootargs "console=sbi minikern.disk=sd minikern.netfs=192.168.86.119:8084 minikern.netroot minikern.init minikern.time=1793408309"
+598144 bytes transferred in 5 ms (114.1 MiB/s)
+Bytes transferred = 598144 (92080 hex)
+StarFive # setenv bootargs "console=sbi minikern.disk=sd minikern.netfs=192.168.86.119:8084 minikern.netroot minikern.init minikern.time=1793470409"
 StarFive # booti 0x82000000 - ${fdtcontroladdr}
-Moving Image from 0x82000000 to 0x40200000, end=0x407d5000
+Moving Image from 0x82000000 to 0x40200000, end=0x407d7000
 ## Flattened Device Tree blob at ff704a20
    Booting using the fdt blob at 0xff704a20
 Working FDT set to ff704a20
@@ -64,138 +64,141 @@ Working FDT set to fe6be000
 Starting kernel ...
 
 
-[00:00:00.000] I minikern 1.0 (RISC-V 64, rv64gc), hart 2
+[00:00:00.000] I minikern 1.0 (RISC-V 64, rv64gc), hart 4
 [00:00:00.000] I sbi: timer yes, hart-state yes, reset yes, debug-console yes, remote-fence yes
 [00:00:00.000] I boot: device tree at 00000000fe6be000, 45056 bytes
 [00:00:00.000] I mem: 8192 MiB at 0000000040000000
-[00:00:00.000] I cmdline: "console=sbi minikern.disk=sd minikern.netfs=192.168.86.119:8084 minikern.netroot minikern.init minikern.time=1793408309"
+[00:00:00.000] I cmdline: "console=sbi minikern.disk=sd minikern.netfs=192.168.86.119:8084 minikern.netroot minikern.init minikern.time=1793470409"
 [00:00:00.000] I mmu: sv39 on, 7 table pages, kernel text read-execute
-[00:00:00.000] I mmu: direct map at ffffffed00000000 (randomised: firmware seed and timer)
+[00:00:00.000] I mmu: direct map at ffffffe040000000 (randomised: firmware seed and timer)
 [00:00:00.000] I mmu: the kernel runs at ffffffc000200b90, its own half
-[00:00:00.000] I boot: device tree at ffffffedbe6be000, 45056 bytes
+[00:00:00.000] I boot: device tree at ffffffe0fe6be000, 45056 bytes
 [00:00:00.000] I mem: 8192 MiB at 0000000040000000
-[00:00:00.000] I cmdline: "console=sbi minikern.disk=sd minikern.netfs=192.168.86.119:8084 minikern.netroot minikern.init minikern.time=1793408309"
+[00:00:00.000] I cmdline: "console=sbi minikern.disk=sd minikern.netfs=192.168.86.119:8084 minikern.netroot minikern.init minikern.time=1793470409"
 [00:00:00.000] I uart: registers 4 bytes apart, 4-byte accesses
 [00:00:00.000] I uart: /soc/serial@10000000 at 0000000010000000, taken over from sbi
-[00:00:00.000] I mem: 2094624 of 2097152 pages free (8182 MiB of 8192 MiB)
-[00:00:00.000] I plic: at 000000000c000000, hart 2 uses context 4
-[00:00:16.581] I timer: 4000000 Hz counter, 100 ticks a second
-[00:00:16.587] I crg: sys at 0000000013020000, aon at 0000000017000000
-[00:00:16.636] I mmc: /soc/mmc@16010000: no card (rc -95, ocr 00000000 after 0 polls)
-[00:00:16.690] I mmc: /soc/mmc@16020000, 15601664 blocks of 512 bytes (7618 MiB), high capacity
-[00:00:16.744] I disk: the root is volume 1 on sd (designware), labelled ROOT
-[00:00:16.751] I disk: sd (designware) , 1818624 sectors of 4096 bytes (7104 MiB)
-[00:00:16.760] I xfs: not an XFS filesystem (magic eb58906d)
-[00:00:17.030] I volumes: FAT32 "BOOT" mounted at /boot
-[00:00:17.062] I xfs: v5, 1818624 blocks of 4096 bytes, 4 groups, 512-byte inodes, root 128, label "ROOT"
-[00:00:17.071] I volumes: "ROOT" at / (the root filesystem's own mount)
-[00:00:17.079] I xfs:   ./
-[00:00:17.081] I xfs:   ../
-[00:00:17.083] I xfs:   bin/
-[00:00:17.086] I xfs:   etc/
-[00:00:17.089] I xfs:   init
-[00:00:17.091] I xfs:   run/
-[00:00:17.094] I xfs:   var/
-[00:00:17.096] I xfs: mounted read-write, 7 entries in /
-[00:00:17.101] I volumes: 2 mounted
-[00:00:17.105] I volumes:   /boot -> BOOT
-[00:00:17.108] I volumes:   / -> ROOT
-[00:00:17.112] D irq: 0 dispatched, 0 unclaimed; waits 0 woken, 0 timed out
-[00:00:17.178] I klog: rotated kernel.8.log to kernel.9.log, 4173 bytes
-[00:00:17.237] I klog: rotated kernel.7.log to kernel.8.log, 4173 bytes
-[00:00:17.298] I klog: rotated kernel.6.log to kernel.7.log, 4173 bytes
-[00:00:17.358] I klog: rotated kernel.5.log to kernel.6.log, 4173 bytes
-[00:00:17.417] I klog: rotated kernel.4.log to kernel.5.log, 4173 bytes
-[00:00:17.477] I klog: rotated kernel.3.log to kernel.4.log, 4173 bytes
-[00:00:17.535] I klog: rotated kernel.2.log to kernel.3.log, 4173 bytes
-[00:00:17.594] I klog: rotated kernel.1.log to kernel.2.log, 4173 bytes
-[00:00:17.654] I klog: rotated kernel.0.log to kernel.1.log, 4173 bytes
-[00:00:17.660] N klog: 9 earlier boots rotated; this one becomes kernel.0.log
-[00:00:17.692] I klog: 3159 bytes of this boot written to /var/log/kernel.0.log
-[00:00:17.701] I gpio: /soc/pinctrl@13040000 at 0000000013040000
-[00:00:17.706] I gpio: /soc/pinctrl@17020000 at 0000000017020000
-[00:00:17.713] I smp: 5 harts in the tree, booted on 2
-[00:00:17.717] I smp:   hart 0 has no usable MMU (skipped)
-[00:00:17.723] I smp:   hart 1 can be started
-[00:00:17.727] I smp:   hart 2 is this one
-[00:00:17.730] I smp:   hart 3 can be started
-[00:00:17.735] I smp:   hart 4 can be started
-[00:00:17.739] I smp: 3 of 3 started harts reached the kernel, 4 running in total
-[00:00:17.746] I time: the epoch is 1793408309, from the command line
-[00:00:17.761] I temp: the die is at 39157 millidegrees (raw 2074), which is a plausible die temperature; /proc/thermal reports it
-[00:00:17.773] I virtio: 0 transport slots, 0 occupied, none of type 1
-[00:00:17.781] I dwmac: /soc/ethernet@16040000, version 00004152
-[00:00:17.787] I dwmac: address 6c:cf:39:00:b6:89
-[00:00:17.791] I dwmac: PHY at 0, id 4f51e91b
-[00:00:17.796] I dwmac: PHY timing from the tree: rx delay 300 ps, tx delay 0 ps
-[00:00:20.728] I dwmac: the tree says this controller is cache-coherent
-[00:00:20.734] I dwmac: rings at 40a30000/40a31000, buffers at 40a32000/40a52000
-[00:00:20.741] I dwmac: link up at 1000 Mbit, full duplex
-[00:00:20.749] I dwmac: filter 00000001, addr 800089b6/0039cf6c, ours 6c:cf:39:00:b6:89
-[00:00:20.756] I net: receive interrupt 78 armed
-[00:00:20.761] I net: over the board's Ethernet, link up at 1000 Mbit full duplex
-[00:00:21.773] I net: eth0 192.168.86.247/24 gw 192.168.86.1 dns 1.1.1.1 (dhcp, lease 86400 s)
-[00:00:21.781] I dwmac: rx dma status 00000405 (RBU bit 7, RPS bit 8, FBE bit 12), rx state 3, current 40a31040 tail 40a31040, driver at 4, 64 of 64 owned by the controller; 0 suspensions resumed, 0 overlapping polls
-[00:00:21.800] I dwmac: rx queue missed/overflow 00000000, debug 00000000
-[00:00:21.807] I net:n 3et89:  h19ou2.se16ke8.e8p6i.ng1  baneaswtesr, ed10 p2 inneg t setiq ck1s,
- now_ms 21799, next ping 21981
-[00:00:21.818] I net: rx 7 tx 5; dropped: malformed 0 checksum 0 fragment 0 not-ours 1 arp 0 rate 0 no-port 2 loop 0
-[00:00:21.828] I tcp: in 0 out 0 conns 0 retransmits 0 resets 0; dropped: checksum 0 malformed 0 no-socket 0 window 0 order 0 backlog 0 reset 0
-[00:00:21.841] I tcp: sack blocks 0 sent, 0 received; window updates 0, acks unsent 0
-[00:00:21.850] I netfs: 192.168.86.119:8084 mounted at / (rc 0)
-[00:00:21.986] I net: 192.168.86.1 answered ping seq 2
-[00:00:22.001] I init: /init is 3408032 bytes
-[00:00:22.005] I aslr: stack 3fff395000, mmap floor 200278c000, trampoline 3fff354000
-[00:00:22.061] I clock: hart 2 armed at 22061814750; sie 222, timer ENABLED
-[00:00:22.068] I clock: hart 4 armed at 22078293500; sie 22, timer ENABLED
-[00:00:22.208] I net: 192.168.86.1 answered ping seq 3
-[00:00:22.408] I clock: hart 1 armed at 22416856750; sie 22, timer ENABLED
-[00:00:22.607] I clone-thread: pid 1 sepc 7c3ee sp 3fb53fc000; below: 7a018 3fb53e4540 3fb5416008
-[00:00:22.615] I clock: hart 3 armed at 22621840750; sie 22, timer ENABLED
-[00:00:22.622] I clone-thread: pid 1 sepc 7c3ee sp 3fb5432000; below: 7a018 3fb53e4a80 3fb5416808
-[00:00:22.631] I clone-thread: pid 1 sepc 7c3ee sp 3fb542e000; below: 7a018 3fb53e5180 3fb5417008
-[00:00:22.640] I clone-thread: pid 1 sepc 7c3ee sp 3fb5498000; below: 7a018 3fb54841c0 3fb5480008
+[00:00:00.000] I mem: 2094622 of 2097152 pages free (8182 MiB of 8192 MiB)
+[00:00:00.000] I plic: at 000000000c000000, hart 4 uses context 8
+[00:00:16.620] I timer: 4000000 Hz counter, 100 ticks a second
+[00:00:16.626] I crg: sys at 0000000013020000, aon at 0000000017000000
+[00:00:16.675] I mmc: /soc/mmc@16010000: no card (rc -95, ocr 00000000 after 0 polls)
+[00:00:16.729] I mmc: /soc/mmc@16020000, 15601664 blocks of 512 bytes (7618 MiB), high capacity
+[00:00:16.784] I disk: the root is volume 1 on sd (designware), labelled ROOT
+[00:00:16.791] I disk: 1 SD read(s) needed a second attempt
+[00:00:16.797] I disk: sd (designware) , 1818624 sectors of 4096 bytes (7104 MiB)
+[00:00:16.806] I xfs: not an XFS filesystem (magic eb58906d)
+[00:00:17.076] I volumes: FAT32 "BOOT" mounted at /boot
+[00:00:17.108] I xfs: v5, 1818624 blocks of 4096 bytes, 4 groups, 512-byte inodes, root 128, label "ROOT"
+[00:00:17.117] I volumes: "ROOT" at / (the root filesystem's own mount)
+[00:00:17.124] I xfs:   ./
+[00:00:17.126] I xfs:   ../
+[00:00:17.129] I xfs:   bin/
+[00:00:17.132] I xfs:   etc/
+[00:00:17.134] I xfs:   init
+[00:00:17.137] I xfs:   run/
+[00:00:17.139] I xfs:   var/
+[00:00:17.142] I xfs: mounted read-write, 7 entries in /
+[00:00:17.147] I volumes: 2 mounted
+[00:00:17.150] I volumes:   /boot -> BOOT
+[00:00:17.154] I volumes:   / -> ROOT
+[00:00:17.157] D irq: 0 dispatched, 0 unclaimed; waits 0 woken, 0 timed out
+[00:00:17.223] I klog: rotated kernel.8.log to kernel.9.log, 4188 bytes
+[00:00:17.282] I klog: rotated kernel.7.log to kernel.8.log, 4188 bytes
+[00:00:17.393] I klog: rotated kernel.6.log to kernel.7.log, 4194 bytes
+[00:00:17.453] I klog: rotated kernel.5.log to kernel.6.log, 4194 bytes
+[00:00:17.512] I klog: rotated kernel.4.log to kernel.5.log, 4194 bytes
+[00:00:17.571] I klog: rotated kernel.3.log to kernel.4.log, 4194 bytes
+[00:00:17.641] I klog: rotated kernel.2.log to kernel.3.log, 4194 bytes
+[00:00:17.701] I klog: rotated kernel.1.log to kernel.2.log, 4194 bytes
+[00:00:17.761] I klog: rotated kernel.0.log to kernel.1.log, 4194 bytes
+[00:00:17.767] N klog: 9 earlier boots rotated; this one becomes kernel.0.log
+[00:00:17.799] I klog: 3219 bytes of this boot written to /var/log/kernel.0.log
+[00:00:17.808] I gpio: /soc/pinctrl@13040000 at 0000000013040000
+[00:00:17.814] I gpio: /soc/pinctrl@17020000 at 0000000017020000
+[00:00:17.820] I smp: 5 harts in the tree, booted on 4
+[00:00:17.825] I smp:   hart 0 has no usable MMU (skipped)
+[00:00:17.830] I smp:   hart 1 can be started
+[00:00:17.834] I smp:   hart 2 can be started
+[00:00:17.838] I smp:   hart 3 can be started
+[00:00:17.842] I smp:   hart 4 is this one
+[00:00:17.846] I smp: 3 of 3 started harts reached the kernel, 4 running in total
+[00:00:17.853] I smp: **8 hart(s) could not find their own index**
+[00:00:17.859] I time: the epoch is 1793470409, from the command line
+[00:00:17.874] I temp: the die is at 37939 millidegrees (raw 2053), which is a plausible die temperature; /proc/thermal reports it
+[00:00:17.886] I virtio: 0 transport slots, 0 occupied, none of type 1
+[00:00:17.894] I dwmac: /soc/ethernet@16040000, version 00004152
+[00:00:17.900] I dwmac: address 6c:cf:39:00:b6:89
+[00:00:17.904] I dwmac: PHY at 0, id 4f51e91b
+[00:00:17.910] I dwmac: PHY timing from the tree: rx delay 300 ps, tx delay 0 ps
+[00:00:20.760] I dwmac: the tree says this controller is cache-coherent
+[00:00:20.767] I dwmac: rings at 40a32000/40a33000, buffers at 40a34000/40a54000
+[00:00:20.774] I dwmac: link up at 1000 Mbit, full duplex
+[00:00:20.781] I dwmac: filter 00000001, addr 800089b6/0039cf6c, ours 6c:cf:39:00:b6:89
+[00:00:20.789] I net: receive interrupt 78 armed
+[00:00:20.793] I net: over the board's Ethernet, link up at 1000 Mbit full duplex
+[00:00:21.802] I net: eth0 192.168.86.247/24 gw 192.168.86.1 dns 1.1.1.1 (dhcp, lease 86400 s)
+[00:00:21.810] I dwmac: rx dma status 00000405 (RBU bit 7, RPS bit 8, FBE bit 12), rx state 3, current 40a33070 tail 40a33070, driver at 7, 64 of 64 owned by the controller; 0 suspensions resumed, 0 overlapping polls
+[00:00:21.829] I dwmac: rx queue missed/overflow 00000000, debug 00000000
+[00:00:2ne1.t8:3 159] 2.I1 6ne8t.8: 63.81 7a hnsowueserkedee ppiinngg  sbeeaqt 1s,
+ 98 net ticks, now_ms 21826, next ping 22010
+[00:00:21.847] I net: rx 9 tx 5; dropped: malformed 0 checksum 0 fragment 0 not-ours 4 arp 0 rate 0 no-port 1 loop 0
+[00:00:21.857] I tcp: in 0 out 0 conns 0 retransmits 0 resets 0; dropped: checksum 0 malformed 0 no-socket 0 window 0 order 0 backlog 0 reset 0
+[00:00:21.869] I tcp: sack blocks 0 sent, 0 received; window updates 0, acks unsent 0
+[00:00:21.878] I netfs: 192.168.86.119:8084 mounted at / (rc 0)
+[00:00:22.017] I net: 192.168.86.1 answered ping seq 2
+[00:00:22.069] I init: /init is 3408032 bytes
+[00:00:22.073] I aslr: stack 3fffbb1000, mmap floor 2001789000, trampoline 3fffb70000
+[00:00:22.129] I clock: hart 4 armed at 22119193750; sie 222, timer ENABLED
+[00:00:22.135] I clock: hart 2 armed at 22145702500; sie 22, timer ENABLED
+[00:00:22.283] I net: 192.168.86.1 answered ping seq 3
+[00:00:22.383] I clock: hart 1 armed at 22392094500; sie 22, timer ENABLED
+[00:00:22.597] I clock: hart 3 armed at 22607513750; sie 22, timer ENABLED
+[00:00:22.751] I clone-thread: pid 1 sepc 7c3ee sp 3fb6958000; below: 7a018 3fb6940540 3fb6972008
+[00:00:22.760] I clone-thread: pid 1 sepc 7c3ee sp 3fb6990000; below: 7a018 3fb6940a80 3fb6972808
+[00:00:22.768] I clone-thread: pid 1 sepc 7c3ee sp 3fb698c000; below: 7a018 3fb6941180 3fb6973008
+[00:00:22.783] I clone-thread: pid 1 sepc 7c3ee sp 3fb6a18000; below: 7a018 3fb6a041c0 3fb6a00008
+[00:00:22.793] I syscall: futex (98) answered EAGAIN
 init: QuokkaOS on quokka, runlevel default
-[00:00:22.672] I syscall: futex (98) answered EAGAIN
-[00:00:22.678] I syscall: futex (98) answered EAGAIN
-[00:00:22.690] I wait4any: pid 1 asks; children 0
-[00:00:22.695] I clone-thread: pid 1 sepc 7c3ee sp 3fb5494000; below: 7a018 3fb54856c0 3fb5480808
-[00:00:22.710] I syscall: futex (98) answered EAGAIN
-[00:00:22.715] I wait4any: pid 1 asks; children 0
-[00:00:22.720] I syscall: futex (98) answered EAGAIN
-[00:00:22.724] I syscall: futex (98) answered EAGAIN
-[00:00:22.730] I syscall: 434 is not implemented
-[00:00:22.739] I execve: /bin/statsd with argc 3, argv[0] /bin/statsd
-[00:00:22.745] I wait4any: pid 1 asks; children 1
-[00:00:22.776] I execve: /bin/qmcd with argc 3, argv[0] /bin/qmcd
-[00:00:23.064] I aslr: stack 3fff56e000, mmap floor 2001158000, trampoline 3fff52d000
-[00:00:23.400] I exec-entry: sstatus 8000000200046020 satp-want 80001000000411a9
-[00:00:23.407] I exec-entry: sp 3fff56de80 argc 3 entry 7ded8; stack write ok, read back 5151515151515151
-[00:00:23.914] I aslr: stack 3fff9a1000, mmap floor 2003320000, trampoline 3fff960000
-[00:00:23.964] I exec-entry: sstatus 8000000200046020 satp-want 80001000000444c0
-[00:00:23.971] I exec-entry: sp 3fff9a0e90 argc 3 entry 7bd40; stack write ok, read back 5151515151515151
-[00:00:23.991] I syscall: futex (98) answered EAGAIN
-[00:00:23.998] I clone-thread: pid 1 sepc 7c3ee sp 3fb55bc000; below: 7a018 3fb559e380 3fb55a8008
-[00:00:24.020] I syscall: read (63) answered EAGAIN
-[00:00:24.024] I syscall: read (63) answered EAGAIN
-[00:00:24.149] I syscall: futex (98) answered EAGAIN
-[00:00:24.244] I syscall: futex (98) answered EAGAIN
-[00:00:24.285] I syscall: futex (98) answered EAGAIN
-[00:00:24.563] I execve: /bin/blog with argc 9, argv[0] /bin/blog
-[00:00:24.824] I clone-thread: pid 2 sepc 7e316 sp 3fb49fc000; below: 7bf40 3fb49d4540 3fb4a16008
-[00:00:24.835] I clone-thread: pid 3 sepc 7c17e sp 3fb7aca000; below: 79da8 3fb7ab0540 3fb7ae4008
-[00:00:24.849] I clone-thread: pid 2 sepc 7e316 sp 3fb4a32000; below: 7bf40 3fb49d48c0 3fb4a16808
-[00:00:24.861] I clone-thread: pid 3 sepc 7c17e sp 3fb7b00000; below: 79da8 3fb7ab0a80 3fb7ae4808
-[00:00:24.871] I clone-thread: pid 2 sepc 7e316 sp 3fb4a2e000; below: 7bf40 3fb4a841c0 3fb4a80008
-[00:00:24.882] I clone-thread: pid 3 sepc 7c17e sp 3fb7afc000; below: 79da8 3fb7ab0e00 3fb7ae5008
-[00:00:24.892] I clone-thread: pid 3 sepc 7c17e sp 3fb7b18000; below: 79da8 3fb7b041c0 3fb7b00008
-[00:00:24.905] I syscall: futex (98) answered EAGAIN
-[00:00:24.914] I clone-thread: pid 2 sepc 7e316 sp 3fb4aa8000; below: 7bf40 3fb4a84a80 3fb4a80808
-[00:00:25.661] I aslr: stack 3fff0e4000, mmap floor 2001cde000, trampoline 3fff0a3000
-[00:00:26.182] I exec-entry: sstatus 8000000200046020 satp-want 800010000004610e
-[00:00:26.189] I exec-entry: sp 3fff0e3e10 argc 9 entry 82b78; stack write ok, read back 5151515151515151
+[00:00:22.834] I wait4any: pid 1 asks; children 0
+[00:00:22.844] I clone-thread: pid 1 sepc 7c3ee sp 3fb6a14000; below: 7a018 3fb6a04540 3fb6a00808
+[00:00:22.855] I syscall: 434 is not implemented
+[00:00:22.859] I wait4any: pid 1 asks; children 0
+[00:00:22.868] I execve: /bin/statsd with argc 3, argv[0] /bin/statsd
+[00:00:22.898] I wait4any: pid 1 asks; children 1
+[00:00:22.904] I syscall: futex (98) answered EAGAIN
+[00:00:22.928] I execve: /bin/blog with argc 9, argv[0] /bin/blog
+[00:00:23.182] I aslr: stack 3fffbaa000, mmap floor 20031a7000, trampoline 3fffb69000
+[00:00:23.519] I exec-entry: sstatus 8000000200046020 satp-want 800010000004118c
+[00:00:23.526] I exec-entry: sp 3fffba9e80 argc 3 entry 7ded8; stack write ok, read back 5151515151515151
+[00:00:24.350] I clone-thread: pid 2 sepc 7e316 sp 3fb5ec8000; below: 7bf40 3fb5ea0540 3fb5ee2008
+[00:00:24.361] I clone-thread: pid 2 sepc 7e316 sp 3fb5efe000; below: 7bf40 3fb5ea0a80 3fb5ee2808
+[00:00:24.375] I clone-thread: pid 2 sepc 7e316 sp 3fb5efa000; below: 7bf40 3fb5ea0e00 3fb5ee3008
+[00:00:24.385] I clone-thread: pid 2 sepc 7e316 sp 3fb5f20000; below: 7bf40 3fb5f0c1c0 3fb5f08008
+[00:00:24.448] I syscall: futex (98) answered EAGAIN
+[00:00:24.472] I syscall: futex (98) answered EAGAIN
+[00:00:24.571] I clone-thread: pid 2 sepc 7e316 sp 3fb6344000; below: 7bf40 3fb5f0da40 3fb6330008
+[00:00:24.585] I clone-thread: pid 2 sepc 7e316 sp 3fb5f1c000; below: 7bf40 3fb60408c0 3fb6047008
+[00:00:24.597] I syscall: futex (98) answered EAGAIN
+[00:00:24.604] I syscall: futex (98) answered EAGAIN
+[00:00:24.610] I clone-thread: pid 2 sepc 7e316 sp 3fb6340000; below: 7bf40 3fb6040c40 3fb6047808
+[00:00:24.621] I syscall: futex (98) answered EAGAIN
+[00:00:24.634] I syscall: futex (98) answered EAGAIN
+[00:00:24.641] I syscall: futex (98) answered EAGAIN
+[00:00:24.662] I syscall: futex (98) answered EAGAIN
+[00:00:24.669] I syscall: futex (98) answered EAGAIN
+[00:00:24.697] I syscall: futex (98) answered EAGAIN
+[00:00:25.083] I aslr: stack 3fff76c000, mmap floor 2003e3c000, trampoline 3fff72b000
+[00:00:25.605] I exec-entry: sstatus 8000000200046020 satp-want 80001000000459af
+[00:00:25.611] I exec-entry: sp 3fff76be10 argc 9 entry 82b78; stack write ok, read back 5151515151515151
+[00:00:25.623] I clone-thread: pid 1 sepc 7c3ee sp 3fb6b32000; below: 7a018 3fb6b14380 3fb6b1e008
+[00:00:26.068] I execve: /bin/qmcd with argc 3, argv[0] /bin/qmcd
+[00:00:26.345] I clone-thread: pid 3 sepc 82fb6 sp 3fb5958000; below: 80be0 3fb591e540 3fb5972008
+[00:00:26.364] I aslr: stack 3fffe82000, mmap floor 200201a000, trampoline 3fffe41000
+[00:00:26.415] I exec-entry: sstatus 8000000200046020 satp-want 8000100000049021
+[00:00:26.422] I exec-entry: sp 3fffe81e90 argc 3 entry 7bd40; stack write ok, read back 5151515151515151
 init: level 1 of 1 is up
-init: blog             ready     ready=true pid=4 restarts=0 
-init: qmcd             ready     ready=true pid=3 restarts=0 
+init: blog             ready     ready=true pid=3 restarts=0 
+init: qmcd             ready     ready=true pid=4 restarts=0 
 init: statsd           ready     ready=true pid=2 restarts=0 
 init: listening on /run/quokka/init.sock
+[00:00:27.385] I syscall: 55 is not implemented

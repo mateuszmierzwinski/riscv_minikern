@@ -272,6 +272,11 @@ int xfsmount_readlink(const char *path, char *out, uint32_t max, uint32_t *got);
  * `unlink` checks what they did rather than that they returned 0. */
 int xfsmount_inode_of(const char *name, uint64_t *ino, uint32_t *nlink);
 
+/* A name's data extents and its b-tree root's level in the inode (0 when
+ * the extents are held in the inode itself): how a test of the fork writer
+ * checks the shape it built. */
+int xfsmount_fork_shape(const char *name, uint32_t *extents, uint32_t *root_level);
+
 /* Prints the root directory's shape. For a failure in the write path,
  * where "it stopped being a directory" needs to say which field says so. */
 void xfsmount_root_shape(void);

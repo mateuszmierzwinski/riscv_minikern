@@ -321,6 +321,11 @@ int xfs_agfl_ensure(struct xfs *fs, uint32_t agno);
  * free list and moves no superblock count — the refill's own path. */
 int xfs_alloc_raw(struct xfs *fs, uint32_t agno, uint32_t count, uint32_t *got);
 
+/* Its opposite, the drain's path: `count` blocks put back into the group's
+ * free-space trees, asking nothing of the free list and moving no
+ * superblock count (a block on the list is counted free already). */
+int xfs_free_raw(struct xfs *fs, uint32_t agno, uint32_t start, uint32_t count);
+
 /* A group's free-space header, with its magic, checksum and UUID checked. */
 int xfs_agf_get(struct xfs *fs, uint32_t agno, struct bbuf **out, uint8_t **agf);
 
@@ -340,6 +345,11 @@ int xfs_count_blocks_free(struct xfs *fs, int64_t delta);
 int xfs_rmap_map(struct xfs *fs, uint64_t fsb, uint32_t count, uint64_t owner, uint64_t offset);
 int xfs_rmap_unmap(struct xfs *fs, uint64_t fsb, uint32_t count, uint64_t owner,
                    uint64_t offset);
+
+/* `xfs_rmap_unmap` without first making the free list ready: for the free
+ * list's own drain, which runs because the list is already too full. */
+int xfs_rmap_unmap_raw(struct xfs *fs, uint64_t fsb, uint32_t count, uint64_t owner,
+                       uint64_t offset);
 
 /* Maps blocks another owner maps too — a reflink's share — which
  * `xfs_rmap_map` refuses as a second mapping (xfs_rmap.c). */
@@ -417,8 +427,9 @@ static inline uint64_t xfs_rmap_offset_of(const struct xfs_extent *e, uint64_t s
 
 /* ── a data fork's extent map, whatever its shape (xfs_fork.c) ─────────── */
 
-#define XFS_FORK_MAP_MAX    4096u /* extents one map may hold while edited */
-#define XFS_FORK_LEAVES_MAX 32u   /* leaves a two-level tree may have */
+#define XFS_FORK_MAP_MAX    65536u /* extents one map may hold while edited (1.5 MiB) */
+#define XFS_FORK_BLOCKS_MAX 1024u  /* blocks, of every level, its tree may have */
+#define XFS_FORK_LEVELS_MAX 5u     /* levels of blocks below the root in the inode */
 
 struct xfs_fork_map {
     struct xfs_extent *e; /* sorted by file offset */
@@ -430,11 +441,11 @@ struct xfs_fork_map {
 uint32_t xfs_bmbt_hdr(const struct xfs *fs);
 
 /* Loads the data fork of the on-disk inode `di` into a map — an extent
- * list or a two-level tree alike — and stores one back in whichever form
+ * list or a tree of any height alike — and stores one back in whichever form
  * fits, taking and giving tree blocks as needed and moving `di_nblocks` by
- * them. **A store follows the load of the same fork**: the tree's leaves
+ * them. **A store follows the load of the same fork**: the tree's blocks
  * are remembered between the two, and nothing in between may load another.
- * KERR_NOSPC for a map past either limit above. */
+ * KERR_NOSPC for a map past any limit above. */
 int xfs_fork_load(struct xfs *fs, const uint8_t *di, struct xfs_fork_map *out);
 int xfs_fork_store(struct xfs *fs, uint64_t ino, uint8_t *di, const struct xfs_fork_map *m);
 

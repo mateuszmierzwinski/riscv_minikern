@@ -870,6 +870,82 @@ static void step_realtime(struct xfs *fs) {
     must(xfs_unlink(fs, &root, "rtgone", 6u, NOW), "realtime unlink");
 }
 
+/* A file of more extents than a root and one level of leaves can name —
+ * 20 x 251 with 512-byte v5 inodes, 25 x 254 with 512-byte v4 ones — so
+ * its map needs a level of nodes between them. Every other block is
+ * written, which makes each block an extent of its own wherever the
+ * allocator puts it. */
+#define TALL_EXTENTS 7000u
+
+/* Block `i` of the tall file holds payload block `i % 1024`. */
+static const uint8_t *tall_block(uint32_t i) {
+    return payload + (size_t)(i % 1024u) * BS;
+}
+
+/* The tall file's written blocks read back, and the holes between them as
+ * zeroes, for the first `extents` of them. */
+static void must_read_tall(struct xfs *fs, uint64_t ino, uint32_t extents) {
+    static uint8_t got[2u * BS], zero[BS];
+    struct xfs_inode ip;
+    read_inode(fs, ino, &ip);
+    for (uint32_t i = 0; i < extents; i++) {
+        uint32_t n = 0;
+        must(xfs_file_read(fs, &ip, (uint64_t)i * 2u * BS, got, 2u * BS, &n), "tall read");
+        if (memcmp(got, tall_block(i), BS) != 0 ||
+            (n == 2u * BS && memcmp(got + BS, zero, BS) != 0)) {
+            fprintf(stderr, "xfs_writecheck: tall file extent %u read back wrong\n", i);
+            exit(1);
+        }
+    }
+}
+
+/* The root's level in the inode: 1 for leaves under it, 2 for nodes. */
+static uint32_t tall_root_level(struct xfs *fs, uint64_t ino) {
+    struct xfs_inode ip;
+    read_inode(fs, ino, &ip);
+    return ip.format == XFS_DINODE_FMT_BTREE ? (uint32_t)ip.fork[0] << 8 | ip.fork[1] : 0;
+}
+
+/* Truncates the tall file to its first `extents` extents and checks them. */
+static void cut_tall(struct xfs *fs, uint64_t ino, uint32_t extents) {
+    struct xfs_inode ip;
+    read_inode(fs, ino, &ip);
+    must(xfs_truncate(fs, &ip, (uint64_t)extents * 2u * BS - BS, NOW), "truncate the tall file");
+    must_read_tall(fs, ino, extents);
+    printf("xfs_writecheck: tall file cut to %u extents, root level %u\n", extents,
+           tall_root_level(fs, ino));
+}
+
+/* Grows the tall file to three levels, reads it, cuts it back through two
+ * levels to extents in the inode, and removes it. Skipped on inodes whose
+ * fork is past what this reader caches (`btreefile` covers those). */
+static void step_tallfork(struct xfs *fs) {
+    struct xfs_inode root, ip;
+    uint64_t ino;
+    uint32_t put;
+    if (fs->inodesize - fs->dinode_size > XFS_FORK_MAX) {
+        return;
+    }
+    read_inode(fs, fs->rootino, &root);
+    must(xfs_create(fs, &root, "tall", 4u, 0100644, NOW, &ino), "create tall");
+    for (uint32_t i = 0; i < TALL_EXTENTS; i++) {
+        read_inode(fs, ino, &ip);
+        must(xfs_file_write(fs, &ip, (uint64_t)i * 2u * BS, tall_block(i), BS, &put), "tall write");
+    }
+    read_inode(fs, ino, &ip);
+    printf("xfs_writecheck: tall file has %u extents, root level %u\n", ip.nextents,
+           tall_root_level(fs, ino));
+    if (ip.nextents != TALL_EXTENTS || tall_root_level(fs, ino) != 2u) {
+        fprintf(stderr, "xfs_writecheck: the tall file is not a three-level tree\n");
+        exit(1);
+    }
+    must_read_tall(fs, ino, TALL_EXTENTS);
+    cut_tall(fs, ino, 900u);
+    cut_tall(fs, ino, 5u);
+    read_inode(fs, fs->rootino, &root);
+    must(xfs_unlink(fs, &root, "tall", 4u, NOW), "unlink tall");
+}
+
 /* On a `-i size=1024` image made with /big (a shortform directory whose
  * fork is past XFS_FORK_MAX) and /beside: the big directory is refused —
  * per inode, KERR_NOTSUP — and everything else on the filesystem still
@@ -902,7 +978,7 @@ static const struct step steps[] = {
     {"inodes", step_inodes},    {"noinodes", step_noinodes},
     {"reflink", step_reflink},  {"holes", step_holes},     {"boardgrow", step_boardgrow},
     {"trim", step_trim},        {"eofzero", step_eofzero},  {"realtime", step_realtime},
-    {"uncommitted", step_uncommitted}, {"bigfork", step_bigfork},
+    {"uncommitted", step_uncommitted}, {"bigfork", step_bigfork}, {"tallfork", step_tallfork},
 };
 
 /* Runs the named steps, or every one when none is named. */

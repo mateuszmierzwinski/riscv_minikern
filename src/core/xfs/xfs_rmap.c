@@ -313,13 +313,18 @@ static int unmap_record(struct xfs_btree_cur *cur, const struct rmap *r) {
 /* Splits a filesystem block into its group and the record for it, with the
  * group's free list made deep enough first — before the tree is opened,
  * because topping the list up maps blocks and can change the tree's height. */
-static int open_for(struct xfs *fs, uint64_t fsb, uint32_t count, uint64_t owner,
-                    uint64_t offset, struct xfs_btree_cur *cur, struct rmap *r) {
+static int open_at(struct xfs *fs, uint64_t fsb, uint32_t count, uint64_t owner,
+                   uint64_t offset, struct xfs_btree_cur *cur, struct rmap *r) {
     uint64_t mask = ((uint64_t)1 << fs->agblklog) - 1u;
-    int rc = xfs_agfl_ensure(fs, xfs_fsb_ag(fs, fsb));
     *r = (struct rmap){.start = (uint32_t)(fsb & mask), .count = count, .owner = owner,
                        .offset = offset};
-    return rc != KERR_OK ? rc : xfs_btree_open(cur, fs, &rmap_ops, xfs_fsb_ag(fs, fsb));
+    return xfs_btree_open(cur, fs, &rmap_ops, xfs_fsb_ag(fs, fsb));
+}
+
+static int open_for(struct xfs *fs, uint64_t fsb, uint32_t count, uint64_t owner,
+                    uint64_t offset, struct xfs_btree_cur *cur, struct rmap *r) {
+    int rc = xfs_agfl_ensure(fs, xfs_fsb_ag(fs, fsb));
+    return rc != KERR_OK ? rc : open_at(fs, fsb, count, owner, offset, cur, r);
 }
 
 /* Maps a range, shared with other owners or not. */
@@ -344,14 +349,27 @@ int xfs_rmap_map_shared(struct xfs *fs, uint64_t fsb, uint32_t count, uint64_t o
     return map_range(fs, fsb, count, owner, offset, true);
 }
 
-int xfs_rmap_unmap(struct xfs *fs, uint64_t fsb, uint32_t count, uint64_t owner,
-                   uint64_t offset) {
+/* Unmaps a range, with the free list made ready first or — for the free
+ * list's own drain — not. */
+static int unmap_range(struct xfs *fs, uint64_t fsb, uint32_t count, uint64_t owner,
+                       uint64_t offset, bool make_ready) {
     struct xfs_btree_cur cur;
     struct rmap r;
     int rc;
     if (!fs->has_rmapbt || count == 0) {
         return KERR_OK;
     }
-    rc = open_for(fs, fsb, count, owner, offset, &cur, &r);
+    rc = make_ready ? open_for(fs, fsb, count, owner, offset, &cur, &r)
+                    : open_at(fs, fsb, count, owner, offset, &cur, &r);
     return rc != KERR_OK ? rc : unmap_record(&cur, &r);
+}
+
+int xfs_rmap_unmap(struct xfs *fs, uint64_t fsb, uint32_t count, uint64_t owner,
+                   uint64_t offset) {
+    return unmap_range(fs, fsb, count, owner, offset, true);
+}
+
+int xfs_rmap_unmap_raw(struct xfs *fs, uint64_t fsb, uint32_t count, uint64_t owner,
+                       uint64_t offset) {
+    return unmap_range(fs, fsb, count, owner, offset, false);
 }

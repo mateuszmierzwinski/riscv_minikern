@@ -254,11 +254,13 @@ static const char *split(const char *in, char parent[OVERLAY_PATH_MAX]) {
 }
 
 /* Gives the upper copy its permission bits, where the upper layer keeps
- * any: a FAT or netfs layer serves its own modes and refuses chmod, and a
- * copy-up must not fail for a bit it could never have stored. */
+ * them: a FAT layer serves its own modes and refuses chmod, and netfs
+ * refuses setuid, setgid and sticky — a copy-up must not fail for a bit
+ * its layer could never have stored. */
 static int keep_mode(const char *to, uint32_t mode) {
     const char *within = NULL;
-    return vfs_resolve(to, &within) != NULL ? KERR_OK : xfsmount_chmod_path(to, mode & 07777u);
+    int rc = xfsmount_chmod_path(to, mode & 07777u);
+    return rc == KERR_PERM && vfs_resolve(to, &within) != NULL ? KERR_OK : rc;
 }
 
 /* Copies a lower regular file at `from` to the upper path `to`. */

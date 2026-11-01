@@ -150,6 +150,41 @@ static int refill(struct xfs *fs, uint32_t agno, uint32_t count) {
                                         XFS_RMAP_OWN_AG, 0);
 }
 
+/* How many blocks are on group `agno`'s ring now. */
+static int ring_count(struct xfs *fs, uint32_t agno, uint32_t *have) {
+    struct agfl_view v;
+    int rc = agfl_get(fs, agno, &v);
+    if (rc == KERR_OK) {
+        *have = xfs_be32(v.agf + XFS_AGF_FLCOUNT);
+        agfl_release(fs, &v);
+    }
+    return rc;
+}
+
+/* Hands blocks back from a ring too full to take what a change gives it,
+ * until it holds `keep`: off the ring, into the free-space trees, out of
+ * the reverse map as the group's. **The ring fills when trees shrink** —
+ * a truncate that frees hundreds of scattered extents merges reverse-map
+ * blocks, and each merged block goes back on the ring — and a full ring
+ * refuses the next merge. Linux trims it the same way
+ * (`xfs_alloc_fix_freelist`). Both steps take the raw paths: the ring is
+ * deep enough for their splits by definition, and asking it to be made
+ * ready would come back here. The superblock's free count stays: a block
+ * on the ring is counted free already. */
+static int drain(struct xfs *fs, uint32_t agno, uint32_t keep) {
+    uint32_t have = 0, agbno = 0;
+    int rc = ring_count(fs, agno, &have);
+    while (rc == KERR_OK && have > keep) {
+        rc = xfs_agfl_pop(fs, agno, XFS_AGFL_PLAIN, &agbno);
+        rc = rc != KERR_OK ? rc : xfs_free_raw(fs, agno, agbno, 1u);
+        rc = rc != KERR_OK ? rc
+                           : xfs_rmap_unmap_raw(fs, ((uint64_t)agno << fs->agblklog) | agbno, 1u,
+                                                XFS_RMAP_OWN_AG, 0);
+        rc = rc != KERR_OK ? rc : ring_count(fs, agno, &have);
+    }
+    return rc;
+}
+
 int xfs_agfl_ensure(struct xfs *fs, uint32_t agno) {
     struct agfl_view v;
     uint32_t need, have, size = ring_size(fs);
@@ -164,7 +199,10 @@ int xfs_agfl_ensure(struct xfs *fs, uint32_t agno) {
         return KERR_NOSPC; /* trees this tall would not fit the ring's guarantee */
     }
     if (have >= need) {
-        return size - have >= need ? KERR_OK : KERR_NOSPC;
+        /* Room for what the change may give back too: drained to where a
+         * refill would have topped it up, or less if the ring is small. */
+        uint32_t keep = 2u * need < size - need ? 2u * need : size - need;
+        return size - have >= need ? KERR_OK : drain(fs, agno, keep);
     }
     /* Topped up to twice the need, so the refill's own changes — it takes
      * from the free-space trees and maps what it took — are covered too. */

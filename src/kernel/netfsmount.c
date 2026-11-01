@@ -161,6 +161,10 @@ static int readlink_op(void *nf, const char *within, char *out, uint32_t max, ui
     return netfs_readlink(nf, within, out, max, got);
 }
 
+static int chmod_op(void *nf, const char *within, uint32_t mode) {
+    return netfs_chmod(nf, within, mode);
+}
+
 static const struct vfs_ops netfs_ops = {
     .name = "netfs",
     .stat_full = stat_op,
@@ -175,6 +179,7 @@ static const struct vfs_ops netfs_ops = {
     .rename = rename_op,
     .times = times_op,
     .readlink = readlink_op,
+    .chmod = chmod_op,
 };
 
 int netfsmount_attach(struct netfs *nf, const char *at) {
