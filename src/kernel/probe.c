@@ -252,10 +252,12 @@ static void report_cpu_clock_registers(void) {
         return;
     }
     kprintf("probe: syscrg at %016llx, CPU clock words:\n", (unsigned long long)base);
+    /* **Through the generator's mapping, never its physical address.** The
+     * physical address was dereferenced here as a pointer, which worked
+     * while the kernel's tables carried an identity map; since step C took
+     * it away, `minikern.probe` panicked on this line. */
     for (uint32_t i = 0; i < 4u; i++) {
-        volatile const uint32_t *reg =
-            (volatile const uint32_t *)(uintptr_t)(base + crg_clock_offset(i));
-        kprintf("probe:   [%u] %08x\n", i, *reg);
+        kprintf("probe:   [%u] %08x\n", i, crg_regs(CRG_SYS)[crg_clock_offset(i) / 4u]);
     }
 }
 
@@ -313,7 +315,19 @@ static void report_cpu_clock_registers(void) {
  * not come back. Nothing here writes.
  */
 #define AXP15060_ADDR 0x36u
-#define AXP15060_DCDC2_VOLTAGE 0x25u
+#define AXP15060_DCDC2_VOLTAGE 0x14u /* mainline axp20x.h; the 0x25 first tried was wrong */
+#define DCDC2_SELECTOR 0x7fu         /* bit 7 is preserved, not part of the voltage */
+
+/* DCDC2's selector as millivolts (mainline axp20x-regulator.c): 500 mV +
+ * 10 mV a step to 0x46, then 1220 mV + 20 mV a step to 0x57. 0 for a
+ * selector past the table. */
+static uint32_t dcdc2_millivolts(uint8_t raw) {
+    uint32_t sel = raw & DCDC2_SELECTOR;
+    if (sel <= 0x46u) {
+        return 500u + sel * 10u;
+    }
+    return sel <= 0x57u ? 1220u + (sel - 0x47u) * 20u : 0u;
+}
 
 static void report_pmic(const struct fdt *fdt) {
     struct i2c_dw bus;
@@ -365,7 +379,7 @@ static void report_pmic(const struct fdt *fdt) {
      * neither — so the map is printed for whoever has the datasheet, and
      * nothing is written.
      */
-    kprintf("probe: PMIC register map (read-only; the core rail is NOT identified):\n");
+    kprintf("probe: PMIC register map (read-only):\n");
     for (uint8_t row = 0x10u; row < 0x40u; row = (uint8_t)(row + 8u)) {
         kprintf("probe:   %02x:", row);
         for (uint8_t c = 0; c < 8u; c++) {
@@ -377,8 +391,14 @@ static void report_pmic(const struct fdt *fdt) {
         }
         kprintf("\n");
     }
-    kprintf("probe:   no register holds 36 (1040 mV), which the device tree says the\n");
-    kprintf("probe:   cores run at — so voltage scaling waits for an authoritative map\n");
+    /* **The core rail, decoded** — DCDC2 at 0x14, from mainline's AXP15060
+     * map. Measured 2026-11-01: 0xa8, which is 900 mV: the firmware runs the
+     * cores below the 1040 mV the tree's top point names, which is why the
+     * old search for a register holding 0x36 found none. Still nothing here
+     * writes it: that is the operator's decision (ROADMAP §4). */
+    if (i2c_dw_read_u8(&bus, AXP15060_ADDR, AXP15060_DCDC2_VOLTAGE, &raw) == KERR_OK) {
+        kprintf("probe: PMIC DCDC2 (vdd_cpu) %02x = %u mV\n", raw, dcdc2_millivolts(raw));
+    }
 }
 
 static void report_i2c_and_regulators(const struct fdt *fdt) {
@@ -435,7 +455,7 @@ static void try_cpu_divider(uint32_t want) {
     if (want == 0 || !crg_present(CRG_SYS)) {
         return;
     }
-    reg = (volatile uint32_t *)(uintptr_t)(crg_base(CRG_SYS) + crg_clock_offset(1u));
+    reg = crg_regs(CRG_SYS) + crg_clock_offset(1u) / 4u; /* the mapping (see above) */
     was = *reg;
     before = measure_loop_rate();
     *reg = (was & ~0xffu) | (want & 0xffu);

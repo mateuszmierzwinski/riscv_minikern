@@ -189,3 +189,31 @@ int display_edid_parse(const uint8_t block[EDID_BLOCK_BYTES], struct edid_info *
     }
     return KERR_OK;
 }
+
+/* ── The cursor image ──────────────────────────────────────────────────── */
+
+#define CURSOR_CLEAR 0x00000000u
+#define CURSOR_WHITE 0xffffffffu
+#define CURSOR_BLACK 0xff000000u
+#define ARROW_ROWS 20u /* the arrow's height; its width at row y is y + 1 */
+
+/* Inside the arrow: a right triangle on the left edge, y + 1 wide. */
+static bool in_arrow(uint32_t x, uint32_t y) {
+    return y < ARROW_ROWS && x <= y;
+}
+
+/* On the outline: inside, with a neighbour outside or off the image. */
+static bool on_outline(uint32_t x, uint32_t y) {
+    return in_arrow(x, y) &&
+           (x == 0 || y == 0 || x == y || y + 1u == ARROW_ROWS || !in_arrow(x + 1u, y));
+}
+
+void display_cursor_arrow(uint32_t out[CURSOR_PIXELS]) {
+    for (uint32_t y = 0; y < CURSOR_SIDE; y++) {
+        for (uint32_t x = 0; x < CURSOR_SIDE; x++) {
+            out[y * CURSOR_SIDE + x] = on_outline(x, y)  ? CURSOR_BLACK
+                                       : in_arrow(x, y) ? CURSOR_WHITE
+                                                        : CURSOR_CLEAR;
+        }
+    }
+}

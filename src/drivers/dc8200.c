@@ -61,6 +61,38 @@ static uint32_t get(uint32_t offset) {
     return regs[offset / 4u];
 }
 
+/* Display 0's cursor block (mainline `vs_cursor_plane_regs.h`; display 1's
+ * is 0x1080 above). CONFIG: bits 1:0 format (2 = ARGB8888), bit 2 image
+ * update, bit 3 commit, bits 7:5 size (0 = 32). LOCATION: x in 14:0, y in
+ * 30:16. */
+#define CURSOR_CONFIG 0x1468u
+#define CURSOR_ADDRESS 0x146cu
+#define CURSOR_LOCATION 0x1470u
+#define CURSOR_ARGB8888 0x2u
+#define CURSOR_IMAGE_UPDATE (1u << 2)
+#define CURSOR_COMMIT (1u << 3)
+#define CURSOR_SIZE_32 (0u << 5)
+#define CURSOR_POSITION_MAX 0x7fffu
+
+int dc8200_cursor_show(phys_t image, uint32_t x, uint32_t y) {
+    if (regs == NULL) {
+        return KERR_NODEV;
+    }
+    if (image >= ((phys_t)1 << 32) || x > CURSOR_POSITION_MAX || y > CURSOR_POSITION_MAX) {
+        return KERR_RANGE;
+    }
+    put(CURSOR_ADDRESS, (uint32_t)image);
+    put(CURSOR_LOCATION, x | (y << 16));
+    put(CURSOR_CONFIG, CURSOR_ARGB8888 | CURSOR_SIZE_32 | CURSOR_IMAGE_UPDATE | CURSOR_COMMIT);
+    return KERR_OK;
+}
+
+void dc8200_cursor_read(uint32_t *config, uint32_t *address, uint32_t *location) {
+    *config = regs != NULL ? get(CURSOR_CONFIG) : 0u;
+    *address = regs != NULL ? get(CURSOR_ADDRESS) : 0u;
+    *location = regs != NULL ? get(CURSOR_LOCATION) : 0u;
+}
+
 int dc8200_init(phys_t base) {
     void *at = mmu_map_device(base, DC_WINDOW_BYTES);
     if (at == NULL) {

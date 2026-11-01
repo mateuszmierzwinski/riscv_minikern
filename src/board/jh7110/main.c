@@ -38,6 +38,9 @@
 #include "core/klog.h"
 #include "kernel/irqwait.h"
 #include "kernel/file.h"
+#include "core/display_mode.h"
+#include "drivers/ccache_jh7110.h"
+#include "drivers/dc8200.h"
 #include "drivers/display_jh7110.h"
 #include "drivers/inno_hdmi.h"
 #include "kernel/fbdev.h"
@@ -1974,6 +1977,26 @@ static void refresh_display_from_beat(void) {
     }
 }
 
+/* The cursor's image, in the kernel's own image so that it is below 4 GiB
+ * (the controller takes 32-bit addresses) and needs no allocator. */
+static uint32_t cursor_image[CURSOR_PIXELS] __attribute__((aligned(4096)));
+
+/* `minikern.hdmicursor`: the arrow in the hardware cursor at (`x`, `y`),
+ * and the registers read back — the proof the controller took it. Whether
+ * it shows is a monitor's question (ROADMAP §10, by eye). */
+static void show_the_cursor(uint32_t x, uint32_t y) {
+    uint32_t config = 0, address = 0, location = 0;
+    phys_t at = mmu_virt_to_phys(cursor_image);
+    display_cursor_arrow(cursor_image);
+    (void)ccache_flush_range(at, sizeof cursor_image);
+    int rc = dc8200_cursor_show(at, x, y);
+    dc8200_cursor_read(&config, &address, &location);
+    kprintf("display: cursor 32x32 at %u,%u (rc %d): config %08x, address %08x %s, "
+            "location %08x %s\n",
+            x, y, rc, config, address, address == (uint32_t)at ? "(ours)" : "(NOT ours)", location,
+            location == (x | (y << 16)) ? "(as set)" : "(NOT as set)");
+}
+
 /* `minikern.hdmi=<width>x<height>`: `/dev/fb0` on the board's HDMI output
  * (ROADMAP §10). The framebuffer must have the same size — given by
  * `minikern.vfb`, or made for the HDMI mode when that is absent. */
@@ -1996,6 +2019,9 @@ static void start_hdmi(const struct fdt *fdt) {
     inno_hdmi_use_hdmi_mode(cmdline_equals(boot_cmdline, "minikern.hdmimode", "hdmi"));
     if (display_jh7110_start(fdt, base, fb.width, fb.height, fb.stride) == KERR_OK) {
         (void)timer_add_housekeeping_hook(refresh_display_from_beat);
+        if (cmdline_has(boot_cmdline, "minikern.hdmicursor")) {
+            show_the_cursor(fb.width / 2u, fb.height / 2u);
+        }
     }
 }
 
@@ -4785,16 +4811,13 @@ static void kmain_high(uint64_t hart, uint64_t dtb) {
      * measured both ways. Without it the only available comparison is
      * against a different binary, and "it is no slower than something else
      * I built" is not a measurement. */
-    /* **Opt-in, for now.** Reads through the interrupt are proven — twenty
-     * dispatched, nineteen waits woken, none timed out — but a *write*
-     * through the same path does not complete, and a disk that cannot be
-     * written is worse than one that is read by polling. So the default
-     * stays polled and `minikern.mmcirq` turns it on, which keeps the
-     * finished part usable and the unfinished part visible.
-     *
-     * The primitive itself and the `sie` fix below it are not opt-in: they
-     * are what made any of this reachable. */
-    if (cmdline_has(boot_cmdline, "minikern.mmcirq")) {
+    /* It was opt-in while a write through the interrupt did not complete;
+     * waiting for `tran` with CMD13 after a write fixed that, and on
+     * 2026-11-01 reads (15.6 MB/s at 50 MHz) and a mounted boot's log
+     * writes were clean through it, so it is on by default. */
+    /* On by default since 2026-11-01 (reads and a mounted boot's writes
+     * clean at 50 MHz); `minikern.mmcpoll` keeps the card polled. */
+    if (!cmdline_has(boot_cmdline, "minikern.mmcpoll")) {
         dwmmc_arm_only(cmdline_has(boot_cmdline, "minikern.mmcirqonly"));
         (void)dwmmc_use_interrupts_if_present(dtb);
     }
@@ -4806,7 +4829,11 @@ static void kmain_high(uint64_t hart, uint64_t dtb) {
     if (cmdline_has(boot_cmdline, "minikern.nvmeirqmeasure")) {
         struct fdt fdt;
         if (fdt_open(&fdt, (const void *)(uintptr_t)dtb, FDT_MAX_BYTES) == KERR_OK) {
-            nvme_measure_intx(&fdt);
+            /* `=<mask>` writes the bridge's +180 first: one setting a boot,
+             * since a PLIC pending bit cannot be cleared without enabling
+             * the source. 57 is the bridge's line in the tree. */
+            nvme_measure_intx(&fdt, (uint32_t)cmdline_number(boot_cmdline,
+                                                              "minikern.nvmeirqmeasure", 0), 57u);
         }
     }
     if (cmdline_has(boot_cmdline, "minikern.nvmeirq") ||

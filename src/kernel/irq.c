@@ -42,6 +42,21 @@ void irq_dispatch(uint32_t source) {
     handlers[source].handle(handlers[source].self);
 }
 
+static bool mask_after_completion[IRQ_MAX_SOURCES];
+
+void irq_mask_when_completed(uint32_t source) {
+    if (source < IRQ_MAX_SOURCES) {
+        mask_after_completion[source] = true;
+    }
+}
+
+void irq_completed(uint32_t source) {
+    if (source < IRQ_MAX_SOURCES && mask_after_completion[source]) {
+        mask_after_completion[source] = false;
+        plic_disable(source);
+    }
+}
+
 uint64_t irq_count(void) {
     return dispatched;
 }

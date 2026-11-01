@@ -126,7 +126,20 @@ static void test_an_empty_line_is_not_an_edid(void) {
     KTEST_CHECK(display_edid_parse(b, &e) == KERR_INVAL);
 }
 
+static uint32_t arrow[CURSOR_PIXELS];
+
+static void test_the_cursor_arrow_is_outlined_and_transparent_around(void) {
+    display_cursor_arrow(arrow);
+    KTEST_CHECK(arrow[0] == 0xff000000u);                       /* the hot spot is the tip */
+    KTEST_CHECK(arrow[5u * CURSOR_SIDE + 2u] == 0xffffffffu);   /* inside: white */
+    KTEST_CHECK(arrow[5u * CURSOR_SIDE + 5u] == 0xff000000u);   /* the diagonal edge */
+    KTEST_CHECK(arrow[5u * CURSOR_SIDE + 6u] == 0u);            /* right of it: clear */
+    KTEST_CHECK(arrow[31u * CURSOR_SIDE + 31u] == 0u);          /* far corner: clear */
+    KTEST_CHECK(arrow[19u * CURSOR_SIDE + 3u] == 0xff000000u);  /* the bottom edge */
+}
+
 int main(void) {
+    KTEST_RUN(test_the_cursor_arrow_is_outlined_and_transparent_around);
     KTEST_RUN(test_the_two_cea_modes_are_known);
     KTEST_RUN(test_dc_words_match_the_vendor_bootloader_at_1080p);
     KTEST_RUN(test_dc_words_at_720p);

@@ -35,6 +35,14 @@ uint32_t dc8200_revision(void);
 uint32_t dc8200_model(void);
 uint32_t dc8200_customer(void);
 
+/* The hardware cursor: a 32×32 ARGB8888 image at physical `image` (below
+ * 4 GiB), its hot spot at (`x`, `y`) — the first of the controller's
+ * planes this driver uses. */
+int dc8200_cursor_show(phys_t image, uint32_t x, uint32_t y);
+
+/* The cursor registers as the controller holds them. */
+void dc8200_cursor_read(uint32_t *config, uint32_t *address, uint32_t *location);
+
 /* Scans out `stride`-byte lines of XRGB8888 at physical `fb` on display 0
  * with timing `t`. The controller takes a 32-bit address, so `fb` must lie
  * below 4 GiB: KERR_RANGE otherwise. */

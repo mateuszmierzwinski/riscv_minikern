@@ -141,6 +141,19 @@ void plic_enable(uint32_t irq) {
     }
 }
 
+#define PLIC_PENDING(irq) (0x1000u + ((irq) / 32u) * 4u)
+
+bool plic_pending(uint32_t irq) {
+    return plic.up && irq < PLIC_MAX_SOURCES &&
+           (read_reg(PLIC_PENDING(irq)) & (1u << (irq % 32u))) != 0;
+}
+
+void plic_set_priority(uint32_t irq, uint32_t priority) {
+    if (plic.up && irq < PLIC_MAX_SOURCES) {
+        write_reg(PLIC_PRIORITY(irq), priority);
+    }
+}
+
 void plic_disable(uint32_t irq) {
     if (plic.up && irq < PLIC_MAX_SOURCES) {
         uint32_t off = PLIC_ENABLE(plic.context) + (irq / 32u) * 4u;

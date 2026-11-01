@@ -66,6 +66,14 @@ void display_hdmi_timing(const struct display_timing *t, uint8_t out[HDMI_TIMING
 void display_avi_infoframe(uint8_t vic, uint8_t out[AVI_INFOFRAME_BYTES]);
 
 /* What a monitor says about itself in the first 128 bytes of its EDID. */
+/* The hardware cursor's image: 32×32 ARGB8888, the smallest size the
+ * DC8200 takes (DISPLAY.md, "Mainline cross-check"). An arrow — white with
+ * a black outline, transparent around it — pointing up and left from its
+ * hot spot at (0, 0). */
+#define CURSOR_SIDE 32u
+#define CURSOR_PIXELS (CURSOR_SIDE * CURSOR_SIDE)
+void display_cursor_arrow(uint32_t out[CURSOR_PIXELS]);
+
 #define EDID_BLOCK_BYTES 128u
 
 struct edid_info {

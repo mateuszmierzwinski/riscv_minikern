@@ -732,6 +732,14 @@ CASES = [
       "display: HDMI mode, AVI infoframe for VIC 16 reads back as sent",
       "(30 expected), underflow no — scanning out"],
      120, None),
+    # The hardware cursor (§10, the first plane): the arrow loaded and placed
+    # at the screen's centre, the registers read back as written. Whether it
+    # shows on a monitor is the operator's check.
+    ("§10: the hardware cursor, placed and read back",
+     "minikern.hdmi=1920x1080 minikern.hdmicursor",
+     ["display: cursor 32x32 at 960,540 (rc 0)", "(ours)", "(as set)",
+      "(30 expected), underflow no — scanning out"],
+     120, None),
     ("§10: HDMI scanout at 720p60",
      "minikern.hdmi=1280x720",
      ["display: HDMI 1280x720, PLLs locked, TMDS on", "(30 expected), underflow no — scanning out"],
@@ -809,6 +817,13 @@ CASES = [
       "s frame at 8000 not read: not its memory",
       "s frame at ffffffc000400000 not read: not its memory"],
      240, "//:sigframe.elf"),
+    # **`minikern.probe` runs to its end** — it panicked on a physical
+    # address used as a pointer since step C, and no case ran it. The PMIC
+    # line is the core rail decoded read-only (ROADMAP §4, voltage scaling).
+    ("§4: the machine probe, to its last line",
+     "minikern.probe",
+     ["probe: PMIC DCDC2 (vdd_cpu)", "probe: ---------------------------------"],
+     90, None),
     # **The watchdog** (§4): armed for 3 s and fed by the kernel's beat, the
     # board outlives a 15 s spin and stops it cleanly at power-off — which
     # fails on this board, so an armed watchdog would otherwise reboot a

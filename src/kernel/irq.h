@@ -37,6 +37,18 @@ int irq_register(uint32_t source, const struct irq_handler *h);
  * ever and the machine will do nothing else. */
 void irq_dispatch(uint32_t source);
 
+/* Asks for `source` to be masked **once its claim is completed** — for a
+ * handler of a level-triggered line it cannot lower itself. Masking it in
+ * the handler is the bug this exists for: the trap completes the claim
+ * after the handler returns, and the PLIC ignores a completion for a
+ * source that is not enabled, so the gateway never forwarded that source
+ * again (the NVMe interrupt, ROADMAP §8). */
+void irq_mask_when_completed(uint32_t source);
+
+/* Called by the trap right after the claim is completed: applies a mask
+ * the handler asked for. */
+void irq_completed(uint32_t source);
+
 /* How many interrupts have been dispatched, and how many had no handler. */
 uint64_t irq_count(void);
 uint64_t irq_spurious(void);

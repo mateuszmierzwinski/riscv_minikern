@@ -1,6 +1,7 @@
 #include "drivers/nvme.h"
 
 #include "arch/riscv/mmu.h"
+#include "arch/riscv/plic.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -8,7 +9,7 @@
 #include "core/console.h"
 #include "core/errno.h"
 #include "drivers/pci.h"
-#include "arch/riscv/plic.h"
+#include "kernel/irq.h"
 #include "kernel/irqwait.h"
 #include "kernel/mem.h"
 
@@ -198,7 +199,7 @@ static uint32_t quiet_the_pin(void) {
      * the completion has been taken off the ring. That is the ordinary
      * treatment of a level-triggered line shared by a whole bridge, and it
      * is what this should have been from the start. */
-    plic_disable(nvme_plic_source);
+    irq_mask_when_completed(nvme_plic_source); /* not plic_disable: see irq.h */
     write_reg(NVME_INTMS, 1u);
     {
         uint32_t intx = pci_bridge_intx_clear();
@@ -300,6 +301,12 @@ static int submit(struct nvme_queue *q, const struct nvme_command *cmd, uint32_t
      * makes a mask left over from an abandoned command self-healing. */
     if (nvme_irq_armed) {
         write_reg(NVME_INTMC, 1u);
+        /* **And the PLIC source, for the same reason.** It was re-enabled
+         * only after a completion was consumed — so a stale assertion that
+         * fired the handler at arming (the bridge's line is pending before
+         * the kernel looks) masked it, and the first command's interrupt
+         * could never arrive: it timed out, every boot. */
+        plic_enable(nvme_plic_source);
     }
     ring(q->id, false, q->sq_tail);
     /* **The interrupt ends the sleep; the phase bit remains the truth.**
@@ -414,7 +421,26 @@ static int nvme_read(void *self, uint64_t lba, uint32_t count, void *buf);
  * because a device that is not asserting cannot make the bridge latch
  * anything — that is the whole point of the exercise.
  */
-void nvme_measure_intx(const struct fdt *fdt) {
+/* Clears a pending bit latched before the kernel looked, the only way the
+ * PLIC allows: enable, claim, complete, disable — with supervisor
+ * interrupts held off throughout, so the enable cannot trap. Pending
+ * afterwards means the line is **still asserted**, not merely stale. */
+static void drain_a_stale_pending(uint32_t source) {
+    uint64_t sstatus;
+    uint32_t claimed;
+    __asm__ volatile("csrrci %0, sstatus, 2" : "=r"(sstatus) : : "memory");
+    plic_enable(source);
+    claimed = plic_claim();
+    if (claimed != 0) {
+        plic_complete(claimed);
+    }
+    plic_disable(source);
+    __asm__ volatile("csrs sstatus, %0" : : "r"(sstatus & 2u) : "memory");
+    kprintf("nvme: claimed %u to drain it; PLIC %u pending now %u\n", claimed, source,
+            plic_pending(source) ? 1u : 0u);
+}
+
+void nvme_measure_intx(const struct fdt *fdt, uint32_t mask, uint32_t source) {
     enum { FIRST = 0x100u / 4u, LAST = 0x200u / 4u };
     const volatile uint32_t *apb;
     uint64_t bytes = 0;
@@ -428,6 +454,18 @@ void nvme_measure_intx(const struct fdt *fdt) {
         kprintf("nvme: no apb window to measure\n");
         return;
     }
+    /* **Cleared first**: INTA was already latched from before the kernel
+     * looked (`01880000`), so a completion that set it again changed
+     * nothing a before/after comparison could see. */
+    write_reg(NVME_INTMS, 1u);
+    if (mask != 0) {
+        pci_bridge_apb_poke(fdt, 0x180u, mask); /* the mask under test */
+    }
+    pci_bridge_apb_poke(fdt, 0x184u, 0xffffffffu);
+    plic_set_priority(source, 1u);
+    kprintf("nvme: +180 %08x, +184 cleared with the drive masked: %08x; PLIC %u pending %u\n",
+            apb[0x180u / 4u], apb[0x184u / 4u], source, plic_pending(source) ? 1u : 0u);
+    drain_a_stale_pending(source);
     for (uint32_t i = 0; i < LAST - FIRST; i++) {
         before[i] = apb[FIRST + i];
     }
@@ -439,8 +477,8 @@ void nvme_measure_intx(const struct fdt *fdt) {
             kprintf("nvme: apb +%03x changed %08x -> %08x\n", (FIRST + i) * 4u, before[i], now);
         }
     }
-    kprintf("nvme: apb +180 %08x +184 %08x (the assumed mask and status)\n",
-            apb[0x180u / 4u], apb[0x184u / 4u]);
+    kprintf("nvme: apb +180 %08x +184 %08x after a completion; PLIC %u pending %u\n",
+            apb[0x180u / 4u], apb[0x184u / 4u], source, plic_pending(source) ? 1u : 0u);
     /* **Does the latch answer to a write of 1s?** Nothing read can say, and
      * it is the question the hang turns on: if bit 24 clears and stays
      * clear, the offsets are right and the fault is re-assertion; if it

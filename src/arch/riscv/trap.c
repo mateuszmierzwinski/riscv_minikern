@@ -151,6 +151,7 @@ static bool handle_interrupt(uint64_t code) {
         if (irq != 0) {
             irq_dispatch(irq);
             plic_complete(irq);
+            irq_completed(irq);
         }
         return true;
     }

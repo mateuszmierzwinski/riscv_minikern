@@ -40,6 +40,15 @@ int plic_init(const struct fdt *fdt, uint64_t hart);
 void plic_enable(uint32_t irq);
 void plic_disable(uint32_t irq);
 
+/* Whether `irq` is pending at its gateway — set when the source asserts,
+ * enabled or not: the way to ask whether a line reaches the controller
+ * without risking a storm by enabling it. */
+bool plic_pending(uint32_t irq);
+
+/* A source's priority without enabling it (a gateway may ignore a source
+ * at priority 0). */
+void plic_set_priority(uint32_t irq, uint32_t priority);
+
 /* The highest-priority pending source, or 0 when there is none. Claiming it
  * also clears its pending bit. */
 uint32_t plic_claim(void);
