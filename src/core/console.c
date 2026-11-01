@@ -81,6 +81,16 @@ void console_write_untranslated(const char *buf, size_t len) {
     }
 }
 
+void console_queue(const char *buf, size_t len, bool translate) {
+    if (attached.queue != NULL) {
+        attached.queue(attached.self, buf, len, translate);
+    } else if (translate) {
+        console_write(buf, len);
+    } else {
+        console_write_untranslated(buf, len);
+    }
+}
+
 bool console_untranslated(void) {
     return attached.write_untranslated != NULL;
 }

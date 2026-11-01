@@ -74,6 +74,11 @@ static void *taken_by[SMP_MAX_HARTS];
  * difference between "some critical section is long" and knowing which. */
 static uint64_t tag_now[SMP_MAX_HARTS];
 static uint64_t worst_held_tag;
+/* **The same, since the loaded program started** (`klock_mark_program`).
+ * A boot holds the lock for its own one-off reasons — a DHCP lease printed
+ * from the GMAC's interrupt was the worst hold of every run — and those
+ * hid what the program itself waits behind. */
+static uint64_t mark_worst, mark_caller, mark_tag;
 
 static uint64_t acquisitions;
 static uint64_t contended;
@@ -139,6 +144,18 @@ uint64_t klock_worst_caller(void) {
     return __atomic_load_n(&worst_held_caller, __ATOMIC_RELAXED);
 }
 
+void klock_mark_program(void) {
+    __atomic_store_n(&mark_worst, 0u, __ATOMIC_RELAXED);
+    __atomic_store_n(&mark_caller, 0u, __ATOMIC_RELAXED);
+    __atomic_store_n(&mark_tag, 0u, __ATOMIC_RELAXED);
+}
+
+void klock_worst_since_mark(uint64_t *cycles, uint64_t *caller, uint64_t *tag) {
+    *cycles = __atomic_load_n(&mark_worst, __ATOMIC_RELAXED);
+    *caller = __atomic_load_n(&mark_caller, __ATOMIC_RELAXED);
+    *tag = __atomic_load_n(&mark_tag, __ATOMIC_RELAXED);
+}
+
 void klock_tag(uint64_t what) {
     uint32_t me = smp_hart_index();
     if (me < SMP_MAX_HARTS) {
@@ -148,6 +165,16 @@ void klock_tag(uint64_t what) {
 
 uint64_t klock_worst_tag(void) {
     return __atomic_load_n(&worst_held_tag, __ATOMIC_RELAXED);
+}
+
+/* Called with the lock still held, so the three stores are one record. */
+static void note_if_longest_since_mark(uint64_t took_cycles, uint32_t me) {
+    if (took_cycles <= __atomic_load_n(&mark_worst, __ATOMIC_RELAXED) || me >= SMP_MAX_HARTS) {
+        return;
+    }
+    __atomic_store_n(&mark_worst, took_cycles, __ATOMIC_RELAXED);
+    __atomic_store_n(&mark_caller, (uint64_t)(uintptr_t)taken_by[me], __ATOMIC_RELAXED);
+    __atomic_store_n(&mark_tag, tag_now[me], __ATOMIC_RELAXED);
 }
 
 void klock_exit(bool took) {
@@ -171,6 +198,7 @@ void klock_exit(bool took) {
                     __atomic_store_n(&worst_held_tag,
                                      me < SMP_MAX_HARTS ? tag_now[me] : 0u, __ATOMIC_RELAXED);
                 }
+                note_if_longest_since_mark(took_cycles, me);
             }
         }
     }

@@ -8,6 +8,9 @@
 #include "core/console.h"
 #include "kernel/irq.h"
 
+/* Set by the composition root: names what this hart does under the lock. */
+static void (*lock_tag)(uint64_t);
+
 /* The frame the entry code writes and the structure the C reads are two
  * descriptions of one thing, so they are checked against each other here
  * rather than trusted to stay in step. */
@@ -149,6 +152,11 @@ static bool handle_interrupt(uint64_t code) {
          * on the architecture this came from allowed you to get wrong. */
         uint32_t irq = plic_claim();
         if (irq != 0) {
+            /* Which source, in the lock's record: "an external interrupt"
+             * held the lock 8 ms and named no device. Bits 32+ of the tag. */
+            if (lock_tag != NULL) {
+                lock_tag(((uint64_t)1u << 63) | IRQ_S_EXTERNAL | ((uint64_t)irq << 32));
+            }
             irq_dispatch(irq);
             plic_complete(irq);
             irq_completed(irq);
@@ -228,7 +236,6 @@ static void on_the_way_back(struct trapframe *tf) {
     }
 }
 
-static void (*lock_tag)(uint64_t);
 
 void trap_set_lock_tag(void (*tag)(uint64_t)) {
     lock_tag = tag;

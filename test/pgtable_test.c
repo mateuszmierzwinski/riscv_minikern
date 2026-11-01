@@ -255,7 +255,24 @@ static void test_a_megapage_window_is_free_only_when_empty(void) {
     pgtable_destroy(&pt);
 }
 
+/* Empty spans: the rest of an absent table's reach, one page for a zero
+ * entry, nothing where a mapping or a swapped page is. */
+static void test_empty_spans_stride_over_what_is_absent(void) {
+    struct pgtable pt = fresh();
+    KTEST_CHECK(pgtable_empty_span(&pt, 0x1000) == 0x40000000ull - 0x1000); /* no level-1 table */
+    KTEST_CHECK(pgtable_map(&pt, 0x1000, 0x80002000ull, PAGE_SIZE, PT_PROT_RW) == KERR_OK);
+    KTEST_CHECK(pgtable_empty_span(&pt, 0x1000) == 0);                     /* mapped */
+    KTEST_CHECK(pgtable_empty_span(&pt, 0x2000) == PAGE_SIZE);             /* a zero entry */
+    KTEST_CHECK(pgtable_empty_span(&pt, 0x200000) == MEGAPAGE_SIZE);       /* no level-0 table */
+    KTEST_CHECK(pgtable_map(&pt, 0x3000, 0x80003000ull, PAGE_SIZE, PT_PROT_RW) == KERR_OK);
+    KTEST_CHECK(pgtable_set_swapped(&pt, 0x3000, 7u) == KERR_OK);          /* a page sent out */
+    KTEST_CHECK(pgtable_empty_span(&pt, 0x3000) == 0);                     /* swapped: not empty */
+    KTEST_CHECK(pgtable_empty_span(&pt, 0x0000004000000000ull) == 0);      /* not canonical */
+    pgtable_destroy(&pt);
+}
+
 int main(void) {
+    KTEST_RUN(test_empty_spans_stride_over_what_is_absent);
     KTEST_RUN(test_canonical_addresses);
     KTEST_RUN(test_a_swapped_page_is_remembered_but_not_mapped);
     KTEST_RUN(test_maps_and_reads_back_a_page);

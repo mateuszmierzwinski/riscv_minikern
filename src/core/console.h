@@ -30,6 +30,11 @@ void console_write(const char *buf, size_t len);
 /* Writes len bytes with no CR added before an LF — a terminal with `OPOST`
  * off. Only when `console_untranslated()`: otherwise it is `console_write`. */
 void console_write_untranslated(const char *buf, size_t len);
+/* A program's output: queued where the device can send it later (its
+ * interrupt drains it), so the caller — holding the kernel lock — does not
+ * wait at 115200 baud. Kernel lines (`kprintf`) stay synchronous. */
+void console_queue(const char *buf, size_t len, bool translate);
+
 bool console_untranslated(void);
 
 /* Whether a port has been attached yet. Output before that is dropped by

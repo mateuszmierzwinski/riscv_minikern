@@ -324,6 +324,37 @@ static void bring_up_memory(const struct bootinfo *info) {
  * A wrapper rather than a direct call, because the disk may be the NVMe
  * drive or a RAM image — and arming an interrupt for a controller nothing
  * is reading would install a handler for a device that will never raise. */
+static void on_uart_interrupt(void *self) {
+    (void)self;
+    jh7110_uart_on_interrupt();
+}
+
+/* **A program's console output is queued, not waited for** (ROADMAP §8,
+ * long work under the lock): its `write` copies into the UART driver's ring
+ * and the transmit interrupt feeds the FIFO, so the writer holds the kernel
+ * lock for a copy rather than ~87 µs a byte. Kernel lines stay synchronous.
+ * `minikern.consolesync` is the control. */
+static void queue_the_console_output(uint64_t dtb) {
+    static const struct irq_handler handler = {.handle = on_uart_interrupt, .self = NULL};
+    struct fdt fdt;
+    uint32_t source;
+    if (cmdline_has(boot_cmdline, "minikern.consolesync") || jh7110_uart_path()[0] == '\0' ||
+        fdt_open(&fdt, (const void *)(uintptr_t)dtb, FDT_MAX_BYTES) != KERR_OK) {
+        return;
+    }
+    source = fdt_get_u32(&fdt, jh7110_uart_path(), "interrupts", 0u);
+    if (source == 0u || irq_register(source, &handler) != KERR_OK) {
+        kprintf("uart: no transmit interrupt (source %u); program output stays synchronous\n",
+                source);
+        return;
+    }
+    /* `minikern.uartfifo=<n>` names the FIFO depth, for measuring it: the
+     * part's parameter register reads 0, which is "not implemented". */
+    kprintf("uart: program output queued, transmit interrupt %u, %u-byte FIFO\n", source,
+            jh7110_uart_start_queueing(
+                (uint32_t)cmdline_number(boot_cmdline, "minikern.uartfifo", 0u)));
+}
+
 static int dwmmc_use_interrupts_if_present(uint64_t dtb) {
     const char *kind = disk_present() ? disk_kind() : NULL;
     /* `disk_kind` is the probe's own word for what it attached, which is
@@ -1279,6 +1310,12 @@ static void report_detectors(void) {
         kprintf("klock: **the kernel lock was not exclusive %u times**\n", klock_breaches());
     }
     report_lock_contention();
+    {
+        uint64_t interrupts = 0, waited = 0;
+        jh7110_uart_queue_stats(&interrupts, &waited);
+        kprintf("uart: %llu transmit interrupts; %llu bytes sent while the ring was full\n",
+                (unsigned long long)interrupts, (unsigned long long)waited);
+    }
     report_the_network_after_everything();
     if (uspace_backed_twice() != 0) {
         kprintf("uspace: **%u pages were backed twice** by two harts at once\n",
@@ -1452,6 +1489,29 @@ static void report_the_network_after_everything(void) {
     }
 }
 
+/* The longest hold, said in words: a syscall tag is its number plus
+ * `KLOCK_TAG_SYSCALL`; an interrupt's is `scause`, with the PLIC source in
+ * bits 32 and up for an external one. */
+static void report_the_longest_hold(uint64_t caller, uint64_t tag) {
+    if ((tag >> 63) != 0u) {
+        kprintf("klock: the longest hold was taken at %016llx, in interrupt cause %llu, source %llu\n",
+                (unsigned long long)caller, (unsigned long long)(tag & 0xffffu),
+                (unsigned long long)((tag >> 32) & 0x7fffffffu));
+        return;
+    }
+    kprintf("klock: the longest hold was taken at %016llx, doing %llu\n", (unsigned long long)caller,
+            (unsigned long long)tag);
+}
+
+/* The longest hold since the loaded program started, apart from boot's. */
+static void report_the_programs_longest_hold(void) {
+    uint64_t cycles = 0, caller = 0, tag = 0;
+    klock_worst_since_mark(&cycles, &caller, &tag);
+    kprintf("klock: during the program the longest hold was %llu us at 1 GHz\n",
+            (unsigned long long)(cycles / 1000u));
+    report_the_longest_hold(caller, tag);
+}
+
 static void report_lock_contention(void) {
     uint64_t acquires = 0, waited = 0, cycles = 0, worst = 0;
     klock_contention(&acquires, &waited, &cycles, &worst);
@@ -1477,9 +1537,8 @@ static void report_lock_contention(void) {
         kprintf("klock: held %llu cycles total, %llu average, %llu worst (%llu us at 1 GHz)\n",
                 (unsigned long long)total, (unsigned long long)(total / acquires),
                 (unsigned long long)worst_held, (unsigned long long)(worst_held / 1000u));
-        kprintf("klock: the longest hold was taken at %016llx, doing %llu\n",
-                (unsigned long long)klock_worst_caller(),
-                (unsigned long long)klock_worst_tag());
+        report_the_longest_hold(klock_worst_caller(), klock_worst_tag());
+        report_the_programs_longest_hold();
     }
 }
 
@@ -5091,6 +5150,7 @@ static void kmain_high(uint64_t hart, uint64_t dtb) {
         dwmmc_arm_only(cmdline_has(boot_cmdline, "minikern.mmcirqonly"));
         (void)dwmmc_use_interrupts_if_present(dtb);
     }
+    queue_the_console_output(dtb);
     /* **The drive has its own switch**, because it is its own device: it
      * reads its interrupt from the PCIe host bridge rather than from its own
      * node, it is the attached disk on this board where the card is not, and

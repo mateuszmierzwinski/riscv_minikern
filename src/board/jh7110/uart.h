@@ -47,6 +47,14 @@ int jh7110_uart_init_at(phys_t base, uint32_t shift, uint32_t width, struct cons
 int jh7110_uart_getc(void);
 
 const char *jh7110_uart_path(void);
+
+/* **Program output, queued and sent by the transmit interrupt.** Called once
+ * the interrupt is registered (`jh7110_uart_on_interrupt` is its handler);
+ * before that, and without it, a queued write is sent at once. Returns the
+ * FIFO depth it will feed per interrupt. */
+uint32_t jh7110_uart_start_queueing(uint32_t depth); /* 0: from the part */
+void jh7110_uart_on_interrupt(void);
+void jh7110_uart_queue_stats(uint64_t *interrupts, uint64_t *sent_while_full);
 phys_t jh7110_uart_base(void);
 
 #endif

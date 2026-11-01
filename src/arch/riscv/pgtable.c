@@ -340,6 +340,25 @@ bool pgtable_megapage_free(const struct pgtable *pt, virt_t va) {
     return table[index_at(va, 1)] == 0;
 }
 
+uint64_t pgtable_empty_span(const struct pgtable *pt, virt_t va) {
+    const uint64_t *table = pt->root;
+    if (!pgtable_va_is_canonical(va)) {
+        return 0;
+    }
+    for (uint32_t l = PT_LEVELS; l-- > 0;) {
+        uint64_t pte = table[index_at(va, l)];
+        if (pte == 0) {
+            uint64_t span = span_at(l);
+            return span - (va & (span - 1u));
+        }
+        if (!pte_is_table(pte)) {
+            return 0; /* a mapping, or a swapped page's entry */
+        }
+        table = pt->mem.to_virt(pt->mem.self, pte_phys(pte));
+    }
+    return 0;
+}
+
 bool pgtable_lookup(const struct pgtable *pt, virt_t va, phys_t *pa, uint64_t *prot, uint64_t *size) {
     const uint64_t *table = pt->root;
     if (!pgtable_va_is_canonical(va)) {

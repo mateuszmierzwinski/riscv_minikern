@@ -43,6 +43,7 @@ static void reclaim_if_short(struct uproc *p);
  * by `uspace_trace_faults`; counts itself down so a run cannot be drowned. */
 static uint32_t fault_trace;
 static int drop_pages(struct uproc *p, virt_t at, uint64_t bytes);
+static int drop_pages_counted(struct uproc *p, virt_t at, uint64_t bytes, uint64_t *dropped);
 static void record_stack(struct uproc *p);
 static void drop_every_file(struct uproc *p);
 static void published_addition(void);
@@ -731,7 +732,10 @@ static bool back_on_demand(struct trapframe *tf) {
          * the regions, never copied it. Capped, because a reservation is
          * *supposed* to keep faulting and would otherwise flood this. */
         static uint32_t said;
-        if (said < 5u) {
+        /* Under `minikern.errors` since 2026-11-01: a runtime that recovers
+         * from nil dereferences (Go) takes this on purpose, and the line
+         * cost ~8 ms of console time with the kernel lock held. */
+        if (said < 5u && syscall_tracing_errors()) {
             said++;
             kprintf("demand: pid %u fault at %016llx: %s\n", me->pid,
                     (unsigned long long)tf->stval,
@@ -1116,6 +1120,7 @@ int64_t uspace_run(struct uproc *p) {
     trap_set_expected(on_user_trap);
     trap_set_user_return_hook(on_user_return);
     calls_at_start = syscall_count();
+    klock_mark_program();
     __asm__ volatile("csrr %0, satp" : "=r"(kernel_satp_saved));
     /* The first thread's register set. `sstatus` carries SUM, because every
      * frame restored from here onwards inherits it — including a cloned
@@ -3348,13 +3353,23 @@ static int give_region(struct uproc *child, struct uproc *parent, const struct v
     if (!huge && split_huge_in(parent, r->start, r->end) != KERR_OK) {
         return KERR_NOMEM;
     }
-    for (virt_t at = r->start; at < r->end; at += huge ? MEGAPAGE_SIZE : PAGE_SIZE) {
-        int rc = huge     ? give_megapage(child, parent, at, r->prot)
-                 : shared ? give_page_shared(child, parent, at)
-                          : give_page_cow(child, parent, at);
+    for (virt_t at = r->start; at < r->end;) {
+        /* Over what the parent never touched in one step, not page by page:
+         * a runtime reserves regions far larger than it uses, and this is
+         * the same per-4 KiB walk that held the lock ~60 ms in `mmap`. */
+        uint64_t empty = pgtable_empty_span(&parent->pt, at);
+        int rc;
+        if (empty != 0) {
+            at += empty;
+            continue;
+        }
+        rc = huge     ? give_megapage(child, parent, at, r->prot)
+             : shared ? give_page_shared(child, parent, at)
+                      : give_page_cow(child, parent, at);
         if (rc != KERR_OK) {
             return rc;
         }
+        at += huge ? MEGAPAGE_SIZE : PAGE_SIZE;
     }
     return KERR_OK;
 }
@@ -3656,29 +3671,22 @@ static void populate(struct uproc *p, virt_t base, uint64_t pages, uint32_t prot
  * `munmap`'s half would remove the record a page at a time, splitting a
  * region once per page on the way. */
 static void clear_the_range(struct uproc *p, bool fixed, virt_t base, uint64_t pages) {
-    for (uint64_t i = 0; i < pages; i++) {
-        virt_t va = base + i * PAGE_SIZE;
-        phys_t was = 0;
-        uint64_t f = 0, sz = 0;
-        if (fixed && pgtable_lookup(&p->pt, va, &was, &f, &sz)) {
-            /* **A mapping that *was* insisted on, over live pages.**
-             *
-             * Not a bug by itself: `MAP_FIXED` means "put it here and throw
-             * away whatever is there", and a program that asks for that is
-             * entitled to it. It is counted because of what it would mean
-             * *here*: this program's runtime maps its heap with `MAP_FIXED`
-             * at addresses it believes it has not used yet, so a fixed
-             * mapping landing on live pages says the runtime was told
-             * those addresses were free — and the only thing that tells it
-             * that is this kernel's placement. A number separate from
-             * `replaced_pages`, because the two have different meanings and
-             * adding them would hide both. */
-            fixed_over_live++;
-        }
-        if (!fixed && pgtable_lookup(&p->pt, va, &was, &f, &sz)) {
-            replaced_pages++;
-        }
-        (void)drop_pages(p, va, PAGE_SIZE);
+    /* **One walk over the range, not one per page.** It was a page-table
+     * lookup, a huge-page edge check and a swap check for every 4 KiB —
+     * 16,384 of each for a Go arena's 64 MiB `MAP_FIXED`, ~40 ms with the
+     * kernel lock held — and the range is usually empty. `drop_pages`
+     * strides over empty spans and says how many pages it dropped.
+     *
+     * The counts mean what they did: a fixed mapping over live pages is
+     * counted separately from a placement that landed on them, because the
+     * first is the program's to ask for and the second would be this
+     * kernel's placement telling a runtime that taken addresses were free. */
+    uint64_t dropped = 0;
+    (void)drop_pages_counted(p, base, pages * PAGE_SIZE, &dropped);
+    if (fixed) {
+        fixed_over_live += dropped;
+    } else {
+        replaced_pages += dropped;
     }
 }
 
@@ -3782,6 +3790,12 @@ int uspace_map(struct uproc *p, const struct uspace_mapping *m, virt_t *out) {
  * pages below the break, which the record never described. Only `munmap`
  * wants both, and that is `uspace_unmap`. */
 static int drop_pages(struct uproc *p, virt_t at, uint64_t bytes) {
+    uint64_t dropped = 0;
+    return drop_pages_counted(p, at, bytes, &dropped);
+}
+
+/* `drop_pages`, saying how many mapped 4 KiB pages it dropped. */
+static int drop_pages_counted(struct uproc *p, virt_t at, uint64_t bytes, uint64_t *dropped) {
     uint64_t pages = 0;
     int rc;
     if ((at & (PAGE_SIZE - 1u)) != 0 || !page_count(bytes, &pages)) {
@@ -3797,7 +3811,11 @@ static int drop_pages(struct uproc *p, virt_t at, uint64_t bytes) {
     for (virt_t va = at; va < at + pages * PAGE_SIZE;) {
         phys_t phys = 0;
         uint64_t flags = 0, size = 0;
-        uint64_t span;
+        uint64_t span = pgtable_empty_span(&p->pt, va);
+        if (span != 0) {
+            va += span; /* nothing here, nor in the rest of the span */
+            continue;
+        }
         if (!pgtable_lookup(&p->pt, va, &phys, &flags, &size)) {
             /* **A page that is out in swap still costs a slot.** Unmapping
              * it has to give that slot back, or a program that pages memory
@@ -3830,6 +3848,7 @@ static int drop_pages(struct uproc *p, virt_t at, uint64_t bytes) {
          * already published before its frame is reusable. */
         published_removal();
         freed_frames += span / PAGE_SIZE;
+        *dropped += span / PAGE_SIZE;
         mem_free_pages(phys, (uint32_t)(span / PAGE_SIZE));
         va = (va & ~(virt_t)(span - 1u)) + span;
     }

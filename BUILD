@@ -166,14 +166,27 @@ cc_library(
     srcs = [
         "src/core/console.c",
         "src/core/klog.c",
+        "src/core/txring.c",
     ],
     hdrs = [
         "src/core/console.h",
         "src/core/klog.h",
         "src/core/ports.h",
+        "src/core/txring.h",
     ],
     strip_include_prefix = "src",
     deps = [":kfmt"],
+)
+
+# The console's transmit ring: order, a full ring refused, indices wrapping.
+cc_test(
+    name = "txring_test",
+    size = "small",
+    srcs = ["test/txring_test.c"],
+    deps = [
+        ":console",
+        ":ktest",
+    ],
 )
 
 cc_test(

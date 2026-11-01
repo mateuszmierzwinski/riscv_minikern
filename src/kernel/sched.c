@@ -2383,9 +2383,12 @@ void sched_arm_timer(void) {
             uint64_t sie = 0;
             __asm__ volatile("csrr %0, sie" : "=r"(sie));
             told |= 1ull << (me_index & 63u);
-            kprintf("clock: hart %u armed at %llu; sie %llx, timer %s\n", me_index,
-                    (unsigned long long)when, (unsigned long long)sie,
-                    (sie & (1ull << 5)) != 0 ? "ENABLED" : "**DISABLED**");
+            /* Only the wrong answer is said: the right one was four lines of
+             * console time under the lock in every program's first moments. */
+            if ((sie & (1ull << 5)) == 0) {
+                kprintf("clock: hart %u armed at %llu; sie %llx, timer **DISABLED**\n", me_index,
+                        (unsigned long long)when, (unsigned long long)sie);
+            }
         }
     }
     check_deadline_is_armed(h->current == SCHED_NO_THREAD ? "idle" : "running");

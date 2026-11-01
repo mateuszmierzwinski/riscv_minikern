@@ -71,6 +71,12 @@ void klock_contention(uint64_t *acquires, uint64_t *waited, uint64_t *cycles, ui
  * about a long critical section rather than about syscall throughput. */
 void klock_held_times(uint64_t *total, uint64_t *worst);
 
+/* Starts a second record of the longest hold, kept beside the one since
+ * boot: called when the loaded program starts, so that what the program
+ * waits behind is not hidden by the boot's own one-off holds. */
+void klock_mark_program(void);
+void klock_worst_since_mark(uint64_t *cycles, uint64_t *caller, uint64_t *tag);
+
 /* The return address of whoever held the lock longest, to be resolved against
  * the image with `nm`. An address is a fact where "some critical section is
  * long" is a hypothesis. */

@@ -7,6 +7,7 @@
 #ifndef MINIKERN_CORE_PORTS_H
 #define MINIKERN_CORE_PORTS_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -18,6 +19,12 @@ struct console_port {
     /* The bytes exactly as given — no CR before each LF. NULL when the
      * device cannot (the SBI firmware adds the CR itself). */
     void (*write_untranslated)(void *self, const char *buf, size_t len);
+    /* **Queued**: the bytes are taken and sent later, by the device's own
+     * interrupt, so the caller does not wait for the wire. `translate` adds
+     * the CR before each LF. NULL, or a device without its interrupt, sends
+     * them now instead. `write` stays synchronous and sends whatever is
+     * queued first, so a kernel line is never stuck behind a buffer. */
+    void (*queue)(void *self, const char *buf, size_t len, bool translate);
     void *self;
 };
 

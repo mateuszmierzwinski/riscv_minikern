@@ -144,11 +144,7 @@ int ktty_set_mode(const struct ktty_mode *mode) {
 
 void ktty_write(const void *buf, uint32_t n) {
     bool onlcr = (term.mode.oflag & (T_OPOST | T_ONLCR)) == (T_OPOST | T_ONLCR);
-    if (onlcr) {
-        console_write(buf, (size_t)n);
-    } else {
-        console_write_untranslated(buf, (size_t)n);
-    }
+    console_queue(buf, (size_t)n, onlcr);
 }
 
 /* A signal from a key, to the group that owns the keyboard.

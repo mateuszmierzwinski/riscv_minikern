@@ -4,8 +4,10 @@
 #include <stdint.h>
 
 #include "arch/riscv/mmu.h"
+#include "arch/riscv/spinlock.h"
 #include "core/console.h"
 #include "core/errno.h"
+#include "core/txring.h"
 
 /* 16550 register *numbers*. How far apart they actually sit, and how wide
  * each access must be, is **the board's business and the device tree says
@@ -31,7 +33,13 @@
 #define UART_THR 0u  /* write: transmit */
 #define UART_RBR 0u  /* read: receive */
 #define UART_IER 1u
+#define UART_IIR 2u  /* read: which interrupt (FCR on write) */
 #define UART_FCR 2u
+#define UART_USR 31u /* DesignWare: status; read to clear a busy-detect */
+#define UART_CPR 61u /* DesignWare: component parameters (0xF4) */
+#define IER_TX_EMPTY 0x02u
+#define IIR_ID_MASK 0x0fu
+#define IIR_BUSY_DETECT 0x07u
 #define UART_LCR 3u
 #define UART_LSR 5u
 
@@ -53,6 +61,21 @@ static struct {
     char path[64];
     bool up;
 } uart;
+
+/* **The transmit side, queued** (`core/txring.h`). `lock` serialises every
+ * sender — the queue, a kernel line, the interrupt — because they all reach
+ * one FIFO; the kernel runs with interrupts off, so a plain spinlock does.
+ * `fifo` is how many bytes may be written when the FIFO reads empty, and
+ * `armed` says the transmit interrupt is wired: until then the queue sends
+ * synchronously, as everything did before. */
+static struct {
+    struct spinlock lock;
+    struct txring ring;
+    uint32_t fifo;
+    bool armed;
+    uint64_t interrupts;
+    uint64_t sent_while_full; /* bytes a full ring made wait for the wire */
+} tx;
 
 /* One register's address, honouring the board's spacing. */
 static volatile void *at(uint32_t reg) {
@@ -108,10 +131,40 @@ int jh7110_uart_getc(void) {
     return (int)get(UART_RBR);
 }
 
-static void uart_write(void *self, const char *data, size_t len) {
-    (void)self;
+/* Sends what the ring holds, waiting byte by byte: the path a kernel line
+ * takes first, so that it comes out after the program output before it. */
+static void drain_the_ring_now(void) {
+    char c = 0;
+    while (txring_pop(&tx.ring, &c)) {
+        wait_for_room();
+        put(UART_THR, (uint8_t)c);
+    }
+}
+
+/* Moves as much of the ring as the FIFO takes without waiting, then asks
+ * for the transmit interrupt exactly while something is left. */
+static void feed_the_fifo(void) {
+    char c = 0;
+    if ((get(UART_LSR) & LSR_THR_EMPTY) != 0) {
+        for (uint32_t i = 0; i < tx.fifo && txring_pop(&tx.ring, &c); i++) {
+            put(UART_THR, (uint8_t)c);
+        }
+    }
+    put(UART_IER, txring_queued(&tx.ring) != 0u ? IER_TX_EMPTY : 0u);
+}
+
+/* One byte into the ring; a full ring sends what it holds first. */
+static void enqueue(char c) {
+    if (txring_full(&tx.ring)) {
+        tx.sent_while_full += txring_queued(&tx.ring);
+        drain_the_ring_now();
+    }
+    (void)txring_push(&tx.ring, c);
+}
+
+static void uart_write_now(const char *data, size_t len, bool translate) {
     for (size_t i = 0; i < len; i++) {
-        if (data[i] == '\n') {
+        if (translate && data[i] == '\n') {
             wait_for_room();
             put(UART_THR, '\r');
         }
@@ -120,12 +173,75 @@ static void uart_write(void *self, const char *data, size_t len) {
     }
 }
 
+static void uart_queue(void *self, const char *data, size_t len, bool translate) {
+    (void)self;
+    spin_lock(&tx.lock);
+    if (!tx.armed) {
+        uart_write_now(data, len, translate);
+    } else {
+        for (size_t i = 0; i < len; i++) {
+            if (translate && data[i] == '\n') {
+                enqueue('\r');
+            }
+            enqueue(data[i]);
+        }
+        feed_the_fifo();
+    }
+    spin_unlock(&tx.lock);
+}
+
+void jh7110_uart_on_interrupt(void) {
+    if ((get(UART_IIR) & IIR_ID_MASK) == IIR_BUSY_DETECT) {
+        (void)get(UART_USR);
+    }
+    spin_lock(&tx.lock);
+    tx.interrupts++;
+    feed_the_fifo();
+    spin_unlock(&tx.lock);
+}
+
+/* The FIFO's depth, from DesignWare's parameter register: FIFO_MODE in bits
+ * 23:16, in units of 16 bytes. **The JH7110's reads 0** ("not implemented"),
+ * so its depth was measured with `minikern.uartfifo=`: the Go program's
+ * output arrived whole at 16 bytes an interrupt and lost lines at 32 — the
+ * 16550A's 16, which is also what Linux assumes for such a part. */
+static uint32_t fifo_depth(void) {
+    uint32_t cpr;
+    if (uart.reg_shift != 2u || uart.io_width != 4u) {
+        return 16u;
+    }
+    cpr = *(volatile uint32_t *)at(UART_CPR);
+    return ((cpr >> 16) & 0xffu) != 0u ? ((cpr >> 16) & 0xffu) * 16u : 16u;
+}
+
+uint32_t jh7110_uart_start_queueing(uint32_t depth) {
+    spin_lock(&tx.lock);
+    tx.fifo = depth != 0u ? depth : fifo_depth();
+    tx.armed = uart.up;
+    spin_unlock(&tx.lock);
+    return tx.fifo;
+}
+
+void jh7110_uart_queue_stats(uint64_t *interrupts, uint64_t *sent_while_full) {
+    *interrupts = tx.interrupts;
+    *sent_while_full = tx.sent_while_full;
+}
+
+static void uart_write(void *self, const char *data, size_t len) {
+    (void)self;
+    spin_lock(&tx.lock);
+    drain_the_ring_now();
+    uart_write_now(data, len, true);
+    spin_unlock(&tx.lock);
+}
+
+
 static void uart_write_untranslated(void *self, const char *data, size_t len) {
     (void)self;
-    for (size_t i = 0; i < len; i++) {
-        wait_for_room();
-        put(UART_THR, (uint8_t)data[i]);
-    }
+    spin_lock(&tx.lock);
+    drain_the_ring_now();
+    uart_write_now(data, len, false);
+    spin_unlock(&tx.lock);
 }
 
 /* Copies a path into the driver's own storage: the one the finder filled
@@ -206,7 +322,10 @@ static int start_at(phys_t base, uint64_t size, uint32_t shift, uint32_t width,
     kprintf("uart: registers %u bytes apart, %u-byte accesses\n",
             1u << uart.reg_shift, uart.io_width);
     *out = (struct console_port){
-        .write = uart_write, .write_untranslated = uart_write_untranslated, .self = NULL};
+        .write = uart_write,
+        .write_untranslated = uart_write_untranslated,
+        .queue = uart_queue,
+        .self = NULL};
     return KERR_OK;
 }
 

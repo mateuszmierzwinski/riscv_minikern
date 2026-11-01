@@ -94,6 +94,11 @@ class SpinnerHart(Measure):
 # 25 % rather than the full range), and storage within ±3 % between rows.
 MEASURES = [
     Measure("go_speedup", "", r"speedup ([0-9.]+)x", +1, 0.25, runs=5, program=GO_PROGRAM),
+    # The longest the kernel lock was held while the Go program ran (boot's
+    # own one-off holds excluded): 8 ms when its console writes went out at
+    # 115200 baud under the lock, before program output was queued.
+    Measure("go_lock_hold_us", "", r"during the program the longest hold was (\d+) us", -1, 0.50,
+            runs=3, program=GO_PROGRAM),
     Measure("nvme_kib_s", f"minikern.disk=nvme {READ_ONLY} minikern.diskbench=64:16",
             r"bench: \d+ KiB in \d+ ms, (\d+) KiB/s, 16 blocks", +1, 0.10),
     Measure("sd_kib_s", f"minikern.disk=sd {READ_ONLY} minikern.diskbench=16:16",

@@ -20,6 +20,8 @@ struct knet {
     struct tcp_stack tcp;
     uint64_t last_tick_ns;
     uint32_t pings_sent;
+    uint32_t pings_answered;
+    ip4_t pinged;
     uint32_t net_ticks;
     uint64_t next_ping_ms;
 };
@@ -59,10 +61,14 @@ static void on_bound(void *self, const struct netif *nif) {
     }
 }
 
+/* Counted, and said in `knet_report`: the boot's three pings land in the
+ * first program's opening moments, and a line from here is console time
+ * with the kernel lock held (and the program's queued output sent first). */
 static void on_echo_reply(void *self, ip4_t from, uint16_t seq) {
-    char ip[16];
     (void)self;
-    kprintf("net: %s answered ping seq %u\n", ip4_format(from, ip), seq);
+    (void)seq;
+    knet.pings_answered++;
+    knet.pinged = from;
 }
 
 /* After DHCP: a few pings of the gateway, PING_EVERY_MS apart. */
@@ -150,6 +156,11 @@ void knet_report(void) {
     kprintf("net: %u housekeeping beats, %u net ticks, now_ms %llu, next ping %llu\n",
             timer_housekeeping_beats(), knet.net_ticks,
             (unsigned long long)knet.nif.now_ms, (unsigned long long)knet.next_ping_ms);
+    {
+        char ip[16];
+        kprintf("net: %s answered %u of %u pings\n", ip4_format(knet.pinged, ip),
+                knet.pings_answered, knet.pings_sent);
+    }
     const struct tcp_stats *t = &knet.tcp.stats;
     kprintf("net: rx %u tx %u; dropped: malformed %u checksum %u fragment %u not-ours %u arp %u "
             "rate %u no-port %u loop %u\n", n->rx_frames, n->tx_frames, n->drop_malformed, n->drop_checksum,

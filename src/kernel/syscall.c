@@ -2472,30 +2472,6 @@ int64_t syscall_clone_thread(struct trapframe *tf) {
      * rather than inherited. Getting this wrong makes the child re-execute
      * the clone, which forks threads until the table is full. */
     child.sepc = tf->sepc + 4u;
-    /* **Where the child is being sent, and what is under its stack.**
-     *
-     * A thread in an exec'd process faults inside `runtime.sysargs` with
-     * zeroed arguments, which it cannot reach by running: either the kernel
-     * resumes it at the wrong address, or it starts correctly and jumps to
-     * a garbage `fn`. Go's riscv64 clone child reads that `fn` from below
-     * the stack pointer it was given, so printing both the resume address
-     * and those words separates the two — and they want opposite fixes. */
-    {
-        static uint32_t said;
-        if (said < 14u) {
-            uint64_t below[3] = {0, 0, 0};
-            said++;
-            (void)uspace_copy_in(below, stack - 24u, 24u);
-            /* The pid, because the first three of these came from init and
-             * the question is about the processes it exec'd — a cap that
-             * hides the subject is a cap that answers the wrong question. */
-            kprintf("clone-thread: pid %u sepc %llx sp %llx; below: %llx %llx %llx\n",
-                    uspace_current() != NULL ? uspace_current()->pid : 0u,
-                    (unsigned long long)child.sepc, (unsigned long long)stack,
-                    (unsigned long long)below[0], (unsigned long long)below[1],
-                    (unsigned long long)below[2]);
-        }
-    }
     rc = sched_spawn(&child, stack, &tid);
     return rc == KERR_OK ? (int64_t)tid : rc;
 }
@@ -2989,23 +2965,6 @@ bool syscall_dispatch(struct trapframe *tf) {
             uint64_t a0 = sysarg(tf, 0), a1 = sysarg(tf, 1), a2 = sysarg(tf, 2);
             uint64_t a3 = sysarg(tf, 3);
             tf->x[10] = (uint64_t)e->call(tf);
-            /* **Any syscall that answers EAGAIN, named.**
-             *
-             * Four separate paths on the fork/exec route answer EAGAIN, and
-             * a Go program reports every one of them as the same string:
-             * "fork/exec: resource temporarily unavailable". Instrumenting
-             * them one at a time cost three boots and proved three of them
-             * innocent, because the real one was somewhere I had not
-             * thought to look. Asking the dispatcher instead needs no
-             * guess about which syscall it is. */
-            if ((int64_t)tf->x[10] == KERR_AGAIN) {
-                static uint32_t said_again;
-                if (said_again < 12u) {
-                    said_again++;
-                    kprintf("syscall: %s (%llu) answered EAGAIN\n", e->name,
-                            (unsigned long long)nr);
-                }
-            }
             if (tracing) {
                 kprintf("call:   -> %lld\n", (long long)(int64_t)tf->x[10]);
             }

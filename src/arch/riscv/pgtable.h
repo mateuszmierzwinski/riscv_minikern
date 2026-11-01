@@ -193,6 +193,13 @@ bool pgtable_megapage_free(const struct pgtable *pt, virt_t va);
  * `size` reports whether it was found as a page, a megapage or a gigapage. */
 bool pgtable_lookup(const struct pgtable *pt, virt_t va, phys_t *pa, uint64_t *prot, uint64_t *size);
 
+/* How many bytes from `va` are certainly empty — no mapping and no swapped
+ * page: the rest of the 1 GiB or 2 MiB span whose table is absent, or the
+ * page itself when its entry is zero. 0 when something is there. What lets
+ * a range walk stride over the empty parts instead of looking at every
+ * page (a 64 MiB `MAP_FIXED` over a reservation was 16,384 lookups). */
+uint64_t pgtable_empty_span(const struct pgtable *pt, virt_t va);
+
 /* Removes the mapping `va` falls in, and says how many bytes it covered.
  * Zero when nothing was mapped. */
 uint64_t pgtable_unmap(struct pgtable *pt, virt_t va);
