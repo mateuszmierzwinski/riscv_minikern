@@ -30,6 +30,11 @@ int dc8200_init(phys_t base);
  * controller's clocks and resets are released, 0 before. */
 uint32_t dc8200_revision(void);
 
+/* The model register — 0x8200 for this controller — and the customer id. */
+#define DC8200_MODEL 0x8200u
+uint32_t dc8200_model(void);
+uint32_t dc8200_customer(void);
+
 /* Scans out `stride`-byte lines of XRGB8888 at physical `fb` on display 0
  * with timing `t`. The controller takes a 32-bit address, so `fb` must lie
  * below 4 GiB: KERR_RANGE otherwise. */

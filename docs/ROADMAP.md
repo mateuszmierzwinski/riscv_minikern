@@ -195,10 +195,10 @@ git, and the pitfalls are in `CLAUDE.md` §5.
 
 ### Open
 - [ ] **IPv6** (L) — The stack is IPv4 only.
-- [ ] **GMAC strict unicast filter** — With the strict filter the controller accepts no unicast frames, even though its registers match the working run. The default is promiscuous (`PR`) as a workaround. Next: find the DWMAC 5.20 / JH7110 cause. `minikern.netfilter` reproduces it in one boot.
 - [ ] **Bits lost across a blocking `recvfrom`** — In `unixsock`, a `.bss` mask lost its low four bits in 4 of 4 runs when no syscall came between the steps. The socket code, the exit path, register save, sibling exit and stack overruns are all ruled out. This looks like a coherency or scheduling window like `endsib`. The test now carries intermediate prints.
 
 ### Done
+- [x] **GMAC strict unicast filter** — the cause was the order of two register writes: the address registers reach the receive clock domain when the **low** word is written, and the driver wrote the low word first, so the filter matched against a high half (and an `AE` bit) it never received — while both read back perfectly from the register side. High word first, as Linux's stmmac does; the strict filter is now the default and the board runs promiscuous only with `minikern.netpromisc`. Board: with `minikern.netfilter` (the old lever) a netfs-loaded `timego` passed every step over unicast TCP; then as the default, "§5: a DHCP lease…", the QuokkaOS case and VNC from the PC pass, with `not-ours` down from a stream of other hosts' frames to 1.
 - [x] **GMAC as the network device** — DHCP, ARP, ping, TCP and DNS all work on the board (see the unicast filter workaround above).
 - [x] **Routing table** — Eight prefixes, longest-prefix match ranked together with the on-link subnet and the default route. Masks with holes are refused (`test/route_test.c`, 10 host cases).
 - [x] **TCP SACK** — Kept by operator decision. The receiver builds coalesced blocks from the reassembly queue. The sender stops retransmitting at the first SACKed block, and forged blocks are discarded. There is no full RFC 6675 scoreboard (host test, both counters).
@@ -275,13 +275,13 @@ summarised in `docs/DISPLAY.md`.
   boot `minikern.hdmi=1920x1080` with `fbdemo.elf` and check the colour-bar order (white, yellow, cyan, green,
   magenta, red, blue, black), a smooth grey ramp and a moving white square; then the EDID line in the log.
   On a TV, also boot with `minikern.hdmimode=hdmi` (HDMI mode with an AVI infoframe) and check it shows.
-- [ ] **Mode from the EDID** (S) — the mode is the command line's; the monitor's preferred timing is read and
+- [ ] **Mode from the EDID** (S) — (mainline cross-check, DISPLAY.md: the stride must be a multiple of 128 bytes, and the timing is programmed from the achieved clock.) The mode is the command line's; the monitor's preferred timing is read and
   only reported. Only 1080p60 and 720p60 have PLL settings.
 - [ ] **Cache maintenance, smarter** (M) — the whole frame is flushed from the L2 ten times a second (~2 ms each,
   ~2% of a hart at 1080p). Better: flush only what changed (a dirty-rectangle `ioctl`, as DRM's `DIRTYFB`), or
   the TRM's uncached DRAM view at `0x4_4000_0000` once its semantics and PMP access are measured. Whether the
   DC snoops the L2 at all is unmeasured — it needs eyes on a monitor with flushing off.
-- [ ] **Acceleration** — the DC8200's planes are the real 2D acceleration (overlays, scaler, hardware cursor);
+- [ ] **Acceleration** — first piece: the **hardware cursor**, fully described by mainline (DISPLAY.md, "Mainline cross-check": registers, 64-pixel maximum, the enable sequence). The DC8200's planes are the real 2D acceleration (overlays, scaler, hardware cursor);
   there is no blitter. The PowerVR BXE-4-32 is an XL project of its own (closed MIPS firmware, ~35k-line
   reference driver, unsupported in Mesa). Measure memset/memcpy and a full-frame flush first.
 

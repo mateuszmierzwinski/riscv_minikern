@@ -74,6 +74,20 @@ uint32_t dc8200_revision(void) {
     return regs == NULL ? 0u : get(CHIP_REV);
 }
 
+/* The model and customer-id registers (mainline `vs_hwdb.c`: model 0x20,
+ * customer 0x30): the model says this is a DC8200 at all, the customer id
+ * tells StarFive's configuration from others of the same revision. */
+#define CHIP_MODEL 0x0020u
+#define CHIP_CUSTOMER 0x0030u
+
+uint32_t dc8200_model(void) {
+    return regs == NULL ? 0u : get(CHIP_MODEL);
+}
+
+uint32_t dc8200_customer(void) {
+    return regs == NULL ? 0u : get(CHIP_CUSTOMER);
+}
+
 /* The primary plane: where, how wide a line, what format, how big — and
  * the commit bit that makes the controller take it (StarFive's order:
  * enabled with the commit clear, written, then committed). */

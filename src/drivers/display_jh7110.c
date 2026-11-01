@@ -186,9 +186,10 @@ static int check_the_controller_answers(void) {
         return rc;
     }
     rev = dc8200_revision();
-    kprintf("display: DC8200 revision %04x (%s)\n", rev,
-            rev == DC8200_REVISION ? "powered and clocked" : "NOT the expected 5720");
-    return rev == DC8200_REVISION ? KERR_OK : KERR_NODEV;
+    kprintf("display: DC8200 revision %04x (%s), model %04x, customer %03x\n", rev,
+            rev == DC8200_REVISION ? "powered and clocked" : "NOT the expected 5720",
+            dc8200_model(), dc8200_customer());
+    return rev == DC8200_REVISION && dc8200_model() == DC8200_MODEL ? KERR_OK : KERR_NODEV;
 }
 
 /* The VOUT generator's pixel-clock registers, as the controller is

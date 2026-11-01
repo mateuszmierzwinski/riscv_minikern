@@ -632,7 +632,7 @@ From ML `vs_primary_plane_regs.h`; SFL h L28–55.
 **Cursor:**
 
 - `0x1468` CURSOR_CONFIG: bits 1:0 = format, 0 = disabled.
-- SFU writes `0x1484 = 0` (cursor clock gating) and `0x24E8` (CONFIG_EX).
+- SFU writes `0x1484 = 0` (cursor clock gating, uncorroborated) and `0x24E8` — **display 1's `CURSOR_CONFIG`** (cursor block at `0x1468 + 0x1080·n`, mainline `vs_cursor_plane_regs.h`), not a "CONFIG_EX" as first written here.
 
 ### 4.3 Display (CRTC) timing
 
@@ -1121,3 +1121,49 @@ DC8200 planes.
 - llvmpipe ORCJIT riscv — https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/26018 , Debian #1058759 https://lists.debian.org/debian-x/2023/12/msg00063.html
 - Memory bandwidth — https://magazinmehatronika.com/en/visionfive-2-review/ , https://forum.rvspace.org/t/star64-memory-benchmark/3285
 - Vendor DDK — https://github.com/starfive-tech/VisionFive2/releases/tag/VF2_v3.1.5 , https://layers.openembedded.org/layerindex/recipe/333647
+
+
+## Mainline cross-check (2026-11-01)
+
+The operator pointed to the mainline driver (`drivers/gpu/drm/verisilicon`, LWN 1033823). It was
+written and tested on the **TH1520**; its cover letter says the JH7110 carries the same IP but claims
+nothing for it, and mainline `jh7110.dtsi` has no display node. Facts read from it — no code taken:
+
+**Corrections to this file and the driver**
+- `0x24E8` is display 1's cursor `CONFIG` (fixed above).
+- **Pitch alignment is 128 bytes** for linear buffers (`vs_drm.c` dumb-buffer creation), not SFL's 32.
+  1080p (7,680 B) and 720p (5,120 B) already are; an EDID mode such as 1366×768 (5,464 B) is not —
+  round `/dev/fb0`'s stride up when modes come from the EDID.
+- Chip identity is three registers: MODEL `0x20` (0x8200), REV `0x24` (0x5720 here), CUSTOMER_ID
+  `0x30` — **measured on this board: model 8200, customer 0x30E** (the driver now checks the model and logs both). The generic 0x8200/0x5720 entry gives two displays, a 64-pixel maximum cursor, no YUV444.
+- The DC binds the generic `verisilicon,dc` compatible as well as `thead,th1520-dc8200`.
+- **Commit bits are only ever set** in mainline — `PANEL_CONFIG_EX` bit 0 after enabling the panel,
+  `FB_CONFIG_EX` bit 12 after every plane update — never cleared or pulsed. Our measured 1→0 order works
+  and stays; whether the hardware clears bit 12 itself is unmeasured (read it back after a commit).
+- Not to copy: mainline's primary-plane disable *sets* `FB_EN`, and its `TILE_MODE` shift (14)
+  disagrees with its own mask (bits 21:17).
+
+**Agreements**: format 5 = X8R8G8B8 and the swizzle codes; sync polarity bit 31 set only for negative
+syncs (CEA 1080p/720p are positive); 32-bit scanout addresses; `DISP_CURRENT_LOCATION` is defined and
+never used (no bit layout), so mainline neither explains nor contradicts our reading of 0.
+
+**For the open §10 items**
+- *Cache maintenance*: mainline flushes nothing explicitly and has no dirty-rectangle path; it relies
+  on the DMA API's mapping, and TH1520 is marked `dma-noncoherent`. Mainline JH7110 is not marked so,
+  while `sifive_ccache` registers non-coherent cache operations for `starfive,jh7110-ccache`. **No
+  evidence either way on whether the DC snoops the L2 here** — the flush-off test by eye still decides.
+- *Mode from the EDID*: the DC has no mode table; a mode is valid when htotal/vtotal fit 15 bits and the
+  pixel clock rounds, and the timing is programmed from the achieved clock (maximum 8192×8192). The
+  JH7110 pixel-clock options are not covered: our PLL tables stay the limit.
+- *Acceleration*: **the cursor plane is fully described** — CONFIG `0x1468` (bits 1:0 format, 0 off /
+  2 ARGB8888; bit 2 image update; bit 3 commit; 7:5 size 32/64/128/256; 12:8 and 20:16 hotspot
+  offsets), ADDRESS `0x146C`, LOCATION `0x1470` (x 14:0, y 30:16), BACKGROUND `0x1474`, FOREGROUND
+  `0x1478`; square power-of-two sizes up to **64** on this revision, pitch exactly width × 4,
+  non-premultiplied alpha; negative positions go into the offset fields (≤ 31). Overlays and the scaler
+  are not covered beyond `OVL_CONFIG_EX(n) = 0x2540 + 4n`; the primary plane cannot blend.
+- *Interrupts*: `TOP_IRQ_EN` `0x14` bit n enables display n's vsync, `TOP_IRQ_ACK` `0x10` reports it
+  and **is acknowledged by being read**; one line for both displays (PLIC 95 on JH7110 per SFL). No
+  frame-done interrupt beyond vsync.
+- *JH7110 glue*: mainline wants five clocks (core, axi, ahb, pix0, pix1) and three resets released in
+  that order before reading the ID — a subset of our bring-up. **Nothing for the Innosilicon HDMI
+  transmitter** (TH1520 uses DW-HDMI); TH1520 wires HDMI to output 1, the JH7110 to display 0.

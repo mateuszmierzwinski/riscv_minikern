@@ -527,34 +527,17 @@ static void configure_mac(void) {
  * driver wants: match unicast against the address registers, accept
  * broadcast, drop the rest. Written explicitly so that the next person
  * reading this knows it was chosen. */
-/* **Every frame on the wire, and this is not where that was meant to land.**
+/* **Match unicast against our address, accept broadcast, drop the rest**
+ * (filter 0) — strict, as the controller is documented to do it.
  *
- * The filter is supposed to be zero here: match unicast against
- * `MAC_ADDR0`, accept broadcast, drop the rest. Measured on the board, that
- * configuration accepts **no unicast at all** — and the registers in the
- * failing run are byte-identical to the working one:
- *
- *     dwmac: filter 00000000, addr 800089b6/0039cf6c, ours 6c:cf:39:00:b6:89
- *
- * `AE` (bit 31) is set, the address is exactly this interface's, the mask
- * bytes are clear, and the reply that never arrives is addressed to
- * `6c:cf:39:00:b6:89`. With `PR` set, the same boot receives the ARP reply
- * and the DNS answer and a name resolves. So this controller drops unicast
- * that matches a correctly programmed address, which is not how the filter
- * is documented to behave, and the cause is **not identified** — it wants
- * the DWMAC 5.20 configuration detail for this SoC, which is not to hand.
- *
- * Why accept everything rather than leave it strict and broken: with the
- * filter closed this board gets a DHCP lease and can then reach nothing —
- * no ARP reply, so no gateway, so no traffic at all. A network that cannot
- * receive a reply is not a network. The cost of `PR` on this board is that
- * the controller hands up frames for other hosts and the stack discards
- * them by address, which costs cycles and leaks nothing: the stack's own
- * `not-ours` counter is where they go.
- *
- * `minikern.netfilter` restores the strict setting for whoever picks this
- * up, because the next person needs to reproduce it in one boot rather than
- * rediscover it. */
+ * It accepted no unicast at all for months, with registers that read back
+ * byte-identical to a working run, and the board ran promiscuous (`PR`) as
+ * the workaround. The cause was the order of the address writes: the
+ * address registers are carried into the receive clock domain **when the
+ * low word is written**, and this driver wrote the low word first, so the
+ * high half — and `AE`, the bit that enables the match — never reached the
+ * side that filters (see `program_the_address`). `minikern.netpromisc`
+ * puts promiscuous mode back, for a capture of other hosts' traffic. */
 static void set_the_receive_filter(void) {
     wr(MAC_PACKET_FILTER, nic.strict_filter ? 0u : MAC_FILTER_PR);
 }
@@ -570,9 +553,12 @@ static void set_the_receive_filter(void) {
  * set it. Writing both registers in one place is what makes the two paths
  * impossible to tell apart, which is the only way this stays fixed. */
 static void program_the_address(void) {
+    /* **High word first.** The low word's write is what synchronises both
+     * into the receive clock domain; written the other way round, the
+     * filter matched against a high half it never received. */
+    wr(MAC_ADDR0_HIGH, (uint32_t)nic.mac[4] | ((uint32_t)nic.mac[5] << 8) | MAC_ADDR_AE);
     wr(MAC_ADDR0_LOW, (uint32_t)nic.mac[0] | ((uint32_t)nic.mac[1] << 8) |
                           ((uint32_t)nic.mac[2] << 16) | ((uint32_t)nic.mac[3] << 24));
-    wr(MAC_ADDR0_HIGH, (uint32_t)nic.mac[4] | ((uint32_t)nic.mac[5] << 8) | MAC_ADDR_AE);
 }
 
 static void take_address(const struct fdt *fdt, const char *path) {

@@ -604,9 +604,8 @@ CASES = [
       "(dhcp, lease",
       # And nothing was dropped as damaged, which a lease alone would not
       # show: a stack can bind while discarding most of what it receives.
-      # `not-ours` is not asserted: the controller runs promiscuous (the
-      # strict-unicast-filter workaround, ROADMAP §5), so other hosts'
-      # frames on the LAN are counted there by design.
+      # `not-ours` is not asserted exactly — a broadcast for another host
+      # still arrives — but the strict filter keeps it to a handful.
       "dropped: malformed 0 checksum 0 fragment 0 not-ours"],
      150, None),
 

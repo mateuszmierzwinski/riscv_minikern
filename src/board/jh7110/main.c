@@ -2158,7 +2158,7 @@ static void bring_up_network(uint64_t dtb) {
     rc = virtio_net_init(&fdt, &port, mac);
     if (rc != KERR_OK) {
         /* Before probing: the filter is written while the address is taken. */
-        dwmac_use_strict_filter(cmdline_has(boot_cmdline, "minikern.netfilter"));
+        dwmac_use_strict_filter(!cmdline_has(boot_cmdline, "minikern.netpromisc"));
         rc = dwmac_init(&fdt, &port);
         if (rc != KERR_OK) {
             kprintf("net: no network device in the tree (rc %d)\n", rc);

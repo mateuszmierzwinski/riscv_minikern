@@ -64,10 +64,9 @@ void dwmac_report_filter(void);
 /* Logs each accepted frame's destination address. Diagnostic. */
 void dwmac_trace_destinations(bool on);
 
-/* Keeps the strict receive filter — match this interface's address, accept
- * broadcast — which is what the filter is documented to do and which on this
- * board receives no unicast at all. Call it before `dwmac_init` to reproduce
- * that in one boot; see the comment on `set_the_receive_filter`. */
+/* The strict receive filter — this interface's address and broadcast — when
+ * on (the default), promiscuous when off (`minikern.netpromisc`). Call it
+ * before `dwmac_init`; see `set_the_receive_filter`. */
 void dwmac_use_strict_filter(bool on);
 
 /* Acknowledges at the device and drains the ring; the count is how many
