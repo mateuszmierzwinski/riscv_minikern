@@ -60,6 +60,7 @@
 #include "drivers/cpufreq_jh7110.h"
 #include "kernel/cpuwhy.h"
 #include "kernel/govern.h"
+#include "kernel/watchdog.h"
 #include "kernel/procfiles.h"
 #include "core/boardspec.h"
 #include "kernel/random.h"
@@ -1609,6 +1610,83 @@ static void prove_the_pwm(const struct fdt *fdt) {
     (void)pwm_jh7110_stop(&pwm, 0);
 }
 
+/* The watchdog counter's rate, measured against the kernel's own clock over
+ * 200 ms: the number every timeout in ticks is converted with. */
+static uint64_t watchdog_rate_hz(struct wdt_jh7110 *wdt) {
+    uint32_t first, second;
+    uint64_t t0, t1;
+    if (wdt_jh7110_start_counting(wdt, 0x40000000u) != KERR_OK) {
+        return 0;
+    }
+    first = wdt_jh7110_counter(wdt);
+    t0 = timer_ns();
+    while (timer_ns() - t0 < 200000000ull) {
+    }
+    second = wdt_jh7110_counter(wdt);
+    t1 = timer_ns();
+    (void)wdt_jh7110_stop(wdt);
+    return first > second ? (uint64_t)(first - second) * 1000000000ull / (t1 - t0) : 0;
+}
+
+/* `minikern.wdtreset=<bit>`: arms control bit `bit` with the run bit and a
+ * one-second count, then stops feeding it for ten seconds. A board that
+ * comes back through U-Boot names the reset bit; one that says "survived"
+ * does not. The board's harness power-cycles it before the next run. */
+static void try_the_watchdog_reset(struct wdt_jh7110 *wdt, uint64_t rate) {
+    uint32_t bit = (uint32_t)cmdline_number(boot_cmdline, "minikern.wdtreset", 99u);
+    uint64_t started = timer_ns();
+    if (bit > 31u || rate == 0) {
+        return;
+    }
+    kprintf("wdt: arming control bit %u with a 1 s count, and not feeding it\n", bit);
+    (void)wdt_jh7110_set_control(wdt, (uint32_t)rate, 1u | (1u << bit));
+    while (timer_ns() - started < 10000000000ull) {
+    }
+    kprintf("wdt: survived 10 s with control bit %u armed (counter %u)\n", bit,
+            wdt_jh7110_counter(wdt));
+    (void)wdt_jh7110_stop(wdt);
+}
+
+/* The watchdog's counter rate on this board (`minikern.wdtprobe`). */
+#define WDT_HZ 24000000u
+
+static struct wdt_jh7110 board_wdt;
+
+static int arm_board_wdt(void *self, uint32_t seconds) {
+    (void)self;
+    return wdt_jh7110_arm(&board_wdt, seconds * WDT_HZ);
+}
+
+static int feed_board_wdt(void *self, uint32_t seconds) {
+    (void)self;
+    return wdt_jh7110_feed(&board_wdt, seconds * WDT_HZ);
+}
+
+static int stop_board_wdt(void *self) {
+    (void)self;
+    return wdt_jh7110_stop(&board_wdt);
+}
+
+/* `minikern.watchdog=<seconds>`: the board resets if nothing feeds it for
+ * that long — the kernel from its beat, or a process through
+ * /dev/watchdog (kernel/watchdog.h). `minikern.wdtstarve=<seconds>` stops
+ * the kernel's feeding after that long: the proof the reset is real. */
+static void start_the_watchdog(uint64_t dtb) {
+    uint32_t seconds = (uint32_t)cmdline_number(boot_cmdline, "minikern.watchdog", 0);
+    uint32_t starve = (uint32_t)cmdline_number(boot_cmdline, "minikern.wdtstarve", 0);
+    struct watchdog_port port = {arm_board_wdt, feed_board_wdt, stop_board_wdt, NULL};
+    struct fdt fdt;
+    int rc;
+    if (seconds == 0 || fdt_open(&fdt, (const void *)(uintptr_t)dtb, FDT_MAX_BYTES) != KERR_OK) {
+        return;
+    }
+    rc = wdt_jh7110_init(&board_wdt, &fdt, "/soc/watchdog@13070000");
+    rc = rc != KERR_OK ? rc : watchdog_start(&port, seconds, starve);
+    kprintf(rc == KERR_OK ? "wdt: armed, %u s, fed by the kernel; /dev/watchdog hands it over\n"
+                          : "wdt: not armed for %u s (rc %d)\n",
+            seconds, rc);
+}
+
 static void prove_the_watchdog(const struct fdt *fdt) {
     struct wdt_jh7110 wdt;
     uint32_t first, second;
@@ -1639,6 +1717,11 @@ static void prove_the_watchdog(const struct fdt *fdt) {
      * but leaving a counter running that nothing feeds is still a mechanism
      * with no owner, which this file's rules are against. */
     (void)wdt_jh7110_stop(&wdt);
+    if (cmdline_has(boot_cmdline, "minikern.wdtprobe")) {
+        uint64_t rate = watchdog_rate_hz(&wdt);
+        kprintf("wdt: the counter runs at %llu Hz\n", (unsigned long long)rate);
+        try_the_watchdog_reset(&wdt, rate);
+    }
 }
 
 /* USB: the VL805 the PCIe work has been enumerating and ignoring.
@@ -2715,6 +2798,29 @@ static void report_past_arms(void) {
  * satisfiable by a core that had never left its idle loop, which is why
  * this counts switches rather than asking whether a hart is up. */
 static void report_detectors(void);
+
+/* Each hart's timer interrupts at the start of a measurement, so the end
+ * can report the **window's** count. `report_hart_usage` counts from boot,
+ * which folds the boot hart's periodic start-up and the idle harts' whole
+ * life into a figure meant for one busy thread (ROADMAP §8). */
+static uint64_t interrupts_at_snapshot[SMP_MAX_HARTS];
+
+static void snapshot_interrupts(void) {
+    for (uint32_t i = 0; i < smp_hart_count() && i < SMP_MAX_HARTS; i++) {
+        interrupts_at_snapshot[i] = timer_interrupts_of(i);
+    }
+}
+
+/* `<what>: timer interrupts in the window by hart: <id>=<n> ...`, with each
+ * hart's switches in the window beside it so the busy one can be told. */
+static void report_interrupts_since_snapshot(const char *what) {
+    kprintf("%s: timer interrupts in the window by hart:", what);
+    for (uint32_t i = 0; i < smp_hart_count() && i < SMP_MAX_HARTS; i++) {
+        kprintf(" %llu=%llu", (unsigned long long)smp_hart(i)->id,
+                (unsigned long long)(timer_interrupts_of(i) - interrupts_at_snapshot[i]));
+    }
+    kprintf("\n");
+}
 
 static void report_hart_usage(void) {
     report_detectors();
@@ -4271,9 +4377,11 @@ static void run_user_programs(void) {
      * only other way to run a program is the operator's SD card. */
     if (cmdline_has(boot_cmdline, "minikern.spin")) {
         uint64_t started = timer_ns();
+        snapshot_interrupts();
         run_one_user_program("spin", user_spin_start, user_spin_end);
         kprintf("spin: %llu ms of one busy thread\n",
                 (unsigned long long)((timer_ns() - started) / 1000000u));
+        report_interrupts_since_snapshot("spin");
         report_hart_usage();
     }
     /* Phase 2's measurement: two threads, nice +5 against nice -5, dividing
@@ -4792,6 +4900,7 @@ void kmain(uint64_t hart, uint64_t dtb) {
  * translation never came up at all. */
 static void kmain_after_devices(uint64_t hart, uint64_t dtb) {
     bring_up_other_harts(dtb, hart);
+    start_the_watchdog(dtb);
     /* **After the harts are up**, because half of what it measures is about
      * them: how many are schedulable, and what an interrupt between two of
      * them costs. */
@@ -4849,6 +4958,7 @@ static void kmain_after_devices(uint64_t hart, uint64_t dtb) {
     kprintf("minikern: boot complete\n");
     if (halt_requested()) {
         kprintf("minikern: powering off\n");
+        watchdog_stop();
         sbi_shutdown();
     }
     for (;;) {

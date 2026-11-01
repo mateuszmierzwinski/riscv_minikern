@@ -34,6 +34,7 @@
 #include "kernel/signal.h"
 #include "kernel/syscall.h"
 #include "kernel/uspace.h"
+#include "kernel/watchdog.h"
 #include "kernel/xfsmount.h"
 
 /* `clone`'s flags, of which these are the ones that change what happens. */
@@ -1018,6 +1019,7 @@ static int64_t sys_reboot(struct trapframe *tf) {
     case REBOOT_CMD_POWER_OFF:
         kprintf("reboot: powering off, by request of pid %u\n",
                 uspace_current() != NULL ? uspace_current()->pid : 0u);
+        watchdog_stop();
         sbi_shutdown();
         return KERR_IO;
     default:

@@ -1309,7 +1309,17 @@ static int open_driver_device(const struct driver_device *d, uint32_t flags) {
         return KERR_ACCES;
     }
     struct file *f = file_new(d->ops, d->priv, flags);
-    return f == NULL ? KERR_NOMEM : fd_install(f);
+    int32_t rc = f == NULL ? KERR_NOMEM : KERR_OK;
+    if (rc == KERR_OK && d->ops->open != NULL) {
+        rc = d->ops->open(f);
+    }
+    if (rc != KERR_OK) {
+        if (f != NULL) {
+            file_put(f);
+        }
+        return rc;
+    }
+    return fd_install(f);
 }
 
 /* The kernel's own device objects by path, or NULL. */

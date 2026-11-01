@@ -95,6 +95,10 @@ struct file_ops {
      * descriptor (`struct file.pos`); NULL leaves `lseek` refusing it with
      * `ESPIPE`, which is right for a stream. */
     uint64_t (*size)(struct file *f);
+    /* Called when a driver's device is opened, before the descriptor is
+     * installed; an error refuses the open (`EBUSY` for a device one holder
+     * at a time may have). NULL: every open is accepted. */
+    int32_t (*open)(struct file *f);
 };
 
 struct file {

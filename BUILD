@@ -1183,6 +1183,7 @@ cc_library(
         "src/kernel/sched.c",
         "src/kernel/fbdev.c",
         "src/kernel/fdobjects.c",
+        "src/kernel/watchdog.c",
         "src/kernel/flock.c",
         "src/kernel/perm.c",
         "src/kernel/tty.c",
@@ -1203,6 +1204,7 @@ cc_library(
     hdrs = [
         "src/arch/riscv/sigframe.h",
         "src/kernel/fbdev.h",
+        "src/kernel/watchdog.h",
         "src/kernel/fdobjects.h",
         "src/kernel/flock.h",
         "src/kernel/perm.h",
@@ -1961,6 +1963,22 @@ user_binary(
 user_image(
     name = "wx.elf",
     program = ":wx",
+)
+
+# /dev/watchdog from a process: the timeout read and set, keep-alives, a
+# second holder refused, and the magic close that hands the feeding back.
+# Exits with a bitmask of the checks that passed, 63 for all six.
+user_binary(
+    name = "wdog",
+    srcs = [
+        "src/userland/start.S",
+        "src/userland/wdog/main.c",
+    ],
+)
+
+user_image(
+    name = "wdog.elf",
+    program = ":wdog",
 )
 
 # Rule 25's syscall surface, second program: the signal frame placed and

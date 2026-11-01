@@ -6,6 +6,6 @@ when	commit	measure	value
 2026-11-01T07:27:19	9edc86b77+	go_speedup	2.1
 2026-11-01T07:27:19	9edc86b77+	nvme_kib_s	332670
 2026-11-01T07:27:19	9edc86b77+	sd_kib_s	8308
-2026-11-01T07:27:19	9edc86b77+	spin_ticks_busy_hart	401
+2026-11-01T07:27:19	9edc86b77+	spin_ticks_busy_hart_since_boot	401
 2026-11-01T07:27:19	9edc86b77+	missed_pokes	0
 2026-11-01T07:27:19	9edc86b77+	lost_deadlines	0

@@ -143,6 +143,21 @@ static uint32_t fifo_offset_of(uint32_t verid) {
 /* Resets the controller's three parts and waits for it to say so. The bits
  * are self-clearing, and a controller that never clears them is one whose
  * clock is not running — which on this SoC is the first thing to suspect. */
+#define DW_IDSTS 0x08cu
+#define BMOD_SWR 0x1u /* the internal DMA controller's own reset */
+
+/* Resets the internal DMA controller and clears its status — **U-Boot's
+ * state, not ours**. U-Boot reads this card with that engine before it hands
+ * over; writing `BMOD` 0 only disables it, and the first transfer after
+ * bring-up then failed with `FRUN` while the host-side byte count read
+ * 8,420 for a 512-byte read (ROADMAP §4). */
+static void stop_the_firmwares_dma(void) {
+    put(DW_BMOD, BMOD_SWR);
+    for (uint32_t spin = 0; spin < WAIT_SPINS && (get(DW_BMOD) & BMOD_SWR) != 0; spin++) {
+    }
+    put(DW_IDSTS, 0xffffffffu);
+}
+
 static int reset_controller(void) {
     put(DW_CTRL, CTRL_RESET | CTRL_FIFO_RESET | CTRL_DMA_RESET);
     for (uint32_t spin = 0; spin < WAIT_SPINS; spin++) {
@@ -155,11 +170,10 @@ static int reset_controller(void) {
 
 /* Empties the FIFO before a data command.
  *
- * **Measured on the board: the first data read after bring-up overran**
- * (`RINTSTS 0x82c`, `FRUN` among the completion bits). Bring-up leaves words
- * in the FIFO — the controller is reset once, before the card is talked to —
- * so the first 512 bytes landed on top of them and the read returned `EIO`
- * with correct data. Nothing noticed while the first read was a whole-disk
+ * Bring-up's own commands can leave words in it — the controller is reset
+ * once, before the card is talked to — and a data read must start empty.
+ * (The first-read `FRUN` this was first written for turned out to be
+ * U-Boot's DMA engine instead: see `stop_the_firmwares_dma`.) Nothing noticed while the first read was a whole-disk
  * superblock that the filesystem simply read again; a partition table read
  * once, and believed, turned it into "this disk has no partitions". */
 static int reset_fifo(void) {
@@ -289,6 +303,20 @@ static int dw_command(void *self, uint8_t index, uint32_t argument, uint32_t kin
  * The FIFO's level is in the status register and the "ready" interrupt bits
  * are the controller's invitation to move a burst; this waits on the level
  * directly, which is simpler and correct whatever the watermark is set to. */
+/* A data error inside a block, said with **where** it happened when
+ * `minikern.mmctrace` asks: an error at word 0 was there before the
+ * transfer moved anything, one mid-block arrived during it — the question
+ * the first-read overrun (ROADMAP §4) turns on. */
+static int data_error(uint32_t rintsts, uint32_t moved) {
+    if (mmc.trace) {
+        kprintf("mmc: data error RINTSTS %08x after %u of %u words, STATUS %08x, card sent %u "
+                "bytes, host took %u, BYTCNT %u\n",
+                (unsigned)rintsts, moved, SD_BLOCK_BYTES / 4u, (unsigned)get(DW_STATUS),
+                (unsigned)get(0x05cu), (unsigned)get(0x060u), (unsigned)get(DW_BYTCNT));
+    }
+    return KERR_IO;
+}
+
 static int dw_move_block(void *self, bool reading, void *buf) {
     uint32_t *words = buf;
     uint32_t moved = 0;
@@ -299,7 +327,7 @@ static int dw_move_block(void *self, bool reading, void *buf) {
         for (uint32_t spin = 0; spin < WAIT_SPINS && !progressed; spin++) {
             status = get(DW_RINTSTS);
             if ((status & INT_ERRORS) != 0) {
-                return KERR_IO;
+                return data_error(status, moved);
             }
             status = get(DW_STATUS);
             if (reading && (status & STATUS_FIFO_EMPTY) == 0) {
@@ -384,7 +412,7 @@ static int wait_for_data_over(void) {
     for (uint32_t spin = 0; spin < WAIT_SPINS; spin++) {
         uint32_t status = get(DW_RINTSTS);
         if ((status & INT_ERRORS) != 0) {
-            return KERR_IO;
+            return data_error(status, SD_BLOCK_BYTES / 4u);
         }
         if ((status & INT_DATA_OVER) != 0) {
             return KERR_OK;
@@ -587,13 +615,14 @@ static int read_once(uint64_t lba, uint32_t count, void *buf) {
 
 /* A read, **retried** when it fails (two more attempts at most).
  *
- * Measured on the board: the first data read after bring-up overruns the
- * FIFO (`RINTSTS 0x82c`, `FRUN`) and returns `EIO` with correct data, and
- * emptying the FIFO first does not prevent it — the cause is in the
- * controller's first transfer at the new clock and width, not identified.
- * A read changes nothing on the card, so another attempt is safe; it
- * succeeds, and `dwmmc_read_retries` counts how often that was needed so
- * the workaround stays visible. A partition table read once and believed
+ * Measured on the board: the first data read after bring-up failed with
+ * `FRUN` (`RINTSTS 0x82c`) and correct data, every boot. **The cause was
+ * U-Boot's internal DMA controller**, disabled but never reset: the trace
+ * read a host-side count of 8,420 bytes for a 512-byte read, and resetting
+ * the engine at bring-up (`stop_the_firmwares_dma`) took the retries from
+ * three in three boots to none in four. The retry stays, because a read
+ * changes nothing on the card and another attempt is safe, and
+ * `dwmmc_read_retries` keeps any future need for it visible. A partition table read once and believed
  * had turned the overrun into "this card has no partitions". */
 static int dw_read(void *self, uint64_t lba, uint32_t count, void *buf) {
     int rc;
@@ -705,6 +734,7 @@ static int try_controller(const struct fdt *fdt, const char *path, phys_t base, 
     }
     put(DW_INTMASK, 0); /* polled until `dwmmc_use_interrupts`, below */
     put(DW_TMOUT, 0xffffffffu);
+    stop_the_firmwares_dma();
     put(DW_BMOD, 0);          /* no internal DMA: the FIFO is the data path */
     put(DW_FIFOTH, (0x2u << 28) | ((8u - 1u) << 16) | 8u);
     put(DW_CTYPE, 0);         /* one bit until the card agrees to four */

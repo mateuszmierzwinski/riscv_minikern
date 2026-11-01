@@ -39,6 +39,7 @@
 
 #define UNLOCK_MAGIC 0x378f0765u
 #define ENABLE_RUN 0x1u
+#define ENABLE_RESET 0x2u /* measured: control bit 1 resets the board (minikern.wdtreset=1) */
 
 static uint32_t rd(const struct wdt_jh7110 *wdt, uint32_t off) {
     return wdt->regs[off / 4u];
@@ -158,5 +159,30 @@ int wdt_jh7110_stop(struct wdt_jh7110 *wdt) {
     }
     unlock(wdt);
     wr(wdt, WDT_ENABLE, 0);
+    return KERR_OK;
+}
+
+int wdt_jh7110_set_control(struct wdt_jh7110 *wdt, uint32_t ticks, uint32_t control) {
+    if (!wdt->up) {
+        return KERR_NODEV;
+    }
+    unlock(wdt);
+    wr(wdt, WDT_ENABLE, 0);
+    wr(wdt, WDT_LOAD, ticks);
+    unlock(wdt);
+    wr(wdt, WDT_ENABLE, control);
+    return KERR_OK;
+}
+
+int wdt_jh7110_arm(struct wdt_jh7110 *wdt, uint32_t ticks) {
+    return wdt_jh7110_set_control(wdt, ticks, ENABLE_RUN | ENABLE_RESET);
+}
+
+int wdt_jh7110_feed(struct wdt_jh7110 *wdt, uint32_t ticks) {
+    if (!wdt->up) {
+        return KERR_NODEV;
+    }
+    unlock(wdt);
+    wr(wdt, WDT_LOAD, ticks); /* a load restarts the count from `ticks` */
     return KERR_OK;
 }

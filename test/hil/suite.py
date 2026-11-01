@@ -810,6 +810,20 @@ CASES = [
       "s frame at 8000 not read: not its memory",
       "s frame at ffffffc000400000 not read: not its memory"],
      240, "//:sigframe.elf"),
+    # **The watchdog** (§4): armed for 3 s and fed by the kernel's beat, the
+    # board outlives a 15 s spin and stops it cleanly at power-off — which
+    # fails on this board, so an armed watchdog would otherwise reboot a
+    # halted kernel. The starved boot (below, in `extra`) proves the reset.
+    ("§4: the watchdog, fed by the kernel",
+     "minikern.watchdog=3 minikern.spin=1",
+     ["wdt: armed, 3 s, fed by the kernel", "spin: 15", "wdt: stopped for the power-off"],
+     90, None),
+    # /dev/watchdog from a process: timeouts read and set, keep-alives, a
+    # second holder refused, the magic close handing the feeding back. 63.
+    ("§4: /dev/watchdog, held and handed back",
+     "minikern.watchdog=3",
+     ["exited with 63", "wdt: stopped for the power-off"],
+     120, "//:wdog.elf"),
     # **W^X** (§6): no mapping is writable and executable at once — `mmap`
     # and `mprotect` refuse it with EACCES — and a page written and then
     # flipped to read-and-execute still runs. 63 is all six checks; the
@@ -975,6 +989,25 @@ def aslr_differs(out_dir):
     return missing, os.path.join(out_dir, "aslr1.log")
 
 
+def watchdog_resets(out_dir):
+    """**The reset is real** (§4): the kernel stops feeding a 3 s watchdog 5 s
+    in, while a 15 s spinner runs — the board must come back through U-Boot
+    before the spinner can finish."""
+    log = os.path.join(out_dir, "wdtstarve.log")
+    subprocess.run([sys.executable, os.path.join(HERE, "board.py"),
+                    "minikern.watchdog=3 minikern.wdtstarve=5 minikern.spin=1",
+                    "-t", "70", "-o", log, "-q", "-w", "900"], check=False)
+    text = open(log, "rb").read().decode("utf-8", "replace") if os.path.exists(log) else ""
+    missing = []
+    if "no longer fed by the kernel" not in text:
+        missing.append("wdt: no longer fed by the kernel")
+    if text.count("U-Boot SPL") < 2:
+        missing.append("a second U-Boot SPL banner: the board did not reset")
+    if "spin: 15" in text:
+        missing.append("the spinner finished, so nothing reset it (spin: 15… was seen)")
+    return missing, log
+
+
 # Where the board finds Go programs over netfs, and where it is on the LAN:
 # netfsd serves ~/vf2/netroot on :8081 and lets only the board's address in.
 NETROOT = os.path.expanduser("~/vf2/netroot")
@@ -1039,7 +1072,8 @@ def main():
     print(f"hil: image md5 {image.stage(PROJECT)}")
     failures = 0
     extra = [("§1: addresses are randomised, compared across two runs", aslr_differs),
-             ("§10: the VFB seen from the PC over VNC", vnc_serves)]
+             ("§10: the VFB seen from the PC over VNC", vnc_serves),
+             ("§4: the watchdog resets a board nothing feeds", watchdog_resets)]
     for case in CASES:
         name, bootargs, wanted, seconds = case[:4]
         program = case[4] if len(case) > 4 else None

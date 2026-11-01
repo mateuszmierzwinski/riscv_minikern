@@ -51,10 +51,11 @@ class Measure:
 
     `better` is +1 when higher is better and -1 when lower is; `tolerance`
     is the fraction of the earlier median a run may lose before it counts
-    as a regression, and None for a counter that must read zero."""
+    as a regression, and None for a counter that must read zero — or, with
+    `ceiling`, stay at or under it."""
 
     def __init__(self, key, bootargs, pattern, better, tolerance, runs=1, seconds=110,
-                 program=None):
+                 program=None, ceiling=None):
         self.key = key
         self.bootargs = bootargs
         self.pattern = re.compile(pattern)
@@ -63,6 +64,7 @@ class Measure:
         self.runs = runs
         self.seconds = seconds
         self.program = program
+        self.ceiling = ceiling  # a fixed limit instead of a comparison with the past
 
     def readings(self, text):
         """Every value the pattern finds in one boot's console."""
@@ -70,19 +72,21 @@ class Measure:
 
 
 class SpinnerHart(Measure):
-    """Timer interrupts on the hart that ran the spinner: the one with a
-    switch on the `smp: switches/ticks by hart` line (`<id>=<switches>/
-    <ticks>t`), since which hart it lands on varies from boot to boot. The
-    idle harts take more — their backstop — so the largest count is the
-    wrong one, and was what this measure first read."""
+    """Timer interrupts on the spinner's hart **during the spin**: the hart
+    with a switch on the `smp: switches/ticks by hart` line (which hart it
+    lands on varies), looked up on the `spin: timer interrupts in the window`
+    line. The `smp:` counts run from boot, so they fold the boot hart's
+    periodic start-up and the idle harts' backstops into a figure meant for
+    one busy thread — reading them is what made this ~400 instead of 0."""
 
     def readings(self, text):
-        out = []
-        for m in self.pattern.finditer(text):
-            harts = [(int(s), float(t)) for s, t in re.findall(r"=(\d+)/(\d+)t", m.group(0))]
-            if harts:
-                out.append(max(harts)[1])
-        return out
+        switches = re.search(r"smp: switches/ticks by hart:[^\n]*", text)
+        window = re.search(r"spin: timer interrupts in the window by hart:[^\n]*", text)
+        if switches is None or window is None:
+            return []
+        busy = max((int(n), hart) for hart, n in re.findall(r" (\d+)=(\d+)/", switches.group(0)))[1]
+        counts = dict(re.findall(r" (\d+)=(\d+)", window.group(0)))
+        return [float(counts[busy])] if busy in counts else []
 
 
 # The spreads behind the tolerances are the ones docs/BENCHMARKS.md records:
@@ -94,8 +98,10 @@ MEASURES = [
             r"bench: \d+ KiB in \d+ ms, (\d+) KiB/s, 16 blocks", +1, 0.10),
     Measure("sd_kib_s", f"minikern.disk=sd {READ_ONLY} minikern.diskbench=16:16",
             r"bench: \d+ KiB in \d+ ms, (\d+) KiB/s, 16 blocks", +1, 0.10),
-    SpinnerHart("spin_ticks_busy_hart", "minikern.spin=1", r"smp: switches/ticks by hart:[^\n]*",
-                -1, 0.50),
+    # Dynamic ticks leave a hart running one thread alone: 0 in the window on
+    # the board, 1,503 with `minikern.periodic=1`. A ceiling rather than an
+    # exact zero, because the beat may land on a busy hart now and then.
+    SpinnerHart("spin_ticks_busy_hart", "minikern.spin=1", r"unused", -1, None, ceiling=5),
     Measure("missed_pokes", "minikern.spin=1", r"sched: (\d+) missed pokes", -1, None),
     Measure("lost_deadlines", "minikern.spin=1", r"(\d+) lost deadlines", -1, None),
 ]
@@ -159,6 +165,8 @@ def verdict(m, now, before):
     if not now:
         return "no reading: the console no longer prints what the pattern expects"
     median = statistics.median(now)
+    if m.ceiling is not None:
+        return "ok" if max(now) <= m.ceiling else f"read {max(now):g}; the ceiling is {m.ceiling:g}"
     if m.tolerance is None:
         return "ok" if max(now) == 0 else f"read {max(now):g}; this counter must stay 0"
     if not before:

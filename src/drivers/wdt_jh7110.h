@@ -50,4 +50,17 @@ void wdt_jh7110_dump(const struct wdt_jh7110 *wdt, uint32_t words);
  * watching whether the counter moves. Returns the offset, or 0. */
 uint32_t wdt_jh7110_find_enable(struct wdt_jh7110 *wdt);
 
+/* Loads `ticks` and writes `control` to the enable register, unlocked:
+ * the measurement path for finding which control bit arms the reset
+ * (`minikern.wdtreset`), and nothing else. */
+int wdt_jh7110_set_control(struct wdt_jh7110 *wdt, uint32_t ticks, uint32_t control);
+
+/* Arms the reset: the board restarts `ticks` counts after the last feed
+ * (24 MHz on this board, measured). Only for a caller that will feed it —
+ * `kernel/watchdog.c`. */
+int wdt_jh7110_arm(struct wdt_jh7110 *wdt, uint32_t ticks);
+
+/* Starts the count again from `ticks`. */
+int wdt_jh7110_feed(struct wdt_jh7110 *wdt, uint32_t ticks);
+
 #endif
