@@ -88,4 +88,12 @@ struct edid_info {
  * an unplugged or unpowered DDC line reads as (all 0xff or all zero). */
 int display_edid_parse(const uint8_t block[EDID_BLOCK_BYTES], struct edid_info *out);
 
+/* The CEA mode to drive a monitor at: its preferred timing's size, when the
+ * transmitter has settings for that size and the monitor's pixel clock is
+ * the mode's to within 1 % (59.94 and 60 Hz both). NULL otherwise — a
+ * 1366x768 panel, or a preferred timing at another rate, gets no guess.
+ * Both modes' lines (7,680 and 5,120 bytes) are multiples of the 128 the
+ * controller wants a stride to be (DISPLAY.md, "Mainline cross-check"). */
+const struct display_timing *display_mode_for_monitor(const struct edid_info *e);
+
 #endif

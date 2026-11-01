@@ -138,7 +138,33 @@ static void test_the_cursor_arrow_is_outlined_and_transparent_around(void) {
     KTEST_CHECK(arrow[19u * CURSOR_SIDE + 3u] == 0xff000000u);  /* the bottom edge */
 }
 
+static struct edid_info monitor_preferring(uint32_t w, uint32_t h, uint32_t khz) {
+    struct edid_info e = {0};
+    e.preferred.hactive = (uint16_t)w;
+    e.preferred.vactive = (uint16_t)h;
+    e.preferred.pixel_khz = khz;
+    return e;
+}
+
+static void test_a_monitor_gets_its_preferred_cea_mode(void) {
+    struct edid_info e = monitor_preferring(1920u, 1080u, 148500u);
+    KTEST_CHECK(display_mode_for_monitor(&e) == display_mode_cea(1920u, 1080u));
+    e = monitor_preferring(1280u, 720u, 74176u); /* 59.94 Hz */
+    KTEST_CHECK(display_mode_for_monitor(&e) == display_mode_cea(1280u, 720u));
+}
+
+static void test_a_mode_without_settings_gets_no_guess(void) {
+    struct edid_info e = monitor_preferring(1366u, 768u, 85500u);
+    KTEST_CHECK(display_mode_for_monitor(&e) == NULL);
+    e = monitor_preferring(1920u, 1080u, 74250u); /* 1080p at 30 Hz */
+    KTEST_CHECK(display_mode_for_monitor(&e) == NULL);
+    e = monitor_preferring(0u, 0u, 0u); /* no detailed timing */
+    KTEST_CHECK(display_mode_for_monitor(&e) == NULL);
+}
+
 int main(void) {
+    KTEST_RUN(test_a_monitor_gets_its_preferred_cea_mode);
+    KTEST_RUN(test_a_mode_without_settings_gets_no_guess);
     KTEST_RUN(test_the_cursor_arrow_is_outlined_and_transparent_around);
     KTEST_RUN(test_the_two_cea_modes_are_known);
     KTEST_RUN(test_dc_words_match_the_vendor_bootloader_at_1080p);

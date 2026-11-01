@@ -740,6 +740,15 @@ CASES = [
      ["display: cursor 32x32 at 960,540 (rc 0)", "(ours)", "(as set)",
       "(30 expected), underflow no — scanning out"],
      120, None),
+    # `minikern.hdmi=auto` (§10, mode from the EDID): with no monitor on the
+    # board the hot-plug line is low, so the default is chosen and said so;
+    # the chooser itself is host-tested against EDIDs (display_mode_test).
+    ("§10: HDMI mode chosen from the monitor, or the default without one",
+     "minikern.hdmi=auto",
+     ["display: auto: no monitor (hot-plug low); 1920x1080 by default",
+      "display: HDMI 1920x1080, PLLs locked, TMDS on",
+      "(30 expected), underflow no — scanning out"],
+     120, None),
     ("§10: HDMI scanout at 720p60",
      "minikern.hdmi=1280x720",
      ["display: HDMI 1280x720, PLLs locked, TMDS on", "(30 expected), underflow no — scanning out"],

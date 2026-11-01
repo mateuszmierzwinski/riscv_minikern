@@ -28,6 +28,12 @@
 #include "core/fdt.h"
 #include "core/types.h"
 
+/* Powers and clocks the display side and reads the monitor's EDID, before
+ * any framebuffer exists — what `minikern.hdmi=auto` chooses a mode from.
+ * KERR_NODEV when nothing pulls the hot-plug line. */
+struct edid_info;
+int display_jh7110_read_monitor(const struct fdt *fdt, struct edid_info *out);
+
 /* Brings HDMI up with the framebuffer at `fb` (`width` x `height`, a CEA
  * mode, `stride` bytes a line) as its picture. Logs every step and its
  * evidence; returns the first step's failure. */

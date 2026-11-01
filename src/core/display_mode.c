@@ -217,3 +217,14 @@ void display_cursor_arrow(uint32_t out[CURSOR_PIXELS]) {
         }
     }
 }
+
+const struct display_timing *display_mode_for_monitor(const struct edid_info *e) {
+    const struct display_timing *t = display_mode_cea(e->preferred.hactive, e->preferred.vactive);
+    uint32_t want, got;
+    if (t == NULL) {
+        return NULL;
+    }
+    want = t->pixel_khz;
+    got = e->preferred.pixel_khz;
+    return (got > want ? got - want : want - got) * 100u <= want ? t : NULL;
+}

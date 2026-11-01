@@ -1945,19 +1945,64 @@ static uint32_t stat_file(char *out, uint32_t room) {
  * mode when only `minikern.hdmi=` is given. KERR_NOENT when neither asks
  * for one; a malformed value is said and refused — it would otherwise size
  * an allocation. */
-static int framebuffer_mode(struct fb_mode *mode) {
+/* The mode `minikern.hdmi=auto` settled on, decided once: the framebuffer
+ * is sized from it and HDMI started with it, and the monitor is read once. */
+static struct fb_mode chosen_hdmi_mode;
+static bool hdmi_mode_chosen;
+
+/* `minikern.hdmi=auto`: the monitor's preferred mode when the transmitter
+ * has settings for it, else 1920x1080 — said either way, with the reason.
+ * Without a monitor (hot-plug low) that is the default, not a failure. */
+static int choose_the_hdmi_mode(const struct fdt *fdt, struct fb_mode *out) {
+    static const char fallback[] = "1920x1080";
+    char text[16];
+    struct edid_info e;
+    const struct display_timing *t = NULL;
+    int rc = display_jh7110_read_monitor(fdt, &e);
+    if (rc == KERR_OK) {
+        t = display_mode_for_monitor(&e);
+    }
+    if (t == NULL) {
+        kprintf("display: auto: %s; %s by default\n",
+                rc == KERR_NODEV ? "no monitor (hot-plug low)"
+                : rc != KERR_OK  ? "no readable EDID"
+                                 : "the monitor prefers a mode with no transmitter settings",
+                fallback);
+        return fbinfo_parse_mode(fallback, sizeof fallback - 1u, out);
+    }
+    size_t n = kfmt_snprintf(text, sizeof text, "%ux%u", t->hactive, t->vactive);
+    kprintf("display: auto: %s \"%s\" prefers %s\n", e.vendor, e.name, text);
+    return fbinfo_parse_mode(text, n, out);
+}
+
+/* `minikern.hdmi`'s mode: parsed, or for `auto` chosen from the monitor. */
+static int hdmi_mode(const struct fdt *fdt, const char *spec, size_t len, struct fb_mode *out) {
+    if (len == 4u && spec[0] == 'a' && spec[1] == 'u' && spec[2] == 't' && spec[3] == 'o') {
+        if (!hdmi_mode_chosen && fdt != NULL &&
+            choose_the_hdmi_mode(fdt, &chosen_hdmi_mode) == KERR_OK) {
+            hdmi_mode_chosen = true;
+        }
+        *out = chosen_hdmi_mode;
+        return hdmi_mode_chosen ? KERR_OK : KERR_NODEV;
+    }
+    return fbinfo_parse_mode(spec, len, out);
+}
+
+static int framebuffer_mode(const struct fdt *fdt, struct fb_mode *mode) {
     size_t len = 0;
     const char *spec = cmdline_value(boot_cmdline, "minikern.vfb", &len);
     const char *option = "minikern.vfb";
+    bool hdmi = false;
     int rc;
     if (spec == NULL) {
         spec = cmdline_value(boot_cmdline, "minikern.hdmi", &len);
         option = "minikern.hdmi";
+        hdmi = true;
     }
     if (spec == NULL) {
         return KERR_NOENT;
     }
-    rc = fbinfo_parse_mode(spec, len, mode);
+    rc = hdmi ? hdmi_mode(fdt, spec, len, mode) : fbinfo_parse_mode(spec, len, mode);
     if (rc != KERR_OK) {
         kprintf("fb: %s=%.*s refused (rc %d)\n", option, (int)len, spec, rc);
     }
@@ -2005,7 +2050,7 @@ static void start_hdmi(const struct fdt *fdt) {
     struct fb_mode fb, want;
     size_t len = 0;
     const char *spec = cmdline_value(boot_cmdline, "minikern.hdmi", &len);
-    if (spec == NULL || fbinfo_parse_mode(spec, len, &want) != KERR_OK ||
+    if (spec == NULL || hdmi_mode(fdt, spec, len, &want) != KERR_OK ||
         fbdev_memory(&base, &fb) != KERR_OK) {
         return;
     }
@@ -2037,7 +2082,8 @@ static void bring_up_display(uint64_t dtb) {
     struct device_owner video = {
         0660u, 0u, (uint32_t)cmdline_number(boot_cmdline, "minikern.videogid", VIDEO_GID)};
     int rc;
-    if (framebuffer_mode(&mode) != KERR_OK) {
+    bool tree = fdt_open(&fdt, (const void *)(uintptr_t)dtb, FDT_MAX_BYTES) == KERR_OK;
+    if (framebuffer_mode(tree ? &fdt : NULL, &mode) != KERR_OK) {
         return;
     }
     rc = fbdev_install(&mode, &video);
@@ -2045,7 +2091,7 @@ static void bring_up_display(uint64_t dtb) {
         kprintf("fb: /dev/fb0 %ux%u could not be installed (rc %d)\n", mode.width, mode.height, rc);
         return;
     }
-    if (fdt_open(&fdt, (const void *)(uintptr_t)dtb, FDT_MAX_BYTES) == KERR_OK) {
+    if (tree) {
         start_hdmi(&fdt);
     }
 }

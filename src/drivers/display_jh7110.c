@@ -296,6 +296,22 @@ static int power_and_clock(const struct fdt *fdt, const struct display_timing *t
     return rc != KERR_OK ? rc : check_the_controller_answers();
 }
 
+int display_jh7110_read_monitor(const struct fdt *fdt, struct edid_info *out) {
+    uint8_t block[EDID_BLOCK_BYTES];
+    int rc;
+    (void)ccache_init(fdt);
+    rc = power_and_clock(fdt, display_mode_cea(1920u, 1080u));
+    rc = rc != KERR_OK ? rc : inno_hdmi_init(HDMI_BASE);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    if (!inno_hdmi_hotplug()) {
+        return KERR_NODEV;
+    }
+    rc = inno_hdmi_read_edid(0, block);
+    return rc != KERR_OK ? rc : display_edid_parse(block, out);
+}
+
 int display_jh7110_start(const struct fdt *fdt, phys_t fb, uint32_t width, uint32_t height,
                          uint32_t stride) {
     const struct display_timing *t = display_mode_cea(width, height);
