@@ -23,7 +23,7 @@ with every one of the mistakes they found.
 | **The FAT boot partition at `/boot`**, read and written — FAT12/16/32 with long names | `test/fat_write_test.sh` (`fsck.fat`, mtools); on the board, a file written there and read back |
 | **Its GPT read**, and the first partition presented as a disk | GPT and MBR, with a GPT disk's protective MBR recognised and skipped rather than followed |
 | **The kernel's own UART**, taking the console over from the firmware | a 16550's registers are not always one byte apart: this one has `reg-shift = 2` and `reg-io-width = 4`, and getting it wrong is *garbling*, not silence |
-| **A GPIO level crossing a physical wire**: driven on pin 60, read on pin 63 | the operator's jumper. It immediately showed what a loopback cannot: the other pin could not be driven at all, because this driver does not yet select a pad's function |
+| **A GPIO level crossing a physical wire**: driven on pin 60, read on pin 63 | the operator's jumper. It immediately showed what a loopback cannot: the other pin could not be driven at all, because the driver did not then select a pad's function (`gpio_jh7110_set_function` now routes a peripheral signal on the sys controller — used for HDMI's DDC; general pinmux is ROADMAP §4) |
 | **Both pin controllers clocked**, including the always-on one | a clock index belongs to a generator, not to a SoC — and the right numbers are in each node's own `clocks` property |
 
 What is **not** done on the board is in `ROADMAP.md`, the only list of it.

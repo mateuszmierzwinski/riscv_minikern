@@ -237,6 +237,7 @@ CASES = [
       # A value too large to share a block with its name goes into blocks of
       # its own, and comes back byte for byte across a mount.
       "fswrite: a 3000-byte value went to its own blocks and came back",
+      "/w_attrs: 600 attributes set, 600 listed, 0 after removal (rc 0)",
       "the log was replayed; the filesystem is clean",
       "the log could not be replayed; mounting read-only"],
      700, None, "small"),
@@ -254,6 +255,7 @@ CASES = [
       "crossed a group after",
       "fswrite: attributes set, listed, survived a mount, removed; 1 to leaf",
       "fswrite: a 3000-byte value went to its own blocks and came back",
+      "/w_attrs: 600 attributes set, 600 listed, 0 after removal (rc 0)",
       "the log was replayed; the filesystem is clean",
       "the log could not be replayed; mounting read-only"],
      700, None, "defaults"),
@@ -289,6 +291,7 @@ CASES = [
       "fswrite: every step passed",
       "fswrite: attributes set, listed, survived a mount, removed",
       "fswrite: a 3000-byte value went to its own blocks and came back",
+      "/w_attrs: 600 attributes set, 600 listed, 0 after removal (rc 0)",
       "the log was replayed; the filesystem is clean"],
      700, None, "v4big"),
 

@@ -182,6 +182,61 @@ static int free_set(struct xfs *fs, struct xfs_inode *dir, uint32_t which, uint3
     return xfs_dir_raw_store(fs, fsb);
 }
 
+/* ── the directory as a da-tree's owner (xfs_danode.c's port) ────────── */
+
+/* The logical block for a new index block: past every one in the leaf
+ * range (between the data and the free index) the directory has. */
+static int dir_next_block(struct xfs *fs, const struct xfs_inode *dir, uint64_t *at) {
+    struct xfs_fork_map m;
+    uint64_t block;
+    uint32_t boffset;
+    struct bbuf *b;
+    int rc;
+    xfs_inode_place(fs, dir->ino, &block, &boffset);
+    rc = bcache_get(fs->cache, block, &b);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    rc = xfs_fork_load(fs, b->data + boffset, &m);
+    bcache_put(fs->cache, b);
+    *at = fs->dir_leaf_block + fs->dirblocks;
+    for (uint32_t i = 0; rc == KERR_OK && i < m.count; i++) {
+        uint64_t end = m.e[i].startoff + m.e[i].blockcount;
+        if (m.e[i].startoff >= fs->dir_leaf_block && m.e[i].startoff < fs->dir_free_block &&
+            end > *at) {
+            *at = end;
+        }
+    }
+    return rc;
+}
+
+static int dir_load(struct xfs_da_tree *t, uint64_t logical, uint64_t *fsb) {
+    return xfs_dir_raw_load(t->fs, t->ip, logical, fsb);
+}
+
+static int dir_store(struct xfs_da_tree *t, uint64_t fsb) {
+    return xfs_dir_raw_store(t->fs, fsb);
+}
+
+static int dir_grow(struct xfs_da_tree *t, uint64_t *logical, uint64_t *fsb, uint64_t now_s) {
+    int rc = dir_next_block(t->fs, t->ip, logical);
+    rc = rc != KERR_OK ? rc : xfs_dir_take_block(t->fs, t->ip->ino >> t->fs->inopblog, fsb);
+    rc = rc != KERR_OK ? rc : xfs_dir_fork_insert(t->fs, t->ip, *logical, *fsb, false, now_s);
+    return rc != KERR_OK ? rc : xfs_inode_read(t->fs, t->ip->ino, t->ip);
+}
+
+static int dir_shrink(struct xfs_da_tree *t, uint64_t logical, uint64_t now_s) {
+    int rc = xfs_dir_fork_remove(t->fs, t->ip, logical, now_s);
+    return rc != KERR_OK ? rc : xfs_inode_read(t->fs, t->ip->ino, t->ip);
+}
+
+static const struct xfs_da_ops dir_ops = {dir_load, dir_store, dir_grow, dir_shrink};
+
+/* The directory's hash index as a tree: root at `dir_leaf_block`. */
+static struct xfs_da_tree dir_tree(struct xfs *fs, struct xfs_inode *dir) {
+    return (struct xfs_da_tree){&dir_ops, fs, dir, fs->dir_leaf_block, fs->dirblocksize};
+}
+
 /* ── the conversion ───────────────────────────────────────────────────── */
 
 /* Moves the leaf's `bests` array into a free block of its own.
@@ -214,7 +269,7 @@ static int free_block_from_leaf(struct xfs *fs, const struct xfs_inode *dir, uin
 /* Writes one of the two leaves the conversion splits into. */
 static int write_leafn(struct xfs *fs, const struct xfs_inode *dir, const uint8_t *pairs,
                        uint32_t count, uint64_t forw, uint64_t back, uint64_t fsb) {
-    xfs_da_header(fs, xfs_magic_for(fs, XFS_BLK_DIR_LEAFN), dir->ino, count, forw, back);
+    xfs_da_header(fs, fs->dirblocksize, xfs_magic_for(fs, XFS_BLK_DIR_LEAFN), dir->ino, count, forw, back);
     xfs_copy_bytes(fs->dirblock + fs->da_hdr, pairs, count * XFS_DA3_ENTRY_SIZE);
     xfs_reseal(fs, fs->dirblock, fs->dirblocksize, XFS_DA3_CRC_OFF);
     return xfs_dir_raw_store(fs, fsb);
@@ -229,7 +284,7 @@ static int write_leafn(struct xfs *fs, const struct xfs_inode *dir, const uint8_
 static int write_root(struct xfs *fs, const struct xfs_inode *dir, const uint8_t *pairs,
                       uint32_t half, uint32_t count, uint64_t root_fsb) {
     uint8_t *e = fs->dirblock + fs->da_hdr;
-    xfs_da_header(fs, xfs_magic_for(fs, XFS_BLK_DA_NODE), dir->ino, 2u, 0, 0);
+    xfs_da_header(fs, fs->dirblocksize, xfs_magic_for(fs, XFS_BLK_DA_NODE), dir->ino, 2u, 0, 0);
     xfs_put_be16(fs->dirblock + fs->da_level, 1u);
     xfs_put_be32(e, top_hash(pairs, half));
     xfs_put_be32(e + 4u, (uint32_t)leaf_n(fs, 0));
@@ -303,10 +358,11 @@ uint16_t xfs_dir_index_shape(struct xfs *fs, const struct xfs_inode *dir) {
  * names answered "no such file". */
 static int split_leaf(struct xfs *fs, struct xfs_inode *dir, struct xfs_da_path *p,
                       uint64_t now_s) {
+    struct xfs_da_tree t = dir_tree(fs, dir);
     uint8_t *pairs = fs->dirpairs;
     uint32_t count, half;
     uint64_t old_fsb = 0, new_fsb = 0, forw, at = 0;
-    int rc = xfs_da_next_block(fs, dir, &at);
+    int rc = dir_next_block(fs, dir, &at);
     rc = rc != KERR_OK ? rc : xfs_dir_raw_load(fs, dir, p->leaf, &old_fsb);
     if (rc != KERR_OK) {
         return rc;
@@ -329,12 +385,12 @@ static int split_leaf(struct xfs *fs, struct xfs_inode *dir, struct xfs_da_path 
     rc = rc != KERR_OK ? rc
                        : write_leafn(fs, dir, pairs + half * XFS_DA3_ENTRY_SIZE, count - half,
                                      forw, p->leaf, new_fsb);
-    rc = rc != KERR_OK ? rc : xfs_da_set_sibling(fs, dir, forw, XFS_DA3_BACK_OFF, (uint32_t)at);
+    rc = rc != KERR_OK ? rc : xfs_da_set_sibling(&t, forw, XFS_DA3_BACK_OFF, (uint32_t)at);
     rc = rc != KERR_OK ? rc : xfs_dir_fork_insert(fs, dir, at, new_fsb, false, now_s);
     rc = rc != KERR_OK ? rc : xfs_inode_read(fs, dir->ino, dir);
     return rc != KERR_OK
                ? rc
-               : xfs_da_add_child(fs, dir, p,
+               : xfs_da_add_child(&t, p,
                                   &(struct xfs_da_split){top_hash(pairs, half), at,
                                                          top_hash(pairs, count)},
                                   now_s);
@@ -356,7 +412,8 @@ static int refresh(struct xfs *fs, struct xfs_inode *ip) {
  * when it is full, after which the hash may belong in the new half. */
 static int leaf_with_room(struct xfs *fs, struct xfs_inode *dir, uint32_t hash,
                           struct xfs_da_path *p, uint64_t *leaf_fsb, uint64_t now_s) {
-    int rc = xfs_da_descend(fs, dir, hash, p);
+    struct xfs_da_tree t = dir_tree(fs, dir);
+    int rc = xfs_da_descend(&t, hash, p);
     rc = rc != KERR_OK ? rc : xfs_dir_raw_load(fs, dir, p->leaf, leaf_fsb);
     if (rc != KERR_OK || xfs_be16(fs->dirblock + fs->da_count) < leafn_capacity(fs)) {
         return rc;
@@ -364,7 +421,7 @@ static int leaf_with_room(struct xfs *fs, struct xfs_inode *dir, uint32_t hash,
     rc = split_leaf(fs, dir, p, now_s);
     fs->leaf_splits += rc == KERR_OK ? 1u : 0u;
     rc = rc != KERR_OK ? rc : refresh(fs, dir);
-    rc = rc != KERR_OK ? rc : xfs_da_descend(fs, dir, hash, p);
+    rc = rc != KERR_OK ? rc : xfs_da_descend(&t, hash, p);
     return rc != KERR_OK ? rc : xfs_dir_raw_load(fs, dir, p->leaf, leaf_fsb);
 }
 
@@ -373,6 +430,7 @@ static int leaf_with_room(struct xfs *fs, struct xfs_inode *dir, uint32_t hash,
  * so — otherwise a later search for that name stops one child early. */
 static int leaf_insert(struct xfs *fs, struct xfs_inode *dir, uint32_t hash,
                        uint32_t address, uint64_t now_s) {
+    struct xfs_da_tree t = dir_tree(fs, dir);
     struct xfs_da_path p;
     uint64_t leaf_fsb = 0;
     uint32_t count;
@@ -386,7 +444,7 @@ static int leaf_insert(struct xfs *fs, struct xfs_inode *dir, uint32_t hash,
     xfs_reseal(fs, fs->dirblock, fs->dirblocksize, XFS_DA3_CRC_OFF);
     rc = xfs_dir_raw_store(fs, leaf_fsb);
     if (rc == KERR_OK && hash >= top_hash(fs->dirblock + fs->da_hdr, count)) {
-        rc = xfs_da_set_top(fs, dir, &p, hash);
+        rc = xfs_da_set_top(&t, &p, hash);
     }
     return rc;
 }
@@ -414,11 +472,12 @@ int xfs_dir_node_add(struct xfs *fs, const struct xfs_inode *dir, const char *na
  * The leaf is in the buffer. */
 static int drop_empty_leaf(struct xfs *fs, struct xfs_inode *dir, struct xfs_da_path *p,
                            uint64_t now_s) {
+    struct xfs_da_tree t = dir_tree(fs, dir);
     uint32_t forw = xfs_be32(fs->dirblock + XFS_DA3_FORW_OFF);
     uint32_t back = xfs_be32(fs->dirblock + XFS_DA3_BACK_OFF);
-    int rc = xfs_da_drop_child(fs, dir, p, now_s);
-    rc = rc != KERR_OK ? rc : xfs_da_set_sibling(fs, dir, back, XFS_DA3_FORW_OFF, forw);
-    rc = rc != KERR_OK ? rc : xfs_da_set_sibling(fs, dir, forw, XFS_DA3_BACK_OFF, back);
+    int rc = xfs_da_drop_child(&t, p, now_s);
+    rc = rc != KERR_OK ? rc : xfs_da_set_sibling(&t, back, XFS_DA3_FORW_OFF, forw);
+    rc = rc != KERR_OK ? rc : xfs_da_set_sibling(&t, forw, XFS_DA3_BACK_OFF, back);
     rc = rc != KERR_OK ? rc : xfs_dir_fork_remove(fs, dir, p->leaf, now_s);
     return rc != KERR_OK ? rc : refresh(fs, dir);
 }
@@ -437,11 +496,12 @@ static uint32_t pair_with(struct xfs *fs, uint32_t count, uint32_t address) {
 
 /* The leaf holding `address`: the one `hash` descends to, or one after it
  * along `forw`, since a run of equal hashes can continue into the next. */
-static int leaf_holding(struct xfs *fs, const struct xfs_inode *dir, uint32_t hash,
+static int leaf_holding(struct xfs *fs, struct xfs_inode *dir, uint32_t hash,
                         uint32_t address, uint64_t *leaf) {
+    struct xfs_da_tree t = dir_tree(fs, dir);
     struct xfs_da_path p;
     uint64_t fsb = 0;
-    int rc = xfs_da_descend(fs, dir, hash, &p);
+    int rc = xfs_da_descend(&t, hash, &p);
     *leaf = p.leaf;
     for (uint32_t hops = 0; rc == KERR_OK && hops < 1024u; hops++) {
         uint32_t count;
@@ -462,11 +522,12 @@ static int leaf_holding(struct xfs *fs, const struct xfs_inode *dir, uint32_t ha
  * the new highest: the checker requires them equal. */
 static int leaf_remove(struct xfs *fs, struct xfs_inode *dir, uint32_t hash, uint32_t address,
                        uint64_t now_s) {
+    struct xfs_da_tree t = dir_tree(fs, dir);
     struct xfs_da_path p;
     uint64_t leaf = 0, fsb = 0;
     uint32_t count, found;
     int rc = leaf_holding(fs, dir, hash, address, &leaf);
-    rc = rc != KERR_OK ? rc : xfs_da_find(fs, dir, hash, leaf, &p);
+    rc = rc != KERR_OK ? rc : xfs_da_find(&t, hash, leaf, &p);
     rc = rc != KERR_OK ? rc : xfs_dir_raw_load(fs, dir, leaf, &fsb);
     if (rc != KERR_OK) {
         return rc;
@@ -488,7 +549,7 @@ static int leaf_remove(struct xfs *fs, struct xfs_inode *dir, uint32_t hash, uin
     xfs_reseal(fs, fs->dirblock, fs->dirblocksize, XFS_DA3_CRC_OFF);
     rc = xfs_dir_raw_store(fs, fsb);
     return rc == KERR_OK && found + 1u == count && count > 1u
-               ? xfs_da_set_top(fs, dir, &p, top_hash(fs->dirblock + fs->da_hdr, count - 1u))
+               ? xfs_da_set_top(&t, &p, top_hash(fs->dirblock + fs->da_hdr, count - 1u))
                : rc;
 }
 

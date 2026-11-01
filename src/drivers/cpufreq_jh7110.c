@@ -63,9 +63,10 @@ static bool read_point(const struct fdt *fdt, const char *child, struct cpu_opp 
 
 /* The thresholds the governor decides against.
  *
- * Numbers rather than measurements, and said so: nothing reads this board's
- * temperature yet (`sfctemp` is not written), so the thermal half of the
- * policy is configured and inert. The load half is live. They are here so
+ * Numbers rather than measurements, and said so: the sensor is read
+ * (`temp_jh7110_sample`, `/proc/thermal`) but nothing feeds it to the
+ * governor yet, so the thermal half of the policy is configured and inert
+ * (ROADMAP §4). The load half is live. They are here so
  * that the policy passes its own validity check, and the moment a sensor
  * exists they are what it feeds. */
 static void set_thresholds(struct cpufreq_policy *p) {

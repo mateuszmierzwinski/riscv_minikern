@@ -46,6 +46,40 @@ struct tree_shape {
     uint32_t total;
 };
 
+/* Where a fork lives in the on-disk inode and how it is counted: the data
+ * fork from the end of the core to `forkoff`, the attribute fork from
+ * `forkoff` to the end of the inode, each with its own format byte and
+ * extent count, and its tree blocks marked as which fork's in the reverse
+ * map. */
+struct fork_view {
+    uint32_t off, bytes, format_at, cache_max;
+    uint64_t tree_rmap;
+    bool attr;
+};
+
+static struct fork_view view_of(const struct xfs *fs, const uint8_t *di, enum xfs_fork_which w) {
+    uint32_t split = (uint32_t)di[XFS_DI_FORKOFF] * 8u;
+    if (w == XFS_ATTR_FORK) {
+        return (struct fork_view){fs->dinode_size + split, fs->inodesize - fs->dinode_size - split,
+                                  XFS_DI_AFORMAT, XFS_AFORK_MAX,
+                                  XFS_RMAP_OFF_BMBT | XFS_RMAP_OFF_ATTR, true};
+    }
+    return (struct fork_view){fs->dinode_size, xfs_fork_bytes(fs, di), XFS_DI_FORMAT, XFS_FORK_MAX,
+                              XFS_RMAP_OFF_BMBT, false};
+}
+
+static uint64_t extents_of(const struct xfs *fs, const uint8_t *di, const struct fork_view *v) {
+    return v->attr ? xfs_dinode_attr_extents(fs, di) : xfs_dinode_data_extents(fs, di);
+}
+
+static void set_extents(const struct xfs *fs, uint8_t *di, const struct fork_view *v, uint32_t n) {
+    if (v->attr) {
+        xfs_dinode_set_attr_extents(fs, di, n);
+    } else {
+        xfs_dinode_set_data_extents(fs, di, n);
+    }
+}
+
 uint32_t xfs_bmbt_hdr(const struct xfs *fs) {
     return fs->v5 ? XFS_BMBT_BLOCK_BYTES : XFS_BMBT_V4_BLOCK_BYTES;
 }
@@ -130,24 +164,30 @@ static int load_tree(struct xfs *fs, const uint8_t *fork, uint32_t bytes, uint32
     return rc;
 }
 
-int xfs_fork_load(struct xfs *fs, const uint8_t *di, struct xfs_fork_map *out) {
-    const uint8_t *fork = di + fs->dinode_size;
-    uint32_t bytes = xfs_fork_bytes(fs, di), n = 0;
+int xfs_fork_load_which(struct xfs *fs, const uint8_t *di, enum xfs_fork_which w,
+                        struct xfs_fork_map *out) {
+    struct fork_view v = view_of(fs, di, w);
+    const uint8_t *fork = di + v.off;
+    uint32_t bytes = v.bytes, n = 0;
     int rc = KERR_OK;
     block_count = 0;
-    if (di[XFS_DI_FORMAT] == XFS_DINODE_FMT_EXTENTS) {
-        n = (uint32_t)xfs_dinode_data_extents(fs, di);
+    if (di[v.format_at] == XFS_DINODE_FMT_EXTENTS) {
+        n = (uint32_t)extents_of(fs, di, &v);
         rc = n * XFS_EXTENT_BYTES <= bytes && n <= XFS_FORK_MAP_MAX ? KERR_OK : KERR_IO;
         for (uint32_t i = 0; rc == KERR_OK && i < n; i++) {
             xfs_extent_unpack(fork + i * XFS_EXTENT_BYTES, &map[i]);
         }
-    } else if (di[XFS_DI_FORMAT] == XFS_DINODE_FMT_BTREE) {
+    } else if (di[v.format_at] == XFS_DINODE_FMT_BTREE) {
         rc = load_tree(fs, fork, bytes, &n);
     } else {
         rc = KERR_NOTSUP; /* a fork held in the inode itself: not an extent map */
     }
     *out = (struct xfs_fork_map){.e = map, .count = n, .cap = XFS_FORK_MAP_MAX};
     return rc;
+}
+
+int xfs_fork_load(struct xfs *fs, const uint8_t *di, struct xfs_fork_map *out) {
+    return xfs_fork_load_which(fs, di, XFS_DATA_FORK, out);
 }
 
 /* ── editing ──────────────────────────────────────────────────────────── */
@@ -243,15 +283,15 @@ void xfs_fork_map_drop(struct xfs_fork_map *m, uint32_t i) {
 /* ── storing ──────────────────────────────────────────────────────────── */
 
 /* Writes the map into the inode's literal area as a plain extent list. */
-static void store_extents(struct xfs *fs, uint8_t *di, const struct xfs_fork_map *m) {
-    uint8_t *fork = di + fs->dinode_size;
-    for (uint32_t i = 0; i < xfs_fork_bytes(fs, di); i++) {
+static void store_extents(uint8_t *di, const struct fork_view *v, const struct xfs_fork_map *m) {
+    uint8_t *fork = di + v->off;
+    for (uint32_t i = 0; i < v->bytes; i++) {
         fork[i] = 0;
     }
     for (uint32_t i = 0; i < m->count; i++) {
         xfs_extent_pack(fork + i * XFS_EXTENT_BYTES, &m->e[i]);
     }
-    di[XFS_DI_FORMAT] = XFS_DINODE_FMT_EXTENTS;
+    di[v->format_at] = XFS_DINODE_FMT_EXTENTS;
 }
 
 /* The tree of least height for `count` records under a root of `root_cap`
@@ -274,7 +314,8 @@ static int plan_tree(const struct xfs *fs, uint32_t count, uint32_t root_cap,
 /* Makes the tree's blocks number `want`: takes new ones near the inode and
  * gives back ones no longer needed, each through the reverse map as this
  * inode's tree block. *delta is how many the inode gained (or lost). */
-static int fit_blocks(struct xfs *fs, uint64_t ino, uint32_t want, int64_t *delta) {
+static int fit_blocks(struct xfs *fs, uint64_t ino, uint64_t tree_rmap, uint32_t want,
+                      int64_t *delta) {
     int rc = KERR_OK;
     *delta = 0;
     while (rc == KERR_OK && block_count < want) {
@@ -282,14 +323,14 @@ static int fit_blocks(struct xfs *fs, uint64_t ino, uint32_t want, int64_t *delt
         rc = xfs_alloc_somewhere(fs, &agno, 1u, 0, &got);
         if (rc == KERR_OK) {
             blocks[block_count] = ((uint64_t)agno << fs->agblklog) | got;
-            rc = xfs_rmap_map(fs, blocks[block_count], 1u, ino, XFS_RMAP_OFF_BMBT);
+            rc = xfs_rmap_map(fs, blocks[block_count], 1u, ino, tree_rmap);
             block_count++;
             (*delta)++;
         }
     }
     while (rc == KERR_OK && block_count > want) {
         block_count--;
-        rc = xfs_free_owned(fs, blocks[block_count], 1u, ino, XFS_RMAP_OFF_BMBT);
+        rc = xfs_free_owned(fs, blocks[block_count], 1u, ino, tree_rmap);
         (*delta)--;
     }
     return rc;
@@ -388,10 +429,11 @@ static int store_level(struct xfs *fs, uint64_t ino, const struct xfs_fork_map *
 }
 
 /* The root in the inode, naming the top level's blocks (blocks[top...]). */
-static void store_root(struct xfs *fs, uint8_t *di, const struct tree_shape *t, uint32_t top) {
-    uint8_t *fork = di + fs->dinode_size;
-    uint32_t mx = root_capacity(xfs_fork_bytes(fs, di)), n = t->width[t->levels - 1u];
-    for (uint32_t i = 0; i < xfs_fork_bytes(fs, di); i++) {
+static void store_root(uint8_t *di, const struct fork_view *v, const struct tree_shape *t,
+                       uint32_t top) {
+    uint8_t *fork = di + v->off;
+    uint32_t mx = root_capacity(v->bytes), n = t->width[t->levels - 1u];
+    for (uint32_t i = 0; i < v->bytes; i++) {
         fork[i] = 0;
     }
     xfs_put_be16(fork, (uint16_t)t->levels);
@@ -401,13 +443,13 @@ static void store_root(struct xfs *fs, uint8_t *di, const struct tree_shape *t, 
         xfs_put_be64(fork + XFS_BMDR_HDR_BYTES + mx * XFS_BMBT_KEY_BYTES + i * XFS_BMBT_PTR_BYTES,
                      blocks[top + i]);
     }
-    di[XFS_DI_FORMAT] = XFS_DINODE_FMT_BTREE;
+    di[v->format_at] = XFS_DINODE_FMT_BTREE;
 }
 
 /* Writes the map as the tree `t`, leaves first, from the pool's blocks in
  * order: the leaves take the first ones, each node level the next. */
-static int store_tree(struct xfs *fs, uint64_t ino, uint8_t *di, const struct xfs_fork_map *m,
-                      const struct tree_shape *t) {
+static int store_tree(struct xfs *fs, uint64_t ino, uint8_t *di, const struct fork_view *v,
+                      const struct xfs_fork_map *m, const struct tree_shape *t) {
     uint32_t base = 0;
     int rc = KERR_OK;
     for (uint32_t l = 0; rc == KERR_OK && l < t->levels; l++) {
@@ -415,33 +457,38 @@ static int store_tree(struct xfs *fs, uint64_t ino, uint8_t *di, const struct xf
         base += t->width[l];
     }
     if (rc == KERR_OK) {
-        store_root(fs, di, t, base - t->width[t->levels - 1u]);
+        store_root(di, v, t, base - t->width[t->levels - 1u]);
     }
     return rc;
 }
 
-int xfs_fork_store(struct xfs *fs, uint64_t ino, uint8_t *di, const struct xfs_fork_map *m) {
-    uint32_t bytes = xfs_fork_bytes(fs, di);
-    bool fits = m->count * XFS_EXTENT_BYTES <= bytes;
+int xfs_fork_store_which(struct xfs *fs, uint64_t ino, uint8_t *di, enum xfs_fork_which w,
+                         const struct xfs_fork_map *m) {
+    struct fork_view v = view_of(fs, di, w);
+    bool fits = m->count * XFS_EXTENT_BYTES <= v.bytes;
     struct tree_shape t = {.levels = 0};
     int64_t delta = 0;
-    int rc = fits ? KERR_OK : plan_tree(fs, m->count, root_capacity(bytes), &t);
+    int rc = fits ? KERR_OK : plan_tree(fs, m->count, root_capacity(v.bytes), &t);
     if (rc != KERR_OK) {
         return rc;
     }
-    if (bytes > XFS_FORK_MAX && (!fits || m->count * XFS_EXTENT_BYTES > XFS_FORK_MAX)) {
+    if (v.bytes > v.cache_max && (!fits || m->count * XFS_EXTENT_BYTES > v.cache_max)) {
         return KERR_NOTSUP; /* the last guard: this reader would refuse the result */
     }
-    rc = fit_blocks(fs, ino, t.total, &delta);
+    rc = fit_blocks(fs, ino, v.tree_rmap, t.total, &delta);
     if (rc != KERR_OK) {
         return rc;
     }
     if (fits) {
-        store_extents(fs, di, m);
+        store_extents(di, &v, m);
     } else {
-        rc = store_tree(fs, ino, di, m, &t);
+        rc = store_tree(fs, ino, di, &v, m, &t);
     }
-    xfs_dinode_set_data_extents(fs, di, m->count);
+    set_extents(fs, di, &v, m->count);
     xfs_put_be64(di + XFS_DI_NBLOCKS, xfs_be64(di + XFS_DI_NBLOCKS) + (uint64_t)delta);
     return rc;
+}
+
+int xfs_fork_store(struct xfs *fs, uint64_t ino, uint8_t *di, const struct xfs_fork_map *m) {
+    return xfs_fork_store_which(fs, ino, di, XFS_DATA_FORK, m);
 }

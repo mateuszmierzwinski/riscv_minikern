@@ -946,6 +946,147 @@ static void step_tallfork(struct xfs *fs) {
     must(xfs_unlink(fs, &root, "tall", 4u, NOW), "unlink tall");
 }
 
+/* A file with more attributes than one leaf block holds: 1,500 names with
+ * 40-byte values (about thirty leaves, so the fork becomes node format and
+ * its leaves split), every tenth with a 3,000-byte value in blocks of its
+ * own. A block is appended to a second file after each set, so the
+ * fork's blocks are never neighbours and its extent map outgrows the inode
+ * and becomes a b-tree. All are read back and listed; every other one is
+ * removed and both halves checked; then the rest, which empties the leaves
+ * and gives every remote value's blocks back. */
+#define MANY_ATTRS 1500u
+
+static void attr_name(char *out, size_t room, uint32_t i) {
+    snprintf(out, room, "user.attribute-number-%05u", i);
+}
+
+/* Attribute `i`'s value: 40 bytes, or 3,000 for every tenth. */
+static uint32_t attr_value(uint32_t i, uint8_t *out) {
+    uint32_t len = i % 10u == 0 ? 3000u : 40u;
+    for (uint32_t k = 0; k < len; k++) {
+        out[k] = (uint8_t)(i * 13u + k);
+    }
+    return len;
+}
+
+/* Attribute `i` of `ino` is there with its value, or is not, as wanted. */
+static void attr_expect(struct xfs *fs, uint64_t ino, uint32_t i, bool present) {
+    static uint8_t want[3000], got[3000];
+    struct xfs_inode ip;
+    char name[48];
+    uint32_t len = attr_value(i, want), vlen = 0;
+    int rc;
+    attr_name(name, sizeof name, i);
+    read_inode(fs, ino, &ip);
+    rc = xfs_attr_get(fs, &ip, name, (uint32_t)strlen(name), got, sizeof got, &vlen);
+    if (present ? rc != KERR_OK || vlen != len || memcmp(got, want, len) != 0
+                : rc != KERR_NOENT) {
+        fprintf(stderr, "xfs_writecheck: %s: rc %d, %u bytes (want %s)\n", name, rc, vlen,
+                present ? "its value" : "gone");
+        exit(1);
+    }
+}
+
+static int count_attr(void *self, const uint8_t *name, uint32_t namelen, uint8_t flags,
+                      uint32_t valuelen) {
+    (void)name;
+    (void)namelen;
+    (void)flags;
+    (void)valuelen;
+    (*(uint32_t *)self)++;
+    return KERR_OK;
+}
+
+static uint32_t attr_count(struct xfs *fs, uint64_t ino) {
+    struct xfs_inode ip;
+    uint32_t n = 0;
+    read_inode(fs, ino, &ip);
+    must(xfs_attr_list(fs, &ip, count_attr, &n), "list attributes");
+    return n;
+}
+
+static void attrs_remove(struct xfs *fs, uint64_t ino, uint32_t first, uint32_t step) {
+    char name[48];
+    for (uint32_t i = first; i < MANY_ATTRS; i += step) {
+        struct xfs_inode ip;
+        read_inode(fs, ino, &ip);
+        attr_name(name, sizeof name, i);
+        must(xfs_attr_remove(fs, &ip, name, (uint32_t)strlen(name), NOW), "remove attribute");
+    }
+}
+
+/* Whether block 0 of the attribute fork is a node (rather than a leaf). */
+static bool attr_root_is_node(struct xfs *fs, uint64_t ino) {
+    struct xfs_inode ip;
+    struct xfs_extent e;
+    struct bbuf *b;
+    bool node;
+    read_inode(fs, ino, &ip);
+    must(xfs_attr_bmap(fs, &ip, 0, &e), "attribute block 0");
+    must(bcache_get(fs->cache, xfs_fsb_to_block(fs, e.startblock), &b), "attribute block 0");
+    node = xfs_be16(b->data + XFS_DA3_MAGIC_OFF) == xfs_magic_for(fs, XFS_BLK_DA_NODE);
+    bcache_put(fs->cache, b);
+    return node;
+}
+
+/* Sets every attribute, appending a block to `spacer` after each. */
+static void attrs_set(struct xfs *fs, uint64_t ino, uint64_t spacer) {
+    static uint8_t value[3000];
+    char name[48];
+    uint32_t put = 0;
+    for (uint32_t i = 0; i < MANY_ATTRS; i++) {
+        struct xfs_inode ip;
+        uint32_t len = attr_value(i, value);
+        read_inode(fs, ino, &ip);
+        attr_name(name, sizeof name, i);
+        must(xfs_attr_set(fs, &ip, name, (uint32_t)strlen(name), value, len, NOW), name);
+        read_inode(fs, spacer, &ip);
+        must(xfs_file_write(fs, &ip, (uint64_t)i * BS, payload, BS, &put), "spacer");
+    }
+}
+
+/* A file named `name` with every attribute set, checked: a node-format
+ * fork whose extent map is a b-tree, all listed, a sample read back. */
+static uint64_t many_attrs_file(struct xfs *fs, const char *name, uint64_t spacer) {
+    struct xfs_inode root, ip;
+    uint64_t ino;
+    read_inode(fs, fs->rootino, &root);
+    ino = make_file(fs, &root, name, 4096u, 4096u);
+    attrs_set(fs, ino, spacer);
+    read_inode(fs, ino, &ip);
+    printf("xfs_writecheck: %s: %u attributes, fork format %u, %u listed, root %s\n", name,
+           MANY_ATTRS, ip.aformat, attr_count(fs, ino),
+           attr_root_is_node(fs, ino) ? "a node" : "a leaf");
+    if (ip.aformat != XFS_DINODE_FMT_BTREE || attr_count(fs, ino) != MANY_ATTRS ||
+        !attr_root_is_node(fs, ino)) {
+        fprintf(stderr, "xfs_writecheck: not a node-format fork in a b-tree, of all of them\n");
+        exit(1);
+    }
+    for (uint32_t i = 0; i < MANY_ATTRS; i += 7u) {
+        attr_expect(fs, ino, i, true);
+    }
+    return ino;
+}
+
+/* `kept` keeps half its attributes, for `xfs_repair` to judge a populated
+ * node fork; `emptied` loses all of them, every leaf and remote value. */
+static void step_manyattrs(struct xfs *fs) {
+    struct xfs_inode root;
+    uint64_t kept, emptied, spacer;
+    read_inode(fs, fs->rootino, &root);
+    must(xfs_create(fs, &root, "spacer", 6u, 0100644, NOW, &spacer), "create spacer");
+    kept = many_attrs_file(fs, "attrs-kept", spacer);
+    attrs_remove(fs, kept, 0, 2u);
+    for (uint32_t i = 0; i < MANY_ATTRS; i += 7u) {
+        attr_expect(fs, kept, i, i % 2u == 1u);
+    }
+    emptied = many_attrs_file(fs, "attrs-emptied", spacer);
+    attrs_remove(fs, emptied, 0, 1u);
+    printf("xfs_writecheck: %u attributes kept, %u left on the emptied file\n",
+           attr_count(fs, kept), attr_count(fs, emptied));
+    must_read_back(fs, emptied, 4096u);
+}
+
 /* A directory past what one node and one free block describe: 200,000
  * names of 40 bytes, which is ~2,800 data blocks (a second free block past
  * 2,016) and a hash index whose root fills at ~177,000 names (a level of
@@ -1063,7 +1204,7 @@ static const struct step steps[] = {
     {"inodes", step_inodes},    {"noinodes", step_noinodes},
     {"reflink", step_reflink},  {"holes", step_holes},     {"boardgrow", step_boardgrow},
     {"trim", step_trim},        {"eofzero", step_eofzero},  {"realtime", step_realtime},
-    {"uncommitted", step_uncommitted}, {"bigfork", step_bigfork}, {"tallfork", step_tallfork},
+    {"uncommitted", step_uncommitted}, {"bigfork", step_bigfork}, {"tallfork", step_tallfork}, {"manyattrs", step_manyattrs},
     {"bigdir", step_bigdir},
 };
 

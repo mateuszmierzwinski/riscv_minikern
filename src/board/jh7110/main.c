@@ -3507,6 +3507,76 @@ static int tally_attr(void *self, const uint8_t *name, uint32_t namelen, uint8_t
     return KERR_OK;
 }
 
+/* **Attributes past one leaf block.** 600 attributes of 40-byte values are
+ * about 36 KiB, which no single leaf holds: setting them all succeeds only
+ * if the fork becomes node format and its leaves split, so success is the
+ * shape's proof. They are counted by listing, sampled across a remount,
+ * and removed, after which the fork is empty again. */
+#define MANY_ATTRS 600u
+
+static void many_attr_name(char *out, uint32_t i) {
+    (void)kfmt_snprintf(out, 24, "user.a-%04u", i);
+}
+
+static int count_one(void *self, const uint8_t *name, uint32_t namelen, uint8_t flags,
+                     uint32_t valuelen) {
+    (void)name;
+    (void)namelen;
+    (void)flags;
+    (void)valuelen;
+    (*(uint32_t *)self)++;
+    return KERR_OK;
+}
+
+static uint32_t many_attrs_listed(void) {
+    uint32_t n = 0;
+    return xfsmount_attr_list("w_attrs", count_one, &n) == KERR_OK ? n : UINT32_MAX;
+}
+
+/* Attribute `i` reads back as its 40 bytes. */
+static int many_attr_reads(uint32_t i) {
+    uint8_t want[40], got[40];
+    char name[24];
+    uint32_t len = 0;
+    int rc;
+    for (uint32_t k = 0; k < sizeof want; k++) {
+        want[k] = (uint8_t)(i * 7u + k);
+    }
+    many_attr_name(name, i);
+    rc = xfsmount_attr_get("w_attrs", name, got, sizeof got, &len);
+    for (uint32_t k = 0; rc == KERR_OK && k < sizeof got; k++) {
+        rc = len == sizeof got && got[k] == want[k] ? KERR_OK : KERR_IO;
+    }
+    return rc;
+}
+
+static int many_attributes_round_trip(void) {
+    uint8_t value[40];
+    char name[24];
+    uint32_t listed;
+    int rc = xfsmount_create("w_attrs", 0100644u);
+    for (uint32_t i = 0; rc == KERR_OK && i < MANY_ATTRS; i++) {
+        for (uint32_t k = 0; k < sizeof value; k++) {
+            value[k] = (uint8_t)(i * 7u + k);
+        }
+        many_attr_name(name, i);
+        rc = xfsmount_attr_set("w_attrs", name, value, sizeof value);
+    }
+    listed = rc == KERR_OK ? many_attrs_listed() : 0;
+    rc = rc != KERR_OK ? rc : xfsmount_remount();
+    for (uint32_t i = 0; rc == KERR_OK && i < MANY_ATTRS; i += 37u) {
+        rc = many_attr_reads(i);
+    }
+    for (uint32_t i = 0; rc == KERR_OK && i < MANY_ATTRS; i++) {
+        many_attr_name(name, i);
+        rc = xfsmount_attr_remove("w_attrs", name);
+    }
+    kprintf("fswrite:   /w_attrs: %u attributes set, %u listed, %u after removal (rc %d)\n",
+            MANY_ATTRS, listed, rc == KERR_OK ? many_attrs_listed() : 0, rc);
+    rc = rc != KERR_OK || (listed == MANY_ATTRS && many_attrs_listed() == 0) ? rc : KERR_IO;
+    return rc != KERR_OK ? rc : xfsmount_unlink("w_attrs");
+}
+
 /* Extended attributes: set, read back, list, remove — and then **mount the
  * filesystem again** and read them once more.
  *
@@ -3808,6 +3878,7 @@ static void run_write_selftest(void) {
     /* Before the dirty-log steps, which leave the filesystem read-only in
      * the control's case and would refuse an attribute write. */
     ok = ok && wrote_and_checked("attributes round trip", attributes_round_trip());
+    ok = ok && wrote_and_checked("attributes past one leaf", many_attributes_round_trip());
     ok = ok && wrote_and_checked("a dirty log is replayed", dirty_then_remount());
     ok = ok && wrote_and_checked("refused replay stays read-only",
                                  refused_replay_is_read_only());

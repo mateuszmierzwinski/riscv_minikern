@@ -149,6 +149,49 @@ int xfs_attr_leaf_get(struct xfs *fs, const struct xfs_inode *ip, const char *na
 int xfs_attr_leaf_list(struct xfs *fs, const struct xfs_inode *ip, xfs_attr_fn fn,
                        void *self);
 
+/* ── an attribute fork in blocks: one leaf, or a tree of them ────────────
+ *
+ * The leaf block's primitives (xfs_attr.c), each on the leaf in
+ * `fs->dirblock`: an empty leaf; an entry's name, value length and where
+ * its value is; a local or remote entry put in hash order (`KERR_NOSPC`
+ * when the block is full); and one taken out by name. And a remote value
+ * read from its own blocks. */
+void xfs_attr_leaf_empty(struct xfs *fs, uint64_t ino);
+int xfs_attr_leaf_entry(const struct xfs *fs, const uint8_t *leaf, uint32_t i,
+                        const uint8_t **name, uint32_t *namelen, uint32_t *valuelen,
+                        uint32_t *value_at, uint8_t *flags);
+int xfs_attr_leaf_put(struct xfs *fs, const char *name, uint32_t namelen, const uint8_t *value,
+                      uint32_t valuelen, uint8_t flags);
+int xfs_attr_leaf_put_remote(struct xfs *fs, const char *name, uint32_t namelen,
+                             uint32_t valueblk, uint32_t valuelen, uint8_t flags);
+bool xfs_attr_leaf_take_out(struct xfs *fs, const char *name, uint32_t namelen, uint8_t flags);
+int xfs_attr_rmt_read(struct xfs *fs, const struct xfs_inode *ip, uint32_t valueblk,
+                      uint32_t valuelen, uint8_t *out, uint32_t room);
+
+/* An attribute to put in the fork: its stored name and namespace flags,
+ * and either its value (local) or where its value's blocks are (remote). */
+struct xfs_attr_new {
+    const char *name;
+    uint32_t namelen;
+    uint8_t flags;
+    const uint8_t *value;
+    uint32_t valuelen;
+    bool remote;
+    uint32_t valueblk;
+};
+
+/* The fork as a whole, leaf or node format (xfs_attrnode.c): a value by
+ * name; every name; an attribute put (replacing one of the same name, the
+ * leaf split or the fork turned into a node when full); one removed, with
+ * its remote value's blocks. `ip` is re-read as the fork changes. */
+int xfs_attr_tree_get(struct xfs *fs, struct xfs_inode *ip, const char *name, uint32_t namelen,
+                      uint8_t flags, uint8_t *out, uint32_t room, uint32_t *valuelen);
+int xfs_attr_tree_list(struct xfs *fs, struct xfs_inode *ip, xfs_attr_fn fn, void *self);
+int xfs_attr_tree_put(struct xfs *fs, struct xfs_inode *ip, const struct xfs_attr_new *n,
+                      uint64_t now_s);
+int xfs_attr_tree_remove(struct xfs *fs, struct xfs_inode *ip, const char *name,
+                         uint32_t namelen, uint8_t flags, uint64_t now_s);
+
 /* Checks the structures this reader walks, without writing anything
  * (xfs_check.c): both headers of every group, their four b-tree roots, the
  * counts each group states about itself, and the root inode.
@@ -447,6 +490,15 @@ uint32_t xfs_bmbt_hdr(const struct xfs *fs);
  * are remembered between the two, and nothing in between may load another.
  * KERR_NOSPC for a map past any limit above. */
 int xfs_fork_load(struct xfs *fs, const uint8_t *di, struct xfs_fork_map *out);
+
+/* Either fork: the data fork (what the two above do) or the attribute fork,
+ * which sits at `forkoff` and whose tree blocks the reverse map marks as the
+ * attribute fork's. */
+enum xfs_fork_which { XFS_DATA_FORK, XFS_ATTR_FORK };
+int xfs_fork_load_which(struct xfs *fs, const uint8_t *di, enum xfs_fork_which w,
+                        struct xfs_fork_map *out);
+int xfs_fork_store_which(struct xfs *fs, uint64_t ino, uint8_t *di, enum xfs_fork_which w,
+                         const struct xfs_fork_map *m);
 int xfs_fork_store(struct xfs *fs, uint64_t ino, uint8_t *di, const struct xfs_fork_map *m);
 
 /* Adds an extent in file order, joined to neighbours it continues; and
@@ -644,35 +696,50 @@ struct xfs_da_node_head {
     uint64_t back;
 };
 
-/* A `da3` header in `fs->dirblock`, the rest zeroed; a sibling pointer at
- * `off` of the index block at `logical` set (nothing for 0); and the
- * logical block for a new index block, past every one the directory has. */
-void xfs_da_header(struct xfs *fs, uint16_t magic, uint64_t ino, uint32_t count, uint64_t forw,
-                   uint64_t back);
-int xfs_da_set_sibling(struct xfs *fs, const struct xfs_inode *dir, uint64_t logical,
-                       uint32_t off, uint32_t value);
-int xfs_da_next_block(struct xfs *fs, const struct xfs_inode *dir, uint64_t *at);
+/* Whose hash index a tree is: a directory's (root at `dir_leaf_block`, in
+ * its data fork) or a file's attributes (root at block 0 of its attribute
+ * fork). The operations work on `fs->dirblock`, the one block buffer:
+ * `load` reads the block at a logical address into it, `store` writes it
+ * back to `fsb`, `grow` takes and maps a new block past every index block
+ * the tree's owner has, and `shrink` gives one back. `grow` and `shrink`
+ * re-read `ip`, whose fork they change. */
+struct xfs_da_tree;
+struct xfs_da_ops {
+    int (*load)(struct xfs_da_tree *t, uint64_t logical, uint64_t *fsb);
+    int (*store)(struct xfs_da_tree *t, uint64_t fsb);
+    int (*grow)(struct xfs_da_tree *t, uint64_t *logical, uint64_t *fsb, uint64_t now_s);
+    int (*shrink)(struct xfs_da_tree *t, uint64_t logical, uint64_t now_s);
+};
+struct xfs_da_tree {
+    const struct xfs_da_ops *ops;
+    struct xfs *fs;
+    struct xfs_inode *ip;
+    uint64_t root;
+    uint32_t bsize;
+};
+
+/* A `da3` header in `fs->dirblock` (`bsize` bytes, the rest zeroed); and a
+ * sibling pointer at `off` of the index block at `logical` set (nothing
+ * for 0). */
+void xfs_da_header(struct xfs *fs, uint32_t bsize, uint16_t magic, uint64_t ino, uint32_t count,
+                   uint64_t forw, uint64_t back);
+int xfs_da_set_sibling(struct xfs_da_tree *t, uint64_t logical, uint32_t off, uint32_t value);
 
 /* The path an insertion of `hash` takes; and the path to the known leaf
  * `leaf` that holds a hash (a run of equal hashes can span leaves). */
-int xfs_da_descend(struct xfs *fs, const struct xfs_inode *dir, uint32_t hash,
-                   struct xfs_da_path *p);
-int xfs_da_find(struct xfs *fs, const struct xfs_inode *dir, uint32_t hash, uint64_t leaf,
-                struct xfs_da_path *p);
+int xfs_da_descend(struct xfs_da_tree *t, uint32_t hash, struct xfs_da_path *p);
+int xfs_da_find(struct xfs_da_tree *t, uint32_t hash, uint64_t leaf, struct xfs_da_path *p);
 
-/* Whether the path's leaf is the directory's only one. */
+/* Whether the path's leaf is the tree's only one. */
 bool xfs_da_only_leaf(const struct xfs_da_path *p);
 
 /* The path's leaf now tops out at `hash`; it split (`s`); it emptied and
  * left. Each keeps every key above it equal to its child's highest hash,
- * splitting full nodes (the root grows a level) and removing empty ones.
- * `dir` is re-read when its fork changes. */
-int xfs_da_set_top(struct xfs *fs, const struct xfs_inode *dir, const struct xfs_da_path *p,
-                   uint32_t hash);
-int xfs_da_add_child(struct xfs *fs, struct xfs_inode *dir, struct xfs_da_path *p,
-                     const struct xfs_da_split *s, uint64_t now_s);
-int xfs_da_drop_child(struct xfs *fs, struct xfs_inode *dir, struct xfs_da_path *p,
-                      uint64_t now_s);
+ * splitting full nodes (the root grows a level) and removing empty ones. */
+int xfs_da_set_top(struct xfs_da_tree *t, const struct xfs_da_path *p, uint32_t hash);
+int xfs_da_add_child(struct xfs_da_tree *t, struct xfs_da_path *p, const struct xfs_da_split *s,
+                     uint64_t now_s);
+int xfs_da_drop_child(struct xfs_da_tree *t, struct xfs_da_path *p, uint64_t now_s);
 
 /* Turns a leaf-format directory into a node-format one, adding `name` as
  * part of the same step, and adds to and removes from one afterwards. */
@@ -811,5 +878,18 @@ int xfs_rt_summary_rebuild(struct xfs *fs, struct xfs_inode *bmp);
  * is not an answer, because Linux rejects a b-tree fork whose extents would
  * fit inline. A write that would need more is refused before it allocates. */
 uint32_t xfs_data_extents_cap(const struct xfs *fs, const struct xfs_inode *ip);
+
+/* The attribute fork's blocks: one taken and mapped past every block the
+ * fork has (`*logical`, `*fsb`; `ip` re-read), and `blocks` at `logical`
+ * given back. Either may turn the fork's extent map into a b-tree or back. */
+int xfs_attr_fork_grow(struct xfs *fs, struct xfs_inode *ip, uint64_t *logical, uint64_t *fsb,
+                       uint64_t now_s);
+int xfs_attr_fork_remove(struct xfs *fs, const struct xfs_inode *ip, uint32_t logical,
+                         uint32_t blocks, uint64_t now_s);
+
+/* The attribute fork with no attributes left: every block given back and
+ * an empty shortform fork in their place. An attribute leaf with no
+ * entries is one `xfs_repair` clears. */
+int xfs_attr_fork_empty(struct xfs *fs, struct xfs_inode *ip, uint64_t now_s);
 
 #endif
