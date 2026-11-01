@@ -1522,6 +1522,11 @@ void sched_run(void) {
              * and for nothing else. */
             sched_arm_timer();
             unload_before_idling(h);
+            /* After the unload: the lock is released while zeroing, and a
+             * process table this hart still had loaded could be freed. */
+            if (klock_held() && uspace_zero_ahead()) {
+                continue;
+            }
             h->idle = true;
             {
                 /* **The one place a hart's idleness has a beginning and an

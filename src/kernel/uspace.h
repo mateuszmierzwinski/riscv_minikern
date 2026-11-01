@@ -823,4 +823,15 @@ bool uspace_break_cow(struct uproc *me, virt_t va);
 uint32_t uspace_cow_copies(void);
 uint32_t uspace_cow_takeovers(void);
 
+/* Zeroes part of a 2 MiB block ahead of need, with the kernel lock released
+ * for the zeroing (it must be held on entry, and is held again on return).
+ * For an idle hart; true when it did some work, so the caller looks for
+ * runnable threads again before it waits. */
+bool uspace_zero_ahead(void);
+void uspace_set_zero_ahead(bool on);
+/* Fills the zeroed pool now, at boot, with nothing else running. */
+void uspace_fill_zeroed_pool(void);
+/* Huge-page faults served from the zeroed pool, and those zeroed inline. */
+void uspace_zeroed_blocks(uint64_t *taken, uint64_t *inline_zeroed);
+
 #endif

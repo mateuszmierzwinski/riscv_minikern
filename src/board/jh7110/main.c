@@ -1311,6 +1311,12 @@ static void report_detectors(void) {
     }
     report_lock_contention();
     {
+        uint64_t taken = 0, inline_zeroed = 0;
+        uspace_zeroed_blocks(&taken, &inline_zeroed);
+        kprintf("uspace: %llu huge pages from the zeroed pool, %llu zeroed in the fault\n",
+                (unsigned long long)taken, (unsigned long long)inline_zeroed);
+    }
+    {
         uint64_t interrupts = 0, waited = 0;
         jh7110_uart_queue_stats(&interrupts, &waited);
         kprintf("uart: %llu transmit interrupts; %llu bytes sent while the ring was full\n",
@@ -4707,6 +4713,8 @@ static void run_user_programs(void) {
     /* The fork fix, on unless the control asks for it off. */
     uspace_set_fork_leaves(!cmdline_has(boot_cmdline, "minikern.noforkleaves"));
     uspace_set_transparent_huge(!cmdline_has(boot_cmdline, "minikern.nothp"));
+    uspace_set_zero_ahead(!cmdline_has(boot_cmdline, "minikern.nozeroahead"));
+    uspace_fill_zeroed_pool();
     uspace_set_low_mappings(cmdline_has(boot_cmdline, "minikern.lowmap"));
     uspace_install_hooks();
     start_swap_if_asked();

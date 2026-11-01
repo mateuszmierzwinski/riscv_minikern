@@ -118,17 +118,38 @@ static volatile uint8_t *frame_at(phys_t at) {
     return (volatile uint8_t *)mmu_phys_to_virt(at);
 }
 
+/* Whether a span can be moved a word at a time. */
+static bool word_aligned(uintptr_t a, uintptr_t b, uint64_t bytes) {
+    return ((a | b | bytes) & 7u) == 0u;
+}
+
+/* **A word at a time**, not a byte: zeroing a 2 MiB page byte by byte was
+ * the longest kernel-lock hold left in a Go run (~4.9 ms, a transparent huge
+ * page's first store). `volatile` keeps the compiler from turning the loop
+ * into a call to this kernel's byte-wise `memset`. */
 static void zero_frames(phys_t at, uint64_t bytes) {
     volatile uint8_t *to = frame_at(at);
-    for (uint64_t i = 0; i < bytes; i++) {
-        to[i] = 0;
+    if (!word_aligned((uintptr_t)to, 0u, bytes)) {
+        for (uint64_t i = 0; i < bytes; i++) {
+            to[i] = 0;
+        }
+        return;
+    }
+    for (uint64_t i = 0; i < bytes / 8u; i++) {
+        ((volatile uint64_t *)to)[i] = 0;
     }
 }
 
 static void copy_to_frames(phys_t at, const volatile uint8_t *from, uint64_t bytes) {
     volatile uint8_t *to = frame_at(at);
-    for (uint64_t i = 0; i < bytes; i++) {
-        to[i] = from[i];
+    if (!word_aligned((uintptr_t)to, (uintptr_t)from, bytes)) {
+        for (uint64_t i = 0; i < bytes; i++) {
+            to[i] = from[i];
+        }
+        return;
+    }
+    for (uint64_t i = 0; i < bytes / 8u; i++) {
+        ((volatile uint64_t *)to)[i] = ((const volatile uint64_t *)from)[i];
     }
 }
 
@@ -2861,13 +2882,104 @@ uint64_t uspace_huge_pages(void) {
  * as memory fragments: the caller falls back to 4 KiB pages rather than
  * failing, because a mapping that works slowly is worth more than one that
  * does not exist. */
+/* **2 MiB blocks zeroed ahead, by idle harts, with the lock released.**
+ *
+ * Zeroing a block takes ~2.5 ms of DRAM bandwidth, and done in the fault
+ * that needs it, that is 2.5 ms of kernel lock — the longest hold in a Go
+ * run once the console was queued. An idle hart claims one block under the
+ * lock, zeroes it a `ZERO_STEP` at a time *without* the lock (nothing else
+ * knows the block exists), and files it here; a fault takes a filed block
+ * when there is one and zeroes inline when there is not. A step, not the
+ * whole block, so a hart that is zeroing answers new work within ~0.3 ms.
+ * `minikern.nozeroahead` is the control. */
+static bool transparent_on; /* defined with the other huge-page state, below */
+#define ZEROED_POOL 4u
+#define ZERO_STEP (256u * 1024u)
+static phys_t zeroed_pool[ZEROED_POOL];
+static uint32_t zeroed_count;
+static phys_t zeroing_block;  /* being zeroed; 0 when none */
+static uint64_t zeroing_done; /* bytes of it already zero */
+static bool zeroing_claimed;  /* a hart is zeroing it now, unlocked */
+static bool zero_ahead_on = true;
+static uint64_t zeroed_taken, zeroed_inline;
+
+void uspace_set_zero_ahead(bool on) {
+    zero_ahead_on = on;
+}
+
+void uspace_zeroed_blocks(uint64_t *taken, uint64_t *inline_zeroed) {
+    *taken = zeroed_taken;
+    *inline_zeroed = zeroed_inline;
+}
+
+/* Claims a block to zero, allocating one when none is in progress. */
+static bool claim_a_block_to_zero(void) {
+    if (!zero_ahead_on || !transparent_on || zeroing_claimed || zeroed_count == ZEROED_POOL) {
+        return false;
+    }
+    if (zeroing_block == 0 &&
+        mem_alloc_pages(MEGAPAGE_PAGES, MEGAPAGE_PAGES, &zeroing_block) != KERR_OK) {
+        zeroing_block = 0;
+        return false;
+    }
+    zeroing_claimed = true;
+    return true;
+}
+
+bool uspace_zero_ahead(void) {
+    phys_t at;
+    if (!claim_a_block_to_zero()) {
+        return false;
+    }
+    at = zeroing_block + zeroing_done;
+    klock_exit(true);
+    zero_frames(at, ZERO_STEP);
+    (void)klock_enter();
+    zeroing_claimed = false;
+    zeroing_done += ZERO_STEP;
+    if (zeroing_done == MEGAPAGE_SIZE) {
+        zeroed_pool[zeroed_count++] = zeroing_block;
+        zeroing_block = 0;
+        zeroing_done = 0;
+    }
+    return true;
+}
+
+/* **Filled once at boot**, before the first program: idle harts only reach
+ * the scheduler's idle loop when a program starts, and a Go start faults its
+ * first 2 MiB pages within milliseconds — a pool of 2, 4 or 8 filled only by
+ * idle harts still had one fault zero inline every run. ~10 ms of boot. */
+void uspace_fill_zeroed_pool(void) {
+    phys_t block = 0;
+    while (zero_ahead_on && transparent_on && zeroed_count < ZEROED_POOL &&
+           mem_alloc_pages(MEGAPAGE_PAGES, MEGAPAGE_PAGES, &block) == KERR_OK) {
+        zero_frames(block, MEGAPAGE_SIZE);
+        zeroed_pool[zeroed_count++] = block;
+    }
+}
+
+/* A zeroed 2 MiB block: a filed one, or one allocated and zeroed now. */
+static int zeroed_megapage(phys_t *block) {
+    int rc;
+    if (zeroed_count != 0u) {
+        *block = zeroed_pool[--zeroed_count];
+        zeroed_taken++;
+        return KERR_OK;
+    }
+    rc = mem_alloc_pages(MEGAPAGE_PAGES, MEGAPAGE_PAGES, block);
+    if (rc == KERR_OK) {
+        zero_frames(*block, MEGAPAGE_SIZE);
+        zeroed_inline++;
+    }
+    return rc;
+}
+
 static int back_one_megapage(struct uproc *p, virt_t base, uint32_t prot) {
     phys_t block = 0;
-    int rc = mem_alloc_pages(MEGAPAGE_PAGES, MEGAPAGE_PAGES, &block);
+    int rc = zeroed_megapage(&block);
     if (rc != KERR_OK) {
         return rc;
     }
-    zero_frames(block, MEGAPAGE_SIZE);
     rc = pgtable_map(&p->pt, base, block, MEGAPAGE_SIZE, prot_bits(prot));
     if (rc != KERR_OK) {
         mem_free_pages(block, MEGAPAGE_PAGES);
