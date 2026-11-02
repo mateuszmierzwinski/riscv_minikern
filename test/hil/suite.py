@@ -754,6 +754,25 @@ CASES = [
       "display: overlay 64-to-256 (rc 0, frames yes, underflow no)",
       "display: overlay fetches: 4 of 4 steps as expected"],
      120, None),
+    # **What the CPU does to a frame** (§10, acceleration's baseline): the
+    # best of eight 1080p clears and copies with 64-bit stores. Measured
+    # 1,144 MB/s fill (7.2 ms a frame) and 738 MB/s copy (11.2 ms) — two
+    # thirds of a 60 Hz frame for one blit, which is what the overlay's
+    # free scaling and composition are weighed against.
+    ("§10: the CPU's fill and copy of a 1080p frame",
+     "", ["memspeed: fill", "memspeed: copy", "exited with 0"],
+     60, "//:memspeed.elf"),
+    # **The overlay from a program** (§10): `fboverlay` draws a card in
+    # /dev/fb0's overlay area and puts it up with MINIKERN_FBIO_OVERLAY;
+    # `minikern.overlaycheck` has the kernel count the controller's fetches
+    # of it (512 bursts a frame for 128×128 shown at 256×256). The program
+    # exits with the card up, so the close must take it down.
+    ("§10: a program's picture on the overlay plane, scaled, and taken down on close",
+     "minikern.hdmi=1920x1080 minikern.overlaycheck",
+     ["display: overlay from a program: 128x128 at 64,64 shown as 256x256 (rc 0)",
+      "display: overlay from a program fetched", "over 10 frames: as expected",
+      "display: overlay from a program taken down", "exited with 15"],
+     150, "//:fboverlay.elf"),
     # `minikern.hdmi=auto` (§10, mode from the EDID): with no monitor on the
     # board the hot-plug line is low, so the default is chosen and said so;
     # the chooser itself is host-tested against EDIDs (display_mode_test).

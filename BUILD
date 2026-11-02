@@ -2030,6 +2030,37 @@ user_image(
     program = ":fbdirty",
 )
 
+# What the CPU does to a 1080p frame: the best of eight clears and copies,
+# in MB/s — the baseline display acceleration is weighed against.
+user_binary(
+    name = "memspeed",
+    srcs = [
+        "src/userland/memspeed/main.c",
+        "src/userland/start.S",
+    ],
+)
+
+user_image(
+    name = "memspeed.elf",
+    program = ":memspeed",
+)
+
+# The overlay plane from a program: a card drawn in /dev/fb0's overlay area
+# and shown scaled 2×, a request past the area and a bad pointer refused,
+# taken down, then left up for close to take down. 15 for all four.
+user_binary(
+    name = "fboverlay",
+    srcs = [
+        "src/userland/fboverlay/main.c",
+        "src/userland/start.S",
+    ],
+)
+
+user_image(
+    name = "fboverlay.elf",
+    program = ":fboverlay",
+)
+
 # /dev/i2c-5 from a program, read-only: the PMIC's id and core-rail
 # registers through I2C_RDWR, and the shapes it must refuse. 127.
 user_binary(

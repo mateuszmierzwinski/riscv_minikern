@@ -2277,6 +2277,14 @@ static int framebuffer_mode(const struct fdt *fdt, struct fb_mode *mode) {
     return rc;
 }
 
+/* The overlay a program put up (`MINIKERN_FBIO_OVERLAY`): its picture is
+ * flushed from the L2 on the display beat, as the frame is, so what the
+ * program keeps drawing there reaches the controller. */
+static struct {
+    phys_t image;
+    uint64_t bytes;
+} program_overlay;
+
 /* Writes the framebuffer back from the L2 ten times a second while HDMI
  * shows it, so what programs draw reaches the display controller. */
 #define DISPLAY_REFRESH_NS 100000000ull
@@ -2289,6 +2297,9 @@ static void refresh_display_from_beat(void) {
         display_jh7110_refresh();
     } else if (bytes != 0) {
         display_jh7110_refresh_range(offset, bytes);
+    }
+    if (program_overlay.bytes != 0u) {
+        (void)ccache_flush_range(program_overlay.image, program_overlay.bytes);
     }
 }
 
@@ -2372,9 +2383,9 @@ static bool count_matches(uint32_t got, uint32_t want) {
     return want == 0u ? got == 0u : got * 50u >= want * 49u && got * 50u <= want * 51u;
 }
 
-static bool count_the_fetches(const char *step, uint32_t side, const struct fb_mode *screen) {
+static bool count_the_fetches(const char *step, uint32_t width, uint32_t height, const struct fb_mode *screen) {
     uint32_t pixels0, primary0, overlay0, frames, frame_pixels = screen->width * screen->height;
-    uint32_t overlay, primary, want_overlay = side != 0u ? bursts_for(side, side) : 0u,
+    uint32_t overlay, primary, want_overlay = bursts_for(width, height),
                                 want_primary = bursts_for(screen->width, screen->height);
     (void)wait_for_a_frame();
     pixels0 = dc8200_debug_counter(DC8200_COUNT_OUTPUT_PIXELS);
@@ -2410,7 +2421,7 @@ static bool overlay_step(const char *step, uint32_t side, uint32_t out, const st
             step, rc, frames ? "yes" : "NO", dc8200_underflow() ? "YES" : "no", r[0], r[1], r[2], r[3], r[4],
             r[5], r[6], r[7]);
     sweep_the_debug_counters(step);
-    return count_the_fetches(step, out != 0u ? side : 0u, screen);
+    return count_the_fetches(step, out != 0u ? side : 0u, side, screen);
 }
 
 /* `minikern.hdmioverlay`: overlay 0 on display 0 — off, at 1:1, scaled
@@ -2427,6 +2438,34 @@ static void try_the_overlay(const struct fb_mode *screen) {
     ok += overlay_step("hidden", OVERLAY_SIDE, 0u, screen) ? 1u : 0u;
     kprintf("display: overlay fetches: %u of 4 steps as expected\n", ok);
 }
+
+/* Shows a program's overlay; with `minikern.overlaycheck`, also counts the
+ * controller's fetches of it over ten frames — the board suite's evidence,
+ * since no monitor sees it. */
+static int show_program_overlay(phys_t image, const struct fb_overlay *o) {
+    struct dc8200_overlay d = {image, o->stride, o->width, o->height, o->x, o->y, o->out_width, o->out_height};
+    struct fb_mode screen;
+    phys_t base;
+    (void)ccache_flush_range(image, (uint64_t)o->stride * o->height);
+    int rc = dc8200_overlay_show(&d);
+    program_overlay.image = rc == KERR_OK ? image : 0u;
+    program_overlay.bytes = rc == KERR_OK ? (uint64_t)o->stride * o->height : 0u;
+    kprintf("display: overlay from a program: %ux%u at %u,%u shown as %ux%u (rc %d)\n", o->width, o->height,
+            o->x, o->y, o->out_width, o->out_height, rc);
+    if (rc == KERR_OK && cmdline_has(boot_cmdline, "minikern.overlaycheck") && fbdev_memory(&base, &screen) == KERR_OK) {
+        (void)count_the_fetches("from a program", o->width, o->height, &screen);
+    }
+    return rc;
+}
+
+static void hide_program_overlay(void) {
+    dc8200_overlay_hide();
+    program_overlay.image = 0u;
+    program_overlay.bytes = 0u;
+    kprintf("display: overlay from a program taken down\n");
+}
+
+static const struct fbdev_overlay_port program_overlay_port = {show_program_overlay, hide_program_overlay};
 
 /* `minikern.hdmi=<width>x<height>`: `/dev/fb0` on the board's HDMI output
  * (ROADMAP §10). The framebuffer must have the same size — given by
@@ -2450,6 +2489,7 @@ static void start_hdmi(const struct fdt *fdt) {
     inno_hdmi_use_hdmi_mode(cmdline_equals(boot_cmdline, "minikern.hdmimode", "hdmi"));
     if (display_jh7110_start(fdt, base, fb.width, fb.height, fb.stride) == KERR_OK) {
         (void)timer_add_housekeeping_every(refresh_display_from_beat, DISPLAY_REFRESH_NS);
+        fbdev_set_overlay_port(&program_overlay_port);
         if (cmdline_has(boot_cmdline, "minikern.hdmicursor")) {
             show_the_cursor(fb.width / 2u, fb.height / 2u);
         }

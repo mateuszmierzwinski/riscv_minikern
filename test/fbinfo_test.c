@@ -111,6 +111,61 @@ static void test_an_empty_or_offscreen_rectangle_flushes_nothing(void) {
     KTEST_CHECK(!fbinfo_dirty_rows(&m, &right, &first, &end));
 }
 
+static const struct fb_mode SCREEN = {1920, 1080, 7680};
+
+/* The test program's request: 128×128 at the start of the area, shown 2×. */
+static struct fb_overlay good(void) {
+    struct fb_overlay o = {0, 512, 128, 128, 64, 64, 256, 256};
+    return o;
+}
+
+static void test_an_overlay_inside_its_area_and_the_screen_is_shown(void) {
+    struct fb_overlay o = good();
+    KTEST_CHECK(fbinfo_overlay_ok(&SCREEN, &o));
+    o.offset = FB_OVERLAY_BYTES - 512u * 128u; /* the last lines of the area */
+    KTEST_CHECK(fbinfo_overlay_ok(&SCREEN, &o));
+    o = good();
+    o.out_width = 64; /* 2× down, the limit */
+    KTEST_CHECK(fbinfo_overlay_ok(&SCREEN, &o));
+    o.x = 1920 - 64; /* touching the right edge */
+    KTEST_CHECK(fbinfo_overlay_ok(&SCREEN, &o));
+}
+
+/* Each way a hostile or careless request could make the controller read
+ * memory it should not, or scale past what was tried. */
+static void test_an_overlay_reaching_outside_is_refused(void) {
+    struct fb_overlay o = good();
+    o.offset = FB_OVERLAY_BYTES - 512u * 127u; /* one line past the end */
+    KTEST_CHECK(!fbinfo_overlay_ok(&SCREEN, &o));
+    o = good();
+    o.offset = 0xffffff80u; /* would wrap in 32 bits */
+    KTEST_CHECK(!fbinfo_overlay_ok(&SCREEN, &o));
+    o = good();
+    o.stride = 0x80000000u; /* stride × height past 2^32 */
+    KTEST_CHECK(!fbinfo_overlay_ok(&SCREEN, &o));
+    o = good();
+    o.offset = 64; /* not 128-aligned */
+    KTEST_CHECK(!fbinfo_overlay_ok(&SCREEN, &o));
+    o = good();
+    o.stride = 384; /* shorter than a line of 128 pixels */
+    KTEST_CHECK(!fbinfo_overlay_ok(&SCREEN, &o));
+    o = good();
+    o.x = 1920 - 255; /* off the right edge by one */
+    KTEST_CHECK(!fbinfo_overlay_ok(&SCREEN, &o));
+    o = good();
+    o.y = 0xffffff00u; /* would wrap */
+    KTEST_CHECK(!fbinfo_overlay_ok(&SCREEN, &o));
+    o = good();
+    o.out_width = 63; /* past 2× down */
+    KTEST_CHECK(!fbinfo_overlay_ok(&SCREEN, &o));
+    o = good();
+    o.out_height = 1025; /* past 8× up */
+    KTEST_CHECK(!fbinfo_overlay_ok(&SCREEN, &o));
+    o = good();
+    o.height = 0;
+    KTEST_CHECK(!fbinfo_overlay_ok(&SCREEN, &o));
+}
+
 int main(void) {
     KTEST_RUN(test_a_dirty_rectangle_becomes_rows_clipped_to_the_screen);
     KTEST_RUN(test_an_empty_or_offscreen_rectangle_flushes_nothing);
@@ -121,5 +176,7 @@ int main(void) {
     KTEST_RUN(test_the_variable_info_is_xrgb8888);
     KTEST_RUN(test_the_fixed_info_hides_the_physical_address);
     KTEST_RUN(test_only_the_current_mode_matches);
+    KTEST_RUN(test_an_overlay_inside_its_area_and_the_screen_is_shown);
+    KTEST_RUN(test_an_overlay_reaching_outside_is_refused);
     return ktest_failures();
 }

@@ -20,9 +20,14 @@
 static struct {
     bool installed;
     phys_t base;
-    uint64_t bytes;
+    uint64_t bytes;  /* the frame's pages: what read, write and lseek see */
     struct fb_mode mode;
 } fb;
+
+/* The frame's pages and the overlay area after them, in one allocation. */
+static uint64_t allocated_bytes(void) {
+    return fb.bytes + FB_OVERLAY_BYTES;
+}
 
 /* The pixels, through the kernel's direct map. */
 static uint8_t *pixels(void) {
@@ -88,11 +93,18 @@ static uint64_t fb_size(struct file *f) {
 /* The frame behind a page of the framebuffer, for `MAP_SHARED`. */
 static int32_t fb_map_page(struct file *f, uint64_t offset, phys_t *phys) {
     (void)f;
-    if ((offset & (PAGE_SIZE - 1u)) != 0 || offset >= fb.bytes) {
+    if ((offset & (PAGE_SIZE - 1u)) != 0) {
         return KERR_INVAL;
     }
-    *phys = fb.base + offset;
-    return KERR_OK;
+    if (offset < fb.bytes) {
+        *phys = fb.base + offset;
+        return KERR_OK;
+    }
+    if (offset >= FB_OVERLAY_MMAP_OFFSET && offset - FB_OVERLAY_MMAP_OFFSET < FB_OVERLAY_BYTES) {
+        *phys = fb.base + fb.bytes + (offset - FB_OVERLAY_MMAP_OFFSET);
+        return KERR_OK;
+    }
+    return KERR_INVAL; /* past the frame, short of the overlay area: nothing */
 }
 
 static int32_t get_var(virt_t arg) {
@@ -173,12 +185,55 @@ bool fbdev_take_dirty(uint64_t *offset, uint64_t *bytes) {
     return true;
 }
 
+/* Who shows the overlay, and which descriptor put one up: when that one
+ * closes the overlay goes, as a dirty-marking descriptor's marks do — a
+ * plane left showing a dead program's memory is a stale picture at best. */
+static struct {
+    const struct fbdev_overlay_port *port;
+    struct file *owner;
+} overlay;
+
+void fbdev_set_overlay_port(const struct fbdev_overlay_port *port) {
+    overlay.port = port;
+}
+
+static void hide_overlay(void) {
+    if (overlay.owner != NULL) {
+        overlay.port->hide();
+        overlay.owner = NULL;
+    }
+}
+
+static int32_t set_overlay(struct file *f, virt_t arg) {
+    struct fb_overlay o;
+    int rc;
+    if (uspace_copy_in(&o, arg, sizeof o) != KERR_OK) {
+        return KERR_FAULT;
+    }
+    if (overlay.port == NULL) {
+        return KERR_NODEV;
+    }
+    if (o.width == 0u) {
+        hide_overlay();
+        return KERR_OK;
+    }
+    if (!fbinfo_overlay_ok(&fb.mode, &o)) {
+        return KERR_INVAL;
+    }
+    rc = overlay.port->show(fb.base + fb.bytes + o.offset, &o);
+    overlay.owner = rc == KERR_OK ? f : overlay.owner;
+    return rc;
+}
+
 /* A descriptor that marked goes: when it was the last, whole frames are
  * flushed again — a later program that draws without marking must not be
  * left unflushed because an earlier one marked. */
 static void fb_release(struct file *f) {
     if (f->priv == &dirty && dirty.users > 0) {
         dirty.users--;
+    }
+    if (overlay.owner == f) {
+        hide_overlay();
     }
 }
 
@@ -196,6 +251,8 @@ static int32_t fb_ioctl(struct file *f, uint32_t request, virt_t arg) {
         return arg <= FB_BLANK_POWERDOWN ? KERR_OK : KERR_INVAL;
     case MINIKERN_FBIO_DIRTY:
         return mark_dirty(f, arg);
+    case MINIKERN_FBIO_OVERLAY:
+        return set_overlay(f, arg);
     default:
         return KERR_NOTTY;
     }
@@ -212,14 +269,16 @@ static const struct file_ops fb_ops = {
     .map_page = fb_map_page,
 };
 
-/* Takes the frames in one run and clears them: a screen starts black, and
- * memory a previous owner left is not this device's to show. */
+/* Takes the frames and the overlay area in one run and clears them: a
+ * screen starts black, and memory a previous owner left is not this
+ * device's to show. */
 static int allocate_the_frames(uint64_t bytes) {
-    int rc = mem_alloc_pages((uint32_t)(bytes / PAGE_SIZE), 1u, &fb.base);
+    uint64_t all = bytes + FB_OVERLAY_BYTES;
+    int rc = mem_alloc_pages((uint32_t)(all / PAGE_SIZE), 1u, &fb.base);
     if (rc != KERR_OK) {
         return rc;
     }
-    for (uint64_t i = 0; i < bytes; i++) {
+    for (uint64_t i = 0; i < all; i++) {
         pixels()[i] = 0;
     }
     fb.bytes = bytes;
@@ -238,7 +297,7 @@ int fbdev_install(const struct fb_mode *mode, const struct device_owner *owner) 
     fb.mode = *mode;
     rc = fdobjects_add_device(FBDEV_PATH, &fb_ops, NULL, owner);
     if (rc != KERR_OK) {
-        (void)mem_free_pages(fb.base, (uint32_t)(fb.bytes / PAGE_SIZE));
+        (void)mem_free_pages(fb.base, (uint32_t)(allocated_bytes() / PAGE_SIZE));
         return rc;
     }
     (void)synthfs_add_device(FBDEV_PATH, owner);

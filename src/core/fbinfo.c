@@ -104,3 +104,28 @@ bool fbinfo_dirty_rows(const struct fb_mode *m, const struct fb_dirty *d, uint32
     *end = d->height > m->height - d->y ? m->height : d->y + d->height;
     return true;
 }
+
+/* A scale from `src` to `out` the controller is used for: up to 8× up,
+ * 2× down. */
+static bool scale_ok(uint32_t src, uint32_t out) {
+    return out != 0u && (uint64_t)out <= (uint64_t)src * 8u && (uint64_t)out * 2u >= src;
+}
+
+bool fbinfo_overlay_ok(const struct fb_mode *m, const struct fb_overlay *o) {
+    uint64_t last;
+    if (o->width == 0u || o->height == 0u || o->width > FB_OVERLAY_MAX_SIDE || o->height > FB_OVERLAY_MAX_SIDE) {
+        return false;
+    }
+    if (o->offset % FB_OVERLAY_ALIGN != 0u || o->stride % FB_OVERLAY_ALIGN != 0u ||
+        (uint64_t)o->stride < (uint64_t)o->width * 4u) {
+        return false;
+    }
+    last = (uint64_t)o->offset + (uint64_t)o->stride * (o->height - 1u) + (uint64_t)o->width * 4u;
+    if (last > FB_OVERLAY_BYTES) {
+        return false;
+    }
+    if ((uint64_t)o->x + o->out_width > m->width || (uint64_t)o->y + o->out_height > m->height) {
+        return false;
+    }
+    return scale_ok(o->width, o->out_width) && scale_ok(o->height, o->out_height);
+}

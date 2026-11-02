@@ -34,6 +34,17 @@ int fbdev_install(const struct fb_mode *mode, const struct device_owner *owner);
  * taken. */
 bool fbdev_take_dirty(uint64_t *offset, uint64_t *bytes);
 
+/* What shows the overlay area on a display (`MINIKERN_FBIO_OVERLAY`): the
+ * board's display driver, set once it scans out. `show` gets the picture's
+ * physical address — always inside the overlay area, checked by
+ * `fbinfo_overlay_ok` first — and `hide` takes it away. Without a port the
+ * ioctl is ENODEV: a virtual framebuffer has no plane to put it on. */
+struct fbdev_overlay_port {
+    int (*show)(phys_t image, const struct fb_overlay *o);
+    void (*hide)(void);
+};
+void fbdev_set_overlay_port(const struct fbdev_overlay_port *port);
+
 /* Where the pixels are and their shape, for a display driver to scan out.
  * KERR_NODEV when no framebuffer was installed. */
 int fbdev_memory(phys_t *base, struct fb_mode *mode);

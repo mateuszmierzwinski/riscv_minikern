@@ -763,6 +763,11 @@ writes 256×256. Counts in a window of whole frames land within 0.5 % (510–511
 two either side of the window's edges. Board case: "§10: overlay 0 fetches its source, scaled or
 not, and stops when hidden". Whether the picture is right is still the monitor's question.
 
+**From a program:** `MINIKERN_FBIO_OVERLAY` on `/dev/fb0` names a rectangle of the device's 4 MiB
+overlay area (mapped at its own offset, 1 GiB) and where and how big to show it; the
+kernel checks it (`fbinfo_overlay_ok`) and gives the controller the area's own physical address.
+Board case "§10: a program's picture on the overlay plane, scaled, and taken down on close".
+
 ## 5. Cache coherency
 
 ### Is the DC DMA-coherent on JH7110?

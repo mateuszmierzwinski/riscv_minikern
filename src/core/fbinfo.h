@@ -38,6 +38,9 @@
  * changed", as DRM's DIRTYFB says it. A program that uses it is flushed
  * only where it drew; one that does not keeps the whole-frame flush. */
 #define MINIKERN_FBIO_DIRTY 0x40104640u
+/* minikern's own: `_IOW('F', 0x41, struct fb_overlay)` — show part of the
+ * overlay area on the display's overlay plane, scaled by the hardware. */
+#define MINIKERN_FBIO_OVERLAY 0x40204641u
 
 struct fb_mode {
     uint32_t width;
@@ -116,6 +119,37 @@ int fbinfo_parse_mode(const char *text, size_t len, struct fb_mode *out);
 struct fb_dirty {
     uint32_t x, y, width, height;
 };
+
+/* **The overlay area**: FB_OVERLAY_BYTES of the device's memory, mapped at
+ * its own `mmap` offset, FB_OVERLAY_MMAP_OFFSET — not straight after the
+ * frame, so a mapping past the frame's end is still refused, as a Linux
+ * client expects — and never read or written through read/write, which
+ * stay the frame's (a screenshot is still one frame).
+ * A program draws a picture there and `MINIKERN_FBIO_OVERLAY` puts it on
+ * the display's overlay plane: the kernel only ever hands the controller
+ * an address inside memory it owns, never a program's pointer. */
+#define FB_OVERLAY_BYTES (4u * 1024u * 1024u)
+#define FB_OVERLAY_MMAP_OFFSET 0x40000000u /* 1 GiB: past any frame */
+_Static_assert((uint64_t)FB_MAX_SIDE * FB_MAX_SIDE * 4u < FB_OVERLAY_MMAP_OFFSET,
+               "the overlay's mmap offset lies past the largest frame");
+/* What the display controller is given: lines start 128-byte aligned (its
+ * burst, as the primary plane's pitch is), and the scaler is used up to 8×
+ * up and 2× down — beyond that is untested hardware behaviour. */
+#define FB_OVERLAY_ALIGN 128u
+#define FB_OVERLAY_MAX_SIDE 4096u
+
+/* `MINIKERN_FBIO_OVERLAY`'s argument: an ARGB8888 picture of width×height
+ * at `offset` bytes into the overlay area, `stride` bytes a line, shown at
+ * (x, y) as out_width×out_height. width 0 takes the overlay away. */
+struct fb_overlay {
+    uint32_t offset, stride, width, height;
+    uint32_t x, y, out_width, out_height;
+};
+
+/* Whether `o` may be shown on a screen of mode `m`: the picture inside the
+ * overlay area, aligned, the output wholly on the screen, and the scale
+ * within limits. Untrusted input, checked with 64-bit arithmetic. */
+bool fbinfo_overlay_ok(const struct fb_mode *m, const struct fb_overlay *o);
 
 /* The lines of `m` the rectangle touches, clipped to the screen: [*first,
  * *end). False — and nothing to flush — for a rectangle empty or wholly off
