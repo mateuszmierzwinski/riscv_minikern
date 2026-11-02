@@ -281,9 +281,7 @@ summarised in `docs/DISPLAY.md`.
   And `minikern.hdmi=auto`: the log should name the monitor and the mode it prefers.
   Last, whether the controller snoops the L2: a build with the beat's flush removed — if `fbdemo`'s square
   still moves smoothly, the flushes are unnecessary.
-- [ ] **Acceleration** — the cursor plane is done (below). Next: the overlay planes and the scaler, which mainline does not cover (only `OVL_CONFIG_EX(n) = 0x2540 + 4n`); the DC8200's planes are the real 2D acceleration (overlays, scaler, hardware cursor);
-  there is no blitter. The PowerVR BXE-4-32 is an XL project of its own (closed MIPS firmware, ~35k-line
-  reference driver, unsupported in Mesa). Measure memset/memcpy and a full-frame flush first.
+- [~] **Acceleration** — the cursor plane is done (below). **Overlay 0 and its scaler (2026-11-02):** `dc8200_overlay_show` — ARGB8888 source, position, opaque blend above the primary, the scaler with our own linear 17×9 filter (`display_scaler_kernel`, `display_scale_factor`, host-tested) — registers from StarFive's vendor driver, facts only (DISPLAY.md §4.7). With no monitor and no write-back, **the controller's undocumented debug counters are the evidence**: a sweep found select 7 counting overlay 0's 128-byte read bursts — 512 a frame for a 128×128 source at 1:1 *and* scaled 2× (the scaler reads the source), 128 for 64×64 scaled to 256, 0 hidden — with the primary's 64,800 alongside (select 0) and the output's 2,073,600 pixels (select 4). Board: "§10: overlay 0 fetches its source, scaled or not, and stops when hidden" (`minikern.hdmioverlay`, 2 of 2), cursor/scanout/dirty-flush cases unchanged. **Next:** overlays for programs (an fbdev ioctl putting a user buffer on overlay 0), then the by-eye check with the monitor. The full-frame flush is measured (2,227 µs, below); memset/memcpy still to measure. There is no blitter; the PowerVR BXE-4-32 is an XL project of its own (closed MIPS firmware, ~35k-line reference driver, unsupported in Mesa).
 
 ### Scrapped for now (operator, 2026-11-01)
 

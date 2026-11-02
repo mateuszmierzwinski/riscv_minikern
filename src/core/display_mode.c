@@ -228,3 +228,37 @@ const struct display_timing *display_mode_for_monitor(const struct edid_info *e)
     got = e->preferred.pixel_khz;
     return (got > want ? got - want : want - got) * 100u <= want ? t : NULL;
 }
+
+uint32_t display_scale_factor(uint32_t src, uint32_t dst) {
+    if (src <= 1u || dst <= 1u) {
+        return 1u << 16;
+    }
+    return (uint32_t)((((uint64_t)src - 1u) << 16) / (dst - 1u));
+}
+
+/* The weight on tap 4 at `phase`: half at phase 0, all of it at the last. */
+static uint32_t far_tap_weight(uint32_t phase) {
+    return SCALER_ONE / 2u + phase * (SCALER_ONE / 2u) / (SCALER_PHASES - 1u);
+}
+
+void display_scaler_kernel(uint32_t out[SCALER_KERNEL_WORDS]) {
+    for (uint32_t half = 0; half < 2u * SCALER_KERNEL_WORDS; half++) {
+        uint32_t phase = (half / SCALER_TAPS) % SCALER_PHASES, tap = half % SCALER_TAPS;
+        uint32_t far = far_tap_weight(phase);
+        uint32_t w = tap == 4u ? far : (tap == 3u ? SCALER_ONE - far : 0u);
+        if ((half & 1u) == 0u) {
+            out[half / 2u] = w;
+        } else {
+            out[half / 2u] |= w << 16;
+        }
+    }
+}
+
+void display_overlay_pattern(uint32_t *out, uint32_t side) {
+    static const uint32_t colours[4] = {0xffff0000u, 0xff00ff00u, 0xff0000ffu, 0xffffffffu};
+    for (uint32_t y = 0; y < side; y++) {
+        for (uint32_t x = 0; x < side; x++) {
+            out[y * side + x] = colours[(y >= side / 2u ? 2u : 0u) + (x >= side / 2u ? 1u : 0u)];
+        }
+    }
+}

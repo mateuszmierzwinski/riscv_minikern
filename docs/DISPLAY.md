@@ -718,6 +718,51 @@ Sources: `sf_vop.c` L512–559 and ML. [C, U]
 
 ---
 
+### 4.7 Overlay 0, its scaler, and the debug counters (board-measured 2026-11-02)
+
+Registers are from StarFive's vendor `vs_dc_hw.h`/`vs_dc_hw.c` (SFL, facts only); overlay n adds 4n
+to each. Mainline covers none of this beyond `OVL_CONFIG_EX`.
+
+| Offset | Name | Use here |
+|---|---|---|
+| 0x1540 | `OVERLAY_CONFIG` | bit 24 enable, bits 20:16 format (6 = ARGB8888), bit 31 commit |
+| 0x1580 | `OVERLAY_BLEND_CONFIG` | 0x3548 = opaque ("pixel alpha none"); 0x3450 premultiplied, 0x3950 coverage |
+| 0x15C0 / 0x1600 | address / stride | 32-bit physical address; bytes per line |
+| 0x1640 / 0x1680 | top-left / bottom-right | x in 14:0, y in 29:15; bottom-right exclusive |
+| 0x16C0 / 0x1700 | src / dst global colour | alpha in 31:24 |
+| 0x17C0 | `OVERLAY_SIZE` | source width in 14:0, height in 29:15 |
+| 0x1A40 / 0x1A80 | scale factor x / y | 16.16, (src − 1) / (dst − 1) |
+| 0x1AC0 / 0x1B00, 0x1B40 / 0x1B80 | H / V filter coefficient index / data | 128 words each, auto-incrementing |
+| 0x1BC0 | `OVERLAY_INIT_OFFSET` | 0x80008000: first sample half a pixel in |
+| 0x1C00 | `OVERLAY_SCALE_CONFIG` | 0x33 (filter taps), bit 8 scaler on |
+| 0x1DC0 | `OVERLAY_WATER_MARK` | 0 |
+| 0x2540 | `OVERLAY_CONFIG_EX` | bits 2:0 z position (1 = above the primary), bit 3 display |
+
+- **The filter table** is 17 phases × 9 taps of Q14 weights (a phase sums to 16384), two per word,
+  low half first. The vendor's table is a non-linear two-tap curve; ours (`display_scaler_kernel`) is
+  plain linear interpolation between taps 3 and 4, written as computed, not copied.
+- **Updates are bracketed** like the primary's: `PANEL_CONFIG_EX` bit 0 set and both planes' commit
+  bits cleared while writing, then commits set and the panel bit cleared.
+- **Overlays 1 and 3 have no scaler**; this driver uses overlay 0.
+
+**No monitor, no write-back: the debug counters are the evidence.** `0x14D0` selects and `0x14D8`
+reads a counter; no driver uses them. A sweep of selects 0–31 across overlay off / on / scaled /
+hidden found (per frame, 1080p XRGB primary):
+
+| Select | Counts | Measured |
+|---|---|---|
+| 0 (and 1) | primary plane's 128-byte read bursts | 64,800 = 8,294,400 B / 128 |
+| 2 (and 3) | primary's 16-byte beats | 8 × select 0 |
+| 4 | pixels sent to the display | 2,073,600 = 1920 × 1080 |
+| 7 (and 8) | overlay 0's 128-byte read bursts | 512 for a 128×128 ARGB source at 1:1 **and** scaled 2×; 128 for a 64×64 source scaled to 256; 0 hidden |
+| 9 (and 10) | overlay 0's 16-byte beats | 8 × select 7 |
+| 20 | non-zero only while the scaler runs | |
+
+Select 7 counting the *source* whatever the output size is what shows the scaler reads 64×64 and
+writes 256×256. Counts in a window of whole frames land within 0.5 % (510–511 for 512): a burst or
+two either side of the window's edges. Board case: "§10: overlay 0 fetches its source, scaled or
+not, and stops when hidden". Whether the picture is right is still the monitor's question.
+
 ## 5. Cache coherency
 
 ### Is the DC DMA-coherent on JH7110?

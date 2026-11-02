@@ -162,6 +162,44 @@ static void test_a_mode_without_settings_gets_no_guess(void) {
     KTEST_CHECK(display_mode_for_monitor(&e) == NULL);
 }
 
+/* The half-word at (phase, tap) of the first copy of the table. */
+static uint32_t weight_at(const uint32_t *k, uint32_t phase, uint32_t tap) {
+    uint32_t half = phase * SCALER_TAPS + tap;
+    return (k[half / 2u] >> (16u * (half & 1u))) & 0xffffu;
+}
+
+/* Every phase sums to one, interpolates linearly between taps 3 and 4 —
+ * halfway at phase 0, on tap 4 at the last — and the table repeats. */
+static void test_the_scaler_kernel_is_linear_and_sums_to_one(void) {
+    static uint32_t k[SCALER_KERNEL_WORDS];
+    display_scaler_kernel(k);
+    for (uint32_t p = 0; p < SCALER_PHASES; p++) {
+        uint32_t sum = 0;
+        for (uint32_t t = 0; t < SCALER_TAPS; t++) {
+            sum += weight_at(k, p, t);
+        }
+        KTEST_CHECK(sum == SCALER_ONE);
+        KTEST_CHECK(weight_at(k, p, 4) == 8192u + p * 512u);
+    }
+    KTEST_CHECK(weight_at(k, 0, 3) == 8192u && weight_at(k, 16, 4) == SCALER_ONE && weight_at(k, 16, 3) == 0u);
+    KTEST_CHECK(weight_at(k, SCALER_PHASES, 3) == 8192u); /* the second copy starts again at phase 0 */
+}
+
+/* Ends land on ends: 128 → 256 steps 127/255 of a pixel; one pixel or none
+ * is no scaling, and the arithmetic does not overflow at 4K. */
+static void test_scale_factors(void) {
+    KTEST_CHECK(display_scale_factor(128, 256) == (127u << 16) / 255u);
+    KTEST_CHECK(display_scale_factor(256, 256) == 1u << 16);
+    KTEST_CHECK(display_scale_factor(1, 256) == 1u << 16 && display_scale_factor(256, 1) == 1u << 16);
+    KTEST_CHECK(display_scale_factor(3840, 2) == 3839u << 16);
+}
+
+static void test_the_overlay_pattern_has_four_opaque_quadrants(void) {
+    uint32_t p[16];
+    display_overlay_pattern(p, 4);
+    KTEST_CHECK(p[0] == 0xffff0000u && p[3] == 0xff00ff00u && p[12] == 0xff0000ffu && p[15] == 0xffffffffu);
+}
+
 int main(void) {
     KTEST_RUN(test_a_monitor_gets_its_preferred_cea_mode);
     KTEST_RUN(test_a_mode_without_settings_gets_no_guess);
@@ -174,5 +212,8 @@ int main(void) {
     KTEST_RUN(test_the_avi_infoframe_sums_to_zero);
     KTEST_RUN(test_an_edid_is_read);
     KTEST_RUN(test_an_empty_line_is_not_an_edid);
+    KTEST_RUN(test_the_scaler_kernel_is_linear_and_sums_to_one);
+    KTEST_RUN(test_scale_factors);
+    KTEST_RUN(test_the_overlay_pattern_has_four_opaque_quadrants);
     return ktest_failures();
 }

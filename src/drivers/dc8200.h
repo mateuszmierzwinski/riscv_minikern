@@ -3,9 +3,9 @@
  * It reads a framebuffer from memory and turns it into a timed pixel
  * stream; on this board its display 0 feeds the HDMI transmitter. One
  * primary plane is all a framebuffer needs: an address, a stride, a format
- * and a size, plus the display's timing. Overlays and the hardware cursor
- * exist and stay off (docs/DISPLAY.md §4 and Part 2 — they are the chip's
- * real 2D acceleration, and a later step).
+ * and a size, plus the display's timing. Beyond it — the chip's real 2D
+ * acceleration — the hardware cursor and overlay 0 with its scaler, both
+ * off unless asked for (docs/DISPLAY.md §4.7).
  *
  * The register values follow StarFive's U-Boot write sequence, the one
  * validated on this SoC, with the timing words computed by
@@ -42,6 +42,45 @@ int dc8200_cursor_show(phys_t image, uint32_t x, uint32_t y);
 
 /* The cursor registers as the controller holds them. */
 void dc8200_cursor_read(uint32_t *config, uint32_t *address, uint32_t *location);
+
+/* Overlay 0 — one of the two overlays with a scaler (overlays 1 and 3 have
+ * none): an ARGB8888 image of `width`×`height` at physical `image` (below
+ * 4 GiB, `stride` bytes a line), shown at (`x`, `y`) as `out_width`×
+ * `out_height` on display 0, above the primary plane and opaque. A size
+ * that differs from the image's turns the scaler on, with a linear filter
+ * (`display_scaler_kernel`). Registers and bit layouts from StarFive's
+ * vendor driver (docs/DISPLAY.md §4.6); no monitor has seen one yet. */
+struct dc8200_overlay {
+    phys_t image;
+    uint32_t stride, width, height;
+    uint32_t x, y, out_width, out_height;
+};
+int dc8200_overlay_show(const struct dc8200_overlay *o);
+
+/* Takes overlay 0 off the screen. */
+void dc8200_overlay_hide(void);
+
+/* Overlay 0's registers as the controller holds them, for the log: config,
+ * address, size, top-left, bottom-right, scale config, x and y factors. */
+#define DC8200_OVERLAY_READBACK 8u
+void dc8200_overlay_read(uint32_t out[DC8200_OVERLAY_READBACK]);
+
+/* The controller's debug counter `select` reads (`0x14D0`/`0x14D8`), which
+ * no driver uses and nothing documents: read here to find, by measurement,
+ * one that counts what the planes fetch. */
+uint32_t dc8200_debug_counter(uint32_t select);
+
+/* What three of them count, **measured on the board** (2026-11-01,
+ * docs/DISPLAY.md §4.6): the pixels display 0 sends (2,073,600 a 1080p
+ * frame), and the 128-byte read bursts the primary plane and overlay 0
+ * fetch (64,800 a frame for a 1080p XRGB primary; for overlay 0 its
+ * *source* lines' bursts, whatever size it is scaled to — 128 for 64×64).
+ * Selects 2 and 9 count 16-byte beats, eight to a burst; 7 and 8, and 9
+ * and 10, read alike; 20 is non-zero only while the scaler runs. */
+#define DC8200_COUNT_PRIMARY_BURSTS 0u
+#define DC8200_COUNT_OUTPUT_PIXELS 4u
+#define DC8200_COUNT_OVERLAY0_BURSTS 7u
+#define DC8200_BURST_BYTES 128u
 
 /* Scans out `stride`-byte lines of XRGB8888 at physical `fb` on display 0
  * with timing `t`. The controller takes a 32-bit address, so `fb` must lie

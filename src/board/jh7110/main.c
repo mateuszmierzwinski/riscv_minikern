@@ -2312,6 +2312,122 @@ static void show_the_cursor(uint32_t x, uint32_t y) {
             location == (x | (y << 16)) ? "(as set)" : "(NOT as set)");
 }
 
+/* The overlay's test image: 128×128 ARGB8888, in the kernel's image for the
+ * same reason as the cursor's. */
+#define OVERLAY_SIDE 128u
+static uint32_t overlay_image[OVERLAY_SIDE * OVERLAY_SIDE] __attribute__((aligned(4096)));
+#define DEBUG_COUNTERS 32u
+#define SWEEP_FRAMES 10u
+#define FRAME_WAIT_NS 50000000ull /* a 60 Hz frame is 16.7 ms; three of them, then give up */
+
+/* Waits for display 0's next frame boundary; false when none came. */
+static bool wait_for_a_frame(void) {
+    uint64_t until = timer_ns() + FRAME_WAIT_NS;
+    dc8200_arm_vsync();
+    while (!dc8200_vsync_seen()) {
+        if (timer_ns() > until) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Every debug counter, before and after two frames: the selects that read
+ * non-zero, as `select=value(+change)`. Which one, if any, counts what the
+ * planes fetch is what the comparison across `minikern.hdmioverlay`'s
+ * steps is for. */
+static void sweep_the_debug_counters(const char *step) {
+    uint32_t before[DEBUG_COUNTERS], after;
+    char line[512];
+    size_t n = kfmt_snprintf(line, sizeof line, "display: counters %s:", step);
+    (void)wait_for_a_frame(); /* whole frames only: the window starts at a boundary */
+    for (uint32_t s = 0; s < DEBUG_COUNTERS; s++) {
+        before[s] = dc8200_debug_counter(s);
+    }
+    for (uint32_t f = 0; f < SWEEP_FRAMES; f++) {
+        (void)wait_for_a_frame();
+    }
+    for (uint32_t s = 0; s < DEBUG_COUNTERS && n < sizeof line - 32u; s++) {
+        after = dc8200_debug_counter(s);
+        if (after != 0u || before[s] != 0u) {
+            n += kfmt_snprintf(line + n, sizeof line - n, " %u=%u(%d)", s, after, (int)(after - before[s]));
+        }
+    }
+    kprintf("%s\n", line);
+}
+
+/* A plane's 128-byte bursts for one frame of `width`×`height` 32-bit
+ * pixels: whole bursts per line. */
+static uint32_t bursts_for(uint32_t width, uint32_t height) {
+    return (width * 4u + DC8200_BURST_BYTES - 1u) / DC8200_BURST_BYTES * height;
+}
+
+/* The overlay's fetch per frame against what its source should cost, over
+ * SWEEP_FRAMES whole frames — the evidence, short of a monitor, that the
+ * controller reads overlay 0 from our image at our size. */
+/* A per-frame count against what it should be, within 2 %: a window of
+ * whole frames still catches a burst or two either side of its edges
+ * (measured 510 for 512, 64,803 for 64,800). Nothing expected means none. */
+static bool count_matches(uint32_t got, uint32_t want) {
+    return want == 0u ? got == 0u : got * 50u >= want * 49u && got * 50u <= want * 51u;
+}
+
+static bool count_the_fetches(const char *step, uint32_t side, const struct fb_mode *screen) {
+    uint32_t pixels0, primary0, overlay0, frames, frame_pixels = screen->width * screen->height;
+    uint32_t overlay, primary, want_overlay = side != 0u ? bursts_for(side, side) : 0u,
+                                want_primary = bursts_for(screen->width, screen->height);
+    (void)wait_for_a_frame();
+    pixels0 = dc8200_debug_counter(DC8200_COUNT_OUTPUT_PIXELS);
+    primary0 = dc8200_debug_counter(DC8200_COUNT_PRIMARY_BURSTS);
+    overlay0 = dc8200_debug_counter(DC8200_COUNT_OVERLAY0_BURSTS);
+    for (uint32_t f = 0; f < SWEEP_FRAMES; f++) {
+        (void)wait_for_a_frame();
+    }
+    frames = (dc8200_debug_counter(DC8200_COUNT_OUTPUT_PIXELS) - pixels0 + frame_pixels / 2u) / frame_pixels;
+    frames = frames == 0u ? 1u : frames;
+    overlay = (dc8200_debug_counter(DC8200_COUNT_OVERLAY0_BURSTS) - overlay0) / frames;
+    primary = (dc8200_debug_counter(DC8200_COUNT_PRIMARY_BURSTS) - primary0) / frames;
+    bool ok = count_matches(overlay, want_overlay) && count_matches(primary, want_primary);
+    kprintf("display: overlay %s fetched %u bursts a frame (%u expected), the primary %u (%u expected), "
+            "over %u frames: %s\n",
+            step, overlay, want_overlay, primary, want_primary, frames, ok ? "as expected" : "NOT as expected");
+    return ok;
+}
+
+/* One overlay step: shown (or hidden when `out` is 0), two frames let pass,
+ * the registers read back, the underflow flag, then the counters. */
+static bool overlay_step(const char *step, uint32_t side, uint32_t out, const struct fb_mode *screen) {
+    uint32_t r[DC8200_OVERLAY_READBACK];
+    struct dc8200_overlay o = {mmu_virt_to_phys(overlay_image), OVERLAY_SIDE * 4u, side, side, 64u, 64u, out, out};
+    int rc = out != 0u ? dc8200_overlay_show(&o) : KERR_OK;
+    if (out == 0u) {
+        dc8200_overlay_hide();
+    }
+    bool frames = wait_for_a_frame() && wait_for_a_frame();
+    dc8200_overlay_read(r);
+    kprintf("display: overlay %s (rc %d, frames %s, underflow %s): config %08x address %08x size %08x "
+            "from %08x to %08x scale %08x factors %08x %08x\n",
+            step, rc, frames ? "yes" : "NO", dc8200_underflow() ? "YES" : "no", r[0], r[1], r[2], r[3], r[4],
+            r[5], r[6], r[7]);
+    sweep_the_debug_counters(step);
+    return count_the_fetches(step, out != 0u ? side : 0u, screen);
+}
+
+/* `minikern.hdmioverlay`: overlay 0 on display 0 — off, at 1:1, scaled
+ * 2×, hidden again — with the debug counters swept at each step. No monitor
+ * sees it; the counters and the read-back are the evidence there is. */
+static void try_the_overlay(const struct fb_mode *screen) {
+    display_overlay_pattern(overlay_image, OVERLAY_SIDE);
+    (void)ccache_flush_range(mmu_virt_to_phys(overlay_image), sizeof overlay_image);
+    sweep_the_debug_counters("off");
+    uint32_t ok = 0;
+    ok += overlay_step("1:1", OVERLAY_SIDE, OVERLAY_SIDE, screen) ? 1u : 0u;
+    ok += overlay_step("2x", OVERLAY_SIDE, 2u * OVERLAY_SIDE, screen) ? 1u : 0u;
+    ok += overlay_step("64-to-256", OVERLAY_SIDE / 2u, 2u * OVERLAY_SIDE, screen) ? 1u : 0u;
+    ok += overlay_step("hidden", OVERLAY_SIDE, 0u, screen) ? 1u : 0u;
+    kprintf("display: overlay fetches: %u of 4 steps as expected\n", ok);
+}
+
 /* `minikern.hdmi=<width>x<height>`: `/dev/fb0` on the board's HDMI output
  * (ROADMAP §10). The framebuffer must have the same size — given by
  * `minikern.vfb`, or made for the HDMI mode when that is absent. */
@@ -2336,6 +2452,9 @@ static void start_hdmi(const struct fdt *fdt) {
         (void)timer_add_housekeeping_every(refresh_display_from_beat, DISPLAY_REFRESH_NS);
         if (cmdline_has(boot_cmdline, "minikern.hdmicursor")) {
             show_the_cursor(fb.width / 2u, fb.height / 2u);
+        }
+        if (cmdline_has(boot_cmdline, "minikern.hdmioverlay")) {
+            try_the_overlay(&fb);
         }
     }
 }

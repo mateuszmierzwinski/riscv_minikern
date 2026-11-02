@@ -740,6 +740,20 @@ CASES = [
      ["display: cursor 32x32 at 960,540 (rc 0)", "(ours)", "(as set)",
       "(30 expected), underflow no — scanning out"],
      120, None),
+    # **Overlay 0 and its scaler** (§10, acceleration): with no monitor and
+    # no write-back, the evidence is the controller's own debug counters —
+    # select 7 counts overlay 0's 128-byte read bursts, select 0 the
+    # primary's (measured, docs/DISPLAY.md §4.6). A 128×128 ARGB source is
+    # 512 bursts a frame at 1:1 and still 512 scaled 2× (the scaler reads the
+    # source, not the output); a 64×64 source scaled to 256 is 128; hidden,
+    # none. The kernel judges each within 2 %.
+    ("§10: overlay 0 fetches its source, scaled or not, and stops when hidden",
+     "minikern.hdmi=1920x1080 minikern.hdmioverlay",
+     ["display: overlay 1:1 fetched", "display: overlay 1:1 (rc 0, frames yes, underflow no)",
+      "display: overlay 2x (rc 0, frames yes, underflow no)",
+      "display: overlay 64-to-256 (rc 0, frames yes, underflow no)",
+      "display: overlay fetches: 4 of 4 steps as expected"],
+     120, None),
     # `minikern.hdmi=auto` (§10, mode from the EDID): with no monitor on the
     # board the hot-plug line is low, so the default is chosen and said so;
     # the chooser itself is host-tested against EDIDs (display_mode_test).

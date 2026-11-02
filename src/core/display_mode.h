@@ -74,6 +74,30 @@ void display_avi_infoframe(uint8_t vic, uint8_t out[AVI_INFOFRAME_BYTES]);
 #define CURSOR_PIXELS (CURSOR_SIDE * CURSOR_SIDE)
 void display_cursor_arrow(uint32_t out[CURSOR_PIXELS]);
 
+/* ── the overlay scaler (DC8200, docs/DISPLAY.md §4.6) ─────────────────── */
+
+/* A scale factor as the controller takes it: 16.16 fixed point, the step
+ * through the source per output pixel, with both ends landing on the end
+ * pixels — (src − 1) / (dst − 1). 1.0 when either side is one pixel. */
+uint32_t display_scale_factor(uint32_t src, uint32_t dst);
+
+/* The scaler's filter: 17 phases of 9 taps, each a Q14 weight (a phase sums
+ * to 16384), packed two to a word, low half first — the layout of the
+ * coefficient table StarFive's driver loads. Ours is **linear
+ * interpolation** between the two taps either side of the sample (taps 3
+ * and 4): phase 0 halfway between them, phase 16 on tap 4. The table is
+ * SCALER_KERNEL_WORDS long, phases repeating from 0 after the 17th. */
+#define SCALER_TAPS 9u
+#define SCALER_PHASES 17u
+#define SCALER_ONE 16384u
+#define SCALER_KERNEL_WORDS 128u
+void display_scaler_kernel(uint32_t out[SCALER_KERNEL_WORDS]);
+
+/* A test image for an overlay: `side`×`side` ARGB8888, opaque, in four
+ * quadrants (red, green, blue, white), so a scaled or misplaced copy is
+ * told apart from a right one by eye. */
+void display_overlay_pattern(uint32_t *out, uint32_t side);
+
 #define EDID_BLOCK_BYTES 128u
 
 struct edid_info {
