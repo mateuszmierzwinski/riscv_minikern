@@ -61,8 +61,29 @@ static void parse_options(const uint8_t *p, uint32_t hlen, struct tcp_seg *seg) 
     }
 }
 
+/* The checksum's starting sum, over the pseudo-header of the segment's own
+ * family. */
+static uint32_t segment_pseudo_sum(const struct tcp_from *a, uint32_t len) {
+    return a->src6 != NULL ? net_ip6_pseudo_sum(a->src6, a->dst6, len, IPPROTO_TCP)
+                           : pseudo_sum(a->src, a->dst, len);
+}
+
+static bool same_ip6(const uint8_t *a, const uint8_t *b) {
+    for (uint32_t i = 0; i < 16u; i++) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Whether c's peer is the segment's sender, in the family it came by. */
+static bool peer_is(const struct tcp_conn *c, const struct tcp_from *a) {
+    return a->src6 != NULL ? c->v6 && same_ip6(c->remote_ip6, a->src6) : !c->v6 && c->remote_ip == a->src;
+}
+
 /* Validates the segment and fills seg. KERR_OK or an error. */
-static int parse_segment(struct tcp_stack *s, ip4_t src, ip4_t dst, const uint8_t *p, uint32_t len,
+static int parse_segment(struct tcp_stack *s, const struct tcp_from *a, const uint8_t *p, uint32_t len,
                          struct tcp_seg *seg) {
     uint32_t hlen;
     if (len < TCP_HLEN) {
@@ -74,7 +95,7 @@ static int parse_segment(struct tcp_stack *s, ip4_t src, ip4_t dst, const uint8_
         s->stats.drop_malformed++;
         return KERR_INVAL;
     }
-    if (net_checksum(p, len, pseudo_sum(src, dst, len)) != 0) {
+    if (net_checksum(p, len, segment_pseudo_sum(a, len)) != 0) {
         s->stats.drop_checksum++;
         return KERR_FAULT;
     }
@@ -92,23 +113,32 @@ static int parse_segment(struct tcp_stack *s, ip4_t src, ip4_t dst, const uint8_
 }
 
 /* The connection this segment belongs to: an exact four-tuple match. */
-static struct tcp_conn *find_exact(struct tcp_stack *s, ip4_t src, const struct tcp_seg *seg) {
+static struct tcp_conn *find_exact(struct tcp_stack *s, const struct tcp_from *a, const struct tcp_seg *seg) {
     for (uint32_t i = 0; i < TCP_MAX_CONNS; i++) {
         struct tcp_conn *c = &s->conns[i];
         if (c->used && c->state != TCP_LISTEN && c->local_port == seg->dport &&
-            c->remote_port == seg->sport && c->remote_ip == src) {
+            c->remote_port == seg->sport && peer_is(c, a)) {
             return c;
         }
     }
     return NULL;
 }
 
+/* Whether a listener takes a SYN sent to this address: its family must be
+ * one the listener hears, and a listener bound to one IPv4 address hears
+ * only that address (an IPv6 one is never bound to it). */
+static bool listens_for(const struct tcp_conn *c, const struct tcp_from *a) {
+    if (a->dst6 != NULL) {
+        return (c->families & TCP_FAMILY_V6) != 0 && c->local_ip == 0;
+    }
+    return (c->families & TCP_FAMILY_V4) != 0 && (c->local_ip == 0 || c->local_ip == a->dst);
+}
+
 /* A listener on the segment's destination port. */
-static struct tcp_conn *find_listener(struct tcp_stack *s, ip4_t dst, uint16_t port) {
+static struct tcp_conn *find_listener(struct tcp_stack *s, const struct tcp_from *a, uint16_t port) {
     for (uint32_t i = 0; i < TCP_MAX_CONNS; i++) {
         struct tcp_conn *c = &s->conns[i];
-        if (c->used && c->state == TCP_LISTEN && c->local_port == port &&
-            (c->local_ip == 0 || c->local_ip == dst)) {
+        if (c->used && c->state == TCP_LISTEN && c->local_port == port && listens_for(c, a)) {
             return c;
         }
     }
@@ -129,7 +159,18 @@ static uint32_t half_open(const struct tcp_stack *s, const struct tcp_conn *list
 }
 
 /* A SYN for a listener: a child connection in SYN_RECEIVED. */
-static void accept_syn(struct tcp_stack *s, struct tcp_conn *listener, ip4_t src, ip4_t dst,
+/* A child's addresses: the segment's, turned round. */
+static void take_addresses(struct tcp_conn *c, const struct tcp_from *a) {
+    c->local_ip = a->dst;
+    c->remote_ip = a->src;
+    c->v6 = a->src6 != NULL;
+    if (c->v6) {
+        net_copy(c->local_ip6, a->dst6, 16u);
+        net_copy(c->remote_ip6, a->src6, 16u);
+    }
+}
+
+static void accept_syn(struct tcp_stack *s, struct tcp_conn *listener, const struct tcp_from *a,
                        const struct tcp_seg *seg) {
     struct tcp_conn *c;
     if (listener->backlog_len + half_open(s, listener) >= listener->backlog_max) {
@@ -141,9 +182,8 @@ static void accept_syn(struct tcp_stack *s, struct tcp_conn *listener, ip4_t src
         s->stats.drop_backlog_full++;
         return;
     }
-    c->local_ip = dst;
+    take_addresses(c, a);
     c->local_port = seg->dport;
-    c->remote_ip = src;
     c->remote_port = seg->sport;
     c->listener = listener;
     c->irs = seg->seq;
@@ -192,7 +232,7 @@ static void in_syn_sent(struct tcp_conn *c, const struct tcp_seg *seg) {
         return;
     }
     if (seg->ack != c->snd_nxt) {
-        tcp_reset_peer(c->stack, c->remote_ip, c->local_port, c->remote_port, seg->ack, 0, false);
+        tcp_reset_conn(c, seg->ack, 0, false);
         return;
     }
     c->irs = seg->seq;
@@ -476,7 +516,7 @@ static bool handle_control(struct tcp_conn *c, const struct tcp_seg *seg) {
     }
     if (seg->flags & TCP_SYN) {
         tcp_fail(c, TCP_ECONNRESET);  /* a SYN inside the window is an error */
-        tcp_reset_peer(c->stack, c->remote_ip, c->local_port, c->remote_port, c->snd_nxt, c->rcv_nxt, true);
+        tcp_reset_conn(c, c->snd_nxt, c->rcv_nxt, true);
         return false;
     }
     return true;
@@ -486,7 +526,7 @@ static bool handle_control(struct tcp_conn *c, const struct tcp_seg *seg) {
  * false when the acknowledgement was wrong and the peer was reset. */
 static bool finish_passive_open(struct tcp_conn *c, const struct tcp_seg *seg) {
     if (seg->ack != c->snd_nxt) {
-        tcp_reset_peer(c->stack, c->remote_ip, c->local_port, c->remote_port, seg->ack, 0, false);
+        tcp_reset_conn(c, seg->ack, 0, false);
         return false;
     }
     c->snd_una = seg->ack;
@@ -538,35 +578,33 @@ static void in_synchronised(struct tcp_conn *c, const struct tcp_seg *seg) {
 
 /* A segment for nothing that exists gets a reset, so the peer learns at
  * once instead of retrying. A reset is never answered with a reset. */
-static void reject(struct tcp_stack *s, ip4_t src, const struct tcp_seg *seg) {
+static void reject(struct tcp_stack *s, const struct tcp_from *a, const struct tcp_seg *seg) {
     s->stats.drop_no_socket++;
     if (seg->flags & TCP_RST) {
         return;
     }
     if (seg->flags & TCP_ACK) {
-        tcp_reset_peer(s, src, seg->dport, seg->sport, seg->ack, 0, false);
+        tcp_reset_peer(s, a, seg->dport, seg->sport, seg->ack, 0, false);
     } else {
-        tcp_reset_peer(s, src, seg->dport, seg->sport, 0, seg->seq + seg->len + 1u, true);
+        tcp_reset_peer(s, a, seg->dport, seg->sport, 0, seg->seq + seg->len + 1u, true);
     }
 }
 
-/* The ip_handler entry point. */
-void tcp_input_packet(void *self, struct netif *nif, ip4_t src, ip4_t dst, const uint8_t *p, uint32_t len) {
-    struct tcp_stack *s = self;
+/* One segment of either family, its addresses in `a`. */
+static void tcp_input(struct tcp_stack *s, const struct tcp_from *a, const uint8_t *p, uint32_t len) {
     struct tcp_seg seg;
     struct tcp_conn *c;
-    (void)nif;
     s->stats.segments_in++;
-    if (parse_segment(s, src, dst, p, len, &seg) != KERR_OK) {
+    if (parse_segment(s, a, p, len, &seg) != KERR_OK) {
         return;
     }
-    c = find_exact(s, src, &seg);
+    c = find_exact(s, a, &seg);
     if (c == NULL) {
-        struct tcp_conn *l = find_listener(s, dst, seg.dport);
+        struct tcp_conn *l = find_listener(s, a, seg.dport);
         if (l != NULL && (seg.flags & TCP_SYN) && !(seg.flags & TCP_ACK) && !(seg.flags & TCP_RST)) {
-            accept_syn(s, l, src, dst, &seg);
+            accept_syn(s, l, a, &seg);
         } else {
-            reject(s, src, &seg);
+            reject(s, a, &seg);
         }
         return;
     }
@@ -575,4 +613,18 @@ void tcp_input_packet(void *self, struct netif *nif, ip4_t src, ip4_t dst, const
     } else if (c->state != TCP_CLOSED) {
         in_synchronised(c, &seg);
     }
+}
+
+/* The ip_handler entry points, one per family. */
+void tcp_input_packet(void *self, struct netif *nif, ip4_t src, ip4_t dst, const uint8_t *p, uint32_t len) {
+    struct tcp_from a = {.src = src, .dst = dst};
+    (void)nif;
+    tcp_input(self, &a, p, len);
+}
+
+void tcp_input_packet6(void *self, struct netif *nif, const uint8_t *src, const uint8_t *dst, const uint8_t *p,
+                       uint32_t len) {
+    struct tcp_from a = {.src6 = src, .dst6 = dst};
+    (void)nif;
+    tcp_input(self, &a, p, len);
 }

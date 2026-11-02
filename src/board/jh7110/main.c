@@ -1506,6 +1506,7 @@ static void report_the_network_after_everything(void) {
                 (unsigned long long)sent, (unsigned long long)received,
                 (unsigned long long)dropped);
     }
+    knet_report_counters();
 }
 
 /* The longest hold, said in words: a syscall tag is its number plus

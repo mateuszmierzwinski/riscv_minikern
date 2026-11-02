@@ -1,6 +1,7 @@
 /* sys_socket — the socket syscalls: socket, bind, connect, listen, accept(4),
  * getsockname, getpeername, sendto, recvfrom, sendmsg, recvmsg, shutdown,
- * setsockopt, getsockopt. Addresses cross the boundary as sockaddr_in. */
+ * setsockopt, getsockopt. Addresses cross the boundary as the socket's own
+ * family's shape: sockaddr_in, sockaddr_in6, sockaddr_un or sockaddr_nl. */
 #include "core/errno.h"
 #include "kernel/uspace.h"
 #include "kernel/socket.h"
@@ -11,6 +12,12 @@
 #include <stddef.h>
 
 #define SOCKADDR_IN_LEN 16u
+#define SOCKADDR_IN6_LEN 28u
+#define SOCKADDR_IN6_MIN 24u   /* RFC 2133's, without the scope id */
+#define IPV6_V6ONLY     26u
+/* The interface index a link-local address is scoped to: the real
+ * interface's in the netlink dump (sock_netlink.c), so Go names the zone. */
+#define ETH_SCOPE_ID    2u
 #define AF_UNSPEC       0
 #define SOL_SOCKET      1u
 #define SO_TYPE         3u
@@ -123,7 +130,105 @@ static int get_addr(virt_t uaddr, uint32_t len, struct sock_addr *a) {
     return KERR_OK;
 }
 
-/* Writes a sockaddr_in to uaddr, honouring and updating *ulen (socklen_t). */
+/* ::ffff:0:0/96, the prefix that marks an IPv4 address in an IPv6 one. */
+static bool is_v4_mapped(const uint8_t *a) {
+    for (uint32_t i = 0; i < 10u; i++) {
+        if (a[i] != 0) {
+            return false;
+        }
+    }
+    return a[10] == 0xff && a[11] == 0xff;
+}
+
+static bool is_unspecified6(const uint8_t *a) {
+    for (uint32_t i = 0; i < 16u; i++) {
+        if (a[i] != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* `sockaddr_in6`: family, port (network order), flow label, address, scope.
+ *
+ * **The mapping is undone here**, once, so nothing below has two spellings
+ * of one IPv4 peer: ::ffff:a.b.c.d becomes the IPv4 address and :: becomes
+ * 0, the wildcard of both families. Only a real IPv6 address sets `v6`. A
+ * V6ONLY socket has no IPv4 side, so a mapped address is refused there. */
+static int get_addr6(const struct sock *s, virt_t uaddr, uint32_t len, struct sock_addr *a) {
+    uint8_t b[SOCKADDR_IN6_LEN] = {0};
+    if (len < 2u || len > 128u) {
+        return KERR_INVAL;
+    }
+    if (uspace_copy_in(b, uaddr, len < sizeof b ? len : sizeof b) != KERR_OK) {
+        return KERR_FAULT;
+    }
+    *a = (struct sock_addr){0};
+    if ((b[0] | (b[1] << 8)) == AF_UNSPEC) {
+        return KERR_OK;
+    }
+    if ((b[0] | (b[1] << 8)) != AF_INET6) {
+        return EAFNOSUPPORT;
+    }
+    if (len < SOCKADDR_IN6_MIN) {
+        return KERR_INVAL;
+    }
+    a->port = (uint16_t)((b[2] << 8) | b[3]);
+    if (is_v4_mapped(b + 8)) {
+        a->ip = ((uint32_t)b[20] << 24) | ((uint32_t)b[21] << 16) | ((uint32_t)b[22] << 8) | b[23];
+        return s->v6only ? KERR_INVAL : KERR_OK;
+    }
+    if (!is_unspecified6(b + 8)) {
+        a->v6 = true;
+        for (uint32_t i = 0; i < 16u; i++) {
+            a->ip6[i] = b[8u + i];
+        }
+    }
+    return KERR_OK;
+}
+
+/* Reads the address a call was given, in the shape the socket's own family
+ * uses. **The socket decides, not the bytes**: every shape begins with a
+ * family, and reading one as another produces an address that is nobody's
+ * rather than an error. `create` is bind's (see get_unix_addr). */
+static int get_sockaddr(const struct sock *s, virt_t uaddr, uint32_t len, struct sock_addr *a, bool create) {
+    switch (s->domain) {
+    case AF_UNIX:
+        return get_unix_addr(uaddr, len, a, create);
+    case AF_NETLINK:
+        return get_netlink_addr(uaddr, len, a);
+    case AF_INET6:
+        return get_addr6(s, uaddr, len, a);
+    default:
+        return get_addr(uaddr, len, a);
+    }
+}
+
+/* A `sockaddr_in6` for an endpoint: its IPv6 address, or an IPv4 one mapped
+ * back (:: for the wildcard), which is how a dual-stack caller sees an IPv4
+ * peer. A link-local address carries the interface's scope. */
+static uint32_t fill_sockaddr_in6(uint8_t *b, struct sock_addr a) {
+    b[0] = AF_INET6;
+    b[2] = (uint8_t)(a.port >> 8);
+    b[3] = (uint8_t)a.port;
+    if (a.v6) {
+        for (uint32_t i = 0; i < 16u; i++) {
+            b[8u + i] = a.ip6[i];
+        }
+        b[24] = a.ip6[0] == 0xfe && (a.ip6[1] & 0xc0u) == 0x80u ? (uint8_t)ETH_SCOPE_ID : 0u;
+    } else if (a.ip != 0) {
+        b[18] = 0xff;
+        b[19] = 0xff;
+        b[20] = (uint8_t)(a.ip >> 24);
+        b[21] = (uint8_t)(a.ip >> 16);
+        b[22] = (uint8_t)(a.ip >> 8);
+        b[23] = (uint8_t)a.ip;
+    }
+    return SOCKADDR_IN6_LEN;
+}
+
+/* Writes the endpoint to uaddr in the family's shape, honouring and
+ * updating *ulen (socklen_t). */
 /* A `sockaddr_un`: the family, then the path, NUL-terminated.
  *
  * **This existed only as `sockaddr_in` and it broke every Unix listener.**
@@ -156,7 +261,7 @@ static uint32_t fill_sockaddr_un(uint8_t *b, uint32_t room, struct sock_addr a) 
 
 #define SOCKADDR_UN_LEN 110u
 
-static int put_addr(virt_t uaddr, virt_t ulen_addr, struct sock_addr a) {
+static int put_addr(int domain, virt_t uaddr, virt_t ulen_addr, struct sock_addr a) {
     uint8_t b[SOCKADDR_UN_LEN] = {AF_INET, 0, (uint8_t)(a.port >> 8), (uint8_t)a.port, (uint8_t)(a.ip >> 24),
                                   (uint8_t)(a.ip >> 16), (uint8_t)(a.ip >> 8), (uint8_t)a.ip};
     uint32_t len, want = SOCKADDR_IN_LEN;
@@ -168,6 +273,11 @@ static int put_addr(virt_t uaddr, virt_t ulen_addr, struct sock_addr a) {
             b[i] = 0;
         }
         want = fill_sockaddr_un(b, sizeof b, a);
+    } else if (domain == AF_INET6) {
+        for (uint32_t i = 0; i < sizeof b; i++) {
+            b[i] = 0;
+        }
+        want = fill_sockaddr_in6(b, a);
     }
     if (uaddr == 0 || ulen_addr == 0) {
         return KERR_OK;
@@ -210,21 +320,7 @@ static int32_t with_addr(struct trapframe *tf, bool connect) {
     if (s == NULL) {
         return err;
     }
-    /* **Which shape the address is depends on the socket, not the bytes.**
-     * A `sockaddr_un` and a `sockaddr_in` both begin with a family, and
-     * reading one as the other produces an address that is nobody's rather
-     * than an error — so the socket's own domain decides. */
-    if (s->domain == AF_UNIX) {
-        err = get_unix_addr(sysarg(tf, 1), sysarg(tf, 2), &a, !connect);
-    } else if (s->domain == AF_NETLINK) {
-        /* `sockaddr_nl`: family, two bytes of pad, the port, then a group
-         * mask. Only the port is read — groups are for multicast
-         * notifications, which this does not send, and accepting a
-         * subscription it would never honour is worse than ignoring it. */
-        err = get_netlink_addr(sysarg(tf, 1), sysarg(tf, 2), &a);
-    } else {
-        err = get_addr(sysarg(tf, 1), sysarg(tf, 2), &a);
-    }
+    err = get_sockaddr(s, sysarg(tf, 1), sysarg(tf, 2), &a, !connect);
     if (err != KERR_OK) {
         return err;
     }
@@ -268,7 +364,7 @@ static int64_t sys_accept4(struct trapframe *tf) {
         file_put(f);
         return fd;
     }
-    (void)put_addr(sysarg(tf, 1), sysarg(tf, 2), c->remote);
+    (void)put_addr(c->domain, sysarg(tf, 1), sysarg(tf, 2), c->remote);
     return fd;
 }
 
@@ -291,7 +387,7 @@ static int32_t name_of(struct trapframe *tf, bool peer) {
     if (peer && !s->connected) {
         return ENOTCONN;
     }
-    return put_addr(sysarg(tf, 1), sysarg(tf, 2), peer ? s->remote : s->local);
+    return put_addr(s->domain, sysarg(tf, 1), sysarg(tf, 2), peer ? s->remote : s->local);
 }
 
 static int64_t sys_getsockname(struct trapframe *tf) {
@@ -349,8 +445,7 @@ static int64_t sys_sendto(struct trapframe *tf) {
     if (sysarg(tf, 4) == 0) {
         return send_user(s, sysarg(tf, 1), sysarg(tf, 2), NULL);
     }
-    err = s->domain == AF_UNIX ? get_unix_addr(sysarg(tf, 4), sysarg(tf, 5), &to, false)
-                               : get_addr(sysarg(tf, 4), sysarg(tf, 5), &to);
+    err = get_sockaddr(s, sysarg(tf, 4), sysarg(tf, 5), &to, false);
     return err != KERR_OK ? err : send_user(s, sysarg(tf, 1), sysarg(tf, 2), &to);
 }
 
@@ -364,7 +459,8 @@ static int64_t sys_recvfrom(struct trapframe *tf) {
         return err;
     }
     r = recv_user(s, sysarg(tf, 1), sysarg(tf, 2), &from, sysarg(tf, 3));
-    if (r >= 0 && put_addr(sysarg(tf, 4), sysarg(tf, 5), s->type == SOCK_STREAM ? s->remote : from) != KERR_OK) {
+    if (r >= 0 &&
+        put_addr(s->domain, sysarg(tf, 4), sysarg(tf, 5), s->type == SOCK_STREAM ? s->remote : from) != KERR_OK) {
         return KERR_FAULT;
     }
     return r;
@@ -443,7 +539,7 @@ static int64_t sys_sendmsg(struct trapframe *tf) {
     if (s == NULL || (err = get_msghdr(sysarg(tf, 1), &m)) != KERR_OK) {
         return err;
     }
-    if (m.name != 0 && (err = get_addr(m.name, m.namelen, &to)) != KERR_OK) {
+    if (m.name != 0 && (err = get_sockaddr(s, m.name, m.namelen, &to, false)) != KERR_OK) {
         return err;
     }
     if ((err = get_first_iovec(&m, &base, &len)) != KERR_OK) {
@@ -474,7 +570,7 @@ static int64_t sys_recvmsg(struct trapframe *tf) {
     /* The sender's address, and the two fields a caller reads afterwards.
      * The offsets are the LP64 ones: `msg_namelen` at 8, `msg_controllen` at
      * 40, `msg_flags` at 48 — not 4, 20 and 24. */
-    (void)put_addr(m.name, m.name != 0 ? sysarg(tf, 1) + MSGHDR_NAMELEN : 0, from);
+    (void)put_addr(s->domain, m.name, m.name != 0 ? sysarg(tf, 1) + MSGHDR_NAMELEN : 0, from);
     (void)uspace_copy_out(sysarg(tf, 1) + MSGHDR_CONTROLLEN, &zero, 8);
     (void)uspace_copy_out(sysarg(tf, 1) + MSGHDR_FLAGS, &zero, 4);
     return r;
@@ -486,9 +582,9 @@ static int64_t sys_shutdown(struct trapframe *tf) {
     return s == NULL ? err : s->ops->shutdown(s, (int)sysarg(tf, 1));
 }
 
-/* The two options that are not ignored: how long a blocking receive or send
- * may wait. Everything else is accepted and has nothing to tune; IPv6
- * options say ENOPROTOOPT, as on a kernel without IPv6. */
+/* The options that are not ignored: how long a blocking receive or send may
+ * wait, and IPV6_V6ONLY. Everything else is accepted and has nothing to
+ * tune; IPv6 options on an IPv4 socket say ENOPROTOOPT, as Linux does. */
 static int32_t set_timeout(struct sock *s, uint32_t name, virt_t uaddr) {
     struct user_timeval tv;
     uint32_t ms;
@@ -506,6 +602,26 @@ static int32_t set_timeout(struct sock *s, uint32_t name, virt_t uaddr) {
     return KERR_OK;
 }
 
+/* IPV6_V6ONLY, which only means something before bind: after it the port
+ * is held for both families or one, and changing that is EINVAL on Linux. */
+static int32_t set_ipv6_option(struct sock *s, uint32_t name, virt_t uaddr) {
+    uint32_t v;
+    if (s->domain != AF_INET6) {
+        return ENOPROTOOPT;
+    }
+    if (name != IPV6_V6ONLY) {
+        return KERR_OK;
+    }
+    if (uspace_copy_in(&v, uaddr, 4) != KERR_OK) {
+        return KERR_FAULT;
+    }
+    if (s->bound) {
+        return KERR_INVAL;
+    }
+    s->v6only = v != 0;
+    return KERR_OK;
+}
+
 static int64_t sys_setsockopt(struct trapframe *tf) {
     int err;
     struct sock *s = sock_fd((int32_t)sysarg(tf, 0), &err);
@@ -513,7 +629,7 @@ static int64_t sys_setsockopt(struct trapframe *tf) {
         return err;
     }
     if (sysarg(tf, 1) == IPPROTO_IPV6) {
-        return ENOPROTOOPT;
+        return set_ipv6_option(s, sysarg(tf, 2), sysarg(tf, 3));
     }
     if (sysarg(tf, 1) == SOL_SOCKET && (sysarg(tf, 2) == SO_RCVTIMEO || sysarg(tf, 2) == SO_SNDTIMEO)) {
         return set_timeout(s, sysarg(tf, 2), sysarg(tf, 3));
@@ -533,6 +649,9 @@ static uint32_t option_value(struct sock *s, uint32_t level, uint32_t name, int 
     }
     if (level == SOL_SOCKET && (name == SO_SNDBUF || name == SO_RCVBUF)) {
         return SOCK_BUF_SIZE;
+    }
+    if (level == IPPROTO_IPV6 && name == IPV6_V6ONLY && s->domain == AF_INET6) {
+        return s->v6only ? 1u : 0u;
     }
     if (level == SOL_SOCKET && name == SO_ACCEPTCONN) {
         return 0;

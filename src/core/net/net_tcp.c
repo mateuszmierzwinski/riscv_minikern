@@ -32,7 +32,7 @@ int tcp_init(struct tcp_stack *s, struct netif *nif, uint32_t seed) {
     s->nif = nif;
     s->iss = seed;
     s->now_ms = nif->now_ms;
-    h = (struct ip_handler){.input = tcp_input_packet, .self = s};
+    h = (struct ip_handler){.input = tcp_input_packet, .self = s, .input6 = tcp_input_packet6};
     return net_ip_register(nif, IPPROTO_TCP, &h);
 }
 
@@ -44,6 +44,7 @@ struct tcp_conn *tcp_alloc(struct tcp_stack *s) {
             c->used = true;
             c->stack = s;
             c->state = TCP_CLOSED;
+            c->families = TCP_FAMILY_V4;
             c->rto_ms = TCP_RTO_MIN_MS;
             c->snd_wnd = TCP_MSS;  /* until the peer tells us its window */
             /* Ten segments to start with, as RFC 6928 settled on: one was
@@ -130,20 +131,22 @@ int tcp_bind(struct tcp_conn *c, ip4_t ip, uint16_t port) {
     return c->local_port == 0 ? KERR_NOMEM : KERR_OK;
 }
 
-int tcp_connect(struct tcp_conn *c, ip4_t ip, uint16_t port) {
+/* Whether c may start an open to port: closed, and with a local port. */
+static int ready_to_connect(struct tcp_conn *c, uint16_t port) {
     if (c->state != TCP_CLOSED) {
         return c->state == TCP_ESTABLISHED ? KERR_EXIST : KERR_INVAL;
     }
-    if (ip == 0 || port == 0) {
+    if (port == 0) {
         return KERR_INVAL;
     }
     if (c->local_port == 0 && tcp_bind(c, 0, 0) != KERR_OK) {
         return KERR_NOMEM;
     }
-    if (c->local_ip == 0) {
-        c->local_ip = net_source_for(c->stack->nif, ip);  /* loopback keeps a loopback source */
-    }
-    c->remote_ip = ip;
+    return KERR_OK;
+}
+
+/* Sends the SYN: the remote address is set, and this is the rest. */
+static int start_active_open(struct tcp_conn *c, uint16_t port) {
     c->remote_port = port;
     c->snd_una = c->stack->iss;
     c->snd_nxt = c->snd_una + 1u;  /* the SYN occupies one sequence number */
@@ -155,6 +158,30 @@ int tcp_connect(struct tcp_conn *c, ip4_t ip, uint16_t port) {
      * for ARP, or a ring that is briefly full, is retried by the timer. */
     (void)tcp_emit(c, c->snd_una, TCP_SYN, NULL, 0, true);
     return KERR_OK;
+}
+
+int tcp_connect(struct tcp_conn *c, ip4_t ip, uint16_t port) {
+    int rc = ip == 0 ? KERR_INVAL : ready_to_connect(c, port);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    if (c->local_ip == 0) {
+        c->local_ip = net_source_for(c->stack->nif, ip);  /* loopback keeps a loopback source */
+    }
+    c->remote_ip = ip;
+    return start_active_open(c, port);
+}
+
+int tcp_connect6(struct tcp_conn *c, const uint8_t ip[16], uint16_t port) {
+    int rc = net_ip6_on_link(ip) && ip[0] != 0xff ? ready_to_connect(c, port) : KERR_NETUNREACH;
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    c->v6 = true;
+    c->local_ip = 0;
+    net_copy(c->local_ip6, c->stack->nif->ip6_link_local, 16u);
+    net_copy(c->remote_ip6, ip, 16u);
+    return start_active_open(c, port);
 }
 
 int tcp_listen(struct tcp_conn *c, uint32_t backlog) {

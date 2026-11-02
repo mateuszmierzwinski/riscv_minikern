@@ -27,6 +27,40 @@ static bool has_peer(const struct tcp_conn *c) {
     return c->state >= TCP_ESTABLISHED;
 }
 
+/* One end of a connection as a socket address, in its own family. */
+static struct sock_addr endpoint(const struct tcp_conn *c, bool local) {
+    struct sock_addr a = {.ip = local ? c->local_ip : c->remote_ip,
+                          .port = local ? c->local_port : c->remote_port, .v6 = c->v6};
+    if (c->v6) {
+        for (uint32_t i = 0; i < 16u; i++) {
+            a.ip6[i] = local ? c->local_ip6[i] : c->remote_ip6[i];
+        }
+    }
+    return a;
+}
+
+static bool same_endpoint(const struct sock_addr *a, const struct sock_addr *b) {
+    if (a->port != b->port || a->v6 != b->v6) {
+        return false;
+    }
+    for (uint32_t i = 0; a->v6 && i < 16u; i++) {
+        if (a->ip6[i] != b->ip6[i]) {
+            return false;
+        }
+    }
+    return a->v6 || a->ip == b->ip;
+}
+
+/* The families a socket's listener hears: an AF_INET socket IPv4 alone, an
+ * AF_INET6 one both unless V6ONLY — or one address's family, once bound to
+ * it. */
+static uint8_t families_of(const struct sock *s, const struct sock_addr *bound) {
+    if (s->domain != AF_INET6 || (bound->ip != 0 && !bound->v6)) {
+        return TCP_FAMILY_V4;
+    }
+    return s->v6only || bound->v6 ? TCP_FAMILY_V6 : (uint8_t)(TCP_FAMILY_V4 | TCP_FAMILY_V6);
+}
+
 /* The TCP stack's notification: the socket's view of the connection follows
  * the protocol's, then the waiters are woken.
  *
@@ -38,8 +72,8 @@ static void on_change(void *self, struct tcp_conn *c) {
     struct sock *s = self;
     s->connected = has_peer(c);
     if (s->connected) {
-        s->local = (struct sock_addr){.ip = c->local_ip, .port = c->local_port};
-        s->remote = (struct sock_addr){.ip = c->remote_ip, .port = c->remote_port};
+        s->local = endpoint(c, true);
+        s->remote = endpoint(c, false);
     }
     if (c->error != 0) {
         s->error = c->error;
@@ -54,10 +88,13 @@ static void adopt(struct sock *s, struct tcp_conn *c) {
     c->notify_self = s;
 }
 
+/* An IPv6 address is bound as the port alone plus the family: this host
+ * has one IPv6 address, so "this address" and "any" differ only in that a
+ * socket bound to it no longer hears IPv4. */
 static int tcp_sock_bind(struct sock *s, struct sock_addr a) {
     struct netif *nif = socket_netif();
     int rc;
-    if (a.ip != 0 && !net_is_local(nif, a.ip)) {
+    if (a.v6 ? !net_ip6_is_local(nif, a.ip6) : a.ip != 0 && !net_is_local(nif, a.ip)) {
         return EADDRNOTAVAIL;
     }
     rc = tcp_bind(conn_of(s), a.ip, a.port);
@@ -65,7 +102,9 @@ static int tcp_sock_bind(struct sock *s, struct sock_addr a) {
         return EADDRINUSE;
     }
     if (rc == KERR_OK) {
-        s->local = (struct sock_addr){.ip = a.ip, .port = conn_of(s)->local_port};
+        conn_of(s)->families = families_of(s, &a);
+        a.port = conn_of(s)->local_port;
+        s->local = a;
         s->bound = true;
     }
     return rc;
@@ -87,8 +126,7 @@ static int wait_connected(struct sock *s, struct tcp_conn *c, bool nonblock) {
         return c->error != 0 ? c->error : ECONNREFUSED;
     }
     s->connected = true;
-    s->local.port = c->local_port;
-    s->local.ip = c->local_ip;
+    s->local = endpoint(c, true);
     return KERR_OK;
 }
 
@@ -101,8 +139,11 @@ static int tcp_sock_connect(struct sock *s, struct sock_addr a) {
     if (c->state == TCP_SYN_SENT) {
         return wait_connected(s, c, (s->file->flags & O_NONBLOCK) != 0) == KERR_OK ? KERR_OK : EALREADY;
     }
+    if (!a.v6 && s->v6only) {
+        return ENETUNREACH;
+    }
     s->remote = a;
-    rc = tcp_connect(c, a.ip, a.port);
+    rc = a.v6 ? tcp_connect6(c, a.ip6, a.port) : tcp_connect(c, a.ip, a.port);
     if (rc != KERR_OK) {
         return rc == KERR_EXIST ? EISCONN : rc;
     }
@@ -154,11 +195,13 @@ static int tcp_sock_accept(struct sock *s, struct sock **out, bool nonblock) {
         return rc;
     }
     (*out)->ops = s->ops;
+    (*out)->domain = s->domain;
+    (*out)->v6only = s->v6only;
     (*out)->type = SOCK_STREAM;
     (*out)->bound = true;
     (*out)->connected = true;
-    (*out)->local = (struct sock_addr){.ip = c->local_ip, .port = c->local_port};
-    (*out)->remote = (struct sock_addr){.ip = c->remote_ip, .port = c->remote_port};
+    (*out)->local = endpoint(c, true);
+    (*out)->remote = endpoint(c, false);
     adopt(*out, c);
     return KERR_OK;
 }
@@ -167,7 +210,7 @@ static int32_t tcp_sock_send(struct sock *s, const void *buf, uint32_t n, const 
     struct tcp_conn *c = conn_of(s);
     bool nonblock = (s->file->flags & O_NONBLOCK) != 0;
     uint32_t done = 0;
-    if (to != NULL && (to->ip != c->remote_ip || to->port != c->remote_port)) {
+    if (to != NULL && !same_endpoint(to, &s->remote)) {
         return EISCONN;  /* a stream socket cannot be redirected per send */
     }
     if (!s->connected && c->state != TCP_ESTABLISHED && c->state != TCP_CLOSE_WAIT) {

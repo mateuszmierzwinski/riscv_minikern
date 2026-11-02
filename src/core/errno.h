@@ -47,6 +47,7 @@
 #define KERR_XDEV    (-18)  /* EXDEV: a link across two filesystems */
 #define KERR_NOTSUP  (-95)  /* EOPNOTSUPP: understood, and refused */
 #define KERR_TIMEDOUT (-110)
+#define KERR_NETUNREACH (-101) /* no route to that network */
 /* A filesystem's log holds work that was never committed to its metadata.
  * Not an error on its own — it says the filesystem is readable and must not
  * be written — so it is distinct from a refusal. */

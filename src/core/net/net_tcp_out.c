@@ -38,7 +38,7 @@ static uint32_t write_options(uint8_t *h, const struct tcp_out *o, bool with_mss
     if (with_mss) {
         h[at] = TCP_OPT_MSS;
         h[at + 1u] = 4;
-        put16(h + at + 2u, (uint16_t)TCP_MSS);
+        put16(h + at + 2u, (uint16_t)(o->remote6 != NULL ? TCP_MSS - 20u : TCP_MSS));
         at += 4u;
         /* Offered on every SYN, which is what lets a peer send us SACK
          * blocks; whether we send any of our own is a separate question. */
@@ -63,9 +63,12 @@ static uint32_t write_options(uint8_t *h, const struct tcp_out *o, bool with_mss
     return at - TCP_HLEN;
 }
 
+/* Over IPv6 the checksum is filled by the IPv6 layer, which owns the
+ * pseudo-header's 16-byte addresses; over IPv4 it is filled here. */
 int tcp_emit_out(const struct tcp_out *o, uint32_t seq, uint8_t flags, const uint8_t *data, uint32_t len,
                  bool with_mss) {
-    uint8_t *h = net_l4_buffer(o->stack->nif);
+    bool v6 = o->remote6 != NULL;
+    uint8_t *h = v6 ? net_l4_buffer6(o->stack->nif) : net_l4_buffer(o->stack->nif);
     uint32_t option_bytes;
     uint32_t hlen;
     uint32_t total;
@@ -74,15 +77,18 @@ int tcp_emit_out(const struct tcp_out *o, uint32_t seq, uint8_t flags, const uin
     option_bytes = write_options(h, o, with_mss);
     hlen = TCP_HLEN + option_bytes;
     total = hlen + len;
-    if (total > NET_L4_MAX) {
+    if (total > (v6 ? NET_L4_MAX6 : NET_L4_MAX)) {
         return KERR_INVAL;
     }
     write_header(h, o, seq, flags, hlen);
     for (uint32_t i = 0; i < len; i++) {
         h[hlen + i] = data[i];
     }
-    put16(h + TH_CKSUM, net_checksum(h, total, pseudo_sum(o->local_ip, o->remote_ip, total)));
     o->stack->stats.segments_out++;
+    if (v6) {
+        return net_ip6_send(o->stack->nif, o->remote6, IPPROTO_TCP, total);
+    }
+    put16(h + TH_CKSUM, net_checksum(h, total, pseudo_sum(o->local_ip, o->remote_ip, total)));
     return net_ip_send_from(o->stack->nif, o->local_ip, o->remote_ip, IPPROTO_TCP, total);
 }
 
@@ -134,7 +140,7 @@ static void fill_sack_blocks(struct tcp_conn *c, struct tcp_out *o) {
 /* The output description of a connection. */
 static struct tcp_out out_of(struct tcp_conn *c) {
     struct tcp_out o = {.stack = c->stack, .local_ip = c->local_ip, .remote_ip = c->remote_ip,
-                        .local_port = c->local_port, .remote_port = c->remote_port, .ack = c->rcv_nxt,
+                        .remote6 = c->v6 ? c->remote_ip6 : NULL, .local_port = c->local_port, .remote_port = c->remote_port, .ack = c->rcv_nxt,
                         .window = tcp_rcv_wnd(c)};
     fill_sack_blocks(c, &o);
     return o;
@@ -153,12 +159,19 @@ void tcp_send_ack(struct tcp_conn *c) {
 
 /* A reset for a segment that belongs to no connection: built from the
  * addresses alone, with no connection state and nothing large on the stack. */
-void tcp_reset_peer(struct tcp_stack *s, ip4_t to, uint16_t our_port, uint16_t their_port, uint32_t seq,
-                    uint32_t ack, bool with_ack) {
-    struct tcp_out o = {.stack = s, .local_ip = net_source_for(s->nif, to), .remote_ip = to,
-                        .local_port = our_port, .remote_port = their_port, .ack = ack, .window = 0};
+void tcp_reset_peer(struct tcp_stack *s, const struct tcp_from *to, uint16_t our_port, uint16_t their_port,
+                    uint32_t seq, uint32_t ack, bool with_ack) {
+    struct tcp_out o = {.stack = s, .local_ip = to->src6 != NULL ? 0u : net_source_for(s->nif, to->src),
+                        .remote_ip = to->src, .remote6 = to->src6, .local_port = our_port,
+                        .remote_port = their_port, .ack = ack, .window = 0};
     s->stats.resets_sent++;
     (void)tcp_emit_out(&o, seq, (uint8_t)(TCP_RST | (with_ack ? TCP_ACK : 0u)), NULL, 0, false);
+}
+
+void tcp_reset_conn(struct tcp_conn *c, uint32_t seq, uint32_t ack, bool with_ack) {
+    struct tcp_from peer = {.src = c->remote_ip, .dst = c->local_ip, .src6 = c->v6 ? c->remote_ip6 : NULL,
+                            .dst6 = c->v6 ? c->local_ip6 : NULL};
+    tcp_reset_peer(c->stack, &peer, c->local_port, c->remote_port, seq, ack, with_ack);
 }
 
 void tcp_arm_timer(struct tcp_conn *c) {
@@ -188,7 +201,7 @@ static uint32_t sendable(const struct tcp_conn *c) {
     uint32_t limit = allowed(c);
     uint32_t room = limit > tcp_in_flight(c) ? limit - tcp_in_flight(c) : 0u;
     uint32_t n = unsent < room ? unsent : room;
-    return n < TCP_MSS ? n : TCP_MSS;
+    return n < tcp_mss(c) ? n : tcp_mss(c);
 }
 
 /* True when the FIN may go now: everything queued has been sent. */
@@ -285,7 +298,7 @@ static void resend_oldest(struct tcp_conn *c) {
          * resending a whole window. Without SACK this is `TCP_MSS` and
          * behaves exactly as before, which is the property that matters:
          * nothing changes for a peer that did not offer the option. */
-        uint32_t len = c->tx_len < TCP_MSS ? c->tx_len : TCP_MSS;
+        uint32_t len = c->tx_len < tcp_mss(c) ? c->tx_len : tcp_mss(c);
         uint32_t stop = sack_hole_end(c, c->snd_una, len);
         (void)tcp_emit(c, c->snd_una, TCP_ACK | TCP_PSH, c->tx, stop, false);
         return;

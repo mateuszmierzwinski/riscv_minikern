@@ -185,7 +185,6 @@ void knet_report(void) {
     if (device_report != NULL) {
         device_report();
     }
-    const struct net_stats *n = &knet.nif.stats;
     kprintf("net: %u housekeeping beats, %u net ticks, now_ms %llu, next ping %llu\n",
             timer_housekeeping_beats(), knet.net_ticks,
             (unsigned long long)knet.nif.now_ms, (unsigned long long)knet.next_ping_ms);
@@ -193,10 +192,14 @@ void knet_report(void) {
         char ip[16];
         kprintf("net: %s answered %u of %u pings\n", ip4_format(knet.pinged, ip),
                 knet.pings_answered, knet.pings_sent);
-        kprintf("net: IPv6 %u packets in, %u neighbour messages refused\n",
-                knet.nif.stats.rx_ip6, knet.nif.stats.drop_ip6_nd);
     }
+    knet_report_counters();
+}
+
+void knet_report_counters(void) {
+    const struct net_stats *n = &knet.nif.stats;
     const struct tcp_stats *t = &knet.tcp.stats;
+    kprintf("net: IPv6 %u packets in, %u neighbour messages refused\n", n->rx_ip6, n->drop_ip6_nd);
     kprintf("net: rx %u tx %u; dropped: malformed %u checksum %u fragment %u not-ours %u arp %u "
             "rate %u no-port %u loop %u\n", n->rx_frames, n->tx_frames, n->drop_malformed, n->drop_checksum,
             n->drop_fragment, n->drop_not_ours, n->drop_arp_unsolicited, n->drop_rate_limited,

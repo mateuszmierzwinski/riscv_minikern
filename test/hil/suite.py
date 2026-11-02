@@ -28,6 +28,7 @@ import argparse
 import os
 import re
 import secrets
+import socket
 import shutil
 import subprocess
 import tempfile
@@ -1152,6 +1153,80 @@ def ipv6_link_local_answers(out_dir):
     return missing, log
 
 
+def wait_for_line(log, pattern, board, seconds=200):
+    """The first match of `pattern` in the board's log as it is written, or
+    None once the board run ends or `seconds` pass."""
+    for _ in range(seconds):
+        text = open(log, "rb").read().decode("utf-8", "replace") if os.path.exists(log) else ""
+        m = re.search(pattern, text)
+        if m is not None:
+            return m
+        if board.poll() is not None:
+            return None
+        time.sleep(1)
+    return None
+
+
+def echo_over(family, address, kind, payload):
+    """One upper-cased echo from the board, or the error as text."""
+    s = socket.socket(family, socket.SOCK_DGRAM if kind == "udp" else socket.SOCK_STREAM)
+    s.settimeout(5)
+    try:
+        if kind == "udp":
+            s.sendto(payload, address)
+            return s.recvfrom(512)[0]
+        s.connect(address)
+        s.sendall(payload + b"\n")
+        return s.recv(512).rstrip(b"\n")
+    except OSError as e:
+        return repr(e).encode()
+    finally:
+        s.close()
+
+
+def dual_stack_serves(out_dir):
+    """**IPv6 sockets, and IPv4 through them** (§5): a Go server listening the
+    ordinary way (`:7777`, `:7778`) gets one dual-stack AF_INET6 socket per
+    protocol now that the kernel has them. This machine then sends UDP and
+    TCP over IPv4 — which arrive IPv4-mapped, the path every Go server on
+    the board now takes — and over IPv6 link-local."""
+    bin_dir = os.path.join(NETROOT, "bin")
+    os.makedirs(bin_dir, exist_ok=True)
+    shutil.copy(built("//src/userland/dualgo:dualgo"),
+                os.path.join(bin_dir, "dualgo"))
+    os.chmod(os.path.join(bin_dir, "dualgo"), 0o755)
+    log = os.path.join(out_dir, "dual.log")
+    board = subprocess.Popen([sys.executable, os.path.join(HERE, "board.py"),
+                              f"minikern.netfs={NETFS_AT} minikern.run=/net/bin/dualgo",
+                              "-t", "150", "-o", log, "-q", "-w", "900"])
+    link = wait_for_line(log, r"net: eth0 (fe80:[0-9a-f:]+)/64 \(IPv6 link-local\)", board)
+    ready = wait_for_line(log, r"dual: ready", board)
+    missing = []
+    if link is None or ready is None:
+        board.wait()
+        return ["dual: ready, with the link-local address"], log
+    iface = subprocess.run(["ip", "-o", "route", "get", BOARD_AT], capture_output=True,
+                           text=True).stdout.split(" dev ")[1].split()[0]
+    scope = socket.if_nametoindex(iface)
+    answers = [("udp over IPv4", echo_over(socket.AF_INET, (BOARD_AT, 7777), "udp", b"four")),
+               ("udp over IPv6", echo_over(socket.AF_INET6, (link.group(1), 7777, 0, scope), "udp",
+                                           b"six")),
+               ("tcp over IPv4", echo_over(socket.AF_INET, (BOARD_AT, 7778), "tcp", b"mapped")),
+               ("tcp over IPv6", echo_over(socket.AF_INET6, (link.group(1), 7778, 0, scope), "tcp",
+                                           b"native"))]
+    board.wait()
+    for (what, got), want in zip(answers, (b"FOUR", b"SIX", b"MAPPED", b"NATIVE")):
+        if got != want:
+            missing.append(f"{what} answered {want!r}, got {got!r}")
+    text = open(log, "rb").read().decode("utf-8", "replace")
+    for want in ["dual: udp [::]:7777 (dual-stack), tcp [::]:7778 (dual-stack)",
+                 "dual: udp from 192.168.86.119:", "dual: udp from [fe80::",
+                 "dual: tcp from 192.168.86.119:", "dual: tcp from [fe80::", "dual: done"]:
+        if want not in text:
+            missing.append(want)
+    return missing, log
+
+
 # Where the board finds Go programs over netfs, and where it is on the LAN:
 # netfsd serves ~/vf2/netroot on :8081 and lets only the board's address in.
 NETROOT = os.path.expanduser("~/vf2/netroot")
@@ -1223,7 +1298,8 @@ def main():
               typed_line_wakes_reader),
              ("§5: an idle network costs no beat (against minikern.netbeat)",
               network_is_tickless),
-             ("§5: IPv6 — the board's link-local address answers pings", ipv6_link_local_answers)]
+             ("§5: IPv6 — the board's link-local address answers pings", ipv6_link_local_answers),
+             ("§5: IPv6 sockets — a dual-stack Go server, over IPv4 and IPv6", dual_stack_serves)]
     for case in CASES:
         name, bootargs, wanted, seconds = case[:4]
         program = case[4] if len(case) > 4 else None

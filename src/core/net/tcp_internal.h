@@ -79,6 +79,12 @@ static inline uint32_t tcp_in_flight(const struct tcp_conn *c) {
     return c->snd_nxt - c->snd_una;
 }
 
+/* The largest segment this connection sends: an IPv6 header is 20 bytes
+ * longer than an IPv4 one, and neither family fragments here. */
+static inline uint32_t tcp_mss(const struct tcp_conn *c) {
+    return c->v6 ? TCP_MSS - 20u : TCP_MSS;
+}
+
 /* Bytes queued but not yet sent. It saturates at zero: a sent FIN (or SYN)
  * occupies a sequence number that is not in the send queue, so what is in
  * flight can exceed what the queue holds. */
@@ -95,6 +101,7 @@ struct tcp_out {
     struct tcp_stack *stack;
     ip4_t local_ip;
     ip4_t remote_ip;
+    const uint8_t *remote6;  /* non-NULL: over IPv6, to this address */
     uint16_t local_port;
     uint16_t remote_port;
     uint32_t ack;     /* the acknowledgement field, when TCP_ACK is set */
@@ -119,8 +126,19 @@ int tcp_emit_out(const struct tcp_out *o, uint32_t seq, uint8_t flags, const uin
                  bool with_mss);
 int tcp_emit(struct tcp_conn *c, uint32_t seq, uint8_t flags, const uint8_t *data, uint32_t len, bool with_mss);
 void tcp_send_ack(struct tcp_conn *c);
-void tcp_reset_peer(struct tcp_stack *s, ip4_t to, uint16_t our_port, uint16_t their_port, uint32_t seq,
-                    uint32_t ack, bool with_ack);
+/* The addresses a segment came with, of either family: over IPv6 `src6`
+ * and `dst6` point at the header's and `src`/`dst` are 0. */
+struct tcp_from {
+    ip4_t src;
+    ip4_t dst;
+    const uint8_t *src6;
+    const uint8_t *dst6;
+};
+
+void tcp_reset_peer(struct tcp_stack *s, const struct tcp_from *to, uint16_t our_port, uint16_t their_port,
+                    uint32_t seq, uint32_t ack, bool with_ack);
+/* The same for a connection's own peer. */
+void tcp_reset_conn(struct tcp_conn *c, uint32_t seq, uint32_t ack, bool with_ack);
 void tcp_flush(struct tcp_conn *c);
 void tcp_arm_timer(struct tcp_conn *c);
 void tcp_cancel_timer(struct tcp_conn *c);
@@ -128,6 +146,8 @@ void tcp_retransmit(struct tcp_conn *c);
 
 /* tcp_in.c */
 void tcp_input_packet(void *self, struct netif *nif, ip4_t src, ip4_t dst, const uint8_t *p, uint32_t len);
+void tcp_input_packet6(void *self, struct netif *nif, const uint8_t *src, const uint8_t *dst, const uint8_t *p,
+                       uint32_t len);
 
 /* tcp.c */
 void tcp_changed(struct tcp_conn *c);

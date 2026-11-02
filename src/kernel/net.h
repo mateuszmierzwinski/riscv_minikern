@@ -60,6 +60,10 @@ struct tcp_stack *knet_tcp(void);
 /* Prints the interface and TCP counters (minikern.netstat=1). */
 void knet_report(void);
 
+/* The stack's packet and drop counters alone, for the end-of-boot report,
+ * which reads them after the program's traffic rather than before it. */
+void knet_report_counters(void);
+
 /* Polls the device (`poll`, or virtio's when NULL) and runs the stack's
  * timers **holding the kernel lock** — taken here when this hart does not
  * already hold it. The stack belongs to the lock's holder: a boot-time loop

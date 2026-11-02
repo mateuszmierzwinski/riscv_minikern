@@ -93,6 +93,14 @@ struct tcp_conn {
     struct tcp_stack *stack;
     enum tcp_state state;
     ip4_t local_ip, remote_ip;
+    /* **Over IPv6** `v6` is set, the addresses are these, and `local_ip`
+     * and `remote_ip` are 0 — so nothing that compares IPv4 addresses can
+     * mistake an IPv6 connection for one. */
+    bool v6;
+    uint8_t local_ip6[16], remote_ip6[16];
+    /* Which families a listener takes a SYN from (TCP_FAMILY_*): IPv4
+     * alone unless a dual-stack socket says otherwise. */
+    uint8_t families;
     uint16_t local_port, remote_port;
 
     uint32_t snd_una;   /* oldest unacknowledged byte */
@@ -166,6 +174,9 @@ struct tcp_conn {
     void (*notify)(void *self, struct tcp_conn *c);
     void *notify_self;
 };
+
+#define TCP_FAMILY_V4 1u
+#define TCP_FAMILY_V6 2u
 
 /* Why a connection failed, as Linux's errno values. */
 #define TCP_ECONNREFUSED (-111)
@@ -251,6 +262,10 @@ int tcp_bind(struct tcp_conn *c, ip4_t ip, uint16_t port);
 /* Starts an active open. KERR_OK means the SYN went out; the caller waits
  * for the state to become ESTABLISHED or for c->error. */
 int tcp_connect(struct tcp_conn *c, ip4_t ip, uint16_t port);
+
+/* The same to an IPv6 address, from our link-local one. KERR_NETUNREACH
+ * off the link, which is all of IPv6 this host reaches. */
+int tcp_connect6(struct tcp_conn *c, const uint8_t ip[16], uint16_t port);
 
 /* Makes a bound connection a listener. */
 int tcp_listen(struct tcp_conn *c, uint32_t backlog);

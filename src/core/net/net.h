@@ -47,7 +47,10 @@ typedef uint32_t ip4_t;
 
 struct netif;
 
-/* A received UDP datagram, pointing into the frame. */
+/* A received UDP datagram, pointing into the frame. **Over IPv6, `src6`
+ * and `dst6` point at the header's 16-byte addresses and `src`/`dst` are
+ * 0**; over IPv4 both pointers are NULL, so a handler that never heard of
+ * IPv6 sees exactly what it saw before. */
 struct udp_datagram {
     ip4_t src;
     ip4_t dst;
@@ -55,6 +58,8 @@ struct udp_datagram {
     uint16_t dport;
     const uint8_t *data;
     uint32_t len;
+    const uint8_t *src6;
+    const uint8_t *dst6;
 };
 
 /* What an IP protocol above the network layer does with a packet: the
@@ -63,6 +68,11 @@ struct udp_datagram {
 struct ip_handler {
     void (*input)(void *self, struct netif *nif, ip4_t src, ip4_t dst, const uint8_t *p, uint32_t len);
     void *self;
+    /* The same over IPv6, with the header's 16-byte addresses; NULL for a
+     * protocol that only runs over IPv4, whose packets then go uncounted
+     * as not ours. */
+    void (*input6)(void *self, struct netif *nif, const uint8_t *src, const uint8_t *dst, const uint8_t *p,
+                   uint32_t len);
 };
 
 /* What one bound UDP port does with a datagram. */
@@ -275,6 +285,39 @@ int net_udp_send_from(struct netif *nif, ip4_t src, ip4_t dst, uint16_t sport, u
  * as it would drop a misdelivered unicast. */
 int net_udp_send_unresolved(struct netif *nif, ip4_t dst, uint16_t sport, uint16_t dport, const void *data,
                             uint32_t len);
+
+/* The largest UDP payload one frame carries over IPv6: a 40-byte header. */
+#define NET_UDP6_MAX (ETH_MTU - 40u - 8u)
+
+/* Sends a UDP datagram over IPv6 from our link-local address. Only the link
+ * is reachable — fe80::/10 and the link-scope groups ff02::/16 — so anything
+ * else is KERR_NETUNREACH, which is what a host with no IPv6 route says.
+ * KERR_AGAIN: held while the neighbour is asked, sent when it answers. */
+int net_udp6_send(struct netif *nif, const uint8_t dst[16], uint16_t sport, uint16_t dport, const void *data,
+                  uint32_t len);
+
+/* True when `ip` is on the link, which is all of IPv6 this host reaches:
+ * fe80::/10 and the link-scope groups ff02::/16. */
+bool net_ip6_on_link(const uint8_t ip[16]);
+
+/* Where an upper protocol writes its header and data before net_ip6_send:
+ * after the 40-byte IPv6 header, so not where net_l4_buffer points. */
+uint8_t *net_l4_buffer6(struct netif *nif);
+
+/* The largest upper-protocol payload one IPv6 frame carries. */
+#define NET_L4_MAX6 (ETH_MTU - 40u)
+
+/* Sends what is at net_l4_buffer6 to dst from our link-local address, the
+ * upper header's checksum (at the protocol's own offset) filled here over
+ * IPv6's pseudo-header. KERR_NETUNREACH off the link; KERR_AGAIN while the
+ * neighbour is asked, the packet held. */
+int net_ip6_send(struct netif *nif, const uint8_t dst[16], uint8_t proto, uint32_t len);
+
+/* The pseudo-header sum an upper checksum over IPv6 starts from. */
+uint32_t net_ip6_pseudo_sum(const uint8_t *src, const uint8_t *dst, uint32_t len, uint8_t next);
+
+/* True when `ip` is an IPv6 address of this interface (its link-local). */
+bool net_ip6_is_local(const struct netif *nif, const uint8_t ip[16]);
 
 /* Sends an ICMP echo request with 32 bytes of payload. */
 int net_ping(struct netif *nif, ip4_t dst, uint16_t id, uint16_t seq);

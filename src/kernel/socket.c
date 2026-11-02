@@ -73,7 +73,7 @@ static int protocol_init(struct sock *s, int type, int protocol) {
 int socket_create(int domain, int type, int protocol, struct file **out) {
     struct sock *s;
     int rc;
-    if (domain != AF_INET && domain != AF_UNIX && domain != AF_NETLINK) {
+    if (domain != AF_INET && domain != AF_INET6 && domain != AF_UNIX && domain != AF_NETLINK) {
         return EAFNOSUPPORT;
     }
     s = kzalloc(sizeof *s);

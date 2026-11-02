@@ -59,7 +59,6 @@ uint16_t net_udp_ephemeral(struct netif *nif) {
 void udp_input(struct netif *nif, ip4_t src, ip4_t dst, const uint8_t *p, uint32_t len) {
     struct udp_datagram d;
     uint32_t ulen;
-    int slot;
     if (len < UDP_HLEN || (ulen = get16(p + 4)) < UDP_HLEN || ulen > len) {
         nif->stats.drop_malformed++;
         return;
@@ -74,12 +73,19 @@ void udp_input(struct netif *nif, ip4_t src, ip4_t dst, const uint8_t *p, uint32
         dhcp_input(nif, &d);
         return;
     }
-    slot = find_port(nif, d.dport);
+    udp_dispatch(nif, &d);
+}
+
+/* One port namespace for both versions, as on a dual-stack host: a socket
+ * bound to a port hears it over IPv4 and IPv6, and decides for itself
+ * (sock_udp.c) which of the two it wants. */
+void udp_dispatch(struct netif *nif, const struct udp_datagram *d) {
+    int slot = find_port(nif, d->dport);
     if (slot < 0) {
         nif->stats.drop_no_port++;
         return;
     }
-    nif->udp[slot].receive(nif->udp[slot].self, nif, &d);
+    nif->udp[slot].receive(nif->udp[slot].self, nif, d);
 }
 
 /* Writes the datagram into nif->tx and returns its total length, or a

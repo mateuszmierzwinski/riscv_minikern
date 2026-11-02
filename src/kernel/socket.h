@@ -1,9 +1,14 @@
-/* socket — BSD sockets over the kernel's IPv4 stack, for Go's net package.
+/* socket — BSD sockets over the kernel's network stack, for Go's net package.
  *
  * A socket is a file whose ops forward to a per-protocol table
- * (struct sock_ops): UDP (sock_udp.c) and TCP (sock_tcp.c). Only AF_INET
- * exists; asking for AF_INET6 is EAFNOSUPPORT, which is how Go learns to
- * use IPv4 alone. Blocking calls sleep on the socket and wake on arrival,
+ * (struct sock_ops): UDP (sock_udp.c) and TCP (sock_tcp.c), in AF_INET or
+ * AF_INET6.
+ *
+ * **An AF_INET6 socket is dual-stack**: an IPv4 peer is an IPv4-mapped
+ * address (::ffff:a.b.c.d) and travels as IPv4, unless IPV6_V6ONLY is set.
+ * That is not optional — once socket(AF_INET6) succeeds, Go listens on
+ * every wildcard address with one AF_INET6 socket, so every IPv4 server
+ * this kernel runs goes through the mapping. Blocking calls sleep on the socket and wake on arrival,
  * a signal, or never (no SO_RCVTIMEO); non-blocking ones return EAGAIN and
  * readiness reaches epoll through vfs_poll_notify. */
 #ifndef MINIKERN_KERNEL_SOCKET_H
@@ -57,6 +62,12 @@ struct file;
 struct sock_addr {
     ip4_t ip;
     uint16_t port;
+    /* **An IPv6 peer**: `v6` set and `ip6` its address, `ip` 0. An IPv4
+     * peer of an AF_INET6 socket is not this — the mapping is undone at the
+     * syscall boundary, so the protocols below only ever see an IPv4
+     * address or a real IPv6 one. */
+    bool v6;
+    uint8_t ip6[16];
     /* **AF_UNIX only**: the index of an interned name, one-based so that zero
      * means "not a unix address". Inert for AF_INET, which never sets it, so
      * UDP and TCP are unchanged by its existence. */
@@ -90,6 +101,7 @@ struct sock {
     struct sock_addr remote;
     bool bound;
     bool connected;
+    bool v6only;            /* IPV6_V6ONLY: an AF_INET6 socket refusing IPv4 */
     int error;              /* SO_ERROR: the last asynchronous failure */
     /* SO_RCVTIMEO and SO_SNDTIMEO, in milliseconds, 0 for "wait for ever".
      *

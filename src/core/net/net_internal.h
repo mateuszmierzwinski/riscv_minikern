@@ -76,6 +76,8 @@ void ipv4_release_held(struct netif *nif, ip4_t hop);
 
 void icmp_input(struct netif *nif, ip4_t src, ip4_t dst, const uint8_t *p, uint32_t len);
 void udp_input(struct netif *nif, ip4_t src, ip4_t dst, const uint8_t *p, uint32_t len);
+/* Hands a checked datagram, of either IP version, to its port's handler. */
+void udp_dispatch(struct netif *nif, const struct udp_datagram *d);
 
 /* DHCP: datagrams for port 68, and retransmission. */
 void dhcp_input(struct netif *nif, const struct udp_datagram *d);
