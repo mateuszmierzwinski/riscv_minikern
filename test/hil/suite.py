@@ -31,6 +31,7 @@ import secrets
 import shutil
 import subprocess
 import tempfile
+import time
 import sys
 
 import fixtures
@@ -1114,11 +1115,49 @@ def network_is_tickless(out_dir):
     return missing, os.path.join(out_dir, "spin_tickless.log")
 
 
+def ipv6_link_local_answers(out_dir):
+    """**IPv6 on the link** (§5): the board's link-local address (from its
+    MAC) answers this machine's pings — which needs our Neighbor
+    Advertisement first, so the neighbour table must then hold the board's
+    own MAC for it. The LAN has no router, so link-local is what can be
+    judged here. The spinner keeps the board up for 15 s."""
+    log = os.path.join(out_dir, "ipv6.log")
+    board = subprocess.Popen([sys.executable, os.path.join(HERE, "board.py"), "minikern.spin=1",
+                              "-t", "120", "-o", log, "-q", "-w", "900"])
+    address = None
+    for _ in range(200):
+        text = open(log, "rb").read().decode("utf-8", "replace") if os.path.exists(log) else ""
+        m = re.search(r"net: eth0 (fe80:[0-9a-f:]+)/64 \(IPv6 link-local\)", text)
+        if m is not None:
+            address = m.group(1)
+            break
+        if board.poll() is not None:
+            break
+        time.sleep(1)
+    missing = []
+    if address is None:
+        board.wait()
+        return ["net: eth0 fe80:…/64 (IPv6 link-local)"], log
+    iface = subprocess.run(["ip", "-o", "route", "get", BOARD_AT], capture_output=True,
+                           text=True).stdout.split(" dev ")[1].split()[0]
+    ping = subprocess.run(["ping", "-6", "-c", "5", "-i", "0.5", "-W", "2", address + "%" + iface],
+                          capture_output=True, text=True)
+    neigh = subprocess.run(["ip", "-6", "neigh", "show", address, "dev", iface],
+                           capture_output=True, text=True).stdout
+    board.wait()
+    if "5 received" not in ping.stdout:
+        missing.append("5 of 5 pings to " + address + " (" + ping.stdout.strip()[-80:] + ")")
+    if BOARD_MAC not in neigh:
+        missing.append("the neighbour table holds " + BOARD_MAC + " for " + address)
+    return missing, log
+
+
 # Where the board finds Go programs over netfs, and where it is on the LAN:
 # netfsd serves ~/vf2/netroot on :8081 and lets only the board's address in.
 NETROOT = os.path.expanduser("~/vf2/netroot")
 NETFS_AT = "192.168.86.119:8081"
 BOARD_AT = "192.168.86.247"
+BOARD_MAC = "6c:cf:39:00:b6:89"
 
 
 def stage_vnc_password():
@@ -1183,7 +1222,8 @@ def main():
              ("§5: a typed line wakes a blocked reader by the UART interrupt",
               typed_line_wakes_reader),
              ("§5: an idle network costs no beat (against minikern.netbeat)",
-              network_is_tickless)]
+              network_is_tickless),
+             ("§5: IPv6 — the board's link-local address answers pings", ipv6_link_local_answers)]
     for case in CASES:
         name, bootargs, wanted, seconds = case[:4]
         program = case[4] if len(case) > 4 else None

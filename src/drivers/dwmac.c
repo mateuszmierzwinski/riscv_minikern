@@ -27,6 +27,7 @@
  * arriving, or arriving and being filtered out", and those two have entirely
  * different fixes. */
 #define MAC_FILTER_PR (1u << 0)
+#define MAC_FILTER_PM (1u << 4) /* pass all multicast */
 #define MAC_VERSION       0x0110u
 #define MAC_MDIO_ADDR     0x0200u
 #define MAC_MDIO_DATA     0x0204u
@@ -538,8 +539,10 @@ static void configure_mac(void) {
  * high half — and `AE`, the bit that enables the match — never reached the
  * side that filters (see `program_the_address`). `minikern.netpromisc`
  * puts promiscuous mode back, for a capture of other hosts' traffic. */
+/* **Multicast passes**: IPv6 neighbour discovery arrives at a group address
+ * (33:33:ff:…), and the stack — which knows its groups — decides. */
 static void set_the_receive_filter(void) {
-    wr(MAC_PACKET_FILTER, nic.strict_filter ? 0u : MAC_FILTER_PR);
+    wr(MAC_PACKET_FILTER, nic.strict_filter ? MAC_FILTER_PM : MAC_FILTER_PR);
 }
 
 /* Programs the address this driver decided on, with the enable bit.

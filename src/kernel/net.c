@@ -54,6 +54,11 @@ static void on_bound(void *self, const struct netif *nif) {
         kprintf("net: eth0 %s/%u gw %s dns %s (dhcp, lease %u s)\n", ip4_format(nif->ip, ip), prefix,
                 ip4_format(nif->gateway, gw), ip4_format(nif->dns, dns), nif->lease_s);
     }
+    {
+        char ip6[40];
+        (void)ip6_format(nif->ip6_link_local, ip6);
+        kprintf("net: eth0 %s/64 (IPv6 link-local)\n", ip6);
+    }
     if (dns_override != 0 && knet.nif.dns != dns_override) {
         knet.nif.dns = dns_override;
         kprintf("net: keeping the resolver the command line named (%s)\n",
@@ -188,6 +193,8 @@ void knet_report(void) {
         char ip[16];
         kprintf("net: %s answered %u of %u pings\n", ip4_format(knet.pinged, ip),
                 knet.pings_answered, knet.pings_sent);
+        kprintf("net: IPv6 %u packets in, %u neighbour messages refused\n",
+                knet.nif.stats.rx_ip6, knet.nif.stats.drop_ip6_nd);
     }
     const struct tcp_stats *t = &knet.tcp.stats;
     kprintf("net: rx %u tx %u; dropped: malformed %u checksum %u fragment %u not-ours %u arp %u "

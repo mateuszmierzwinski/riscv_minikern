@@ -195,7 +195,7 @@ git, and the pitfalls are in `CLAUDE.md` §5.
 ## 5. Networking
 
 ### Open
-- [ ] **IPv6** (L) — The stack is IPv4 only.
+- [~] **IPv6** (L) — **On the link, answering (2026-11-01):** a link-local address from the MAC (EUI-64, printed at boot), the all-nodes and solicited-node groups (the GMAC now passes multicast; the stack decides), Neighbor Discovery — a solicitation for our address answered and its sender learned, accepted only at hop limit 255; a reply to an unknown neighbour held while we ask, as IPv4 holds one for ARP — and ICMPv6 echo (rate-limited, never to a group). Host-tested (`ipv6_test`: frames and checksums built by the test, plus the hostile shapes — a zero-length option, forged hop limit, a payload length past the frame, a bad checksum); board: this machine pings `fe80::6ecf:39ff:fe00:b689` 5 of 5 and its neighbour table holds the board's MAC (suite case, twice, cold and warm cache). **Next:** UDP and TCP over IPv6 and `AF_INET6` sockets (Go opens IPv6 sockets first); then **SLAAC — needs the operator**: this LAN has no router advertising a prefix (the PC has only a link-local address), so a global address cannot be judged here.
 
 ### Done
 - [x] **Bits lost across a blocking `recvfrom`** — no longer reproduces. It failed 4 of 4 runs when recorded; on 2026-11-01 the program was put back in its original shape (no `volatile` on the mask, no prints between the steps — the two things that had been changed to study it) and passed 4 of 4, and in its current shape 2 of 2. Which of the context-switch and signal fixes since then cured it is not identified; the case ("§5: two threads over a unix-domain socket") keeps guarding it.

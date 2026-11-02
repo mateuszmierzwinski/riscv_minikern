@@ -588,6 +588,7 @@ cc_library(
         "src/core/net/net_echo.c",
         "src/core/net/net_eth.c",
         "src/core/net/net_ipv4.c",
+        "src/core/net/net_ipv6.c",
         "src/core/net/net_route.c",
         "src/core/net/net_tcp.c",
         "src/core/net/net_tcp_in.c",
@@ -617,6 +618,20 @@ cc_test(
     name = "route_test",
     size = "small",
     srcs = ["test/route_test.c"],
+    deps = [
+        ":ktest",
+        ":net",
+    ],
+)
+
+# IPv6 on one link: address, Neighbor Discovery, echo, and the hostile shapes.
+cc_test(
+    name = "ipv6_test",
+    size = "small",
+    srcs = [
+        "test/ipv6_test.c",
+        "test/net_frames.h",
+    ],
     deps = [
         ":ktest",
         ":net",

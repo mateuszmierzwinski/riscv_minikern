@@ -25,6 +25,7 @@
 #define ETH_MTU        1500u
 #define ETH_FRAME_MAX  (ETH_HLEN + ETH_MTU)
 #define NET_ARP_ENTRIES 8u
+#define NET_ND_ENTRIES  8u   /* IPv6 neighbours remembered (net_ipv6.c) */
 /* Routes beyond the interface's own subnet and the default gateway, which are
  * rules rather than entries and are not stored here. */
 #define NET_ROUTES 8u
@@ -127,6 +128,15 @@ struct dhcp_client {
 };
 
 /* Why frames were dropped: each is a test assertion and a log line. */
+/* An IPv6 neighbour: an address and the link-layer address it answered
+ * with. `mac_known` false is a solicitation sent and not yet answered. */
+struct nd_entry {
+    uint8_t ip[16];
+    uint8_t mac[ETH_ALEN];
+    bool used;
+    bool mac_known;
+};
+
 struct net_stats {
     uint32_t rx_frames;
     uint32_t tx_frames;
@@ -138,6 +148,8 @@ struct net_stats {
     uint32_t drop_rate_limited;
     uint32_t drop_no_port;
     uint32_t drop_loop_full;
+    uint32_t rx_ip6;       /* IPv6 packets taken in */
+    uint32_t drop_ip6_nd;  /* neighbour discovery refused (hop limit, options) */
 };
 
 struct netif {
@@ -151,6 +163,11 @@ struct netif {
     uint32_t lease_s;
     uint64_t now_ms;
     struct arp_entry arp[NET_ARP_ENTRIES];
+    uint8_t ip6_link_local[16]; /* fe80::/64 from the MAC (EUI-64), at net_init */
+    struct nd_entry nd[NET_ND_ENTRIES];
+    uint8_t held6[ETH_MTU];   /* one IPv6 packet waiting for its neighbour */
+    uint32_t held6_len;
+    uint8_t held6_dst[16];
     struct route route[NET_ROUTES];
     struct dhcp_client dhcp;
     uint16_t udp_port[NET_UDP_PORTS];
@@ -184,6 +201,10 @@ void net_input(struct netif *nif, const uint8_t *frame, uint32_t len);
 
 /* True for 127.0.0.0/8 and, once configured, our own address. */
 bool net_is_local(const struct netif *nif, ip4_t ip);
+
+/* An IPv6 address as text (RFC 5952: lowest-case hex, the longest run of
+ * zero groups as "::"); `out` holds at least 40 bytes. Returns the length. */
+uint32_t ip6_format(const uint8_t a[16], char *out);
 
 /* Time passes: DHCP retransmits, the ICMP bucket refills. */
 void net_tick(struct netif *nif, uint64_t now_ms);

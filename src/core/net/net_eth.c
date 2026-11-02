@@ -9,6 +9,7 @@ void net_init(struct netif *nif, const uint8_t mac[ETH_ALEN], const struct netde
     nif->dev = *dev;
     nif->events = *events;
     nif->icmp_tokens = NET_ICMP_BURST;
+    ipv6_init(nif);
 }
 
 int eth_send(struct netif *nif, const uint8_t dst[ETH_ALEN], uint16_t type, uint32_t payload_len) {
@@ -24,7 +25,8 @@ int eth_send(struct netif *nif, const uint8_t dst[ETH_ALEN], uint16_t type, uint
 
 /* Frames for us: our MAC or broadcast (DHCP and ARP need the latter). */
 static bool addressed_to_us(const struct netif *nif, const uint8_t *dst) {
-    return mac_equal(dst, nif->mac) || mac_equal(dst, mac_broadcast);
+    return mac_equal(dst, nif->mac) || mac_equal(dst, mac_broadcast) ||
+           ipv6_wants_frame(nif, dst);
 }
 
 void net_input(struct netif *nif, const uint8_t *frame, uint32_t len) {
@@ -44,6 +46,8 @@ void net_input(struct netif *nif, const uint8_t *frame, uint32_t len) {
         arp_input(nif, frame + ETH_HLEN, len - ETH_HLEN);
     } else if (type == ETHERTYPE_IPV4) {
         ipv4_input(nif, frame + ETH_HLEN, len - ETH_HLEN);
+    } else if (type == ETHERTYPE_IPV6) {
+        ipv6_input(nif, frame + ETH_HLEN, len - ETH_HLEN);
     } else {
         nif->stats.drop_not_ours++;
     }

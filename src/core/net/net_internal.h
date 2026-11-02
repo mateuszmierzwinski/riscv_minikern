@@ -5,6 +5,7 @@
 #include "core/net/net.h"
 
 #define ETHERTYPE_IPV4 0x0800u
+#define ETHERTYPE_IPV6 0x86ddu
 #define ETHERTYPE_ARP  0x0806u
 #define IP_HLEN        20u
 #define UDP_HLEN       8u
@@ -50,6 +51,9 @@ int arp_request(struct netif *nif, ip4_t ip);
 /* IPv4: input, and output of a payload already placed after the IP header
  * in nif->tx. */
 void ipv4_input(struct netif *nif, const uint8_t *p, uint32_t len);
+void ipv6_input(struct netif *nif, const uint8_t *p, uint32_t len);
+void ipv6_init(struct netif *nif);
+bool ipv6_wants_frame(const struct netif *nif, const uint8_t *dst_mac);
 int ipv4_send(struct netif *nif, ip4_t dst, uint8_t proto, uint32_t payload_len);
 
 /* ipv4_send with an explicit source address (0: let the stack choose).
