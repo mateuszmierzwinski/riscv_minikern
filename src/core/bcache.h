@@ -36,6 +36,8 @@ struct bcache {
     const struct blockdev *dev;
     struct bbuf slots[BCACHE_MAX_SLOTS];
     uint32_t nslots;
+    uint8_t *gather;       /* bcache_set_gather's buffer; NULL: one block per write */
+    uint32_t gather_slots; /* how many blocks it holds */
     uint64_t clock;
     /* Counters, for the netstat log and for tests that assert a read was
      * served from memory rather than from the network. */
@@ -48,6 +50,13 @@ struct bcache {
  * least nslots * block_size and stay alive as long as the cache does).
  * KERR_INVAL on a bad device or slot count. */
 int bcache_init(struct bcache *c, const struct blockdev *dev, void *mem, uint32_t nslots);
+
+/* Gives the cache a buffer of `slots` blocks to write back **runs** with:
+ * a flush then writes consecutive dirty blocks with one device call (up to
+ * `slots` at a time) instead of one call per block. A card programs a
+ * multi-block write once, so this is the difference between 0.4 MB/s and
+ * several on the SD card. NULL keeps one block per call. */
+void bcache_set_gather(struct bcache *c, void *mem, uint32_t slots);
 
 /* The block at lba, read from the device if it is not already here, pinned.
  * KERR_OK and *out set, or KERR_INVAL/KERR_IO/KERR_NOMEM (every slot

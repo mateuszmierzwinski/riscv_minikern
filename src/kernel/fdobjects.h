@@ -61,6 +61,23 @@ int32_t fdobjects_getdents(struct file *f, void *buf, uint32_t room);
 
 int fdobjects_open_path(const char *path, uint32_t flags);
 
+/* `fdobjects_open_path` with the mode a created file gets (less the
+ * umask), which is openat's third argument. */
+int fdobjects_open_path_mode(const char *path, uint32_t flags, uint32_t mode);
+
+/* How long the synthesised /etc/resolv.conf is now, for `stat`: a file
+ * that opens must also stat, or a resolver that checks first (Go's does)
+ * never reads it. */
+uint32_t fdobjects_resolv_bytes(void);
+
+/* A generated file's descriptor (/proc, /etc/resolv.conf): its length, for
+ * `fstat`, and whether it is the resolver's (0644) rather than /proc's
+ * (0444). False for any other descriptor. */
+bool fdobjects_snapshot_len(int32_t fd, uint64_t *len, bool *writable_by_owner);
+
+/* The path a file or directory descriptor was opened from; NULL otherwise. */
+const char *fdobjects_file_path(int32_t fd);
+
 /* The bytes behind a descriptor that is a regular file, for a mapping to be
  * backed from. KERR_BADF for a descriptor that is not open, KERR_NODEV for
  * one that is not a file — which is what `mmap` answers for a console or a
@@ -98,6 +115,10 @@ int fdobjects_open_pipe(int32_t out[2], uint32_t flags);
  * a program that computed an offset wrongly read plausible data from the
  * wrong place. */
 int fdobjects_seek(int32_t fd, int64_t offset, uint32_t whence, uint64_t *result);
+
+/* Whether a descriptor holds a file or directory at or under `at` — the
+ * busy check `umount2` uses (`volumes_set_busy_check`). */
+bool fdobjects_open_under(const char *at);
 
 /* The same two operations a program gets from `lseek` and `read`, for the
  * board self-test, which runs inside the kernel and has no syscall layer to

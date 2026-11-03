@@ -34,6 +34,7 @@
 #include "kernel/signal.h"
 #include "arch/riscv/timer.h"
 #include "kernel/uspace.h"
+#include "kernel/volumes.h"
 
 /* **A user pointer is acceptable only if the process has it mapped.**
  *
@@ -569,6 +570,29 @@ static int64_t sys_clock_gettime(struct trapframe *tf) {
     return 0;
 }
 
+/* clock_settime(CLOCK_REALTIME, ts): `CAP_SYS_TIME`, as on Linux. The board
+ * has no real-time clock and a card boot has no `minikern.time`, so without
+ * this a booted system believed it was 1970 for good — and an S3 server
+ * refuses every signed request as "time too skewed". Other clocks cannot be
+ * set (EINVAL), and the nanoseconds must be a fraction of a second. */
+static int64_t sys_clock_settime(struct trapframe *tf) {
+    const struct user_timespec *in = (const struct user_timespec *)(uintptr_t)sysarg(tf, 1);
+    struct user_timespec ts;
+    if (!uspace_capable(CAP_SYS_TIME)) {
+        return KERR_PERM;
+    }
+    if (sysarg(tf, 0) != CLOCK_REALTIME) {
+        return KERR_INVAL;
+    }
+    if (uspace_copy_in(&ts, (virt_t)(uintptr_t)in, sizeof ts) != KERR_OK) {
+        return KERR_FAULT;
+    }
+    if (ts.sec < 0 || ts.nsec < 0 || ts.nsec >= 1000000000) {
+        return KERR_INVAL;
+    }
+    return wallclock_set_ns((uint64_t)ts.sec * 1000000000ull + (uint64_t)ts.nsec);
+}
+
 static int64_t sys_getrandom(struct trapframe *tf) {
     uint8_t *to = (uint8_t *)(uintptr_t)sysarg(tf, 0);
     uint64_t n = sysarg(tf, 1);
@@ -1080,7 +1104,7 @@ static int64_t sys_pipe2(struct trapframe *tf) {
  * `/dev/null` is the entry that had to exist: a runtime opens it for any
  * command whose input it was not given, so `os/exec` could not start a
  * program at all without it. */
-#define OPEN_MAX_PATH 128u
+#define OPEN_MAX_PATH 256u
 
 /* Defined with the other path helpers, below. */
 static int copy_in_path_at(struct trapframe *tf, uint32_t dirfd_argno, uint32_t argno,
@@ -1097,9 +1121,11 @@ static int64_t sys_openat(struct trapframe *tf) {
     if (rc != KERR_OK) {
         return rc;
     }
-    return fdobjects_open_path(path, (uint32_t)sysarg(tf, 2) &
-                                         (O_ACCMODE | O_CREAT | O_EXCL | O_TRUNC | O_APPEND |
-                                          O_NONBLOCK | O_CLOEXEC));
+    return fdobjects_open_path_mode(path,
+                                    (uint32_t)sysarg(tf, 2) &
+                                        (O_ACCMODE | O_CREAT | O_EXCL | O_TRUNC | O_APPEND |
+                                         O_NONBLOCK | O_CLOEXEC),
+                                    (uint32_t)sysarg(tf, 3));
 }
 
 /* `struct stat` as the generic ABI lays it out — which is what riscv64 uses,
@@ -1162,6 +1188,15 @@ static bool put_times(const char *path, uint8_t *out, uint32_t atime_at, uint32_
  * against `dirfd`, or the working directory for `AT_FDCWD`
  * (`copy_in_path_at`).
  */
+static bool is_synthesised_resolv(const char *path) {
+    const char *want = "/etc/resolv.conf";
+    uint32_t i = 0;
+    while (want[i] != '\0' && path[i] == want[i]) {
+        i++;
+    }
+    return want[i] == '\0' && path[i] == '\0';
+}
+
 static int64_t sys_newfstatat(struct trapframe *tf) {
     char path[OPEN_MAX_PATH];
     uint8_t out[STAT_BYTES] = {0};
@@ -1195,6 +1230,16 @@ static int64_t sys_newfstatat(struct trapframe *tf) {
         nlink = 1u;
     } else {
         rc = xfsmount_stat_full(path, &mode, &size, &nlink);
+        if (rc == KERR_NOENT && is_synthesised_resolv(path)) {
+            /* **The resolver's file answers a stat too**, as /proc's do:
+             * it opened and read fine, but Go's resolver stats it first and,
+             * told it does not exist, asked [::1]:53 — so no name resolved on
+             * a card-booted board, and its clock could never be set. */
+            mode = 0100644u;
+            size = fdobjects_resolv_bytes();
+            nlink = 1u;
+            rc = KERR_OK;
+        }
         if (rc != KERR_OK) {
             return rc;
         }
@@ -1367,11 +1412,41 @@ static int64_t sys_mkdirat(struct trapframe *tf) {
     return rc != KERR_OK ? rc : xfsmount_mkdir_p(path);
 }
 
+/* AT_REMOVEDIR: unlinkat removes a directory only when asked to. */
+#define AT_REMOVEDIR_FLAG 0x200u
+
+/* Why `path` may not be removed the way `flags` asks: **EISDIR for a
+ * directory without AT_REMOVEDIR, ENOTDIR for anything else with it**, as
+ * Linux answers. Go's `os.RemoveAll` unlinks first and recurses only on
+ * EISDIR; this used to remove a directory whatever was asked and answer
+ * ENOTEMPTY for a full one, so RemoveAll gave up and removed nothing. */
+static int unlink_kind_refusal(const char *path, uint32_t flags) {
+    uint32_t mode = 0, nlink = 0;
+    uint64_t size = 0;
+    bool dir;
+    if (flags & ~AT_REMOVEDIR_FLAG) {
+        return KERR_INVAL;
+    }
+    if (xfsmount_stat_full(path, &mode, &size, &nlink) != KERR_OK) {
+        return KERR_OK; /* the unlink itself says what is wrong */
+    }
+    dir = (mode & 0170000u) == 0040000u;
+    if (dir && (flags & AT_REMOVEDIR_FLAG) == 0) {
+        return KERR_ISDIR;
+    }
+    return !dir && (flags & AT_REMOVEDIR_FLAG) != 0 ? KERR_NOTDIR : KERR_OK;
+}
+
 static int64_t sys_unlinkat(struct trapframe *tf) {
     char path[OPEN_MAX_PATH];
     int rc = copy_in_path_at(tf, 0, 1, path);
+    rc = rc != KERR_OK ? rc : unlink_kind_refusal(path, (uint32_t)sysarg(tf, 2));
     rc = rc != KERR_OK ? rc : perm_may_change_entry(path);
-    return rc != KERR_OK ? rc : fdobjects_unlink(path);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    return ((uint32_t)sysarg(tf, 2) & AT_REMOVEDIR_FLAG) != 0 ? xfsmount_rmdir_path(path)
+                                                               : fdobjects_unlink(path);
 }
 
 /* A NUL-terminated user string of fewer than `room` bytes, into out.
@@ -1460,9 +1535,19 @@ static int copy_in_mount_data(virt_t at, char *out, uint32_t room) {
     return at == 0 ? KERR_OK : copy_in_string(at, out, room);
 }
 
+/* MS_RDONLY, the one mount flag read. */
+#define MOUNT_FLAG_RDONLY 1u
+
+/* A source naming a block volume: "/dev/<name>", as on Linux. */
+static bool is_device_source(const char *source) {
+    return source[0] == '/' && source[1] == 'd' && source[2] == 'e' && source[3] == 'v' &&
+           source[4] == '/' && source[5] != '\0';
+}
+
 /* mount(source, target, fstype, flags, data): `CAP_SYS_ADMIN`, as on Linux.
- * The flags are not read; the data is handed to the type (an overlay's
- * layers). */
+ * A `/dev/<volume>` source is a block volume (`volumes_mount_named`, which
+ * reads MS_RDONLY); anything else goes to the type's hook with its data (an
+ * overlay's layers, a netfs server). */
 static int64_t sys_mount(struct trapframe *tf) {
     char source[MOUNT_ARG_MAX], fstype[MOUNT_ARG_MAX], target[OPEN_MAX_PATH];
     char *data;
@@ -1475,8 +1560,12 @@ static int64_t sys_mount(struct trapframe *tf) {
     rc = rc != KERR_OK ? rc : copy_in_path(tf, 1, target);
     rc = rc != KERR_OK ? rc : copy_in_string(sysarg(tf, 2), fstype, sizeof fstype);
     rc = rc != KERR_OK ? rc : copy_in_mount_data(sysarg(tf, 4), data, MOUNT_DATA_MAX);
-    rc = rc != KERR_OK ? rc : (mount_hook != NULL ? mount_hook(fstype, source, target, data)
-                                                  : KERR_NODEV);
+    if (rc == KERR_OK && is_device_source(source)) {
+        rc = volumes_mount_named(source + 5, target, fstype,
+                                 (sysarg(tf, 3) & MOUNT_FLAG_RDONLY) != 0);
+    } else if (rc == KERR_OK) {
+        rc = mount_hook != NULL ? mount_hook(fstype, source, target, data) : KERR_NODEV;
+    }
     kfree(data);
     return rc;
 }
@@ -1490,7 +1579,10 @@ static int64_t sys_umount2(struct trapframe *tf) {
         return KERR_PERM;
     }
     rc = copy_in_path(tf, 0, target);
-    return rc != KERR_OK ? rc : vfs_umount(target);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    return volumes_is_mount_point(target) ? volumes_umount(target) : vfs_umount(target);
 }
 
 /* readlinkat(dirfd, path, buf, bufsiz).
@@ -1604,6 +1696,15 @@ static int64_t sys_fstat(struct trapframe *tf) {
     if (fdobjects_stat_of(fd, &mode, &real_size, &nlink, &ino) == KERR_OK) {
         return put_fstat(sysarg(tf, 1), mode, real_size, nlink, ino);
     }
+    {
+        /* **A generated file is a regular file to fstat too.** It answered
+         * EBADF, and Go's resolver, which fstats the file it opened, then
+         * took its defaults ([::1]:53): no name resolved on the board. */
+        bool resolver = false;
+        if (fdobjects_snapshot_len(fd, &real_size, &resolver)) {
+            return put_fstat(sysarg(tf, 1), resolver ? 0100644u : 0100444u, real_size, 1u, ino);
+        }
+    }
     if (fdobjects_file_of(fd) == NULL) {
         return KERR_BADF;
     }
@@ -1655,6 +1756,27 @@ static int64_t sys_fchmodat(struct trapframe *tf) {
     rc = copy_in_path_at(tf, 0, 1, path);
     rc = rc != KERR_OK ? rc : perm_may_chmod(path);
     return rc != KERR_OK ? rc : xfsmount_chmod_path(path, (uint32_t)sysarg(tf, 2));
+}
+
+/* fchmod(fd, mode): fchmodat's check and change, on the path the
+ * descriptor was opened from. Go's `File.Chmod` is this call; without it a
+ * program that tightens a file it just created (a key, a config written
+ * 0600) failed with ENOSYS. `EBADF` for a descriptor with no path. */
+static int64_t sys_fchmod(struct trapframe *tf) {
+    const char *path = fdobjects_file_path((int32_t)sysarg(tf, 0));
+    char copy[OPEN_MAX_PATH];
+    uint32_t i = 0;
+    int rc;
+    if (path == NULL) {
+        return KERR_BADF;
+    }
+    while (path[i] != '\0' && i + 1u < sizeof copy) {
+        copy[i] = path[i];
+        i++;
+    }
+    copy[i] = '\0';
+    rc = perm_may_chmod(copy);
+    return rc != KERR_OK ? rc : xfsmount_chmod_path(copy, (uint32_t)sysarg(tf, 1));
 }
 
 static int64_t sys_fchownat(struct trapframe *tf) {
@@ -2757,6 +2879,7 @@ static const struct syscall_entry table[] = {
     {SYS_MPROTECT, "mprotect", sys_mprotect},
     {SYS_MADVISE, "madvise", sys_madvise},
     {SYS_CLOCK_GETTIME, "clock_gettime", sys_clock_gettime},
+    {112u, "clock_settime", sys_clock_settime},
     {SYS_GETRANDOM, "getrandom", sys_getrandom},
     {SYS_GETPID, "getpid", sys_getpid},
     {SYS_GETTID, "gettid", sys_gettid},
@@ -2802,6 +2925,7 @@ static const struct syscall_entry table[] = {
     {37u, "linkat", sys_linkat},
     {78u, "readlinkat", sys_readlinkat},
     {276u, "renameat2", sys_renameat2},
+    {52u, "fchmod", sys_fchmod},
     {53u, "fchmodat", sys_fchmodat},
     {62u, "lseek", sys_lseek},
     {SYS_PREAD64, "pread64", sys_pread64},

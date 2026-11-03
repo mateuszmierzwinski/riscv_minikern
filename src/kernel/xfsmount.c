@@ -229,6 +229,10 @@ static uint32_t create_permissions(uint32_t base) {
     return base & ~mask & 07777u;
 }
 
+uint32_t xfsmount_create_permissions(uint32_t base) {
+    return create_permissions(base);
+}
+
 /* The XFS volume a path is on, and the path inside it.
  *
  * NULL for a path on a FAT volume, which `volumes_resolve` marks by leaving
@@ -364,11 +368,16 @@ int xfsmount_stat(const char *path, uint32_t *uid, uint32_t *gid, uint32_t *mode
         return other_stat(m, in, uid, gid, mode);
     }
     struct xfs_inode ip;
+    const char *within = path;
+    /* **The volume the path is on**, not the root filesystem: a file on
+     * a second XFS volume (`/volumes/DATA/x`) was looked for on the root,
+     * so it could be listed but not opened for reading. */
+    struct xfs *vol = owner_of(path, &within);
     int rc;
-    if (!mounted) {
+    if (vol == NULL) {
         return KERR_NODEV;
     }
-    rc = xfs_path_lookup(&fs, path, &ip);
+    rc = xfs_path_lookup(vol, within, &ip);
     if (rc != KERR_OK) {
         return rc;
     }
@@ -775,7 +784,19 @@ int xfsmount_unlink(const char *name) {
  * which is exactly what is wanted for clearing it. A *correct* directory is
  * refused by `xfs_unlink` with `EISDIR`, which is right: removing one is
  * `rmdir`, and this is not it. */
+static int remove_path(const char *path, bool directory);
+
 int xfsmount_unlink_path(const char *path) {
+    return remove_path(path, false);
+}
+
+/* rmdir(2) by path: the XFS directory must be empty (`xfs_rmdir`); another
+ * filesystem's unlink removes an empty directory itself. */
+int xfsmount_rmdir_path(const char *path) {
+    return remove_path(path, true);
+}
+
+static int remove_path(const char *path, bool directory) {
     const char *in = NULL;
     const struct vfs_mount *m = vfs_resolve(path, &in);
     if (m != NULL) {
@@ -784,7 +805,7 @@ int xfsmount_unlink_path(const char *path) {
     struct xfs_inode dir;
     const char *within = path;
     struct xfs *vol = owner_of(path, &within);
-    char parent[128];
+    char parent[256];
     uint32_t cut = 0, n = 0;
     int rc;
     if (vol == NULL) {
@@ -810,7 +831,8 @@ int xfsmount_unlink_path(const char *path) {
     if (rc != KERR_OK) {
         return rc;
     }
-    rc = xfs_unlink(vol, &dir, within + cut + 1u, n - cut - 1u, now_seconds());
+    rc = directory ? xfs_rmdir(vol, &dir, within + cut + 1u, n - cut - 1u, now_seconds())
+                   : xfs_unlink(vol, &dir, within + cut + 1u, n - cut - 1u, now_seconds());
     return rc != KERR_OK ? rc : xfs_flush(vol);
 }
 
@@ -877,7 +899,7 @@ int xfsmount_mkdir_p(const char *path) {
     struct xfs_inode here;
     const char *within = path;
     struct xfs *vol = owner_of(path, &within);
-    char so_far[128];
+    char so_far[256];
     uint32_t at = 0;
     int rc;
     if (vol == NULL) {
@@ -1126,7 +1148,7 @@ int xfsmount_symlink(const char *path, const char *target) {
     struct xfs_inode dir;
     const char *within = path;
     struct xfs *vol = owner_of(path, &within);
-    char dirpath[128];
+    char dirpath[256];
     const char *leaf = NULL;
     uint32_t namelen = 0;
     uint32_t targetlen = 0;
@@ -1209,7 +1231,7 @@ int xfsmount_link_path(const char *from, const char *to) {
     const char *towithin = to;
     struct xfs *fromvol = owner_of(from, &fromwithin);
     struct xfs *tovol = owner_of(to, &towithin);
-    char dirpath[128];
+    char dirpath[256];
     const char *leaf = NULL;
     uint32_t namelen = 0;
     int rc;
@@ -1303,8 +1325,8 @@ int xfsmount_rename_path(const char *from, const char *to) {
     const char *towithin = to;
     struct xfs *fromvol = owner_of(from, &fromwithin);
     struct xfs *tovol = owner_of(to, &towithin);
-    char fromdir[128];
-    char todir[128];
+    char fromdir[256];
+    char todir[256];
     const char *fromleaf = NULL;
     const char *toleaf = NULL;
     uint32_t fromlen = 0;

@@ -88,6 +88,7 @@
 #include "drivers/spi_pl022.h"
 #include "drivers/dwmac_probe.h"
 #include "kernel/volumes.h"
+#include "core/vfs.h"
 #include "lib/sha256.h"
 #include "kernel/probe.h"
 #include "kernel/xfsmount.h"
@@ -687,6 +688,7 @@ static void bring_up_storage(uint64_t dtb) {
     size_t kindlen = 0;
     const char *kind = cmdline_value(boot_cmdline, "minikern.disk", &kindlen);
     dwmmc_set_trace(cmdline_has(boot_cmdline, "minikern.mmctrace"));
+    dwmmc_set_single_writes(cmdline_has(boot_cmdline, "minikern.sdsinglewrites"));
     /* `minikern.sdhs=0`: default speed, the control for high-speed mode. */
     dwmmc_allow_high_speed(cmdline_number(boot_cmdline, "minikern.sdhs", 1u) != 0);
     if (netboot_root(dtb)) {
@@ -811,6 +813,8 @@ static void list_the_volumes(void) {
  * RAM disk by a test still mounts it by hand. Automount is what a machine
  * does when nobody told it anything. */
 static void automount_the_disk(void) {
+    volumes_set_busy_check(fdobjects_open_under); /* umount2's EBUSY */
+    vfs_set_claim(volumes_xfs_claim);             /* an XFS volume under a vfs mount wins */
     (void)volumes_automount();
 }
 

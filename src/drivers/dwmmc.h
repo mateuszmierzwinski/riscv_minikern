@@ -43,6 +43,11 @@ int dwmmc_init(const struct fdt *fdt, struct blockdev *out);
  * faults that an `EIO` makes indistinguishable. */
 void dwmmc_set_trace(bool on);
 
+/* `minikern.sdsinglewrites`: write one block per command (CMD24), as before
+ * multi-block writes — the control a write-speed or write-integrity
+ * question is judged against. */
+void dwmmc_set_single_writes(bool on);
+
 /* Installs the handler and unmasks the device but keeps the wait polled —
  * for telling "unmasking storms" apart from "the wait is wrong". */
 void dwmmc_arm_only(bool on);

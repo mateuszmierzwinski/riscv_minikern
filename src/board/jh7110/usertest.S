@@ -579,7 +579,7 @@ user_hostile_start:
     ori     s1, s1, 64
 7:
     /* 8: the calls added since — `getresuid` writing its three ids into
-     * the kernel, and `clock_nanosleep` reading its request from it, at
+     * the kernel, `clock_nanosleep` and `clock_settime` reading theirs from it, at
      * the address the kernel now actually runs at (its top-half text).
      * They share bit 128: the status is eight bits wide. */
     li      a0, 0xffffffc000200000
@@ -593,6 +593,11 @@ user_hostile_start:
     li      a2, 0xffffffc000200000
     li      a3, 0
     li      a7, 115              /* clock_nanosleep */
+    ecall
+    bgez    a0, 81f
+    li      a0, 0                /* CLOCK_REALTIME: clock_settime reading its */
+    li      a1, 0xffffffc000200000 /* time from the kernel's text (2026-11-03) */
+    li      a7, 112              /* clock_settime */
     ecall
     bgez    a0, 81f
     j       8f

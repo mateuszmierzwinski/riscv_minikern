@@ -81,6 +81,12 @@ int vfs_resolve_pair(const char *from, const char *to, const struct vfs_mount **
 uint32_t vfs_count(void);
 const struct vfs_mount *vfs_at(uint32_t i);
 
+/* Installs who else mounts at paths: `claim(path)` is the length of the
+ * longest mount point another table has for `path` (0 for none). A path
+ * such a mount covers more closely than any here is not answered here —
+ * `vfs_resolve` returns NULL and the caller asks that table. */
+void vfs_set_claim(uint32_t (*claim)(const char *path));
+
 /* Empties the table (the host tests). */
 void vfs_reset(void);
 

@@ -122,8 +122,92 @@ void bcache_dirty(struct bbuf *b) {
     b->dirty = true;
 }
 
+void bcache_set_gather(struct bcache *c, void *mem, uint32_t slots) {
+    c->gather = mem;
+    c->gather_slots = mem != NULL ? slots : 0u;
+}
+
+/* The dirty slot holding block lba, or NULL. */
+static struct bbuf *dirty_at(struct bcache *c, uint64_t lba) {
+    struct bbuf *b = find(c, lba);
+    return b != NULL && b->dirty ? b : NULL;
+}
+
+/* The dirty slot with the lowest block number at or above `from`, or NULL. */
+static struct bbuf *lowest_dirty_from(struct bcache *c, uint64_t from) {
+    struct bbuf *best = NULL;
+    for (uint32_t i = 0; i < c->nslots; i++) {
+        struct bbuf *b = &c->slots[i];
+        if (b->valid && b->dirty && b->lba >= from && (best == NULL || b->lba < best->lba)) {
+            best = b;
+        }
+    }
+    return best;
+}
+
+/* How many consecutive dirty blocks start at `first`, up to the gather size. */
+static uint32_t run_length(struct bcache *c, const struct bbuf *first) {
+    uint32_t n = 1;
+    while (n < c->gather_slots && dirty_at(c, first->lba + n) != NULL) {
+        n++;
+    }
+    return n;
+}
+
+/* Writes `n` consecutive dirty blocks from `lba` with one device call,
+ * through the gather buffer, and leaves them clean. */
+static int write_run(struct bcache *c, uint64_t lba, uint32_t n) {
+    uint32_t bs = c->dev->block_size;
+    int rc;
+    for (uint32_t i = 0; i < n; i++) {
+        copy_bytes(c->gather + (uint64_t)i * bs, dirty_at(c, lba + i)->data, bs);
+    }
+    rc = c->dev->write(c->dev->self, lba, n, c->gather);
+    for (uint32_t i = 0; rc == KERR_OK && i < n; i++) {
+        dirty_at(c, lba + i)->dirty = false;
+        c->writebacks++;
+    }
+    return rc;
+}
+
+/* A run that failed, block by block: what still fails **stays dirty**, as a
+ * single-block flush leaves it, so nothing is dropped; the first error is
+ * returned. */
+static int write_singly(struct bcache *c, uint64_t lba, uint32_t n) {
+    int first = KERR_OK;
+    for (uint32_t i = 0; i < n; i++) {
+        struct bbuf *b = dirty_at(c, lba + i);
+        int rc = b != NULL ? write_back(c, b) : KERR_OK;
+        first = first == KERR_OK ? rc : first;
+    }
+    return first;
+}
+
+/* Every dirty block written back, consecutive ones together, in block
+ * order; each run is visited once, so a failing one is not retried here. */
+static int flush_runs(struct bcache *c) {
+    int first = KERR_OK;
+    uint64_t from = 0;
+    struct bbuf *b;
+    while ((b = lowest_dirty_from(c, from)) != NULL) {
+        uint64_t lba = b->lba;
+        uint32_t n = run_length(c, b);
+        int rc = write_run(c, lba, n);
+        if (rc != KERR_OK) {
+            rc = write_singly(c, lba, n);
+        }
+        first = first == KERR_OK ? rc : first;
+        from = lba + n;
+    }
+    return first;
+}
+
 int bcache_flush(struct bcache *c) {
     int first = KERR_OK;
+    if (c->gather != NULL && c->gather_slots > 1u) {
+        first = flush_runs(c);
+        return first != KERR_OK || c->dev->read_only ? first : c->dev->flush(c->dev->self);
+    }
     for (uint32_t i = 0; i < c->nslots; i++) {
         struct bbuf *b = &c->slots[i];
         int rc = b->valid && b->dirty ? write_back(c, b) : KERR_OK;

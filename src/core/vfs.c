@@ -94,6 +94,14 @@ static uint32_t covers(const struct vfs_mount *m, const char *path) {
     return i == m->at_len && (path[i] == '\0' || path[i] == '/') ? i : 0u;
 }
 
+/* Who else mounts filesystems at paths: the kernel's volume table (XFS
+ * volumes live there, not here). NULL: nobody. */
+static uint32_t (*claimed)(const char *path);
+
+void vfs_set_claim(uint32_t (*claim)(const char *path)) {
+    claimed = claim;
+}
+
 const struct vfs_mount *vfs_resolve(const char *path, const char **within) {
     const struct vfs_mount *best = NULL;
     uint32_t best_len = 0;
@@ -106,6 +114,14 @@ const struct vfs_mount *vfs_resolve(const char *path, const char **within) {
             best = &table[i];
             best_len = len;
         }
+    }
+    /* **A longer mount elsewhere wins.** With netfs as `/`, an XFS volume
+     * mounted at /volumes/DATA was answered by the netfs server — an empty
+     * directory on the workstation — because this table matched `/` and the
+     * volume table was never asked. A tie stays here: `/` on netfs over the
+     * card's own root is what a netroot boot means. */
+    if (best != NULL && claimed != NULL && claimed(path) > best_len) {
+        return NULL;
     }
     if (best != NULL) {
         const char *rest = best->at_len == 1u ? path : path + best_len;

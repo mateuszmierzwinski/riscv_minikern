@@ -36,6 +36,11 @@
  * Called from the composition root, before anything timestamps anything. */
 void wallclock_set_epoch(uint64_t unix_seconds);
 
+/* Sets the clock to `unix_ns` now: `clock_settime(CLOCK_REALTIME)`, which a
+ * time service (QuokkaOS's SNTP client) calls once it has asked the network.
+ * -EINVAL for a time before 2020, as the command line refuses one. */
+int wallclock_set_ns(uint64_t unix_ns);
+
 /* Whether a real epoch was given. A caller that must not act on a guessed
  * date — a quota grace period, say — asks this first. */
 bool wallclock_is_real(void);

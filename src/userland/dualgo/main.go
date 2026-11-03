@@ -4,7 +4,8 @@
 // peers, so this is what proves IPv4 still works through the mapping, and
 // that UDP and TCP reach the board over IPv6.
 //
-// It echoes, upper-cased, a UDP datagram on :7777 and a TCP line on :7778,
+// It echoes, upper-cased, a UDP datagram on :7777 (and on :7779 from an
+// AF_INET socket) and a TCP line on :7778,
 // printing each peer, until it has served the counts asked for on the
 // command line or a minute has passed.
 package main
@@ -20,7 +21,7 @@ import (
 )
 
 var (
-	udpWanted = flag.Int("udp", 2, "UDP datagrams to answer before exiting")
+	udpWanted = flag.Int("udp", 3, "UDP datagrams to answer before exiting")
 	tcpWanted = flag.Int("tcp", 2, "TCP connections to answer before exiting")
 	lifetime  = flag.Duration("for", time.Minute, "how long to wait for them")
 )
@@ -86,10 +87,18 @@ func main() {
 	if err != nil {
 		fail("Listen", err)
 	}
+	// An AF_INET socket, as a program asking for "udp4" gets: its sendto
+	// read an IPv4 address into a half-initialised struct and sent some
+	// replies down the IPv6 path (ENETUNREACH).
+	pc4, err := net.ListenPacket("udp4", ":7779")
+	if err != nil {
+		fail("ListenPacket udp4", err)
+	}
 	fmt.Printf("dual: udp %v (%s), tcp %v (%s)\n", pc.LocalAddr(), family(pc.LocalAddr()),
 		l.Addr(), family(l.Addr()))
 	udpDone, tcpDone := make(chan string), make(chan string)
 	go serveUDP(pc, udpDone)
+	go serveUDP(pc4, udpDone)
 	go serveTCP(l, tcpDone)
 	fmt.Println("dual: ready")
 	deadline := time.After(*lifetime)

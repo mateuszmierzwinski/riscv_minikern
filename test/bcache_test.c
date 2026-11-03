@@ -303,7 +303,64 @@ static void test_a_zeroed_get_does_not_read(void) {
     KTEST_CHECK(bcache_flush(&cache) == KERR_OK && ram.data[7u * BS] == 0);
 }
 
+/* Dirties blocks `lbas` (each filled with its own value + 100). */
+static void dirty_blocks(const uint64_t *lbas, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++) {
+        struct bbuf *b = NULL;
+        KTEST_CHECK(bcache_get(&cache, lbas[i], &b) == KERR_OK);
+        memset(b->data, (int)(lbas[i] + 100u), BS);
+        bcache_dirty(b);
+        bcache_put(&cache, b);
+    }
+}
+
+static uint8_t gather_mem[SLOTS * BS];
+
+/* A run of consecutive dirty blocks goes out in one write; a block apart
+ * in another; and the bytes are each block's own. */
+static void test_a_flush_writes_runs_together(void) {
+    const uint64_t lbas[] = {7, 5, 6, 12};
+    setup(false);
+    bcache_set_gather(&cache, gather_mem, SLOTS);
+    dirty_blocks(lbas, 4);
+    KTEST_CHECK(bcache_flush(&cache) == KERR_OK);
+    KTEST_CHECK(ram.writes == 2u); /* 5..7, then 12 */
+    for (uint32_t i = 0; i < 4; i++) {
+        KTEST_CHECK(ram.data[lbas[i] * BS] == (uint8_t)(lbas[i] + 100u));
+        KTEST_CHECK(ram.data[lbas[i] * BS + BS - 1u] == (uint8_t)(lbas[i] + 100u));
+    }
+    KTEST_CHECK(ram.data[8 * BS] == 8u); /* untouched between the runs */
+    KTEST_CHECK(cache.writebacks == 4u);
+}
+
+/* No gather buffer: one write per block, as before. */
+static void test_without_a_gather_buffer_one_write_per_block(void) {
+    const uint64_t lbas[] = {5, 6, 7};
+    setup(false);
+    dirty_blocks(lbas, 3);
+    KTEST_CHECK(bcache_flush(&cache) == KERR_OK);
+    KTEST_CHECK(ram.writes == 3u);
+}
+
+/* A run that fails is not dropped: its blocks stay dirty, the error is
+ * returned, and a later flush writes them. */
+static void test_a_failed_run_stays_dirty(void) {
+    const uint64_t lbas[] = {2, 3};
+    setup(false);
+    bcache_set_gather(&cache, gather_mem, SLOTS);
+    dirty_blocks(lbas, 2);
+    ram.fail_write = KERR_IO;
+    KTEST_CHECK(bcache_flush(&cache) == KERR_IO);
+    KTEST_CHECK(ram.data[2 * BS] == 2u && ram.data[3 * BS] == 3u);
+    ram.fail_write = KERR_OK;
+    KTEST_CHECK(bcache_flush(&cache) == KERR_OK);
+    KTEST_CHECK(ram.data[2 * BS] == 102u && ram.data[3 * BS] == 103u);
+}
+
 int main(void) {
+    KTEST_RUN(test_a_flush_writes_runs_together);
+    KTEST_RUN(test_without_a_gather_buffer_one_write_per_block);
+    KTEST_RUN(test_a_failed_run_stays_dirty);
     KTEST_RUN(test_init_checks_its_arguments);
     KTEST_RUN(test_a_second_read_is_free);
     KTEST_RUN(test_out_of_range_is_refused);

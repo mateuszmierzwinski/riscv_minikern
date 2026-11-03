@@ -10,10 +10,12 @@
 #include "core/caps.h"
 #include "core/vfs.h"
 #include "core/vma.h"
+#include "kernel/disk.h"
 #include "kernel/procfs.h"
 #include "kernel/sched.h"
 #include "kernel/synthfs.h"
 #include "kernel/uspace.h"
+#include "kernel/volumes.h"
 #include "kernel/wallclock.h"
 #include "lib/kfmt.h"
 
@@ -135,9 +137,85 @@ static uint32_t cpuinfo_file(char *out, uint32_t room) {
     return t.at;
 }
 
+/* A field of a /proc table: `-` when empty, and a space, tab, newline or
+ * backslash in it written as an octal escape (`\040`), as /proc/mounts does
+ * — so a label with a space cannot split one field into two. */
+static void put_field(struct text *t, const char *s) {
+    if (s == NULL || s[0] == '\0') {
+        put(t, "-");
+        return;
+    }
+    for (uint32_t i = 0; s[i] != '\0'; i++) {
+        char c = s[i];
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\\') {
+            put(t, "\\%03o", (unsigned)(uint8_t)c);
+        } else {
+            put(t, "%c", c);
+        }
+    }
+}
+
+static bool is_boot_volume(const struct volinfo *v, const char *at) {
+    return (at != NULL && at[0] == '/' && at[1] == 'b' && at[2] == 'o' && at[3] == 'o' &&
+            at[4] == 't' && at[5] == '\0') ||
+           (v->label[0] == 'B' && v->label[1] == 'O' && v->label[2] == 'O' && v->label[3] == 'T' &&
+            v->label[4] == '\0');
+}
+
+static bool is_root_mount(const char *at) {
+    return at != NULL && at[0] == '/' && at[1] == '\0';
+}
+
+/* One /proc/volumes line: name fstype label uuid bytes mountpoint flags. */
+static void put_volume(struct text *t, uint32_t i) {
+    const struct volinfo *v = disk_volume_info(i);
+    bool ro = false;
+    const char *at = volumes_mount_point_of(i, &ro);
+    bool boot = is_boot_volume(v, at), root = is_root_mount(at);
+    put_field(t, v->name);
+    put(t, " %s ", v->fstype);
+    put_field(t, v->label);
+    put(t, " ");
+    put_field(t, v->uuid);
+    put(t, " %llu ", (unsigned long long)v->bytes);
+    put_field(t, at);
+    put(t, " ");
+    if (at == NULL && !boot) {
+        put(t, "-\n");
+        return;
+    }
+    put(t, "%s%s%s\n", at == NULL ? "" : (ro ? "ro" : "rw"),
+        boot ? (at == NULL ? "boot" : ",boot") : "", root ? ",root" : "");
+}
+
+/* **Every volume on every disk**, mounted or not: what a storage server
+ * offers to mount. Volumes of disks other than the root's are listed with
+ * `-` for a mount point until `mount(2)` puts them somewhere. */
+static uint32_t volumes_file(char *out, uint32_t room) {
+    struct text t = {out, room, 0};
+    for (uint32_t i = 0; i < disk_volume_count(); i++) {
+        put_volume(&t, i);
+    }
+    return t.at;
+}
+
+/* The XFS volumes besides the root, which the vfs table below does not
+ * hold (the volumes table routes them): Linux's form, device first. */
+static void put_xfs_volume_mounts(struct text *t) {
+    for (uint32_t i = 0; i < disk_volume_count(); i++) {
+        const struct volinfo *v = disk_volume_info(i);
+        bool ro = false;
+        const char *at = volumes_mount_point_of(i, &ro);
+        if (at != NULL && !is_root_mount(at) && v->fstype[0] == 'x') {
+            put(t, "/dev/%s %s xfs %s 0 0\n", v->name, at, ro ? "ro" : "rw");
+        }
+    }
+}
+
 static uint32_t mounts_file(char *out, uint32_t room) {
     struct text t = {out, room, 0};
     put(&t, "ROOT / xfs rw 0 0\n");
+    put_xfs_volume_mounts(&t);
     for (uint32_t i = 0; i < vfs_count(); i++) {
         const struct vfs_mount *m = vfs_at(i);
         put(&t, "%s %s %s rw 0 0\n", m->ops->name, m->at, m->ops->name);
@@ -335,6 +413,7 @@ void procfiles_install(void) {
     (void)procfs_add("/proc/loadavg", loadavg_file);
     (void)procfs_add("/proc/cpuinfo", cpuinfo_file);
     (void)procfs_add("/proc/mounts", mounts_file);
+    (void)procfs_add("/proc/volumes", volumes_file);
     (void)procfs_add("/proc/version", version_file);
     (void)procfs_add("/sys/kernel/mm/transparent_hugepage/enabled", thp_enabled_file);
     (void)procfs_add("/sys/kernel/mm/transparent_hugepage/hpage_pmd_size", thp_size_file);

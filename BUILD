@@ -346,6 +346,26 @@ cc_test(
 )
 
 cc_test(
+    name = "vfs_test",
+    size = "small",
+    srcs = ["test/vfs_test.c"],
+    deps = [
+        ":ktest",
+        ":vfs",
+    ],
+)
+
+cc_test(
+    name = "volinfo_test",
+    size = "small",
+    srcs = ["test/volinfo_test.c"],
+    deps = [
+        ":ktest",
+        ":volinfo",
+    ],
+)
+
+cc_test(
     name = "partition_test",
     size = "small",
     srcs = ["test/partition_test.c"],
@@ -1138,6 +1158,17 @@ cc_library(
 )
 
 cc_library(
+    name = "volinfo",
+    srcs = ["src/core/volinfo.c"],
+    hdrs = ["src/core/volinfo.h"],
+    strip_include_prefix = "src",
+    deps = [
+        ":fat",
+        ":xfs",
+    ],
+)
+
+cc_library(
     name = "partition",
     srcs = ["src/core/partition.c"],
     hdrs = ["src/core/partition.h"],
@@ -1275,6 +1306,7 @@ cc_library(
         ":kernel_net",
         ":kernel_xfs",
         ":kernel_random",
+        ":kernel_volumes",
         ":klock",
         ":net",
         ":pgtable",
@@ -1472,8 +1504,10 @@ cc_library(
     deps = [
         ":klock",
         ":arch_riscv",
+        ":kernel_disk",
         ":kernel_procfs",
         ":kernel_uspace",
+        ":kernel_volumes",
         ":kernel_wallclock",
         ":kfmt",
         ":vfs",
@@ -1496,6 +1530,7 @@ cc_library(
         ":kernel_mem",
         ":partition",
         ":storage",
+        ":volinfo",
         ":xfs",
     ],
 )

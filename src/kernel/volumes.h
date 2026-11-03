@@ -76,6 +76,37 @@ const char *volumes_at(uint32_t i);
 const char *volumes_label(uint32_t i);
 bool volumes_readonly(uint32_t i);
 
+/* Where disk volume `vol` is mounted, and whether read-only; NULL when it
+ * is not mounted. */
+const char *volumes_mount_point_of(uint32_t vol, bool *readonly);
+
+/* **mount(2) of a block volume**: the disk volume called `name`
+ * ("nvme0n1p1") at `at`, which must be `/volumes/<one name>`.
+ *
+ * `fstype` must be what the volume is ("xfs", "vfat") or "auto". A volume
+ * already mounted, or a mount point taken, is KERR_BUSY; an unreadable or
+ * mismatched type KERR_INVAL; no such volume KERR_NOENT. `readonly` puts the
+ * volume behind a device that refuses every write — the filesystem cannot
+ * write even if it decides to. */
+int volumes_mount_named(const char *name, const char *at, const char *fstype, bool readonly);
+
+/* **umount2(2)**: takes the volume mounted at exactly `at` out of the
+ * table, after flushing it. KERR_BUSY for the root, for a mount this table
+ * only points at, and while the busy check says a file under `at` is open;
+ * KERR_INVAL when nothing is mounted there. */
+int volumes_umount(const char *at);
+
+/* Whether a block volume is mounted at exactly `at`. */
+bool volumes_is_mount_point(const char *at);
+
+/* Who answers "is a file under this mount point open?" — the descriptor
+ * tables, which live above this layer. */
+void volumes_set_busy_check(bool (*fn)(const char *at));
+
+/* The length of the longest XFS volume mount point covering `path` (1 for
+ * a volume at `/`), 0 for none — the vfs table's claim hook. */
+uint32_t volumes_xfs_claim(const char *path);
+
 /* Whether a path names the virtual `/volumes` directory itself. */
 bool volumes_is_the_dir(const char *path);
 

@@ -86,4 +86,21 @@ void irqwait_rearm(struct irqwait *w);
  * slower than the polling it replaced, and looks identical from outside. */
 void irqwait_counts(uint64_t *woken, uint64_t *timed_out);
 
+/* **One operation at a time on a device whose operations sleep.**
+ *
+ * A driver that waits for its interrupt lets the kernel lock go while it
+ * waits, so a second thread could start a command on the same controller
+ * in the middle of the first one's transfer — the SD card returned another
+ * read's bytes or timed out whenever three programs were loaded from it at
+ * once. `take` waits (sleeping when a thread can) while another holds the
+ * device; `give` lets the next one in. Both are called with the kernel lock
+ * held, which is what makes the test-and-set of `busy` one step. */
+struct irqwait_device {
+    volatile bool busy;
+    uint64_t waited; /* how many takes found it busy: contention, counted */
+};
+
+void irqwait_device_take(struct irqwait_device *d);
+void irqwait_device_give(struct irqwait_device *d);
+
 #endif /* MINIKERN_KERNEL_IRQWAIT_H */

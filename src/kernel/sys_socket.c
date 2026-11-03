@@ -118,8 +118,13 @@ static int get_addr(virt_t uaddr, uint32_t len, struct sock_addr *a) {
     if (uspace_copy_in(b, uaddr, len < sizeof b ? len : sizeof b) != KERR_OK) {
         return KERR_FAULT;
     }
+    /* **Every field, not only the two an IPv4 address has.** `sendto`'s
+     * address lives on the stack uninitialised, so a `v6` left as it was
+     * sent an IPv4 datagram down the IPv6 path whenever the stack held a
+     * nonzero byte there: `sendto` on an AF_INET UDP socket answered
+     * ENETUNREACH, run after run, for a peer on the link. */
+    *a = (struct sock_addr){0};
     if ((b[0] | (b[1] << 8)) == AF_UNSPEC) {
-        *a = (struct sock_addr){0};
         return KERR_OK;
     }
     if ((b[0] | (b[1] << 8)) != AF_INET) {
@@ -436,7 +441,7 @@ static int32_t recv_user(struct sock *s, virt_t ubuf, uint32_t n, struct sock_ad
 
 /* sendto(fd, buf, len, flags, addr, addrlen). */
 static int64_t sys_sendto(struct trapframe *tf) {
-    struct sock_addr to;
+    struct sock_addr to = {0};
     int err;
     struct sock *s = sock_fd((int32_t)sysarg(tf, 0), &err);
     if (s == NULL) {
@@ -531,7 +536,7 @@ static int get_first_iovec(const struct user_msghdr *m, virt_t *base, uint64_t *
  * passes and all a datagram socket here needs. */
 static int64_t sys_sendmsg(struct trapframe *tf) {
     struct user_msghdr m;
-    struct sock_addr to;
+    struct sock_addr to = {0};
     virt_t base = 0;
     uint64_t len = 0;
     int err;

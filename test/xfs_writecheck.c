@@ -1238,6 +1238,41 @@ static bool bigdir_has_second_free_block(struct xfs *fs, uint64_t dirino) {
            xfs_be32(fs->dirblock) == xfs_magic_for(fs, XFS_BLK_DIR_FREE);
 }
 
+/* rmdir: an empty short-form directory, a nested pair (the full one
+ * refused first), and a block directory emptied of 300 entries — each
+ * removed, with the parent's link count given back. xfs_repair judges. */
+static void step_rmdir(struct xfs *fs) {
+    struct xfs_inode root, dir;
+    uint64_t outer, inner, big;
+    char name[48];
+    read_inode(fs, fs->rootino, &root);
+    must(xfs_mkdir(fs, &root, "rmempty", 7u, NOW, &outer), "mkdir rmempty");
+    read_inode(fs, fs->rootino, &root);
+    must(xfs_rmdir(fs, &root, "rmempty", 7u, NOW), "rmdir an empty directory");
+    read_inode(fs, fs->rootino, &root);
+    must(xfs_mkdir(fs, &root, "rmouter", 7u, NOW, &outer), "mkdir rmouter");
+    read_inode(fs, outer, &dir);
+    must(xfs_mkdir(fs, &dir, "inner", 5u, NOW, &inner), "mkdir inner");
+    read_inode(fs, fs->rootino, &root);
+    if (xfs_rmdir(fs, &root, "rmouter", 7u, NOW) != KERR_NOTEMPTY) {
+        must(KERR_INVAL, "rmdir of a full directory must be ENOTEMPTY");
+    }
+    read_inode(fs, outer, &dir);
+    must(xfs_rmdir(fs, &dir, "inner", 5u, NOW), "rmdir inner");
+    read_inode(fs, fs->rootino, &root);
+    must(xfs_rmdir(fs, &root, "rmouter", 7u, NOW), "rmdir rmouter");
+    read_inode(fs, fs->rootino, &root);
+    must(xfs_mkdir(fs, &root, "rmbig", 5u, NOW, &big), "mkdir rmbig");
+    fill_directory(fs, big, 300u);
+    for (uint32_t i = 0; i < 300u; i++) {
+        read_inode(fs, big, &dir);
+        snprintf(name, sizeof name, "entry-with-a-long-name-%04u", i);
+        must(xfs_unlink(fs, &dir, name, (uint32_t)strlen(name), NOW), "unlink rmbig");
+    }
+    read_inode(fs, fs->rootino, &root);
+    must(xfs_rmdir(fs, &root, "rmbig", 5u, NOW), "rmdir an emptied block directory");
+}
+
 static void step_bigdir(struct xfs *fs) {
     struct xfs_inode root, dir;
     uint64_t dirino, ino;
@@ -1312,7 +1347,7 @@ static const struct step steps[] = {
     {"trim", step_trim},        {"eofzero", step_eofzero},  {"realtime", step_realtime},
     {"uncommitted", step_uncommitted}, {"bigfork", step_bigfork}, {"tallfork", step_tallfork}, {"manyattrs", step_manyattrs},
     {"linuxlog", step_linuxlog}, {"efi", step_efi},
-    {"bigdir", step_bigdir},
+    {"bigdir", step_bigdir}, {"rmdir", step_rmdir},
 };
 
 /* Runs the named steps, or every one when none is named. */

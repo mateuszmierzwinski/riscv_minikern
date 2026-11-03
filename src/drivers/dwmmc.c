@@ -106,6 +106,7 @@ static struct {
     /* Set once the card has been asked why a write failed, so the answer is
      * printed once per boot rather than once per refused block. */
     bool asked_why;
+    bool single_writes; /* minikern.sdsinglewrites: one CMD24 per block, the control */
     /* The next command carries data although its index is not one of the
      * four block commands: CMD6, whose index ACMD6 (no data) shares. */
     bool data_follows;
@@ -128,6 +129,10 @@ void dwmmc_arm_only(bool on) {
 
 void dwmmc_set_trace(bool on) {
     mmc.trace = on;
+}
+
+void dwmmc_set_single_writes(bool on) {
+    mmc.single_writes = on;
 }
 
 static void put(uint32_t off, uint32_t v) {
@@ -685,6 +690,48 @@ static int read_many(uint64_t lba, uint32_t count, uint8_t *to) {
     return rc;
 }
 
+/* Writes several blocks with **one command** (CMD25), the counterpart of
+ * `read_many`.
+ *
+ * Every block used to be its own CMD24 followed by a wait for the card to
+ * finish programming it: a 512-byte round trip to flash each time, measured
+ * at under 0.3 MB/s on the board — an 8 MiB upload to a file server took
+ * longer than its client would wait. A stream costs one command, one stop
+ * and one programming wait for all `count` blocks.
+ *
+ * The stop is sent whatever happened, as after a read, and the card is then
+ * waited for: it programs the stream after the stop, and the next command
+ * must not reach it in the `prg` state. Each block is copied into a word
+ * buffer first, because the FIFO takes words and the caller's buffer is
+ * const and need not be aligned. */
+static int write_many(uint64_t lba, uint32_t count, const uint8_t *from) {
+    uint32_t argument = mmc.card.high_capacity ? (uint32_t)lba : (uint32_t)(lba * SD_BLOCK_BYTES);
+    uint32_t words[SD_BLOCK_BYTES / 4u];
+    int rc = reset_fifo();
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    put(DW_BLKSIZ, SD_BLOCK_BYTES);
+    put(DW_BYTCNT, count * SD_BLOCK_BYTES);
+    rc = dw_command(NULL, CMD_WRITE_MULTIPLE, argument, SD_RESP_SHORT, NULL);
+    for (uint32_t i = 0; rc == KERR_OK && i < count; i++) {
+        const uint8_t *block = from + (size_t)i * SD_BLOCK_BYTES;
+        for (uint32_t b = 0; b < SD_BLOCK_BYTES; b++) {
+            ((uint8_t *)words)[b] = block[b];
+        }
+        rc = dw_move_block(NULL, false, words);
+    }
+    rc = rc != KERR_OK ? rc : wait_for_data_over();
+    {
+        int stop = dw_command(NULL, CMD_STOP_TRANSMISSION, 0, SD_RESP_BUSY, NULL);
+        rc = rc != KERR_OK ? rc : stop;
+    }
+    {
+        int ready = wait_until_ready_for_a_command();
+        return rc != KERR_OK ? rc : ready;
+    }
+}
+
 static int read_once(uint64_t lba, uint32_t count, void *buf) {
     return count == 1u ? one_block(true, lba, buf) : read_many(lba, count, buf);
 }
@@ -700,13 +747,36 @@ static int read_once(uint64_t lba, uint32_t count, void *buf) {
  * changes nothing on the card and another attempt is safe, and
  * `dwmmc_read_retries` keeps any future need for it visible. A partition table read once and believed
  * had turned the overrun into "this card has no partitions". */
+/* The controller, one operation at a time (irqwait.h says why). */
+static struct irqwait_device controller;
+
+static int read_blocks(uint64_t lba, uint32_t count, void *buf);
+static int write_blocks(uint64_t lba, uint32_t count, const void *buf);
+
 static int dw_read(void *self, uint64_t lba, uint32_t count, void *buf) {
     int rc;
     (void)self;
     if (count == 0) {
         return KERR_INVAL;
     }
-    rc = read_once(lba, count, buf);
+    irqwait_device_take(&controller);
+    rc = read_blocks(lba, count, buf);
+    irqwait_device_give(&controller);
+    return rc;
+}
+
+static int dw_write(void *self, uint64_t lba, uint32_t count, const void *buf) {
+    int rc;
+    (void)self;
+    irqwait_device_take(&controller);
+    rc = write_blocks(lba, count, buf);
+    irqwait_device_give(&controller);
+    return rc;
+}
+
+/* A read, retried: the controller is already this caller's. */
+static int read_blocks(uint64_t lba, uint32_t count, void *buf) {
+    int rc = read_once(lba, count, buf);
     /* Up to two more tries: one was not always enough — a boot on
      * 2026-10-28 failed a read twice running, and the partition table that
      * read was for went unseen. */
@@ -721,9 +791,11 @@ uint64_t dwmmc_read_retries(void) {
     return mmc.read_retries;
 }
 
-static int dw_write(void *self, uint64_t lba, uint32_t count, const void *buf) {
+static int write_blocks(uint64_t lba, uint32_t count, const void *buf) {
     const uint8_t *from = buf;
-    (void)self;
+    if (count > 1u && !mmc.single_writes) {
+        return write_many(lba, count, from);
+    }
     for (uint32_t i = 0; i < count; i++) {
         /* The block is copied because the transport writes words from a
          * mutable pointer; the caller's buffer is const. */

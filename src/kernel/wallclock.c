@@ -42,3 +42,16 @@ uint64_t wallclock_seconds(void) {
     }
     return epoch_seconds + (now - epoch_at_ns) / 1000000000ull;
 }
+
+int wallclock_set_ns(uint64_t unix_ns) {
+    uint64_t seconds = unix_ns / 1000000000ull;
+    if (seconds < 1577836800ull) {
+        return -22; /* EINVAL: the same plausibility floor as the command line's */
+    }
+    /* The epoch is kept as whole seconds at a counter value, so the counter
+     * value is moved back by the fraction: the clock then reads unix_ns now. */
+    epoch_seconds = seconds;
+    epoch_at_ns = timer_ns() - unix_ns % 1000000000ull;
+    have_epoch = true;
+    return 0;
+}

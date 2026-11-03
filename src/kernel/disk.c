@@ -9,6 +9,7 @@
 #include "arch/riscv/mmu.h"
 #include "core/errno.h"
 #include "drivers/nvme.h"
+#include "core/volinfo.h"
 #include "drivers/ramdisk.h"
 #include "drivers/pci.h"
 #include "drivers/sdhci.h"
@@ -47,11 +48,18 @@ static bool present;
  * presented device *points at* its partition wrapper and its scaler — a
  * device built on a caller's stack is a device whose innards are freed
  * while the mount is still reading through them. */
-static struct partdev vol_part[PARTITION_MAX];
-static struct blockscale vol_scale[PARTITION_MAX];
-static struct blockdev vol_over[PARTITION_MAX];
-static struct blockdev vol_dev[PARTITION_MAX];
+/* The root's disk comes first (its volumes keep the indices the root
+ * decision made), then every other disk's: up to three disks' tables. */
+#define VOLUME_SLOTS (PARTITION_MAX * 3u)
+
+static struct partdev vol_part[VOLUME_SLOTS];
+static struct blockscale vol_scale[VOLUME_SLOTS];
+static struct blockdev vol_over[VOLUME_SLOTS];
+static struct blockdev vol_dev[VOLUME_SLOTS];
+static struct volinfo vol_info[VOLUME_SLOTS];
 static uint32_t vol_count;
+/* How many of them are on the root's disk: those are mounted at boot. */
+static uint32_t root_disk_count;
 
 /* Which adapter is in use, so the boot log names the device rather than
  * merely its size. */
@@ -145,18 +153,28 @@ static uint32_t candidate_count;
 
 /* Attaches the next device `ways` can offer after position `*from`, into
  * the next candidate slot. False when none is left. */
-static bool attach_next(const struct fdt *fdt, uint32_t *from) {
+/* Which `ways` have a device attached: a controller is brought up once. */
+static bool way_attached[WAYS];
+
+static bool attach_next_of(const struct fdt *fdt, uint32_t *from, bool any_kind) {
     for (; *from < WAYS; (*from)++) {
         const struct attach_way *w = &ways[*from];
-        if (!allowed(w->kind) || w->init(fdt, &candidates[candidate_count]) != KERR_OK) {
+        if (way_attached[*from] || (!any_kind && !allowed(w->kind)) ||
+            w->init(fdt, &candidates[candidate_count]) != KERR_OK) {
             continue;
         }
+        way_attached[*from] = true;
         candidate_kind[candidate_count] = w->init == attach_sdhci ? sdhci_kind() : w->kind;
         candidate_count++;
         (*from)++;
         return true;
     }
     return false;
+}
+
+/* The next device of the kind the operator asked for (`minikern.disk=`). */
+static bool attach_next(const struct fdt *fdt, uint32_t *from) {
+    return attach_next_of(fdt, from, false);
 }
 
 /* Presents each partition (or the whole disk) as a block device of
@@ -166,10 +184,12 @@ static bool attach_next(const struct fdt *fdt, uint32_t *from) {
  * skipped rather than refused: one unusable partition on a disk must not
  * stop the others being mounted, which is the difference between automount
  * and the single-device path above. */
-static void present_volumes(uint32_t found) {
-    vol_count = 0;
-    for (uint32_t i = 0; i < found && i < PARTITION_MAX; i++) {
-        if (partition_wrap(&raw, &parts[i], &vol_part[vol_count], &vol_over[vol_count]) !=
+/* Appends one disk's volumes after those already presented, each named
+ * as Linux would name it (`base` plus its partition number). */
+static void present_disk(struct blockdev *dev, const struct partition *table, uint32_t found,
+                         const char *base) {
+    for (uint32_t i = 0; i < found && i < PARTITION_MAX && vol_count < VOLUME_SLOTS; i++) {
+        if (partition_wrap(dev, &table[i], &vol_part[vol_count], &vol_over[vol_count]) !=
             KERR_OK) {
             continue;
         }
@@ -177,12 +197,22 @@ static void present_volumes(uint32_t found) {
                             &vol_dev[vol_count]) != KERR_OK) {
             continue;
         }
+        volinfo_name(base, i + 1u, vol_info[vol_count].name);
         vol_count++;
     }
-    if (found == 0 &&
-        blockscale_wrap(&raw, FILESYSTEM_BLOCK, &vol_scale[0], &vol_dev[0]) == KERR_OK) {
-        vol_count = 1; /* a whole-disk filesystem, which is what a card is */
+    if (found == 0 && vol_count < VOLUME_SLOTS &&
+        blockscale_wrap(dev, FILESYSTEM_BLOCK, &vol_scale[vol_count], &vol_dev[vol_count]) ==
+            KERR_OK) {
+        volinfo_name(base, 0, vol_info[vol_count].name);
+        vol_count++; /* a whole-disk filesystem, which is what a card is */
     }
+}
+
+static const char *scanning_kind = "";
+
+static void present_volumes(uint32_t found) {
+    vol_count = 0;
+    present_disk(&raw, parts, found, volinfo_base(scanning_kind));
 }
 
 uint32_t disk_volume_count(void) {
@@ -236,6 +266,7 @@ bool disk_has_root(void) {
 static int scan_candidate(uint32_t c) {
     int rc = KERR_IO;
     raw = candidates[c];
+    scanning_kind = candidate_kind[c];
     for (uint32_t a = 0; rc == KERR_IO && a < DECIDING_READS; a++) {
         rc = partition_scan_checked(&raw, parts, PARTITION_MAX, &parts_found);
     }
@@ -282,12 +313,19 @@ static int take_first_if_xfs(uint8_t *page) {
  * drive while the kernel came off the card. With no `ROOT` anywhere, the
  * first device's first volume is used — the old rule, and what an unlabelled
  * card or a test image still relies on. */
+/* The next `ways` entry to try, kept so the disks after the root's can
+ * still be attached once the root is found; and which candidate it is on. */
+static uint32_t next_way;
+static uint32_t root_candidate;
+
 static int choose_root(const struct fdt *fdt, uint8_t *page) {
     uint32_t from = 0;
     while (attach_next(fdt, &from)) {
         uint32_t c = candidate_count - 1u;
         root_volume = look_for_root(c, page);
         if (root_volume < vol_count) {
+            next_way = from;
+            root_candidate = c;
             attached_kind = candidate_kind[c];
             kprintf("disk: the root is volume %u on %s, labelled ROOT\n", root_volume,
                     attached_kind);
@@ -301,6 +339,8 @@ static int choose_root(const struct fdt *fdt, uint8_t *page) {
      * the first device's volumes again, and what it found was thrown away —
      * so a first look spoiled by a failed read sent the machine to the FAT
      * partition while this one was reading `ROOT` right beside it. */
+    next_way = from;
+    root_candidate = 0;
     root_volume = look_for_root(0, page);
     attached_kind = candidate_kind[0];
     if (vol_count == 0) {
@@ -338,6 +378,90 @@ static int adopt_the_root(const struct fdt *fdt) {
     return KERR_OK;
 }
 
+/* Each other disk's partition table: kept, because its presented volumes
+ * point into it for as long as the kernel runs. */
+static struct partition other_parts[WAYS][PARTITION_MAX];
+
+/* **Every other disk the machine has**, after the root's: attached, its
+ * table read and its volumes presented — but not mounted. Automount takes
+ * the root's disk only; a second drive is listed (`/proc/volumes`) and
+ * mounted when somebody asks (`mount(2)`), because a drive put in a slot is
+ * not consent to have it written to. */
+static void present_other_disks(const struct fdt *fdt) {
+    uint32_t from = 0;
+    root_disk_count = vol_count;
+    /* **Every kind, whatever `minikern.disk=` asked for.** The preference
+     * chooses where the root comes from; it used to be the only disk
+     * attached, so a card-booted board (`minikern.disk=sd`) could not list
+     * its NVMe drive at all. Nothing here is mounted, so attaching it
+     * writes nothing; a kind already attached is skipped. */
+    while (attach_next_of(fdt, &from, true)) {
+    }
+    for (uint32_t c = 0; c < candidate_count; c++) {
+        uint32_t found = 0;
+        int rc = KERR_IO;
+        for (uint32_t a = 0; c != root_candidate && rc == KERR_IO && a < DECIDING_READS; a++) {
+            rc = partition_scan_checked(&candidates[c], other_parts[c], PARTITION_MAX, &found);
+        }
+        if (rc == KERR_OK) {
+            present_disk(&candidates[c], other_parts[c], found, volinfo_base(candidate_kind[c]));
+        }
+    }
+}
+
+/* What each presented volume is, from its first block, read once now: the
+ * listing and a mount by name answer from this rather than reading a disk
+ * that may be mounted and busy. */
+static void probe_volumes(void) {
+    phys_t page = 0;
+    uint8_t *p;
+    if (mem_alloc_pages(1, 1, &page) != KERR_OK) {
+        return;
+    }
+    p = (uint8_t *)mmu_phys_to_virt(page);
+    for (uint32_t i = 0; i < vol_count; i++) {
+        const struct blockdev *v = &vol_dev[i];
+        int rc = KERR_IO;
+        for (uint32_t a = 0; rc != KERR_OK && a < DECIDING_READS && v->block_size <= 4096u; a++) {
+            rc = v->read(v->self, 0, 1, p);
+        }
+        volinfo_probe(rc == KERR_OK ? p : NULL, v->block_size, &vol_info[i]);
+        vol_info[i].bytes = v->blocks * v->block_size;
+        vol_info[i].root_disk = i < root_disk_count;
+    }
+    (void)mem_free_pages(page, 1);
+}
+
+uint32_t disk_root_disk_count(void) {
+    return root_disk_count;
+}
+
+const struct volinfo *disk_volume_info(uint32_t i) {
+    return i < vol_count ? &vol_info[i] : NULL;
+}
+
+uint32_t disk_volume_named(const char *name) {
+    uint32_t i = 0;
+    while (i < vol_count && !volinfo_same(vol_info[i].name, name)) {
+        i++;
+    }
+    return i;
+}
+
+/* Whole pages for the cache to write runs of blocks through (bcache.h): the
+ * SD card programs a multi-block write once, so consecutive dirty blocks go
+ * together. 16 blocks of 4 KiB; without the memory the cache writes one at
+ * a time, as it always did. */
+#define GATHER_BLOCKS 16u
+
+void give_the_cache_a_gather_buffer(struct bcache *c, uint32_t block_size) {
+    uint32_t npages = (GATHER_BLOCKS * block_size + 4095u) / 4096u;
+    phys_t pages = 0;
+    if (mem_alloc_pages(npages, 1, &pages) == KERR_OK) {
+        bcache_set_gather(c, mmu_phys_to_virt(pages), GATHER_BLOCKS);
+    }
+}
+
 int disk_attach(const struct fdt *fdt) {
     void *mem;
     int rc;
@@ -354,6 +478,8 @@ int disk_attach(const struct fdt *fdt) {
     if (rc != KERR_OK) {
         return rc;
     }
+    present_other_disks(fdt);
+    probe_volumes();
     /* The filesystem's block over the controller's sector. A device whose
      * sector size does not divide it is refused rather than rounded: a
      * ratio that is not whole cannot be a block device. */
@@ -390,6 +516,7 @@ int disk_attach(const struct fdt *fdt) {
         (void)mem_free_pages(pages, npages);
         return rc;
     }
+    give_the_cache_a_gather_buffer(&cache, device.block_size);
     present = true;
     return KERR_OK;
 }

@@ -169,6 +169,9 @@ int xfsmount_write(const char *name, uint64_t off, const void *buf, uint32_t len
  * needs the file to fit in one allocation, which a test that fills an
  * allocation group deliberately does not. */
 int xfsmount_read_at(const char *name, uint64_t off, void *buf, uint32_t len);
+
+/* `base` with the calling process's umask applied: a create's mode. */
+uint32_t xfsmount_create_permissions(uint32_t base);
 /* Extended attributes of a file in the root directory. Names carry Linux's
  * namespace prefix (`user.`, `trusted.`, `security.`), which the filesystem
  * translates into the flag it stores. */
@@ -188,6 +191,9 @@ int xfsmount_unlink(const char *name);
  * refused (that is `rmdir`); one whose inode is broken is removed, which is
  * how a bad entry gets cleared. */
 int xfsmount_unlink_path(const char *path);
+
+/* Removes an empty directory by path (rmdir): KERR_NOTEMPTY when it is not. */
+int xfsmount_rmdir_path(const char *path);
 
 /* Makes a symbolic link at `path` holding `target`.
  *

@@ -394,34 +394,42 @@ static const struct file_ops random_ops = {.read = random_read, .write = null_wr
 
 /* ── a regular file ─────────────────────────────────────────────────────── */
 
-/* A file off the disk, read **whole** into the kernel's heap when it is
- * opened.
+/* A file off the disk, opened for reading: **its path, read where it is
+ * asked for**, and its bytes held whole only once something maps it.
  *
- * Not how a real kernel does it, and the reason is the filesystem
- * underneath: `xfsmount` reads a file by name, not a block of one by
- * offset, so there is nothing to be lazy with yet. What this buys is the
- * two things that were missing — a descriptor a program can `read`, and a
- * mapping that can be backed from a file — and what it costs is the file's
- * size in kernel memory for as long as the descriptor is open. The limit is
- * stated rather than discovered: a file larger than it will not open.
+ * It used to read the whole file into the kernel's heap at open, because
+ * `xfsmount` once read files only by name. It reads by offset now
+ * (`xfsmount_read_path_at`, what a read-write descriptor has used for
+ * SQLite), so a reader costs nothing until it reads, a file of any size
+ * opens, and a file server sending fifty photos at once does not hold fifty
+ * photos in kernel memory. A **mapping** still wants the file's bytes in
+ * memory (the fault path cannot sleep on a disk), so `mmap` loads them
+ * once, up to DISKFILE_MAX_BYTES, and reads then come from that copy, so a
+ * mapping and a read agree.
  *
- * It is read-only. Writing one needs the filesystem's write path, which is
- * `ROADMAP.md` §3's business. */
+ * Reads are live, as Linux's are: a file another descriptor writes is read
+ * as it is now, and its end is its size now. */
 #define DISKFILE_MAX_BYTES (16u * 1024u * 1024u)
+#define DISKFILE_PATH_MAX 256u
 
 struct diskfile {
-    uint8_t *bytes;
-    uint32_t size;
-    uint32_t offset; /* how much of it this descriptor has handed over */
-    bool used;       /* claimed before the read, which can sleep */
+    uint8_t *bytes;  /* NULL until a mapping asks; then the whole file */
+    uint32_t mapped_size;
+    uint64_t offset; /* how much of it this descriptor has handed over */
+    uint64_t identity; /* reclock_identity of the path, fstat's inode */
+    char path[DISKFILE_PATH_MAX];
+    bool orphan;     /* unlinked while open: removed at the last close */
+    bool used;       /* claimed before anything that can sleep */
 };
 
 static struct diskfile diskfiles[FD_MAX];
 
-/* A free slot, **claimed at once**: it was recognised by `bytes == NULL`,
- * which stays true across the read that fills it — and that read sleeps
- * (NVMe, netfs), so two opens took one slot and closing either freed the
- * other's bytes. */
+static int32_t read_path_bounced(const char *path, void *buf, uint32_t n, uint64_t at);
+static uint32_t writers_of(const char *path);
+static void copy_path(const char *from, char *to, uint32_t room);
+
+/* A free slot, **claimed at once**: the open that fills it can sleep
+ * (NVMe, netfs), and two opens must not take one slot. */
 static struct diskfile *diskfile_alloc(void) {
     for (uint32_t i = 0; i < FD_MAX; i++) {
         if (!diskfiles[i].used) {
@@ -432,22 +440,15 @@ static struct diskfile *diskfile_alloc(void) {
     return NULL;
 }
 
-static int32_t diskfile_read(struct file *f, void *buf, uint32_t n) {
-    struct diskfile *d = f->priv;
-    uint32_t left = d->size - d->offset;
-    uint32_t take = n < left ? n : left;
-    for (uint32_t i = 0; i < take; i++) {
-        ((uint8_t *)buf)[i] = d->bytes[d->offset + i];
+/* n bytes at `off` into the caller's buffer: from the mapped copy when
+ * there is one, otherwise from the file where it lies. */
+static int32_t diskfile_read_at(const struct diskfile *d, void *buf, uint32_t n, uint64_t off) {
+    uint32_t take;
+    if (d->bytes == NULL) {
+        return read_path_bounced(d->path, buf, n, off);
     }
-    d->offset += take;
-    return (int32_t)take;
-}
-
-/* A range of the snapshot, copied out rather than stored through: the
- * caller's buffer is only a number until the copy checks it. */
-static int32_t diskfile_pread(struct file *f, void *buf, uint32_t n, uint64_t off) {
-    const struct diskfile *d = f->priv;
-    uint32_t take = off >= d->size ? 0u : (d->size - off < n ? (uint32_t)(d->size - off) : n);
+    take = off >= d->mapped_size ? 0u
+                                 : (d->mapped_size - off < n ? (uint32_t)(d->mapped_size - off) : n);
     if (take == 0) {
         return 0;
     }
@@ -456,23 +457,50 @@ static int32_t diskfile_pread(struct file *f, void *buf, uint32_t n, uint64_t of
                : KERR_FAULT;
 }
 
-static void diskfile_release_buffer(struct diskfile *d) {
-    kfree_image(d->bytes);
-    *d = (struct diskfile){0};
+static int32_t diskfile_read(struct file *f, void *buf, uint32_t n) {
+    struct diskfile *d = f->priv;
+    int32_t got = diskfile_read_at(d, buf, n, d->offset);
+    d->offset += got > 0 ? (uint64_t)got : 0u;
+    return got;
+}
+
+static int32_t diskfile_pread(struct file *f, void *buf, uint32_t n, uint64_t off) {
+    return diskfile_read_at(f->priv, buf, n, off);
+}
+
+/* The file's size as it is now (the mapped copy's, once mapped). */
+static uint64_t diskfile_size(const struct diskfile *d) {
+    uint32_t mode = 0, nlink = 0;
+    uint64_t size = 0;
+    if (d->bytes != NULL) {
+        return d->mapped_size;
+    }
+    return xfsmount_stat_full(d->path, &mode, &size, &nlink) == KERR_OK ? size : 0u;
 }
 
 static void diskfile_release(struct file *f) {
-    diskfile_release_buffer(f->priv);
+    struct diskfile *d = f->priv;
+    bool remove = d->orphan;
+    char path[DISKFILE_PATH_MAX];
+    copy_path(d->path, path, sizeof path);
+    kfree_image(d->bytes);
+    *d = (struct diskfile){0};
+    if (remove && writers_of(path) == 0) {
+        (void)xfsmount_unlink_path(path); /* the last close of a removed file */
+    }
 }
 
 /* `FIONREAD` on a file: what is left after this descriptor's offset. */
 static int32_t diskfile_ioctl(struct file *f, uint32_t request, virt_t arg) {
     const struct diskfile *d = f->priv;
+    uint64_t size;
     uint32_t left;
     if (request != FIONREAD_REQ || d == NULL) {
         return KERR_NOTTY;
     }
-    left = d->size - d->offset;
+    size = diskfile_size(d);
+    left = size <= d->offset ? 0u : (size - d->offset > 0x7fffffffu ? 0x7fffffffu
+                                                                     : (uint32_t)(size - d->offset));
     return uspace_copy_out(arg, &left, sizeof left) == KERR_OK ? 0 : KERR_FAULT;
 }
 
@@ -480,12 +508,31 @@ static const struct file_ops diskfile_ops = {.read = diskfile_read, .ioctl = dis
                                              .release = diskfile_release,
                                              .pread = diskfile_pread};
 
-/* The bytes behind a descriptor, for a mapping to be backed from — and
- * `KERR_NODEV` for a descriptor that is not a file, which is `mmap`'s
+/* Reads the whole file into memory for a mapping, once. */
+static int diskfile_load(struct diskfile *d) {
+    uint8_t *bytes = NULL;
+    uint32_t size = 0;
+    int rc;
+    if (d->bytes != NULL) {
+        return KERR_OK;
+    }
+    rc = xfsmount_read_file(d->path, DISKFILE_MAX_BYTES, &bytes, &size);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    d->bytes = bytes;
+    d->mapped_size = size;
+    return KERR_OK;
+}
+
+/* The bytes behind a descriptor, for a mapping to be backed from — loaded
+ * now if they were not, which is why only `mmap` calls this (it may sleep)
+ * — and `KERR_NODEV` for a descriptor that is not a file, which is `mmap`'s
  * answer for a console or a socket. */
 int fdobjects_file_bytes(int32_t fd, const uint8_t **bytes, uint32_t *size) {
     struct file *f = fd_get(fd);
-    const struct diskfile *d;
+    struct diskfile *d;
+    int rc;
     if (f == NULL) {
         return KERR_BADF;
     }
@@ -493,8 +540,12 @@ int fdobjects_file_bytes(int32_t fd, const uint8_t **bytes, uint32_t *size) {
         return KERR_NODEV;
     }
     d = f->priv;
+    rc = diskfile_load(d);
+    if (rc != KERR_OK) {
+        return rc;
+    }
     *bytes = d->bytes;
-    *size = d->size;
+    *size = d->mapped_size;
     return KERR_OK;
 }
 
@@ -505,7 +556,8 @@ struct file *fdobjects_file_of(int32_t fd) {
 
 /* The same question asked of the object rather than a descriptor, which is
  * what a *mapping* has: it holds the file itself, precisely so that it does
- * not depend on a descriptor number that the program may have closed. */
+ * not depend on a descriptor number that the program may have closed. The
+ * fault path asks this and cannot sleep, so it never loads: `mmap` did. */
 int fdobjects_file_of_object(void *object, const uint8_t **bytes, uint32_t *size) {
     const struct file *f = object;
     const struct diskfile *d;
@@ -513,8 +565,11 @@ int fdobjects_file_of_object(void *object, const uint8_t **bytes, uint32_t *size
         return KERR_NODEV;
     }
     d = f->priv;
+    if (d->bytes == NULL) {
+        return KERR_NODEV;
+    }
     *bytes = d->bytes;
-    *size = d->size;
+    *size = d->mapped_size;
     return KERR_OK;
 }
 
@@ -526,9 +581,9 @@ int fdobjects_file_of_object(void *object, const uint8_t **bytes, uint32_t *size
  * is exactly where the owner/group/other bits mean something, and the mode
  * comes from the filesystem's own inode rather than from a guess. */
 static int open_directory(const char *path);
-static int open_for_writing(const char *path, uint32_t flags);
+static int open_for_writing(const char *path, uint32_t flags, uint32_t mode);
 
-static int open_regular(const char *path, uint32_t flags) {
+static int open_regular(const char *path, uint32_t flags, uint32_t create_mode) {
     uint32_t uid = 0, gid = 0, mode = 0;
     if ((flags & O_ACCMODE) != O_RDONLY) {
         /* **Re-enabled, and the evidence is worth keeping.**
@@ -554,7 +609,7 @@ static int open_regular(const char *path, uint32_t flags) {
          * **Decided before the file is looked for**, because the stat below
          * would otherwise fail with `ENOENT` on a file that does not exist
          * yet — the one case `O_CREAT` is for. */
-        return open_for_writing(path, flags);
+        return open_for_writing(path, flags, create_mode);
     }
     {
         /* **A directory is a different kind of descriptor.** It used to fall
@@ -569,8 +624,6 @@ static int open_regular(const char *path, uint32_t flags) {
             return open_directory(path);
         }
     }
-    uint8_t *bytes = NULL;
-    uint32_t size = 0;
     struct diskfile *d;
     struct file *f;
     int rc = xfsmount_stat(path, &uid, &gid, &mode);
@@ -580,21 +633,15 @@ static int open_regular(const char *path, uint32_t flags) {
     if (!uspace_may_access(uid, gid, mode, ACCESS_READ)) {
         return KERR_ACCES;
     }
-
     d = diskfile_alloc();
-    rc = d == NULL ? KERR_NOMEM : xfsmount_read_file(path, DISKFILE_MAX_BYTES, &bytes, &size);
-    if (rc != KERR_OK) {
-        if (d != NULL) {
-            d->used = false;
-        }
-        return rc;
+    if (d == NULL) {
+        return KERR_NOMEM;
     }
-    d->bytes = bytes;
-    d->size = size;
-    d->offset = 0;
+    copy_path(path, d->path, sizeof d->path);
+    d->identity = reclock_identity(path);
     f = file_new(&diskfile_ops, d, flags);
     if (f == NULL) {
-        diskfile_release_buffer(d);
+        *d = (struct diskfile){0};
         return KERR_NOMEM;
     }
     return fd_install(f);
@@ -627,7 +674,7 @@ static int open_regular(const char *path, uint32_t flags) {
  * a 16 MiB allocation per open descriptor and wedged the service after one
  * file. An offset-taking writer already existed in the mount layer; it was
  * only root-relative, which is the single reason it was not used. */
-#define WRITEFILE_PATH_MAX 128u
+#define WRITEFILE_PATH_MAX 256u
 
 struct writefile {
     char dir[WRITEFILE_PATH_MAX];
@@ -685,7 +732,7 @@ static void copy_path(const char *from, char *to, uint32_t room) {
 }
 
 /* How much of a write is staged in the kernel at once. */
-#define WRITE_BOUNCE 16384u
+#define WRITE_BOUNCE 65536u /* the cache's gather run (16 x 4 KiB): one card write per chunk */
 
 /* Writes n bytes of the caller's buffer at w's offset **through a kernel
  * copy**, a chunk at a time: a write over netfs sleeps while the reply
@@ -737,13 +784,13 @@ static int32_t writefile_write(struct file *f, const void *buf, uint32_t n) {
 /* Reads n bytes at `at` into the caller's buffer **through a kernel copy**,
  * for the reason `write_bounced` writes through one: the read can sleep on
  * the network, and the caller's mapping may be gone when it returns. */
-static int32_t read_bounced(const struct writefile *w, void *buf, uint32_t n, uint64_t at) {
+static int32_t read_path_bounced(const char *path, void *buf, uint32_t n, uint64_t at) {
     uint8_t *bounce = kzalloc(n < WRITE_BOUNCE ? (n == 0 ? 1u : n) : WRITE_BOUNCE);
     uint32_t done = 0;
     int rc = bounce == NULL ? KERR_NOMEM : KERR_OK;
     while (rc == KERR_OK && done < n) {
         uint32_t chunk = n - done < WRITE_BOUNCE ? n - done : WRITE_BOUNCE, got = 0;
-        rc = xfsmount_read_path_at(w->path, at + done, bounce, chunk, &got);
+        rc = xfsmount_read_path_at(path, at + done, bounce, chunk, &got);
         if (rc == KERR_OK && got > 0 &&
             uspace_copy_out((virt_t)(uintptr_t)buf + done, bounce, got) != KERR_OK) {
             rc = KERR_FAULT;
@@ -767,14 +814,14 @@ static int32_t writefile_read(struct file *f, void *buf, uint32_t n) {
     if (w == NULL || !w->readable) {
         return KERR_BADF;
     }
-    got = read_bounced(w, buf, n, w->offset);
+    got = read_path_bounced(w->path, buf, n, w->offset);
     w->offset += got > 0 ? (uint64_t)got : 0u;
     return got;
 }
 
 static int32_t writefile_pread(struct file *f, void *buf, uint32_t n, uint64_t off) {
     const struct writefile *w = f->priv;
-    return w == NULL || !w->readable ? KERR_BADF : read_bounced(w, buf, n, off);
+    return w == NULL || !w->readable ? KERR_BADF : read_path_bounced(w->path, buf, n, off);
 }
 
 /* `pwrite64`: at `off` and nowhere else — Linux ignores O_APPEND here only
@@ -803,6 +850,7 @@ static uint32_t writers_of(const char *path) {
     uint32_t n = 0;
     for (uint32_t i = 0; i < FD_MAX; i++) {
         n += writefiles[i].used && same_path(writefiles[i].path, path) ? 1u : 0u;
+        n += diskfiles[i].used && same_path(diskfiles[i].path, path) ? 1u : 0u;
     }
     return n;
 }
@@ -816,7 +864,9 @@ static void append_text(char *out, uint32_t *at, uint32_t room, const char *text
 }
 
 /* The hidden name `path` moves to: its directory, ".deleted-<n>". */
-static int orphan_name(const char *path, char out[WRITEFILE_PATH_MAX * 2u]) {
+/* noinline: its two halves and the caller's name must not share one frame. */
+__attribute__((noinline)) static int orphan_name(const char *path,
+                                                char out[WRITEFILE_PATH_MAX * 2u]) {
     char dir[WRITEFILE_PATH_MAX], leaf[WRITEFILE_PATH_MAX], number[12];
     uint32_t n = ++orphans_made, at = 0, d = sizeof number - 1u;
     if (split_path(path, dir, leaf) != KERR_OK) {
@@ -835,7 +885,7 @@ static int orphan_name(const char *path, char out[WRITEFILE_PATH_MAX * 2u]) {
 }
 
 /* Points every writer of `from` at `to`, marking them orphans. */
-static void follow_orphan(const char *from, const char *to) {
+__attribute__((noinline)) static void follow_orphan(const char *from, const char *to) {
     char was[WRITEFILE_PATH_MAX * 2u];
     copy_path(from, was, sizeof was);
     for (uint32_t i = 0; i < FD_MAX; i++) {
@@ -843,6 +893,10 @@ static void follow_orphan(const char *from, const char *to) {
         if (w->used && same_path(w->path, was) && split_path(to, w->dir, w->leaf) == KERR_OK) {
             copy_path(to, w->path, sizeof w->path);
             w->orphan = true;
+        }
+        if (diskfiles[i].used && same_path(diskfiles[i].path, was)) {
+            copy_path(to, diskfiles[i].path, sizeof diskfiles[i].path);
+            diskfiles[i].orphan = true;
         }
     }
 }
@@ -857,6 +911,13 @@ int fdobjects_unlink(const char *path) {
     rc = rc != KERR_OK ? rc : xfsmount_rename_path(path, hidden);
     if (rc == KERR_OK) {
         follow_orphan(path, hidden);
+    }
+    /* **The last holder may have closed during the rename**, which can
+     * sleep (netfs) and let the lock go: it was released before it was
+     * marked an orphan, so nothing would ever remove the hidden name — a
+     * `.deleted-N` left for good and its directory never empty again. */
+    if (rc == KERR_OK && writers_of(hidden) == 0) {
+        (void)xfsmount_unlink_path(hidden);
     }
     return rc;
 }
@@ -902,11 +963,12 @@ static const struct file_ops writefile_ops = {
 /* Whether `path` may be opened for writing with these flags: write
  * permission (perm.h), O_CREAT needed to create, O_EXCL refusing an
  * existing file, and no directories. */
-static int writable_open(const char *path, uint32_t flags) {
+static int writable_open(const char *path, uint32_t flags, bool *existed) {
     uint32_t mode = 0, nlink = 0;
     uint64_t size = 0;
     bool exists = false;
     int rc = perm_may_write(path, &exists);
+    *existed = exists;
     if (rc != KERR_OK) {
         return rc;
     }
@@ -931,10 +993,28 @@ static struct writefile *writefile_claim(void) {
     return NULL;
 }
 
-static int open_for_writing(const char *path, uint32_t flags) {
+/* **A new file gets the mode its creator asked for**, less the umask, as
+ * Linux's does. It used to get 0666 less the umask whatever was asked, so a
+ * key file a program created 0600 came out readable by everyone — a
+ * security property the program had stated and the kernel dropped. */
+static int apply_create_mode(const char *path, bool existed, uint32_t mode) {
+    uint32_t want = xfsmount_create_permissions(mode & 07777u);
+    int rc;
+    if (existed || want == xfsmount_create_permissions(0666u)) {
+        return KERR_OK; /* an existing file keeps its mode; 0666 is the default */
+    }
+    rc = xfsmount_chmod_path(path, want);
+    /* A filesystem that keeps no modes (FAT, at /boot) answers EPERM to a
+     * chmod: the file is created as that filesystem makes files, which is
+     * what Linux's vfat does with a create's mode too. */
+    return rc == KERR_PERM || rc == KERR_NOTSUP ? KERR_OK : rc;
+}
+
+static int open_for_writing(const char *path, uint32_t flags, uint32_t mode) {
     struct writefile *w;
     struct file *f;
-    int rc = writable_open(path, flags);
+    bool existed = false;
+    int rc = writable_open(path, flags, &existed);
     if (rc != KERR_OK) {
         return rc;
     }
@@ -945,6 +1025,7 @@ static int open_for_writing(const char *path, uint32_t flags) {
     rc = split_path(path, w->dir, w->leaf) != KERR_OK ? KERR_INVAL : KERR_OK;
     rc = rc != KERR_OK ? rc : xfsmount_write_at(w->dir, w->leaf, 0, NULL, 0);
     rc = rc != KERR_OK || (flags & O_TRUNC) == 0 ? rc : xfsmount_truncate_path(path, 0);
+    rc = rc != KERR_OK ? rc : apply_create_mode(path, existed, mode);
     f = rc == KERR_OK ? file_new(&writefile_ops, w, O_WRONLY) : NULL;
     if (f == NULL) {
         w->used = false;
@@ -974,7 +1055,7 @@ static int open_for_writing(const char *path, uint32_t flags) {
  * The path is kept because the filesystem resolves by name; there is no
  * inode handle to hold, and holding one would have to be invalidated by
  * every write. */
-#define DIRFILE_PATH_MAX 128u
+#define DIRFILE_PATH_MAX 256u
 
 struct dirfile {
     char path[DIRFILE_PATH_MAX];
@@ -1254,6 +1335,17 @@ static int fill_proc(const char *path, struct snapshot *snap, uint32_t room) {
     return procfs_generate(path, snap->text, room, &snap->len) == KERR_OK ? KERR_OK : KERR_NOENT;
 }
 
+uint32_t fdobjects_resolv_bytes(void) {
+    static union {
+        struct snapshot snap;
+        char room[sizeof(struct snapshot) + RESOLV_SNAPSHOT_BYTES];
+    } sizing;
+    sizing.snap.len = 0;
+    sizing.snap.offset = 0;
+    fill_resolv_snapshot(&sizing.snap);
+    return sizing.snap.len;
+}
+
 static int fill_resolv(const char *path, struct snapshot *snap, uint32_t room) {
     (void)path;
     (void)room;
@@ -1337,6 +1429,10 @@ static const struct file_ops *device_ops(const char *path) {
 }
 
 int fdobjects_open_path(const char *path, uint32_t flags) {
+    return fdobjects_open_path_mode(path, flags, 0666u);
+}
+
+int fdobjects_open_path_mode(const char *path, uint32_t flags, uint32_t mode) {
     const struct file_ops *ops = device_ops(path);
     const struct driver_device *driver = driver_device(path);
     struct file *f;
@@ -1358,11 +1454,11 @@ int fdobjects_open_path(const char *path, uint32_t flags) {
          * this kernel cannot see and must not override; the synthesised one
          * is for when there is none, which on a DHCP-configured machine
          * with a read-only root is every boot. */
-        int real = open_regular(path, flags);
+        int real = open_regular(path, flags, mode);
         return real >= 0 ? real
                          : open_snapshot(&resolv_ops, RESOLV_SNAPSHOT_BYTES, path, fill_resolv, flags);
     }
-    return open_regular(path, flags);
+    return open_regular(path, flags, mode);
 }
 
 /* ── a pipe ─────────────────────────────────────────────────────────────── */
@@ -1735,7 +1831,7 @@ static int seek_span(const struct file *f, int32_t fd, uint64_t *at, uint64_t *s
     if (f->ops == &diskfile_ops) {
         const struct diskfile *d = f->priv;
         *at = d->offset;
-        *size = d->size;
+        *size = diskfile_size(d);
     } else if (f->ops == &writefile_ops) {
         *at = ((const struct writefile *)f->priv)->offset;
         *size = written_size(fd);
@@ -1751,7 +1847,7 @@ static int seek_span(const struct file *f, int32_t fd, uint64_t *at, uint64_t *s
 /* Moves `f`'s position to `at`, wherever that kind keeps it. */
 static void seek_store(struct file *f, uint64_t at) {
     if (f->ops == &diskfile_ops) {
-        ((struct diskfile *)f->priv)->offset = (uint32_t)at;
+        ((struct diskfile *)f->priv)->offset = at;
     } else if (f->ops == &writefile_ops) {
         ((struct writefile *)f->priv)->offset = at;
     } else {
@@ -1847,6 +1943,12 @@ int fdobjects_identity_of(int32_t fd, uint64_t *identity) {
 int fdobjects_stat_of(int32_t fd, uint32_t *mode, uint64_t *size, uint32_t *nlink,
                       uint64_t *ino) {
     const struct writefile *w = writefile_of(fd);
+    struct file *f = fd_get(fd);
+    if (w == NULL && f != NULL && f->ops == &diskfile_ops) {
+        const struct diskfile *d = f->priv;
+        *ino = d->identity;
+        return xfsmount_stat_full(d->path, mode, size, nlink); /* never loads the file */
+    }
     if (w == NULL) {
         return KERR_BADF;
     }
@@ -1889,4 +1991,55 @@ const char *fdobjects_path_of(int32_t fd) {
     }
     joined[at] = '\0';
     return joined;
+}
+
+/* Whether `path` is `at` or lies beneath it. */
+static bool under_mount(const char *path, const char *at) {
+    uint32_t i = 0;
+    while (at[i] != '\0') {
+        if (path[i] != at[i]) {
+            return false;
+        }
+        i++;
+    }
+    return path[i] == '\0' || path[i] == '/';
+}
+
+/* Whether any descriptor holds a file or directory under mount point `at`:
+ * what makes umount2 answer EBUSY. */
+bool fdobjects_open_under(const char *at) {
+    for (uint32_t i = 0; i < FD_MAX; i++) {
+        if ((writefiles[i].used && under_mount(writefiles[i].path, at)) ||
+            (dirfiles[i].used && under_mount(dirfiles[i].path, at)) ||
+            (diskfiles[i].used && under_mount(diskfiles[i].path, at))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The path any file descriptor was opened from — a file being read or
+ * written, or a directory — for `fchmod`; NULL for anything else. */
+const char *fdobjects_file_path(int32_t fd) {
+    struct file *f = fd_get(fd);
+    if (f == NULL) {
+        return NULL;
+    }
+    if (f->ops == &diskfile_ops) {
+        return ((const struct diskfile *)f->priv)->path;
+    }
+    if (f->ops == &dirfile_ops) {
+        return ((const struct dirfile *)f->priv)->path;
+    }
+    return f->ops == &writefile_ops ? ((const struct writefile *)f->priv)->path : NULL;
+}
+
+bool fdobjects_snapshot_len(int32_t fd, uint64_t *len, bool *writable_by_owner) {
+    struct file *f = fd_get(fd);
+    if (f == NULL || (f->ops != &procfile_ops && f->ops != &resolv_ops)) {
+        return false;
+    }
+    *len = ((const struct snapshot *)f->priv)->len;
+    *writable_by_owner = f->ops == &resolv_ops;
+    return true;
 }

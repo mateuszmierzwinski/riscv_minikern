@@ -25,6 +25,7 @@ ways, and any of them will do), and the log of every case is kept
 under the output directory so a failure can be read rather than re-run.
 """
 import argparse
+import hashlib
 import os
 import re
 import secrets
@@ -1244,11 +1245,13 @@ def dual_stack_serves(out_dir):
     answers = [("udp over IPv4", echo_over(socket.AF_INET, (BOARD_AT, 7777), "udp", b"four")),
                ("udp over IPv6", echo_over(socket.AF_INET6, (link.group(1), 7777, 0, scope), "udp",
                                            b"six")),
+               ("udp over an AF_INET socket", echo_over(socket.AF_INET, (BOARD_AT, 7779), "udp",
+                                                        b"inet")),
                ("tcp over IPv4", echo_over(socket.AF_INET, (BOARD_AT, 7778), "tcp", b"mapped")),
                ("tcp over IPv6", echo_over(socket.AF_INET6, (link.group(1), 7778, 0, scope), "tcp",
                                            b"native"))]
     board.wait()
-    for (what, got), want in zip(answers, (b"FOUR", b"SIX", b"MAPPED", b"NATIVE")):
+    for (what, got), want in zip(answers, (b"FOUR", b"SIX", b"INET", b"MAPPED", b"NATIVE")):
         if got != want:
             missing.append(f"{what} answered {want!r}, got {got!r}")
     text = open(log, "rb").read().decode("utf-8", "replace")
@@ -1266,6 +1269,111 @@ NETROOT = os.path.expanduser("~/vf2/netroot")
 NETFS_AT = "192.168.86.119:8081"
 BOARD_AT = "192.168.86.247"
 BOARD_MAC = "6c:cf:39:00:b6:89"
+
+
+def stage_volgo():
+    """volgo's fixtures in the netfs root: a 20 MiB file (larger than the
+    kernel's whole-file limit) with its digest, and a 177-byte path."""
+    where = os.path.join(NETROOT, "volgo")
+    deep = os.path.join(where, "d" * 60, "e" * 60)
+    os.makedirs(deep, exist_ok=True)
+    with open(os.path.join(deep, "f" * 40 + ".txt"), "w") as f:
+        f.write("long\n")
+    big = os.urandom(20 * 1024 * 1024)
+    with open(os.path.join(where, "big.bin"), "wb") as f:
+        f.write(big)
+    with open(os.path.join(where, "big.bin.sha256"), "w") as f:
+        f.write(hashlib.sha256(big).hexdigest() + "\n")
+
+
+def volumes_serve(out_dir):
+    """**What a file server needs from storage** (§3, fssd): /proc/volumes
+    lists every disk's volumes, another disk's volume is mounted read-only
+    by device name (the NVMe drive — never written), umount2 refuses while a
+    directory on it is open, the refusals answer as Linux's do, and a file
+    larger than the whole-file limit is read where it is asked for."""
+    bin_dir = os.path.join(NETROOT, "bin")
+    os.makedirs(bin_dir, exist_ok=True)
+    shutil.copy(built("//src/userland/volgo:volgo"),
+                os.path.join(bin_dir, "volgo"))
+    os.chmod(os.path.join(bin_dir, "volgo"), 0o755)
+    stage_volgo()
+    log = os.path.join(out_dir, "volgo.log")
+    subprocess.run([sys.executable, os.path.join(HERE, "board.py"),
+                    f"minikern.netfs={NETFS_AT} minikern.run=/net/bin/volgo",
+                    "-t", "110", "-o", log, "-q", "-w", "900"], check=False)
+    text = open(log, "rb").read().decode("utf-8", "replace")
+    missing = [line for line in text.splitlines() if line.startswith("volgo: FAIL")]
+    for want in ["volgo: PASS mount /dev/", "volgo: PASS umount while it is open is EBUSY",
+                 "volgo: PASS its digest", "volgo: done 0 failures"]:
+        if want not in text:
+            missing.append(want)
+    return missing, log
+
+
+def sd_reads_at_once(out_dir):
+    """**Three large files read from the card at once** (§4): the SD
+    controller let a second command start while the first slept for its
+    interrupt, so concurrent reads returned another read's bytes or timed
+    out — three QuokkaOS services loaded together ran one on garbage."""
+    bin_dir = os.path.join(NETROOT, "bin")
+    os.makedirs(bin_dir, exist_ok=True)
+    shutil.copy(built("//src/userland/sdconcurrent:sdconcurrent"),
+                os.path.join(bin_dir, "sdconcurrent"))
+    os.chmod(os.path.join(bin_dir, "sdconcurrent"), 0o755)
+    log = os.path.join(out_dir, "sdconcurrent.log")
+    subprocess.run([sys.executable, os.path.join(HERE, "board.py"),
+                    f"minikern.disk=sd minikern.netfs={NETFS_AT} minikern.run=/net/bin/sdconcurrent",
+                    "-t", "150", "-o", log, "-q", "-w", "900"], check=False)
+    text = open(log, "rb").read().decode("utf-8", "replace")
+    missing = [line for line in text.splitlines() if line.startswith("sd: FAIL")]
+    if "sd: done 0 failures" not in text:
+        missing.append("sd: done 0 failures")
+    return missing, log
+
+
+def sd_writes_stream(out_dir):
+    """**Writes to the card, streamed** (§4): one CMD24 per block ran at
+    0.05 MB/s (`minikern.sdsinglewrites`, the control); CMD25 streams each
+    write. Two 8 MiB files are written with fsync, read back and compared;
+    below 0.2 MB/s is a regression to the old path."""
+    bin_dir = os.path.join(NETROOT, "bin")
+    os.makedirs(bin_dir, exist_ok=True)
+    shutil.copy(built("//src/userland/sdwrite:sdwrite"),
+                os.path.join(bin_dir, "sdwrite"))
+    os.chmod(os.path.join(bin_dir, "sdwrite"), 0o755)
+    log = os.path.join(out_dir, "sdwrite.log")
+    subprocess.run([sys.executable, os.path.join(HERE, "board.py"),
+                    f"minikern.disk=sd minikern.netfs={NETFS_AT} minikern.run=/net/bin/sdwrite",
+                    "-t", "200", "-o", log, "-q", "-w", "900"], check=False)
+    text = open(log, "rb").read().decode("utf-8", "replace")
+    missing = [line for line in text.splitlines() if line.startswith("sdw: FAIL")]
+    if "sdw: done 0 failures" not in text:
+        missing.append("sdw: done 0 failures")
+    for rate in re.findall(r"sdw: wrote \S+ in \S+ \(([0-9.]+) MB/s\)", text):
+        if float(rate) < 0.2:
+            missing.append(f"a write at {rate} MB/s (want at least 0.2)")
+    return missing, log
+
+
+def go_resolves_a_name(out_dir):
+    """**A name resolved by a stock Go program** (§5), on a card-booted
+    board: the synthesised /etc/resolv.conf opened but did not stat or
+    fstat, so Go's resolver fell back to [::1]:53."""
+    bin_dir = os.path.join(NETROOT, "bin")
+    os.makedirs(bin_dir, exist_ok=True)
+    shutil.copy(built("//src/userland/dnsgo:dnsgo"),
+                os.path.join(bin_dir, "dnsgo"))
+    os.chmod(os.path.join(bin_dir, "dnsgo"), 0o755)
+    log = os.path.join(out_dir, "dnsgo.log")
+    subprocess.run([sys.executable, os.path.join(HERE, "board.py"),
+                    f"minikern.disk=sd minikern.netfs={NETFS_AT} minikern.run=/net/bin/dnsgo",
+                    "-t", "70", "-o", log, "-q", "-w", "900"], check=False)
+    text = open(log, "rb").read().decode("utf-8", "replace")
+    missing = [line for line in text.splitlines() if line.startswith("dns: FAIL")]
+    if "dns: PASS" not in text:
+        missing.append("dns: PASS")
+    return missing, log
 
 
 def stage_vnc_password():
@@ -1332,7 +1440,12 @@ def main():
              ("§5: an idle network costs no beat (against minikern.netbeat)",
               network_is_tickless),
              ("§5: IPv6 — the board's link-local address answers pings", ipv6_link_local_answers),
-             ("§5: IPv6 sockets — a dual-stack Go server, over IPv4 and IPv6", dual_stack_serves)]
+             ("§5: IPv6 sockets — a dual-stack Go server, over IPv4 and IPv6", dual_stack_serves),
+             ("§3: volumes — every disk listed, one mounted by name, a large file streamed",
+              volumes_serve),
+             ("§4: concurrent reads from the SD card return their own bytes", sd_reads_at_once),
+             ("§4: SD writes are streamed (CMD25) and read back intact", sd_writes_stream),
+             ("§5: a stock Go program resolves a name (resolv.conf stats)", go_resolves_a_name)]
     for case in CASES:
         name, bootargs, wanted, seconds = case[:4]
         program = case[4] if len(case) > 4 else None

@@ -362,6 +362,64 @@ int xfs_unlink(struct xfs *fs, const struct xfs_inode *dir, const char *name, ui
     return rc != KERR_OK ? rc : take_one_name_away(fs, dir, name, namelen, ino, now_s);
 }
 
+/* Stops a listing at the first entry that is not "." or "..". */
+static int any_entry(void *self, const struct xfs_dirent *e) {
+    bool dot = e->name_len == 1u && e->name[0] == '.';
+    bool dotdot = e->name_len == 2u && e->name[0] == '.' && e->name[1] == '.';
+    (void)self;
+    return dot || dotdot ? KERR_OK : KERR_NOTEMPTY;
+}
+
+/* Removes an **empty** directory named `name` in `dir`: its blocks, its
+ * entry, its inode, and the parent's link its ".." held.
+ *
+ * Its own frame for the reason `remove_the_last_name` has one: it holds an
+ * inode. A block directory keeps its blocks when it empties (see
+ * `xfs_dir_remove`), so they are freed here with the inode. */
+__attribute__((noinline)) static int remove_empty_dir(struct xfs *fs, const struct xfs_inode *dir,
+                                                       const char *name, uint32_t namelen,
+                                                       uint64_t ino, uint64_t now_s) {
+    struct xfs_inode ip;
+    int rc = xfs_inode_read(fs, ino, &ip);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    if (!xfs_is_dir(&ip)) {
+        return KERR_NOTDIR;
+    }
+    rc = xfs_dir_list(fs, &ip, any_entry, NULL);
+    if (rc != KERR_OK) {
+        return rc; /* KERR_NOTEMPTY for a directory with anything in it */
+    }
+    if (ip.format != XFS_DINODE_FMT_LOCAL && ip.format != XFS_DINODE_FMT_EXTENTS &&
+        ip.format != XFS_DINODE_FMT_BTREE) {
+        return KERR_NOTSUP;
+    }
+    rc = remove_the_last_name(fs, dir, &ip, name, namelen, now_s);
+    return rc != KERR_OK ? rc : xfs_inode_adjust_nlink(fs, dir->ino, -1);
+}
+
+int xfs_rmdir(struct xfs *fs, const struct xfs_inode *dir, const char *name, uint32_t namelen,
+              uint64_t now_s) {
+    uint64_t ino = 0;
+    int rc;
+    if (!xfs_writable(fs)) {
+        return KERR_ROFS;
+    }
+    if (!xfs_is_dir(dir)) {
+        return KERR_NOTDIR;
+    }
+    if ((namelen == 1u && name[0] == '.') || (namelen == 2u && name[0] == '.' && name[1] == '.')) {
+        return KERR_INVAL; /* rmdir of "." or ".." is EINVAL, as on Linux */
+    }
+    if (dir->format != XFS_DINODE_FMT_LOCAL && dir->format != XFS_DINODE_FMT_EXTENTS &&
+        dir->format != XFS_DINODE_FMT_BTREE) {
+        return KERR_NOTSUP;
+    }
+    rc = xfs_dir_lookup(fs, dir, name, namelen, &ino);
+    return rc != KERR_OK ? rc : remove_empty_dir(fs, dir, name, namelen, ino, now_s);
+}
+
 /* Removes an entry from a directory of whatever shape.
  *
  * The counterpart of `xfs_dir_add`, and for the same reason: unlink and

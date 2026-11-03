@@ -820,6 +820,12 @@ int xfs_chown(struct xfs *fs, const struct xfs_inode *ip, uint32_t uid, uint32_t
 int xfs_rename(struct xfs *fs, const struct xfs_inode *olddir, const char *from, uint32_t fromlen,
                const struct xfs_inode *newdir, const char *to, uint32_t tolen, uint64_t now_s);
 
+/* Removes the empty directory `name` from `dir` — rmdir(2). KERR_NOTEMPTY
+ * when it holds anything but "." and "..", KERR_NOTDIR for a file, KERR_INVAL
+ * for "." or "..". The parent loses the link the child's ".." held. */
+int xfs_rmdir(struct xfs *fs, const struct xfs_inode *dir, const char *name, uint32_t namelen,
+              uint64_t now_s);
+
 int xfs_unlink(struct xfs *fs, const struct xfs_inode *dir, const char *name, uint32_t namelen,
                uint64_t now_s);
 

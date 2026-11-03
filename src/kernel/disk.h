@@ -15,6 +15,7 @@
 #include "core/bcache.h"
 #include "core/blockdev.h"
 #include "core/fdt.h"
+#include "core/volinfo.h"
 
 /* Attaches the first storage device the machine offers and builds a cache
  * over it. KERR_NOENT when there is none, which is not an error: a kernel
@@ -55,7 +56,22 @@ uint32_t disk_root_volume(void);
 bool disk_has_root(void);
 const struct blockdev *disk_volume(uint32_t i);
 
+/* How many of the volumes are on the root's disk: they come first, and
+ * they are the ones mounted at boot. The rest are other disks', presented
+ * and probed but left unmounted until `mount(2)` asks. */
+uint32_t disk_root_disk_count(void);
+
+/* What volume `i` is (name, filesystem, label, identity, size); NULL past
+ * the end. Read once at attach. */
+const struct volinfo *disk_volume_info(uint32_t i);
+
+/* The volume called `name` ("nvme0n1p1"), or disk_volume_count() for none. */
+uint32_t disk_volume_named(const char *name);
+
 struct bcache *disk_cache(void);
+
+/* Gives a cache over a disk volume its run-writing buffer (bcache.h). */
+void give_the_cache_a_gather_buffer(struct bcache *c, uint32_t block_size);
 
 /* The device itself, for anything that wants whole sectors. */
 const struct blockdev *disk_device(void);

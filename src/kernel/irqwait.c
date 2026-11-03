@@ -174,3 +174,41 @@ void irqwait_counts(uint64_t *woken, uint64_t *timed_out) {
     *woken = woken_count;
     *timed_out = timeout_count;
 }
+
+/* How long one wait for a busy device lasts before it looks again: the
+ * holder's give wakes it sooner; the bound is for a give that found no
+ * sleeper to wake. */
+#define DEVICE_RECHECK_NS 2000000ull
+
+/* Lets the lock go and watches `busy` until it clears or `deadline` —
+ * the path for a caller that is not a thread (no sleeper, or boot). */
+static void watch_with_lock_released(const struct irqwait_device *d, uint64_t deadline) {
+    bool held = klock_held();
+    klock_exit(held);
+    while (d->busy && timer_ns() < deadline) {
+        /* Nothing: the holder's give is what ends this. */
+    }
+    if (held) {
+        (void)klock_enter();
+    }
+}
+
+void irqwait_device_take(struct irqwait_device *d) {
+    if (d->busy) {
+        d->waited++;
+    }
+    while (d->busy) {
+        uint64_t deadline = timer_ns() + DEVICE_RECHECK_NS;
+        if (sleeper_wait == NULL || sleeper_wait(d, deadline) == KERR_INVAL) {
+            watch_with_lock_released(d, deadline);
+        }
+    }
+    d->busy = true;
+}
+
+void irqwait_device_give(struct irqwait_device *d) {
+    d->busy = false;
+    if (sleeper_wake != NULL) {
+        (void)sleeper_wake(d, 1);
+    }
+}
